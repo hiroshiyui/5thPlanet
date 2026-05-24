@@ -185,4 +185,19 @@ impl Saturn {
     pub fn now(&self) -> u64 {
         self.scheduler.now()
     }
+
+    /// Run one NTSC frame worth of cycles and produce the rendered
+    /// framebuffer. Cycle count is the SH-2 master clock (28.6 MHz)
+    /// divided by 60 Hz ≈ 476 932 cycles per frame.
+    ///
+    /// Writes into `out`, which must be exactly
+    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes (RGBA8888 320×224).
+    /// VBlank-IN generation lands in a follow-up — for M3 task #6
+    /// this is just "run the system, then snapshot the framebuffer";
+    /// task #7 (SDL2 frontend) consumes it as-is.
+    pub fn run_frame(&mut self, out: &mut [u8]) {
+        const CYCLES_PER_FRAME: u64 = 476_932;
+        self.run_for(CYCLES_PER_FRAME);
+        crate::vdp2::render_frame(&self.bus.vdp2, out);
+    }
 }

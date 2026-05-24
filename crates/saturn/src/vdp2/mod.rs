@@ -19,10 +19,12 @@
 
 pub mod cram;
 pub mod regs;
+pub mod renderer;
 pub mod vram;
 
 pub use cram::Cram;
 pub use regs::Vdp2Regs;
+pub use renderer::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES, render_frame};
 pub use vram::Vram;
 
 pub const VRAM_BASE: u32 = 0x05E0_0000;
