@@ -133,8 +133,40 @@ exit criterion for M3.
 - Cycle-stealing DMA accuracy — refinement for whichever later milestone surfaces a game that needs it
 - Multiple NBG/RBG layer compositing, transparency, line-scroll, mosaic, window planes — M4+
 
+## Milestone 4 — Finish the M3 stretch: SEGA splash on screen 🚧 active
+
+M3 shipped all the scaffolding but the BIOS parks in an early init poll
+because it's waiting on peripheral data we don't model. M4 is laser-
+focused on closing that gap. Everything originally sketched for M4
+(VDP1, audio, save states, keyboard input) defers to M5 — keeping the
+scope tight matches the project's one-chip-at-a-time discipline.
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | SMPC `INTBACK` — full response (no-controller status, OREG fill, raise SCU SMPC source) | pending |
+| 2 | CD-block presence stub at `0x05_8980_00+` — defined "no disc, ready" reads, OK command responses | pending |
+| 3 | VDP1 register + VRAM + framebuffer stub at `0x05_C000_00`/`0x05_D000_00` (no rendering) | pending |
+| 4 | VDP2 register-decode fidelity — renderer reads `MPOFN`/`MPABN0..MPCDR0`/scroll from regs instead of constants | pending |
+| 5 | Iterate-to-splash — trace BIOS, fix the next blocker, repeat until splash renders | pending |
+| 6 | Commit splash framebuffer hash as the new golden + visual confirmation via SDL2 | pending |
+
+### Verification gates
+
+1. `cargo test --workspace` — all 240+ prior tests still green.
+2. `cargo test -p saturn --test intback` — INTBACK populates OREG0..31 with a no-controller response and raises the SMPC interrupt.
+3. `cargo test -p saturn --test bios_boot` — hash matches the new splash golden (replaces the current all-black baseline).
+4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
+
+### Explicitly out of scope for M4
+
+- VDP1 sprite/polygon engine (registers stubbed in M4; rendering is M5)
+- SCSP + MC68EC000 + audio — M5
+- Keyboard input + full SMPC peripheral protocol — M5
+- CD-ROM image loading + real SH-1 / CD-block firmware — M6
+- Save states — M5+ once the peripheral set stabilises
+
 ## Later milestones (queued)
 
-- **M4** — VDP1 (sprites/polygons), SCSP + M68k (audio), SDL2 keyboard input, save states.
-- **M5** — CD block (SH-1), CD-ROM image loading, first commercial game booting.
+- **M5** — VDP1 sprite/polygon engine, SCSP + M68k + SDL2 audio, SDL2 keyboard mapping via SMPC peripheral data, save states.
+- **M6** — CD-block (SH-1), CD-ROM image loading, first commercial game booting.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
