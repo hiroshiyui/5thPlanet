@@ -6,7 +6,9 @@
 pub mod bus;
 pub mod memory;
 pub mod scheduler;
+pub mod system;
 
 pub use bus::SaturnBus;
 pub use memory::{BiosRom, Ram, StubRegisterBank};
 pub use scheduler::{EntityId, SchedEntity, Scheduler, Sh2Entity};
+pub use system::Saturn;

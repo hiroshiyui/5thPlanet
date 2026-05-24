@@ -1,0 +1,135 @@
+//! Dual-SH-2 coscheduling end-to-end test (M2 task #5).
+//!
+//! The canonical Saturn-flavour smoke test: master writes a sentinel
+//! into shared work RAM, slave polls until it sees it. Proves that the
+//! complete chain — decoder → interpreter → cache → routed memory →
+//! Saturn bus → scheduler — works for two CPUs sharing real Saturn-
+//! mapped memory.
+
+use saturn::Saturn;
+
+const MASTER_PC: u32 = 0x0020_1000;
+const SLAVE_PC: u32 = 0x0020_2000;
+const SHARED: u32 = 0x0600_1000;
+const SENTINEL: u32 = 0xCAFE_F00D;
+
+/// Place a sequence of 16-bit words into the bus at `addr`.
+fn load(bus: &mut saturn::SaturnBus, addr: u32, words: &[u16]) {
+    use sh2::bus::{AccessKind, Bus};
+    for (i, w) in words.iter().enumerate() {
+        bus.write16(addr + (i as u32) * 2, *w, AccessKind::Data);
+    }
+}
+
+#[test]
+fn master_writes_sentinel_slave_observes_it_within_budget() {
+    // Master program at MASTER_PC:
+    //   MOV.L R2, @R1   (write sentinel via address in R1)
+    //   BRA   -2        (loop back to self; delay slot below)
+    //   NOP             (BRA delay slot)
+    //
+    // After the one MOV.L the master spins inside BRA + NOP forever.
+    //
+    // Slave program at SLAVE_PC:
+    //   MOV.L @R1, R10  (read shared address into R10)
+    //   BRA   -3        (loop back to MOV.L; delay slot below)
+    //   NOP             (BRA delay slot)
+    let mut sat = Saturn::with_blank_bios();
+    load(
+        &mut sat.bus,
+        MASTER_PC,
+        &[
+            0x2122, // MOV.L R2, @R1  (n=1, m=2)
+            0xAFFE, // BRA -2
+            0x0009, // NOP slot
+        ],
+    );
+    load(
+        &mut sat.bus,
+        SLAVE_PC,
+        &[
+            0x6A12, // MOV.L @R1, R10  (n=10, m=1)
+            0xAFFD, // BRA -3
+            0x0009, // NOP slot
+        ],
+    );
+
+    // Set up master: R1 = shared address, R2 = sentinel, PC = program.
+    {
+        let m = sat.master_mut();
+        m.regs.pc = MASTER_PC;
+        m.regs.r[1] = SHARED;
+        m.regs.r[2] = SENTINEL;
+        m.regs.r[15] = 0x0020_8000;
+    }
+    {
+        let s = sat.slave_mut();
+        s.regs.pc = SLAVE_PC;
+        s.regs.r[1] = SHARED;
+        s.regs.r[10] = 0;
+        s.regs.r[15] = 0x0020_8400;
+    }
+
+    // Run until slave's R10 reflects the sentinel, but cap at a budget
+    // so a deadlock would fail loudly rather than hang the test runner.
+    const BUDGET: u64 = 500;
+    let mut observed = false;
+    for _ in 0..BUDGET {
+        sat.run_for(1);
+        if sat.slave().regs.r[10] == SENTINEL {
+            observed = true;
+            break;
+        }
+    }
+    assert!(observed, "slave never observed master's sentinel write within {BUDGET} cycles");
+
+    // Sanity: the shared memory itself holds the sentinel (proves it
+    // wasn't slave R10 getting stamped by some other path).
+    use sh2::bus::{AccessKind, Bus};
+    let (v, _) = sat.bus.read32(SHARED, AccessKind::Data);
+    assert_eq!(v, SENTINEL);
+}
+
+#[test]
+fn run_for_advances_both_cpus_independently() {
+    // Both CPUs spin in a NOP loop; verify the scheduler interleaves
+    // them so neither runs away with all the cycles.
+    let mut sat = Saturn::with_blank_bios();
+    load(
+        &mut sat.bus,
+        MASTER_PC,
+        &[0x0009, 0x0009, 0xAFFD, 0x0009], // NOP NOP BRA -3 NOP
+    );
+    load(
+        &mut sat.bus,
+        SLAVE_PC,
+        &[0x0009, 0x0009, 0xAFFD, 0x0009],
+    );
+    sat.master_mut().regs.pc = MASTER_PC;
+    sat.master_mut().regs.r[15] = 0x0020_8000;
+    sat.slave_mut().regs.pc = SLAVE_PC;
+    sat.slave_mut().regs.r[15] = 0x0020_8400;
+
+    sat.run_for(200);
+    let m = sat.master().pipeline.cycles;
+    let s = sat.slave().pipeline.cycles;
+    assert!(m >= 200, "master reached horizon");
+    assert!(s >= 200, "slave reached horizon");
+    let drift = m.abs_diff(s);
+    assert!(drift < 50, "drift {drift} suggests scheduler fairness regressed");
+}
+
+#[test]
+fn reset_loads_pc_and_sp_from_bios_vector() {
+    // Bake known reset-vector values into a BIOS image, construct
+    // Saturn from it, call reset, and verify both CPUs picked them up.
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&0x0020_2000u32.to_be_bytes()); // PC
+    bios[4..8].copy_from_slice(&0x0020_8000u32.to_be_bytes()); // SP
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    assert_eq!(sat.master().regs.pc, 0x0020_2000);
+    assert_eq!(sat.master().regs.r[15], 0x0020_8000);
+    assert_eq!(sat.slave().regs.pc, 0x0020_2000);
+    assert_eq!(sat.slave().regs.r[15], 0x0020_8000);
+}
