@@ -1,0 +1,14 @@
+[package]
+name = "scu_dsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SEGA Saturn SCU-DSP — 32-bit vector DSP embedded in the SCU."
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

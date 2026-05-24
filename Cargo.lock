@@ -17,5 +17,9 @@ dependencies = [
 ]
 
 [[package]]
+name = "scu_dsp"
+version = "0.1.0"
+
+[[package]]
 name = "sh2"
 version = "0.1.0"
