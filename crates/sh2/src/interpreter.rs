@@ -1,15 +1,18 @@
 //! Top-level CPU state and instruction dispatch.
 //!
-//! Task #3 wires up the first batch of opcodes (data transfer, basic ALU,
-//! compares, branches with delay slots, system NOP/CLRT/SETT). The remaining
-//! ~120 ops land in task #4.
+//! Task #4 lands the full SH-2 opcode set. Cycle counts are the base values
+//! from *SH-1/SH-2 Software Manual* Appendix A; pipeline interlocks that
+//! refine them land in task #5. Exception handling (TRAPA stack frame, RTE
+//! pop, slot-illegal / address-error vectoring) gets its full plumbing in
+//! task #7 — what's here is enough for software TRAPA/RTE round-trips on a
+//! well-behaved fixture.
 
 use crate::bus::{AccessKind, Bus};
 use crate::cache::Cache;
 use crate::decoder::decode;
 use crate::isa::Op;
 use crate::pipeline::Pipeline;
-use crate::regs::Registers;
+use crate::regs::{Registers, Sr};
 
 /// One Hitachi SH-2 (SH7604) core.
 #[derive(Clone, Debug)]
@@ -84,12 +87,12 @@ impl Cpu {
         total
     }
 
-    /// Execute one decoded op. Returns the issue cycle cost; bus stalls from
-    /// data accesses are accumulated inline.
     fn execute(&mut self, op: Op, instr_pc: u32, bus: &mut impl Bus) -> u32 {
         use Op::*;
         match op {
-            // ---- System ----
+            // ============================================================
+            // System control
+            // ============================================================
             Nop => 1,
             Clrt => {
                 self.regs.sr.set_t(false);
@@ -99,48 +102,146 @@ impl Cpu {
                 self.regs.sr.set_t(true);
                 1
             }
+            Clrmac => {
+                self.regs.mach = 0;
+                self.regs.macl = 0;
+                1
+            }
+            // SLEEP halts the CPU until an interrupt or NMI. For M1 we model
+            // it as a 3-cycle NOP — wake-up plumbing arrives with task #7.
+            Sleep => 3,
 
-            // ---- Data transfer (subset) ----
+            // ============================================================
+            // Data transfer
+            // ============================================================
             MovI { rn, imm } => {
                 self.regs.r[rn as usize] = imm as i32 as u32;
                 1
+            }
+            MovWPcRel { rn, disp } => {
+                let addr = instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 1);
+                let (val, s) = bus.read16(addr, AccessKind::Data);
+                self.regs.r[rn as usize] = val as i16 as i32 as u32;
+                1 + s
+            }
+            MovLPcRel { rn, disp } => {
+                let addr = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rn as usize] = val;
+                1 + s
             }
             MovRR { rn, rm } => {
                 self.regs.r[rn as usize] = self.regs.r[rm as usize];
                 1
             }
+
+            MovBS { rn, rm } => {
+                let s = bus.write8(
+                    self.regs.r[rn as usize],
+                    self.regs.r[rm as usize] as u8,
+                    AccessKind::Data,
+                );
+                1 + s
+            }
+            MovWS { rn, rm } => {
+                let s = bus.write16(
+                    self.regs.r[rn as usize],
+                    self.regs.r[rm as usize] as u16,
+                    AccessKind::Data,
+                );
+                1 + s
+            }
             MovLS { rn, rm } => {
-                let addr = self.regs.r[rn as usize];
-                let val = self.regs.r[rm as usize];
-                let s = bus.write32(addr, val, AccessKind::Data);
+                let s = bus.write32(
+                    self.regs.r[rn as usize],
+                    self.regs.r[rm as usize],
+                    AccessKind::Data,
+                );
+                1 + s
+            }
+            MovBL { rn, rm } => {
+                let (val, s) = bus.read8(self.regs.r[rm as usize], AccessKind::Data);
+                self.regs.r[rn as usize] = val as i8 as i32 as u32;
+                1 + s
+            }
+            MovWL { rn, rm } => {
+                let (val, s) = bus.read16(self.regs.r[rm as usize], AccessKind::Data);
+                self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLL { rn, rm } => {
-                let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = bus.read32(self.regs.r[rm as usize], AccessKind::Data);
                 self.regs.r[rn as usize] = val;
+                1 + s
+            }
+            MovBM { rn, rm } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(1);
+                let s = bus.write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                1 + s
+            }
+            MovWM { rn, rm } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(2);
+                let s = bus.write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
                 1 + s
             }
             MovLM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let val = self.regs.r[rm as usize];
-                let s = bus.write32(addr, val, AccessKind::Data);
+                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
+            MovBP { rn, rm } => {
+                let (val, s) = bus.read8(self.regs.r[rm as usize], AccessKind::Data);
+                self.regs.r[rn as usize] = val as i8 as i32 as u32;
+                if rn != rm {
+                    self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(1);
+                }
+                1 + s
+            }
+            MovWP { rn, rm } => {
+                let (val, s) = bus.read16(self.regs.r[rm as usize], AccessKind::Data);
+                self.regs.r[rn as usize] = val as i16 as i32 as u32;
+                if rn != rm {
+                    self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(2);
+                }
+                1 + s
+            }
             MovLP { rn, rm } => {
-                let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = bus.read32(self.regs.r[rm as usize], AccessKind::Data);
                 self.regs.r[rn as usize] = val;
                 if rn != rm {
-                    self.regs.r[rm as usize] = addr.wrapping_add(4);
+                    self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(4);
                 }
+                1 + s
+            }
+
+            MovBS0 { rn, disp } => {
+                let addr = self.regs.r[rn as usize].wrapping_add(disp as u32);
+                let s = bus.write8(addr, self.regs.r[0] as u8, AccessKind::Data);
+                1 + s
+            }
+            MovWS0 { rn, disp } => {
+                let addr = self.regs.r[rn as usize].wrapping_add((disp as u32) << 1);
+                let s = bus.write16(addr, self.regs.r[0] as u16, AccessKind::Data);
                 1 + s
             }
             MovLS4 { rn, rm, disp } => {
                 let addr = self.regs.r[rn as usize].wrapping_add((disp as u32) << 2);
-                let val = self.regs.r[rm as usize];
-                let s = bus.write32(addr, val, AccessKind::Data);
+                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
+                1 + s
+            }
+            MovBL0 { rm, disp } => {
+                let addr = self.regs.r[rm as usize].wrapping_add(disp as u32);
+                let (val, s) = bus.read8(addr, AccessKind::Data);
+                self.regs.r[0] = val as i8 as i32 as u32;
+                1 + s
+            }
+            MovWL0 { rm, disp } => {
+                let addr = self.regs.r[rm as usize].wrapping_add((disp as u32) << 1);
+                let (val, s) = bus.read16(addr, AccessKind::Data);
+                self.regs.r[0] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLL4 { rn, rm, disp } => {
@@ -149,15 +250,103 @@ impl Cpu {
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
-            MovLPcRel { rn, disp } => {
-                // PC-relative address: (PC_of_instr + 4 + disp*4) & ~3.
-                let addr = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
+
+            MovBSX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
+                let s = bus.write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data);
+                1 + s
+            }
+            MovWSX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
+                let s = bus.write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data);
+                1 + s
+            }
+            MovLSX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
+                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
+                1 + s
+            }
+            MovBLX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
+                let (val, s) = bus.read8(addr, AccessKind::Data);
+                self.regs.r[rn as usize] = val as i8 as i32 as u32;
+                1 + s
+            }
+            MovWLX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
+                let (val, s) = bus.read16(addr, AccessKind::Data);
+                self.regs.r[rn as usize] = val as i16 as i32 as u32;
+                1 + s
+            }
+            MovLLX { rn, rm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
                 let (val, s) = bus.read32(addr, AccessKind::Data);
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
 
-            // ---- Arithmetic (subset) ----
+            MovBSG { disp } => {
+                let addr = self.regs.gbr.wrapping_add(disp as u32);
+                let s = bus.write8(addr, self.regs.r[0] as u8, AccessKind::Data);
+                1 + s
+            }
+            MovWSG { disp } => {
+                let addr = self.regs.gbr.wrapping_add((disp as u32) << 1);
+                let s = bus.write16(addr, self.regs.r[0] as u16, AccessKind::Data);
+                1 + s
+            }
+            MovLSG { disp } => {
+                let addr = self.regs.gbr.wrapping_add((disp as u32) << 2);
+                let s = bus.write32(addr, self.regs.r[0], AccessKind::Data);
+                1 + s
+            }
+            MovBLG { disp } => {
+                let addr = self.regs.gbr.wrapping_add(disp as u32);
+                let (val, s) = bus.read8(addr, AccessKind::Data);
+                self.regs.r[0] = val as i8 as i32 as u32;
+                1 + s
+            }
+            MovWLG { disp } => {
+                let addr = self.regs.gbr.wrapping_add((disp as u32) << 1);
+                let (val, s) = bus.read16(addr, AccessKind::Data);
+                self.regs.r[0] = val as i16 as i32 as u32;
+                1 + s
+            }
+            MovLLG { disp } => {
+                let addr = self.regs.gbr.wrapping_add((disp as u32) << 2);
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[0] = val;
+                1 + s
+            }
+
+            Mova { disp } => {
+                self.regs.r[0] = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
+                1
+            }
+            Movt { rn } => {
+                self.regs.r[rn as usize] = self.regs.sr.t() as u32;
+                1
+            }
+            SwapB { rn, rm } => {
+                let m = self.regs.r[rm as usize];
+                self.regs.r[rn as usize] =
+                    (m & 0xFFFF_0000) | ((m & 0xFF) << 8) | ((m & 0xFF00) >> 8);
+                1
+            }
+            SwapW { rn, rm } => {
+                self.regs.r[rn as usize] = self.regs.r[rm as usize].rotate_left(16);
+                1
+            }
+            Xtrct { rn, rm } => {
+                let m = self.regs.r[rm as usize];
+                let n = self.regs.r[rn as usize];
+                self.regs.r[rn as usize] = ((m & 0xFFFF) << 16) | ((n >> 16) & 0xFFFF);
+                1
+            }
+
+            // ============================================================
+            // Arithmetic
+            // ============================================================
             Add { rn, rm } => {
                 self.regs.r[rn as usize] =
                     self.regs.r[rn as usize].wrapping_add(self.regs.r[rm as usize]);
@@ -168,57 +357,345 @@ impl Cpu {
                     self.regs.r[rn as usize].wrapping_add(imm as i32 as u32);
                 1
             }
+            Addc { rn, rm } => {
+                let t_in = self.regs.sr.t() as u32;
+                let (s1, c1) = self.regs.r[rn as usize].overflowing_add(self.regs.r[rm as usize]);
+                let (s2, c2) = s1.overflowing_add(t_in);
+                self.regs.r[rn as usize] = s2;
+                self.regs.sr.set_t(c1 || c2);
+                1
+            }
+            Addv { rn, rm } => {
+                let (s, ov) =
+                    (self.regs.r[rn as usize] as i32).overflowing_add(self.regs.r[rm as usize] as i32);
+                self.regs.r[rn as usize] = s as u32;
+                self.regs.sr.set_t(ov);
+                1
+            }
             Sub { rn, rm } => {
                 self.regs.r[rn as usize] =
                     self.regs.r[rn as usize].wrapping_sub(self.regs.r[rm as usize]);
                 1
             }
-            CmpEq { rn, rm } => {
-                let t = self.regs.r[rn as usize] == self.regs.r[rm as usize];
-                self.regs.sr.set_t(t);
+            Subc { rn, rm } => {
+                let t_in = self.regs.sr.t() as u32;
+                let (s1, b1) = self.regs.r[rn as usize].overflowing_sub(self.regs.r[rm as usize]);
+                let (s2, b2) = s1.overflowing_sub(t_in);
+                self.regs.r[rn as usize] = s2;
+                self.regs.sr.set_t(b1 || b2);
                 1
             }
-            CmpEqI { imm } => {
-                let t = self.regs.r[0] == (imm as i32 as u32);
-                self.regs.sr.set_t(t);
+            Subv { rn, rm } => {
+                let (s, ov) =
+                    (self.regs.r[rn as usize] as i32).overflowing_sub(self.regs.r[rm as usize] as i32);
+                self.regs.r[rn as usize] = s as u32;
+                self.regs.sr.set_t(ov);
                 1
             }
-            CmpHs { rn, rm } => {
-                let t = self.regs.r[rn as usize] >= self.regs.r[rm as usize];
-                self.regs.sr.set_t(t);
+            Neg { rn, rm } => {
+                self.regs.r[rn as usize] = 0u32.wrapping_sub(self.regs.r[rm as usize]);
                 1
             }
-            CmpGe { rn, rm } => {
-                let t = (self.regs.r[rn as usize] as i32) >= (self.regs.r[rm as usize] as i32);
-                self.regs.sr.set_t(t);
+            Negc { rn, rm } => {
+                let t_in = self.regs.sr.t() as u32;
+                let (s1, b1) = 0u32.overflowing_sub(self.regs.r[rm as usize]);
+                let (s2, b2) = s1.overflowing_sub(t_in);
+                self.regs.r[rn as usize] = s2;
+                self.regs.sr.set_t(b1 || b2);
                 1
             }
-            CmpHi { rn, rm } => {
-                let t = self.regs.r[rn as usize] > self.regs.r[rm as usize];
-                self.regs.sr.set_t(t);
-                1
-            }
-            CmpGt { rn, rm } => {
-                let t = (self.regs.r[rn as usize] as i32) > (self.regs.r[rm as usize] as i32);
-                self.regs.sr.set_t(t);
+            Dt { rn } => {
+                let v = self.regs.r[rn as usize].wrapping_sub(1);
+                self.regs.r[rn as usize] = v;
+                self.regs.sr.set_t(v == 0);
                 1
             }
 
-            // ---- Branches (subset) ----
-            // SH-2 PC-relative branch base is `PC_of_instr + 4`.
+            CmpEqI { imm } => {
+                self.regs.sr.set_t(self.regs.r[0] == (imm as i32 as u32));
+                1
+            }
+            CmpEq { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t(self.regs.r[rn as usize] == self.regs.r[rm as usize]);
+                1
+            }
+            CmpHs { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t(self.regs.r[rn as usize] >= self.regs.r[rm as usize]);
+                1
+            }
+            CmpGe { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t((self.regs.r[rn as usize] as i32) >= (self.regs.r[rm as usize] as i32));
+                1
+            }
+            CmpHi { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t(self.regs.r[rn as usize] > self.regs.r[rm as usize]);
+                1
+            }
+            CmpGt { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t((self.regs.r[rn as usize] as i32) > (self.regs.r[rm as usize] as i32));
+                1
+            }
+            CmpPl { rn } => {
+                self.regs.sr.set_t((self.regs.r[rn as usize] as i32) > 0);
+                1
+            }
+            CmpPz { rn } => {
+                self.regs.sr.set_t((self.regs.r[rn as usize] as i32) >= 0);
+                1
+            }
+            CmpStr { rn, rm } => {
+                // T = any byte of (Rn ^ Rm) is zero — i.e. any matching byte.
+                let x = self.regs.r[rn as usize] ^ self.regs.r[rm as usize];
+                let any_zero_byte = (x & 0xFF00_0000) == 0
+                    || (x & 0x00FF_0000) == 0
+                    || (x & 0x0000_FF00) == 0
+                    || (x & 0x0000_00FF) == 0;
+                self.regs.sr.set_t(any_zero_byte);
+                1
+            }
+
+            ExtsB { rn, rm } => {
+                self.regs.r[rn as usize] = self.regs.r[rm as usize] as i8 as i32 as u32;
+                1
+            }
+            ExtsW { rn, rm } => {
+                self.regs.r[rn as usize] = self.regs.r[rm as usize] as i16 as i32 as u32;
+                1
+            }
+            ExtuB { rn, rm } => {
+                self.regs.r[rn as usize] = self.regs.r[rm as usize] & 0xFF;
+                1
+            }
+            ExtuW { rn, rm } => {
+                self.regs.r[rn as usize] = self.regs.r[rm as usize] & 0xFFFF;
+                1
+            }
+
+            // ---- Multiplies ----
+            MulL { rn, rm } => {
+                self.regs.macl = self.regs.r[rn as usize].wrapping_mul(self.regs.r[rm as usize]);
+                // Manual: 2–4 cycles. Use 2 as base; pipeline interlock model
+                // (task #5) will refine this with MAC-ready scoreboard.
+                2
+            }
+            MulsW { rn, rm } => {
+                let m = self.regs.r[rm as usize] as i16 as i32;
+                let n = self.regs.r[rn as usize] as i16 as i32;
+                self.regs.macl = (m.wrapping_mul(n)) as u32;
+                1
+            }
+            MuluW { rn, rm } => {
+                let m = (self.regs.r[rm as usize] as u16) as u32;
+                let n = (self.regs.r[rn as usize] as u16) as u32;
+                self.regs.macl = m.wrapping_mul(n);
+                1
+            }
+            DmulsL { rn, rm } => {
+                let prod = (self.regs.r[rn as usize] as i32 as i64)
+                    .wrapping_mul(self.regs.r[rm as usize] as i32 as i64);
+                self.regs.macl = prod as u32;
+                self.regs.mach = (prod >> 32) as u32;
+                2
+            }
+            DmuluL { rn, rm } => {
+                let prod = (self.regs.r[rn as usize] as u64)
+                    .wrapping_mul(self.regs.r[rm as usize] as u64);
+                self.regs.macl = prod as u32;
+                self.regs.mach = (prod >> 32) as u32;
+                2
+            }
+            MacL { rn, rm } => self.exec_mac_l(rn, rm, bus),
+            MacW { rn, rm } => self.exec_mac_w(rn, rm, bus),
+
+            // ---- Division ----
+            Div0u => {
+                self.regs.sr.set_m(false);
+                self.regs.sr.set_q(false);
+                self.regs.sr.set_t(false);
+                1
+            }
+            Div0s { rn, rm } => {
+                let m = (self.regs.r[rm as usize] as i32) < 0;
+                let q = (self.regs.r[rn as usize] as i32) < 0;
+                self.regs.sr.set_m(m);
+                self.regs.sr.set_q(q);
+                self.regs.sr.set_t(m != q);
+                1
+            }
+            Div1 { rn, rm } => {
+                self.exec_div1(rn, rm);
+                1
+            }
+
+            // ============================================================
+            // Logical
+            // ============================================================
+            And { rn, rm } => {
+                self.regs.r[rn as usize] &= self.regs.r[rm as usize];
+                1
+            }
+            AndI { imm } => {
+                self.regs.r[0] &= imm as u32;
+                1
+            }
+            AndBG { imm } => self.exec_logical_bg(imm, bus, |a, b| a & b),
+            Or { rn, rm } => {
+                self.regs.r[rn as usize] |= self.regs.r[rm as usize];
+                1
+            }
+            OrI { imm } => {
+                self.regs.r[0] |= imm as u32;
+                1
+            }
+            OrBG { imm } => self.exec_logical_bg(imm, bus, |a, b| a | b),
+            Xor { rn, rm } => {
+                self.regs.r[rn as usize] ^= self.regs.r[rm as usize];
+                1
+            }
+            XorI { imm } => {
+                self.regs.r[0] ^= imm as u32;
+                1
+            }
+            XorBG { imm } => self.exec_logical_bg(imm, bus, |a, b| a ^ b),
+            Not { rn, rm } => {
+                self.regs.r[rn as usize] = !self.regs.r[rm as usize];
+                1
+            }
+            Tst { rn, rm } => {
+                self.regs
+                    .sr
+                    .set_t((self.regs.r[rn as usize] & self.regs.r[rm as usize]) == 0);
+                1
+            }
+            TstI { imm } => {
+                self.regs.sr.set_t((self.regs.r[0] & imm as u32) == 0);
+                1
+            }
+            TstBG { imm } => {
+                let addr = self.regs.r[0].wrapping_add(self.regs.gbr);
+                let (val, s) = bus.read8(addr, AccessKind::Data);
+                self.regs.sr.set_t((val & imm) == 0);
+                3 + s
+            }
+            Tas { rn } => {
+                let addr = self.regs.r[rn as usize];
+                let (val, sr) = bus.read8(addr, AccessKind::Data);
+                self.regs.sr.set_t(val == 0);
+                let sw = bus.write8(addr, val | 0x80, AccessKind::Data);
+                4 + sr + sw
+            }
+
+            // ============================================================
+            // Shifts / rotates
+            // ============================================================
+            Shll { rn } | Shal { rn } => {
+                let v = self.regs.r[rn as usize];
+                self.regs.sr.set_t(v & 0x8000_0000 != 0);
+                self.regs.r[rn as usize] = v << 1;
+                1
+            }
+            Shlr { rn } => {
+                let v = self.regs.r[rn as usize];
+                self.regs.sr.set_t(v & 1 != 0);
+                self.regs.r[rn as usize] = v >> 1;
+                1
+            }
+            Shar { rn } => {
+                let v = self.regs.r[rn as usize];
+                self.regs.sr.set_t(v & 1 != 0);
+                self.regs.r[rn as usize] = ((v as i32) >> 1) as u32;
+                1
+            }
+            Rotl { rn } => {
+                let v = self.regs.r[rn as usize];
+                self.regs.sr.set_t(v & 0x8000_0000 != 0);
+                self.regs.r[rn as usize] = v.rotate_left(1);
+                1
+            }
+            Rotr { rn } => {
+                let v = self.regs.r[rn as usize];
+                self.regs.sr.set_t(v & 1 != 0);
+                self.regs.r[rn as usize] = v.rotate_right(1);
+                1
+            }
+            Rotcl { rn } => {
+                let v = self.regs.r[rn as usize];
+                let new_msb = v & 0x8000_0000 != 0;
+                self.regs.r[rn as usize] = (v << 1) | (self.regs.sr.t() as u32);
+                self.regs.sr.set_t(new_msb);
+                1
+            }
+            Rotcr { rn } => {
+                let v = self.regs.r[rn as usize];
+                let new_lsb = v & 1 != 0;
+                self.regs.r[rn as usize] = ((self.regs.sr.t() as u32) << 31) | (v >> 1);
+                self.regs.sr.set_t(new_lsb);
+                1
+            }
+            Shll2 { rn } => {
+                self.regs.r[rn as usize] <<= 2;
+                1
+            }
+            Shlr2 { rn } => {
+                self.regs.r[rn as usize] >>= 2;
+                1
+            }
+            Shll8 { rn } => {
+                self.regs.r[rn as usize] <<= 8;
+                1
+            }
+            Shlr8 { rn } => {
+                self.regs.r[rn as usize] >>= 8;
+                1
+            }
+            Shll16 { rn } => {
+                self.regs.r[rn as usize] <<= 16;
+                1
+            }
+            Shlr16 { rn } => {
+                self.regs.r[rn as usize] >>= 16;
+                1
+            }
+
+            // ============================================================
+            // Branches
+            // ============================================================
             Bra { disp } => {
-                let target = instr_pc
-                    .wrapping_add(4)
-                    .wrapping_add(((disp as i32) << 1) as u32);
-                self.pending_branch = Some(target);
+                self.pending_branch = Some(
+                    instr_pc
+                        .wrapping_add(4)
+                        .wrapping_add(((disp as i32) << 1) as u32),
+                );
                 2
             }
             Bsr { disp } => {
                 self.regs.pr = instr_pc.wrapping_add(4);
-                let target = instr_pc
-                    .wrapping_add(4)
-                    .wrapping_add(((disp as i32) << 1) as u32);
-                self.pending_branch = Some(target);
+                self.pending_branch = Some(
+                    instr_pc
+                        .wrapping_add(4)
+                        .wrapping_add(((disp as i32) << 1) as u32),
+                );
+                2
+            }
+            Braf { rm } => {
+                self.pending_branch =
+                    Some(instr_pc.wrapping_add(4).wrapping_add(self.regs.r[rm as usize]));
+                2
+            }
+            Bsrf { rm } => {
+                self.regs.pr = instr_pc.wrapping_add(4);
+                self.pending_branch =
+                    Some(instr_pc.wrapping_add(4).wrapping_add(self.regs.r[rm as usize]));
                 2
             }
             Jmp { rm } => {
@@ -256,10 +733,11 @@ impl Cpu {
             }
             BtS { disp } => {
                 if self.regs.sr.t() {
-                    let target = instr_pc
-                        .wrapping_add(4)
-                        .wrapping_add(((disp as i32) << 1) as u32);
-                    self.pending_branch = Some(target);
+                    self.pending_branch = Some(
+                        instr_pc
+                            .wrapping_add(4)
+                            .wrapping_add(((disp as i32) << 1) as u32),
+                    );
                     2
                 } else {
                     1
@@ -267,26 +745,305 @@ impl Cpu {
             }
             BfS { disp } => {
                 if !self.regs.sr.t() {
-                    let target = instr_pc
-                        .wrapping_add(4)
-                        .wrapping_add(((disp as i32) << 1) as u32);
-                    self.pending_branch = Some(target);
+                    self.pending_branch = Some(
+                        instr_pc
+                            .wrapping_add(4)
+                            .wrapping_add(((disp as i32) << 1) as u32),
+                    );
                     2
                 } else {
                     1
                 }
             }
 
-            Illegal(_) => {
-                // Vector 4 dispatch lands in task #7. For now: stall 1 cycle
-                // so test fixtures don't deadlock.
+            // ============================================================
+            // Control-register transfer
+            // ============================================================
+            LdcSr { rm } => {
+                self.regs.sr.0 = self.regs.r[rm as usize] & Sr::WRITE_MASK;
                 1
             }
+            LdcGbr { rm } => {
+                self.regs.gbr = self.regs.r[rm as usize];
+                1
+            }
+            LdcVbr { rm } => {
+                self.regs.vbr = self.regs.r[rm as usize];
+                1
+            }
+            LdcLSr { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.sr.0 = val & Sr::WRITE_MASK;
+                3 + s
+            }
+            LdcLGbr { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.gbr = val;
+                3 + s
+            }
+            LdcLVbr { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.vbr = val;
+                3 + s
+            }
+            StcSr { rn } => {
+                self.regs.r[rn as usize] = self.regs.sr.0;
+                1
+            }
+            StcGbr { rn } => {
+                self.regs.r[rn as usize] = self.regs.gbr;
+                1
+            }
+            StcVbr { rn } => {
+                self.regs.r[rn as usize] = self.regs.vbr;
+                1
+            }
+            StcLSr { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.sr.0, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                2 + s
+            }
+            StcLGbr { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.gbr, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                2 + s
+            }
+            StcLVbr { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.vbr, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                2 + s
+            }
+            LdsMach { rm } => {
+                self.regs.mach = self.regs.r[rm as usize];
+                1
+            }
+            LdsMacl { rm } => {
+                self.regs.macl = self.regs.r[rm as usize];
+                1
+            }
+            LdsPr { rm } => {
+                self.regs.pr = self.regs.r[rm as usize];
+                1
+            }
+            LdsLMach { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.mach = val;
+                1 + s
+            }
+            LdsLMacl { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.macl = val;
+                1 + s
+            }
+            LdsLPr { rm } => {
+                let addr = self.regs.r[rm as usize];
+                let (val, s) = bus.read32(addr, AccessKind::Data);
+                self.regs.r[rm as usize] = addr.wrapping_add(4);
+                self.regs.pr = val;
+                1 + s
+            }
+            StsMach { rn } => {
+                self.regs.r[rn as usize] = self.regs.mach;
+                1
+            }
+            StsMacl { rn } => {
+                self.regs.r[rn as usize] = self.regs.macl;
+                1
+            }
+            StsPr { rn } => {
+                self.regs.r[rn as usize] = self.regs.pr;
+                1
+            }
+            StsLMach { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.mach, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                1 + s
+            }
+            StsLMacl { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.macl, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                1 + s
+            }
+            StsLPr { rn } => {
+                let addr = self.regs.r[rn as usize].wrapping_sub(4);
+                let s = bus.write32(addr, self.regs.pr, AccessKind::Data);
+                self.regs.r[rn as usize] = addr;
+                1 + s
+            }
 
-            // Remaining ops land in task #4. Decoded but not yet executed —
-            // treat as NOP-ish so a partly-implemented program can still be
-            // single-stepped without panicking.
-            _ => 1,
+            // ============================================================
+            // Exception primitives — minimal forms; full plumbing in task #7
+            // ============================================================
+            Trapa { imm } => {
+                // Push SR, then PC of next instruction (instr_pc + 2), then
+                // vector through VBR + imm*4.
+                let mut sp = self.regs.r[15];
+                sp = sp.wrapping_sub(4);
+                let s1 = bus.write32(sp, self.regs.sr.0, AccessKind::Data);
+                sp = sp.wrapping_sub(4);
+                let s2 = bus.write32(sp, instr_pc.wrapping_add(2), AccessKind::Data);
+                self.regs.r[15] = sp;
+                let vec_addr = self.regs.vbr.wrapping_add((imm as u32) << 2);
+                let (target, s3) = bus.read32(vec_addr, AccessKind::Data);
+                self.regs.pc = target;
+                8 + s1 + s2 + s3
+            }
+            Rte => {
+                // Pop PC then SR. RTE has a delay slot; the slot's PC is the
+                // instruction after RTE, but the architecture says the slot
+                // executes *before* the popped PC takes effect, so we mirror
+                // the branch path: set pending_branch to the popped PC.
+                let sp = self.regs.r[15];
+                let (new_pc, s1) = bus.read32(sp, AccessKind::Data);
+                let (new_sr, s2) = bus.read32(sp.wrapping_add(4), AccessKind::Data);
+                self.regs.r[15] = sp.wrapping_add(8);
+                self.regs.sr.0 = new_sr & Sr::WRITE_MASK;
+                self.pending_branch = Some(new_pc);
+                4 + s1 + s2
+            }
+
+            Illegal(_) => {
+                // Vector 4 (general illegal instruction) dispatch lands in
+                // task #7. For M1 we stall a cycle so the harness doesn't
+                // deadlock — but tests should fail loudly on unexpected
+                // illegal opcodes.
+                1
+            }
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Helpers
+    // ----------------------------------------------------------------------
+
+    /// AND.B/OR.B/XOR.B #imm,@(R0,GBR). 3 cycles plus bus stalls.
+    fn exec_logical_bg(
+        &mut self,
+        imm: u8,
+        bus: &mut impl Bus,
+        f: fn(u8, u8) -> u8,
+    ) -> u32 {
+        let addr = self.regs.r[0].wrapping_add(self.regs.gbr);
+        let (val, sr) = bus.read8(addr, AccessKind::Data);
+        let sw = bus.write8(addr, f(val, imm), AccessKind::Data);
+        3 + sr + sw
+    }
+
+    /// Non-restoring division step. Faithful port of the SH-2 software
+    /// manual algorithm (§6, DIV1). Operates on Rn (dividend high half)
+    /// using Rm as the divisor.
+    fn exec_div1(&mut self, rn: u8, rm: u8) {
+        let old_q = self.regs.sr.q();
+        let m = self.regs.sr.m();
+        let t_in = self.regs.sr.t();
+        let divisor = self.regs.r[rm as usize];
+
+        let new_q = self.regs.r[rn as usize] & 0x8000_0000 != 0;
+        let shifted = (self.regs.r[rn as usize] << 1) | (t_in as u32);
+
+        let (result, q) = if !old_q {
+            if !m {
+                let r = shifted.wrapping_sub(divisor);
+                let tmp1 = r > shifted;
+                let q = if new_q { !tmp1 } else { tmp1 };
+                (r, q)
+            } else {
+                let r = shifted.wrapping_add(divisor);
+                let tmp1 = r < shifted;
+                let q = if new_q { tmp1 } else { !tmp1 };
+                (r, q)
+            }
+        } else if !m {
+            let r = shifted.wrapping_add(divisor);
+            let tmp1 = r < shifted;
+            let q = if new_q { !tmp1 } else { tmp1 };
+            (r, q)
+        } else {
+            let r = shifted.wrapping_sub(divisor);
+            let tmp1 = r > shifted;
+            let q = if new_q { tmp1 } else { !tmp1 };
+            (r, q)
+        };
+
+        self.regs.r[rn as usize] = result;
+        self.regs.sr.set_q(q);
+        self.regs.sr.set_t(q == m);
+    }
+
+    /// MAC.L @Rm+,@Rn+. Signed 32×32 multiply, 64-bit accumulate into
+    /// MACH:MACL. S-bit saturation is implemented to the 48-bit signed
+    /// range (per SH7604 manual); rare in practice but exercised by some
+    /// DSP-heavy code paths.
+    fn exec_mac_l(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
+        let addr_m = self.regs.r[rm as usize];
+        let (sm, s1) = bus.read32(addr_m, AccessKind::Data);
+        self.regs.r[rm as usize] = addr_m.wrapping_add(4);
+
+        let addr_n = self.regs.r[rn as usize];
+        let (sn, s2) = bus.read32(addr_n, AccessKind::Data);
+        self.regs.r[rn as usize] = addr_n.wrapping_add(4);
+
+        let prod = (sm as i32 as i64).wrapping_mul(sn as i32 as i64);
+        let acc = ((self.regs.mach as u64) << 32) | (self.regs.macl as u64);
+        let sum = (acc as i64).wrapping_add(prod);
+
+        let final_sum = if self.regs.sr.s() {
+            const MAX: i64 = (1i64 << 47) - 1;
+            const MIN: i64 = -(1i64 << 47);
+            sum.clamp(MIN, MAX)
+        } else {
+            sum
+        };
+        self.regs.macl = final_sum as u32;
+        self.regs.mach = (final_sum >> 32) as u32;
+        3 + s1 + s2
+    }
+
+    /// MAC.W @Rm+,@Rn+. Signed 16×16 multiply. With S=0 the 32-bit product
+    /// is added to MACH:MACL as a 64-bit signed value. With S=1 it
+    /// accumulates into MACL only with 32-bit saturation (MACH retains the
+    /// "overflow occurred" indicator in bit 0, per the SH7604 manual).
+    fn exec_mac_w(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
+        let addr_m = self.regs.r[rm as usize];
+        let (sm, s1) = bus.read16(addr_m, AccessKind::Data);
+        self.regs.r[rm as usize] = addr_m.wrapping_add(2);
+
+        let addr_n = self.regs.r[rn as usize];
+        let (sn, s2) = bus.read16(addr_n, AccessKind::Data);
+        self.regs.r[rn as usize] = addr_n.wrapping_add(2);
+
+        let prod = (sm as i16 as i32).wrapping_mul(sn as i16 as i32);
+
+        if !self.regs.sr.s() {
+            let acc = ((self.regs.mach as u64) << 32) | (self.regs.macl as u64);
+            let sum = (acc as i64).wrapping_add(prod as i64);
+            self.regs.macl = sum as u32;
+            self.regs.mach = (sum >> 32) as u32;
+        } else {
+            let (sum, ov) = (self.regs.macl as i32).overflowing_add(prod);
+            if ov {
+                // Saturate and set the overflow flag in MACH bit 0.
+                self.regs.macl = if prod < 0 { i32::MIN as u32 } else { i32::MAX as u32 };
+                self.regs.mach |= 1;
+            } else {
+                self.regs.macl = sum as u32;
+            }
+        }
+        3 + s1 + s2
     }
 }
