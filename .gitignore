@@ -1,1 +1,7 @@
 /target
+
+# SEGA Saturn BIOS images live in bios/ and must never be committed —
+# they are copyrighted by SEGA. Each developer supplies their own dump.
+# Keep the directory documented via bios/README.md (whitelisted below).
+bios/*
+!bios/README.md
