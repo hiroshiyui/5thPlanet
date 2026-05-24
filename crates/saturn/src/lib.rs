@@ -37,6 +37,7 @@ pub mod scheduler;
 pub mod scu;
 pub mod smpc;
 pub mod system;
+pub mod vdp2;
 
 pub use bus::SaturnBus;
 pub use memory::{BiosRom, Ram, StubRegisterBank};
@@ -44,3 +45,4 @@ pub use scheduler::{EntityId, SchedEntity, Scheduler, Sh2Entity};
 pub use scu::{DmaRequest, Scu, Source as ScuSource};
 pub use smpc::{Command as SmpcCommand, Smpc};
 pub use system::Saturn;
+pub use vdp2::{Cram, Vdp2, Vdp2Regs, Vram};
