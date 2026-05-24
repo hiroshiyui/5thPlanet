@@ -1,0 +1,14 @@
+[package]
+name = "sh2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cycle-accurate Hitachi SH-2 (SH7604) CPU core."
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true
