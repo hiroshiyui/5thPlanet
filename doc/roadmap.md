@@ -68,9 +68,46 @@ The cache-wiring tests serve double-duty as both "task #2 done" and the M2
 verification gate "second read of the same address from master costs fewer
 cycles" — the `CountingBus` directly proves the hit path.
 
+## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2: BIOS to splash 🚧 active
+
+Goal: **the SEGA logo on screen.** A real BIOS image boots, the splash
+renders, and an SDL2 window displays it. Stands up the system bridge
+(SCU + DMA + interrupt aggregator), the slave-release path (SMPC), the
+display generator (VDP2 minimal — one NBG layer), the SCU-DSP, and the
+frontend shell.
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | SMPC — registers + `SETSL`/`SETSM` slave hold-release | pending |
+| 2 | SCU registers + DMA channels (3 channels, synchronous transfer) | pending |
+| 3 | SCU interrupt aggregator + wiring into SH-2 master INTC | pending |
+| 4 | `scu_dsp` crate — 32-bit DSP core (ISA, decoder, interpreter, opcode tests) | pending |
+| 5 | VDP2 register bank + VRAM (512 KiB) + CRAM (4 KiB) | pending |
+| 6 | VDP2 minimal renderer — one NBG layer (bitmap + 4-cell tile, 8/16/32 bpp via CRAM) | pending |
+| 7 | SDL2 frontend skeleton — window, run loop, framebuffer texture upload | pending |
+| 8 | BIOS boot integration — load real BIOS, hash splash framebuffer against committed golden | pending |
+
+### Verification gates
+
+1. `cargo test --workspace` — all 156 prior tests still green.
+2. `cargo test -p scu_dsp` — DSP per-opcode tests pass.
+3. `cargo test -p saturn --test scu` — DMA transfers, INTC priority.
+4. `cargo test -p saturn --test smpc` — `SETSL` releases the halted slave.
+5. `cargo test -p saturn --test vdp2_render` — hand-crafted scene renders to known RGBA bytes.
+6. `cargo test -p saturn --test bios_boot` — splash framebuffer hash matches golden.
+7. Manual: `cargo run -p fifth_planet -- bios/Sega\ Saturn\ BIOS\ (USA).bin` shows the SEGA splash.
+
+### Explicitly out of scope for M3
+
+- VDP1 (sprites/polygons) — M4
+- SCSP + M68k + audio — M4
+- Keyboard input + SMPC peripheral data — M4
+- Save states — M4 or M5 once the peripheral set stabilises
+- Cycle-stealing DMA accuracy — refinement for whichever later milestone surfaces a game that needs it
+- Multiple NBG/RBG layer compositing, transparency, line-scroll, mosaic, window planes — M4+
+
 ## Later milestones (queued)
 
-- **M3** — VDP1 + VDP2, SCU + SCU-DSP, SMPC stub, BIOS boot to splash, SDL2 frontend (window + input), save states.
-- **M4** — SCSP M68k + SCSP-DSP, audio output via SDL2.
+- **M4** — VDP1 (sprites/polygons), SCSP + M68k (audio), SDL2 keyboard input, save states.
 - **M5** — CD block (SH-1), CD-ROM image loading, first commercial game booting.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
