@@ -32,8 +32,12 @@ Run the binary with `cargo run -p fifth_planet` (currently just `Hello, world!`;
 crates/sh2/        — M1 deliverable: standalone SH-2 (SH7604) core.
                      no_std + extern alloc. Library-shaped, no I/O.
 crates/saturn/     — M2+ deliverable: Saturn system glue (bus, scheduler,
-                     SMPC, SCU). VDP2/VDP1/SCSP/CD-block to follow.
-fifth_planet/      — Binary crate. Gets the SDL2 frontend in M3.
+                     SMPC, SCU + DMA + INTC). VDP2/VDP1/SCSP/CD-block
+                     to follow.
+crates/scu_dsp/    — M3 deliverable: SCU's embedded 32-bit DSP. Standalone
+                     for now; SCU host wiring lands when target microcode
+                     surfaces in M3+/M4.
+fifth_planet/      — Binary crate. Gets the SDL2 frontend in M3 task #7.
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```

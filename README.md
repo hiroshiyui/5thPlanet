@@ -19,7 +19,7 @@ foundation stays solid.
 | M3        | SCU, SMPC, VDP2 minimal, SDL2 window: BIOS to splash    | 🚧 active   |
 | M4+       | VDP1, audio, save states, CD block, first game booting  | queued       |
 
-Current test count: **182 workspace-wide, 0 failures.** Task-by-task
+Current test count: **210 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 ## Quick start
@@ -45,9 +45,13 @@ cargo run -p fifth_planet
 - [`crates/sh2`](crates/sh2) — cycle-accurate SH-2 (SH7604) CPU core.
   `no_std` + `alloc`, no I/O.
 - [`crates/saturn`](crates/saturn) — Saturn system: memory map, dual
-  SH-2 scheduler, SMPC, SCU + DMA. VDP1/2, SCSP, CD-block to follow.
+  SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator. VDP1/2,
+  SCSP, CD-block to follow.
+- [`crates/scu_dsp`](crates/scu_dsp) — SCU's embedded 32-bit DSP.
+  Standalone for now; wired into the SCU host as M3+/M4 microcode
+  needs surface.
 - [`fifth_planet`](fifth_planet) — frontend binary. Gets an SDL2
-  window in M3.
+  window in M3 task #7.
 
 ## BIOS
 
