@@ -25,6 +25,7 @@
 use sh2::bus::{AccessKind, Bus};
 
 use crate::memory::{BiosRom, Ram, StubRegisterBank};
+use crate::smpc::Smpc;
 
 pub const BIOS_BASE: u32 = 0x0000_0000;
 pub const BIOS_END: u32 = 0x000F_FFFF;
@@ -52,7 +53,7 @@ const STUB_WAITS: u32 = 0;
 #[derive(Clone, Debug)]
 pub struct SaturnBus {
     pub bios: BiosRom,
-    pub smpc: StubRegisterBank,
+    pub smpc: Smpc,
     pub backup: Ram,
     pub low_wram: Ram,
     pub sound: StubRegisterBank,
@@ -66,7 +67,7 @@ impl SaturnBus {
     pub fn new(bios: Vec<u8>) -> Self {
         Self {
             bios: BiosRom::new(bios),
-            smpc: StubRegisterBank::new("SMPC"),
+            smpc: Smpc::new(),
             backup: Ram::new(32 * 1024),
             low_wram: Ram::new(1024 * 1024),
             sound: StubRegisterBank::new("SOUND"),

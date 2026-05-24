@@ -121,16 +121,33 @@ pub struct EntityId(pub(crate) usize);
 // ---- Concrete entity: SH-2 wrapped for the Saturn bus context. -----------
 
 /// Schedulable wrapper around an `sh2::Cpu`. The entity's `next_deadline`
-/// is exactly the CPU's `pipeline.cycles`, so a CPU that has run more
-/// cycles is "ahead" and the scheduler will prefer the other.
+/// is the CPU's `pipeline.cycles` when running, or `u64::MAX` when
+/// halted — that way the scheduler's "most-behind wins" rule naturally
+/// skips a halted CPU (it's "infinitely ahead") without any special-
+/// casing in the scheduler. The slave SH-2 lives in this halted state
+/// from power-on until SMPC's `SETSL` command releases it.
 #[derive(Clone, Debug)]
 pub struct Sh2Entity {
     pub cpu: sh2::Cpu,
+    halted: bool,
 }
 
 impl Sh2Entity {
     pub fn new(cpu: sh2::Cpu) -> Self {
-        Self { cpu }
+        Self { cpu, halted: false }
+    }
+
+    /// Construct already-halted — what the slave starts as on power-on.
+    pub fn new_halted(cpu: sh2::Cpu) -> Self {
+        Self { cpu, halted: true }
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn set_halted(&mut self, halted: bool) {
+        self.halted = halted;
     }
 }
 
@@ -138,10 +155,16 @@ impl SchedEntity for Sh2Entity {
     type Context = crate::SaturnBus;
 
     fn next_deadline(&self) -> u64 {
-        self.cpu.pipeline.cycles
+        if self.halted {
+            u64::MAX
+        } else {
+            self.cpu.pipeline.cycles
+        }
     }
 
     fn step(&mut self, ctx: &mut Self::Context) {
-        self.cpu.step(ctx);
+        if !self.halted {
+            self.cpu.step(ctx);
+        }
     }
 }
