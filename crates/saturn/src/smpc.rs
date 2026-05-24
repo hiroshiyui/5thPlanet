@@ -67,6 +67,11 @@ pub enum Command {
     SetSMem = 0x17,
     /// SETTIME — initialise the clock. M3 stores the request and clears SF.
     SetTime = 0x18,
+    /// Undocumented SMPC command observed at USA BIOS boot. Probably
+    /// a hardware self-test or selftest-related call; behaviour is
+    /// not in the published manual. Recognised as a no-op so the
+    /// trace doesn't flag it as `last_unknown_command`.
+    Unknown1A = 0x1A,
 }
 
 impl Command {
@@ -89,6 +94,7 @@ impl Command {
             0x16 => Self::IntBack,
             0x17 => Self::SetSMem,
             0x18 => Self::SetTime,
+            0x1A => Self::Unknown1A,
             _ => return None,
         })
     }

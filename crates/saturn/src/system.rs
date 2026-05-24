@@ -126,13 +126,71 @@ impl Saturn {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
                 SmpcCommand::SshOff => self.halt_slave(),
-                // Other commands are recognised but have no M3 side
-                // effect — they'll get real implementations as the
-                // corresponding subsystems land in M3/M4.
+                SmpcCommand::NmiReq => {
+                    // SMPC NMIREQ asserts NMI on the master SH-2.
+                    // NMI bypasses SR.imask so it fires at the next
+                    // instruction boundary regardless of mask state —
+                    // which is exactly what the BIOS expects: it sets
+                    // imask=15 and busy-waits on an NMI handler.
+                    self.master_mut()
+                        .onchip
+                        .intc
+                        .raise(sh2::InterruptSource::Nmi);
+                }
+                SmpcCommand::IntBack => self.respond_to_intback(),
+                // Other commands are recognised but have no
+                // emulator-side effect yet (SETTIME / SETSMEM / etc.)
+                // — they get real implementations as the corresponding
+                // peripherals land in later milestones.
                 _ => {}
             }
             self.bus.smpc.mark_command_done();
         }
+    }
+
+    /// Populate OREG0..31 with a status response describing "no
+    /// controller in either port, USA region, valid RTC". Then raise
+    /// the SCU's SMPC interrupt source so a BIOS handler can read it.
+    ///
+    /// The fields and layout follow the SMPC IO Manual §4 (INTBACK
+    /// response format). For M4 the values are static — keyboard input
+    /// and a real peripheral protocol are M5.
+    fn respond_to_intback(&mut self) {
+        let s = &mut self.bus.smpc;
+        // OREG0 — STE (set-time-enable) = 0 → time field valid;
+        // RESD (reset-disabled) = 0 → reset button enabled.
+        s.oreg[0] = 0x00;
+        // OREG1..6 — BCD time. Year hi / year lo / month / day-of-week+day
+        // / hour / minute. Values arbitrary; BIOS just needs them to be
+        // BCD-parseable.
+        s.oreg[1] = 0x20;
+        s.oreg[2] = 0x26;
+        s.oreg[3] = 0x05;
+        s.oreg[4] = 0x18;
+        s.oreg[5] = 0x12;
+        s.oreg[6] = 0x00;
+        // OREG7 — cartridge code (none).
+        s.oreg[7] = 0x00;
+        // OREG8 — area code. 0x06 = USA; matches the BIOS image variant
+        // we're testing against. PAL / JP variants would set 0x05 / 0x01.
+        s.oreg[8] = 0x06;
+        // OREG9 — system status.
+        s.oreg[9] = 0x00;
+        // OREG10 — SMPC status.
+        s.oreg[10] = 0x00;
+        // OREG11..30 — peripheral data slots. M4 reports no peripheral
+        // in either port via SMPC's 0xF0 "port empty" tag in the port
+        // headers.
+        s.oreg[11] = 0xF0; // port 1 header: no peripheral
+        s.oreg[12] = 0xF0; // port 2 header: no peripheral
+        for i in 13..31 {
+            s.oreg[i] = 0;
+        }
+        // OREG31 — end-of-data marker per the manual.
+        s.oreg[31] = 0xF0;
+
+        // Surface the SMPC interrupt so the BIOS's SMPC handler runs.
+        self.bus.scu.raise(crate::scu::Source::Smpc);
     }
 
     /// Run any DMA transfers that the SCU queued during the last

@@ -118,3 +118,74 @@ fn ireg_oreg_round_trip_through_the_bus() {
     assert_eq!(ireg0, 0xAB);
     assert_eq!(oreg0, 0xCD);
 }
+
+#[test]
+fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
+    let mut sat = build();
+    // Replace the NOP train at PC0 with a tight BRA-self so the master
+    // doesn't run off into uninitialised memory and cascade vector-4
+    // illegal-instruction dispatches (which would also push SR+PC and
+    // muddy the signal we're testing).
+    sat.bus.low_wram.write16(0x1000, 0xAFFE); // BRA -2
+    sat.bus.low_wram.write16(0x1002, 0x0009); // NOP slot
+    sat.master_mut().regs.pc = 0x0020_1000;
+
+    // Install a real NMI handler so the all-zero default doesn't itself
+    // cascade. Point VBR at low WRAM and put a self-loop at vector 11.
+    sat.master_mut().regs.vbr = 0x0020_4000;
+    let handler = 0x0020_5000;
+    sat.bus.write32(0x0020_4000 + 11 * 4, handler, AccessKind::Data);
+    sat.bus.write16(handler, 0xAFFE, AccessKind::Data);
+    sat.bus.write16(handler + 2, 0x0009, AccessKind::Data);
+
+    let sp_before = sat.master().regs.r[15];
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // NMIREQ
+    sat.run_for(512);
+    let sp_after = sat.master().regs.r[15];
+
+    // NMI is the only thing that pushes SR+PC unprompted; if SP dropped
+    // by exactly 8 the master vectored through once. (Once dispatched,
+    // the pending bit clears, so checking `next_pending` directly is
+    // racy — the stack-frame side effect is the durable signal.)
+    assert_eq!(
+        sp_before.wrapping_sub(sp_after),
+        8,
+        "NMI should have pushed SR + PC = 8 bytes onto master stack"
+    );
+    // And master should be inside the handler now.
+    assert!(
+        sat.master().regs.pc == handler || sat.master().regs.pc == handler + 2,
+        "master should be executing the NMI handler, got PC=0x{:08X}",
+        sat.master().regs.pc
+    );
+}
+
+#[test]
+fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
+    let mut sat = build();
+    sat.bus.write8(COMREG, 0x16, AccessKind::Data); // INTBACK
+    sat.run_for(512);
+    // OREG8 = area code (USA = 0x06).
+    assert_eq!(sat.bus.smpc.oreg[8], 0x06);
+    // OREG11 / OREG12 = port 1 / port 2 peripheral headers (no peripheral).
+    assert_eq!(sat.bus.smpc.oreg[11], 0xF0);
+    assert_eq!(sat.bus.smpc.oreg[12], 0xF0);
+    // OREG31 = end marker.
+    assert_eq!(sat.bus.smpc.oreg[31], 0xF0);
+    // SCU's SMPC source is the path BIOS handlers wait on.
+    let pending = sat.bus.scu.take_pending_interrupt(0);
+    assert_eq!(pending.map(|(s, _)| s), Some(saturn::ScuSource::Smpc));
+}
+
+#[test]
+fn undocumented_command_1a_is_no_longer_an_unknown_event() {
+    let mut sat = build();
+    sat.bus.write8(COMREG, 0x1A, AccessKind::Data);
+    sat.run_for(512);
+    assert!(
+        sat.bus.smpc.last_unknown_command.is_none(),
+        "0x1A was observed at USA BIOS boot — it must be recognised as a no-op rather than logged as unknown"
+    );
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF drops after processing");
+}
