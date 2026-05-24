@@ -71,33 +71,61 @@ impl Cpu {
     /// Fetch + decode + execute one instruction. Returns total cycles
     /// (instruction issue cost + bus stalls + interlock stalls).
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
+        // ---- Interrupt boundary: check pending INTC sources first ----
+        // SH-2 only accepts interrupts at instruction boundaries (never
+        // inside a delay slot — that's a hardware invariant).
+        if self.pending_branch.is_none()
+            && let Some((src, level)) = self.onchip.intc.next_pending(self.regs.sr.imask())
+        {
+            let vector = self.onchip.intc.vector_for(src);
+            self.onchip.intc.acknowledge(src);
+            // External (level-triggered) sources stay asserted until the
+            // line drops; on-chip sources are edge-triggered and we just
+            // cleared the bit above. The Saturn-side glue will re-raise
+            // External(level) on every step while IRL is held.
+            let cost = self.take_exception(vector, Some(level), bus);
+            self.pipeline.advance(cost);
+            return cost;
+        }
+
         let instr_pc = self.regs.pc;
         let (word, fetch_stall) = self.mem_read16(instr_pc, AccessKind::Fetch, bus);
         self.regs.pc = instr_pc.wrapping_add(2);
         let op = decode(word);
 
         // ---- Pre-dispatch interlocks ----
-        // Load-use: 1-cycle stall if the previous instruction's loaded reg
-        // is read here. Consumed by any one instruction (or simply expires
-        // on the next, whichever comes first).
         let mut interlock_stall = 0u32;
         if let Some(loaded) = self.load_dest_pending.take()
             && op.reads_reg(loaded)
         {
             interlock_stall += 1;
         }
-        // MAC read: stall a STS until the multiplier has retired.
         if op.reads_mac() {
             interlock_stall += self.pipeline.stall_for_mac();
         }
 
         let was_pending = self.pending_branch.is_some();
         self.in_delay_slot = was_pending;
+
+        // ---- Slot-illegal instruction ----
+        // A delay-slot containing a branch / SR-mutating op / PC-fetching
+        // op raises vector 6. The pushed PC is the *branch* address
+        // (instr_pc - 2), so RTE restarts the branch with consistent state.
         if was_pending && op.is_illegal_in_slot() {
-            // Slot illegal instruction (vector 6). Full handling in task #7;
-            // for M1 we discard the branch and continue so trace tooling
-            // doesn't wedge.
             self.pending_branch = None;
+            self.in_delay_slot = false;
+            self.regs.pc = instr_pc; // un-advance: re-fetch the slot on return
+            let cost = self.take_exception(6, None, bus);
+            self.pipeline.advance(interlock_stall + fetch_stall + cost);
+            return interlock_stall + fetch_stall + cost;
+        }
+
+        // ---- General illegal instruction ----
+        if matches!(op, Op::Illegal(_)) {
+            self.regs.pc = instr_pc; // RTE returns to the offending op
+            let cost = self.take_exception(4, None, bus);
+            self.pipeline.advance(interlock_stall + fetch_stall + cost);
+            return interlock_stall + fetch_stall + cost;
         }
 
         let exec_cycles = self.execute(op, instr_pc, bus);
@@ -114,8 +142,6 @@ impl Cpu {
             self.load_dest_pending = Some(rn);
         }
         if let Some(lat) = op.multiply_latency() {
-            // Schedule against the cycle the multiplier *finishes issuing*,
-            // i.e. after `exec_cycles` have already been booked.
             self.pipeline
                 .schedule_mac(lat + exec_cycles + interlock_stall);
         }
@@ -123,6 +149,35 @@ impl Cpu {
         let total = interlock_stall + fetch_stall + exec_cycles;
         self.pipeline.advance(total);
         total
+    }
+
+    /// Push SR then PC on the stack and vector through `VBR + vector*4`.
+    /// Returns the bus-stall cycles incurred; the caller adds the fixed
+    /// 5-cycle exception overhead. If `set_imask` is `Some(lvl)` the SR
+    /// interrupt mask is raised to it after the push (interrupt entry).
+    fn take_exception(
+        &mut self,
+        vector: u8,
+        set_imask: Option<u8>,
+        bus: &mut impl Bus,
+    ) -> u32 {
+        let mut sp = self.regs.r[15];
+        sp = sp.wrapping_sub(4);
+        let s1 = self.mem_write32(sp, self.regs.sr.0, AccessKind::Data, bus);
+        sp = sp.wrapping_sub(4);
+        let s2 = self.mem_write32(sp, self.regs.pc, AccessKind::Data, bus);
+        self.regs.r[15] = sp;
+        if let Some(lvl) = set_imask {
+            self.regs.sr.set_imask(lvl);
+        }
+        let vec_addr = self.regs.vbr.wrapping_add((vector as u32) << 2);
+        let (target, s3) = self.mem_read32(vec_addr, AccessKind::Data, bus);
+        self.regs.pc = target;
+        // Reset interlocks; the handler executes from a fresh pipeline
+        // state, just like after a branch.
+        self.pending_branch = None;
+        self.load_dest_pending = None;
+        5 + s1 + s2 + s3
     }
 
     fn execute(&mut self, op: Op, instr_pc: u32, bus: &mut impl Bus) -> u32 {
@@ -919,21 +974,13 @@ impl Cpu {
             }
 
             // ============================================================
-            // Exception primitives — minimal forms; full plumbing in task #7
+            // Exception primitives
             // ============================================================
             Trapa { imm } => {
-                // Push SR, then PC of next instruction (instr_pc + 2), then
-                // vector through VBR + imm*4.
-                let mut sp = self.regs.r[15];
-                sp = sp.wrapping_sub(4);
-                let s1 = self.mem_write32(sp, self.regs.sr.0, AccessKind::Data, bus);
-                sp = sp.wrapping_sub(4);
-                let s2 = self.mem_write32(sp, instr_pc.wrapping_add(2), AccessKind::Data, bus);
-                self.regs.r[15] = sp;
-                let vec_addr = self.regs.vbr.wrapping_add((imm as u32) << 2);
-                let (target, s3) = self.mem_read32(vec_addr, AccessKind::Data, bus);
-                self.regs.pc = target;
-                8 + s1 + s2 + s3
+                // self.regs.pc is already instr_pc + 2 (advanced in step()),
+                // so take_exception pushes the correct resume address.
+                let cost = self.take_exception(imm, None, bus);
+                3 + cost
             }
             Rte => {
                 // Pop PC then SR. RTE has a delay slot; the slot's PC is the
@@ -950,11 +997,10 @@ impl Cpu {
             }
 
             Illegal(_) => {
-                // Vector 4 (general illegal instruction) dispatch lands in
-                // task #7. For M1 we stall a cycle so the harness doesn't
-                // deadlock — but tests should fail loudly on unexpected
-                // illegal opcodes.
-                1
+                // Intercepted in step() before reaching execute(): vector 4
+                // is taken immediately. Reaching this arm means the
+                // step-level guard regressed.
+                unreachable!("Op::Illegal must be handled in step(), not execute()");
             }
         }
     }
