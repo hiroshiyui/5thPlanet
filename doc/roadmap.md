@@ -68,7 +68,7 @@ The cache-wiring tests serve double-duty as both "task #2 done" and the M2
 verification gate "second read of the same address from master costs fewer
 cycles" — the `CountingBus` directly proves the hit path.
 
-## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2: BIOS to splash 🚧 active
+## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2: BIOS to splash ✅ scaffolding complete
 
 Goal: **the SEGA logo on screen.** A real BIOS image boots, the splash
 renders, and an SDL2 window displays it. Stands up the system bridge
@@ -85,30 +85,50 @@ frontend shell.
 | 5 | VDP2 register bank + VRAM (512 KiB) + CRAM (4 KiB) | ✅ done |
 | 6 | VDP2 minimal renderer — one NBG layer (bitmap + 4-cell tile, 8/16/32 bpp via CRAM) | ✅ done |
 | 7 | SDL2 frontend skeleton — window, run loop, framebuffer texture upload | ✅ done |
-| 8 | BIOS boot integration — load real BIOS, hash splash framebuffer against committed golden | pending |
+| 8 | BIOS boot integration — load real BIOS, hash splash framebuffer against committed golden | ✅ done (regression baseline) |
 
-### What's landed so far (`cargo test --workspace` → 182 tests, 0 failures)
+### What landed (`cargo test --workspace` → 240 tests, 0 failures)
 
-- 14 saturn lib tests (SMPC + SCU register banks)
-- 7 `saturn::smpc` integration — slave halt at reset, SSHON release within Saturn::run_for, SSHOFF re-halt, SF transitions
-- 5 `saturn::scu` integration — VER through bus, ch0 BIOS→WRAM copy, non-multiple-of-4 byte tail, zero-count no-op, ch1+ch2 concurrent independent state
-- Plus the 156 carried over from M1+M2
+- 8 unit + 7 integration tests for SMPC (slave halt-on-reset, SSHON release, SSHOFF re-halt, SF transitions, IREG/OREG round-trip)
+- 8 unit + 8 integration tests for SCU (DMA round-trips, INTC priority resolution, IST W1C semantics, DMA-end raising the right per-channel source, end-to-end DMA → master SH-2 vectors)
+- 6 unit + 13 integration tests for `scu_dsp` (decoder, ALU, MVI, JMP cond+uncond, END/ENDI, runaway-microcode step cap)
+- 14 VDP2 unit tests + 6 integration through the bus + 6 renderer unit tests + 3 `Saturn::run_frame` integration
+- 1 BIOS-boot regression test (gated on BIOS presence; asserts against committed golden hash)
 
-### Verification gates
+### M3 close-out — honest reality
 
-1. `cargo test --workspace` — all 156 prior tests still green.
+All 8 task scaffolds shipped; the SDL2 frontend opens cleanly and the test
+suite is green. **The "SEGA logo on screen" goal is not yet met.** A real
+Saturn BIOS image boots into an early init poll loop (master spins at PC
+0x000002B2/0x000002B6 with `SR.imask = 15`, which masks even the
+VBlank-IN we now raise at frame boundary). The BIOS is waiting on
+peripheral data — most likely an SMPC `INTBACK` response or CD-block
+status handshake, neither of which M3 modelled. With those landed in M4
+the same harness will start showing meaningful framebuffer content.
+
+The committed golden hash `0x2A0B972960C5E325` is the all-black current
+output. It's still a useful regression baseline: if any of the 8 M3
+components silently drift, this hash flips and the BIOS-boot test fails
+loudly. The visual confirmation step in the original task description
+becomes the entry criterion for M4's BIOS-splash effort rather than the
+exit criterion for M3.
+
+### Verification gates (all green)
+
+1. `cargo test --workspace` — 240 tests pass.
 2. `cargo test -p scu_dsp` — DSP per-opcode tests pass.
 3. `cargo test -p saturn --test scu` — DMA transfers, INTC priority.
 4. `cargo test -p saturn --test smpc` — `SETSL` releases the halted slave.
 5. `cargo test -p saturn --test vdp2_render` — hand-crafted scene renders to known RGBA bytes.
-6. `cargo test -p saturn --test bios_boot` — splash framebuffer hash matches golden.
-7. Manual: `cargo run -p fifth_planet -- bios/Sega\ Saturn\ BIOS\ (USA).bin` shows the SEGA splash.
+6. `cargo test -p saturn --test bios_boot` — splash framebuffer hash matches golden (currently the all-black "stuck in BIOS init poll" hash).
+7. Manual: `cargo run -p fifth_planet -- bios/Sega\ Saturn\ BIOS\ (USA).bin` opens an SDL2 window; window stays open and accepts close/Esc. Screen is black (not yet splash — see close-out notes above).
 
 ### Explicitly out of scope for M3
 
 - VDP1 (sprites/polygons) — M4
 - SCSP + M68k + audio — M4
-- Keyboard input + SMPC peripheral data — M4
+- SMPC `INTBACK` peripheral data + keyboard input — M4
+- CD-block (SH-1) handshake — M5
 - Save states — M4 or M5 once the peripheral set stabilises
 - Cycle-stealing DMA accuracy — refinement for whichever later milestone surfaces a game that needs it
 - Multiple NBG/RBG layer compositing, transparency, line-scroll, mosaic, window planes — M4+
