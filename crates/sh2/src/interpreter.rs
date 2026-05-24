@@ -8,12 +8,26 @@
 //! well-behaved fixture.
 
 use crate::bus::{AccessKind, Bus};
-use crate::cache::Cache;
+use crate::cache::{self, Cache};
 use crate::decoder::decode;
 use crate::isa::Op;
 use crate::onchip::OnChip;
 use crate::pipeline::Pipeline;
 use crate::regs::{Registers, Sr};
+
+/// Decode an SH-2 logical address into (physical Saturn-bus address,
+/// cacheable?). Cached and cache-through regions alias the same physical
+/// memory; the cacheable flag tells the CPU whether to consult its cache.
+/// Addresses outside both regions pass through unmodified — those are
+/// SH-2 control areas the bus typically returns open-bus for.
+#[inline]
+const fn classify(addr: u32) -> (u32, bool) {
+    match addr {
+        0x0000_0000..=0x1FFF_FFFF => (addr, true),
+        0x2000_0000..=0x3FFF_FFFF => (addr & 0x1FFF_FFFF, false),
+        _ => (addr, false),
+    }
+}
 
 /// One Hitachi SH-2 (SH7604) core.
 #[derive(Clone, Debug)]
@@ -1009,60 +1023,135 @@ impl Cpu {
     // Memory routing
     // ----------------------------------------------------------------------
     //
-    // Every CPU memory access goes through these helpers. Addresses
-    // covered by SH7604 on-chip peripherals (FFFFFE00..FFFFFFFF) are
-    // serviced internally and reported as 0-stall; everything else
-    // delegates to the external [`Bus`] with its wait-state count.
+    // Every CPU memory access goes through these helpers. SH7604 address
+    // space is partitioned by the top 3 bits:
+    //
+    //   0x00000000..0x1FFFFFFF  cached area      → probe cache, miss-fills line
+    //   0x20000000..0x3FFFFFFF  cache-through    → bypass cache, present masked addr
+    //   0xFFFFFE00..0xFFFFFFFF  on-chip peripherals (intercepted before bus)
+    //   anything else           pass through to bus untouched (control regions)
+    //
+    // The cache uses the masked physical address (low 29 bits) for tag
+    // matching so a cached and cache-through access to the same physical
+    // memory see the same line storage.
 
     #[inline]
     pub(crate) fn mem_read8(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u8, u32) {
         if OnChip::owns(addr) {
-            (self.onchip.read8(addr), 0)
-        } else {
-            bus.read8(addr, kind)
+            return (self.onchip.read8(addr), 0);
         }
+        let (phys, cacheable) = classify(addr);
+        if cacheable
+            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
+        {
+            return (cache::extract_u8(&line, phys), stall);
+        }
+        bus.read8(phys, kind)
     }
+
     #[inline]
     pub(crate) fn mem_read16(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u16, u32) {
         if OnChip::owns(addr) {
-            (self.onchip.read16(addr), 0)
-        } else {
-            bus.read16(addr, kind)
+            return (self.onchip.read16(addr), 0);
         }
+        let (phys, cacheable) = classify(addr);
+        if cacheable
+            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
+        {
+            return (cache::extract_u16(&line, phys), stall);
+        }
+        bus.read16(phys, kind)
     }
+
     #[inline]
     pub(crate) fn mem_read32(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u32, u32) {
         if OnChip::owns(addr) {
-            (self.onchip.read32(addr), 0)
-        } else {
-            bus.read32(addr, kind)
+            return (self.onchip.read32(addr), 0);
         }
+        let (phys, cacheable) = classify(addr);
+        if cacheable
+            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
+        {
+            return (cache::extract_u32(&line, phys), stall);
+        }
+        bus.read32(phys, kind)
     }
+
     #[inline]
     pub(crate) fn mem_write8(&mut self, addr: u32, val: u8, kind: AccessKind, bus: &mut impl Bus) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write8(addr, val);
-            0
-        } else {
-            bus.write8(addr, val, kind)
+            return 0;
         }
+        let (phys, cacheable) = classify(addr);
+        if cacheable {
+            // Write-through: update the cached line if resident, then
+            // always reach the bus.
+            self.cache.write_through_u8(phys, val);
+        }
+        bus.write8(phys, val, kind)
     }
+
     #[inline]
     pub(crate) fn mem_write16(&mut self, addr: u32, val: u16, kind: AccessKind, bus: &mut impl Bus) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write16(addr, val);
-            0
-        } else {
-            bus.write16(addr, val, kind)
+            return 0;
         }
+        let (phys, cacheable) = classify(addr);
+        if cacheable {
+            self.cache.write_through_u16(phys, val);
+        }
+        bus.write16(phys, val, kind)
     }
+
     #[inline]
     pub(crate) fn mem_write32(&mut self, addr: u32, val: u32, kind: AccessKind, bus: &mut impl Bus) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write32(addr, val);
-            0
-        } else {
-            bus.write32(addr, val, kind)
+            return 0;
+        }
+        let (phys, cacheable) = classify(addr);
+        if cacheable {
+            self.cache.write_through_u32(phys, val);
+        }
+        bus.write32(phys, val, kind)
+    }
+
+    /// Cache miss-fill. Returns `Some((line, stall))` if the cache is
+    /// active and we successfully obtained a line (hit or freshly filled);
+    /// `None` if the cache is disabled or this access kind is masked off
+    /// (ID/OD) — in which case the caller bypasses to the bus directly.
+    ///
+    /// On a miss we fetch the full 16-byte line aligned to `phys & !0xF`
+    /// via four sequential `bus.read32` calls (the SH7604 burst is four
+    /// 32-bit beats), install it, and return the populated line.
+    fn cache_fill(
+        &mut self,
+        phys: u32,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> Option<([u8; cache::LINE_BYTES], u32)> {
+        let lookup = match kind {
+            AccessKind::Fetch => self.cache.lookup_fetch(phys),
+            AccessKind::Data | AccessKind::Dma => self.cache.lookup_data(phys),
+        };
+        match lookup {
+            cache::Lookup::Hit(line) => Some((line, 0)),
+            cache::Lookup::Bypass => None,
+            cache::Lookup::Miss => {
+                let base = phys & !0xF;
+                let mut line = [0u8; cache::LINE_BYTES];
+                let mut stall = 0u32;
+                for chunk in 0..4u32 {
+                    let (val, s) = bus.read32(base + chunk * 4, kind);
+                    let off = (chunk * 4) as usize;
+                    line[off..off + 4].copy_from_slice(&val.to_be_bytes());
+                    stall += s;
+                }
+                self.cache.install(phys, line);
+                Some((line, stall))
+            }
         }
     }
 
