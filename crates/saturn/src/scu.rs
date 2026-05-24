@@ -44,6 +44,74 @@ const CHANNEL_STRIDE: u32 = 0x20;
 /// DGO ("DMA Go") enable bit in D*EN.
 const DGO_BIT: u32 = 1 << 8;
 
+/// Sources the SCU's interrupt aggregator forwards to the master
+/// SH-2 as an `External(level)` IRL assertion. Hardware-fixed priority
+/// (no programmability for these in M3) and IST bit assignment per
+/// the SCU manual.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Source {
+    VBlankIn = 0,
+    VBlankOut = 1,
+    HBlankIn = 2,
+    Timer0 = 3,
+    Timer1 = 4,
+    DspEnd = 5,
+    SoundRequest = 6,
+    Smpc = 7,
+    Pad = 8,
+    Level2DmaEnd = 9,
+    Level1DmaEnd = 10,
+    Level0DmaEnd = 11,
+    DmaIllegal = 12,
+    SpriteDrawEnd = 13,
+}
+
+impl Source {
+    /// Bit position within `ist` / `ims`.
+    pub const fn bit(self) -> u32 {
+        self as u32
+    }
+
+    /// Hardware-fixed priority level (1..=15) asserted on the SH-2's
+    /// IRL lines when this source fires.
+    pub const fn priority(self) -> u8 {
+        match self {
+            Source::VBlankIn => 15,
+            Source::VBlankOut => 14,
+            Source::HBlankIn => 13,
+            Source::Timer0 => 12,
+            Source::Timer1 => 11,
+            Source::DspEnd => 10,
+            Source::SoundRequest => 9,
+            Source::Smpc | Source::Pad => 8,
+            Source::Level2DmaEnd | Source::Level1DmaEnd => 6,
+            Source::Level0DmaEnd => 5,
+            Source::DmaIllegal => 3,
+            Source::SpriteDrawEnd => 2,
+        }
+    }
+}
+
+/// Scan order used by `take_pending_interrupt`. Highest priority first,
+/// so the first match in the scan is the winner.
+const ALL_SOURCES: &[Source] = &[
+    Source::VBlankIn,
+    Source::VBlankOut,
+    Source::HBlankIn,
+    Source::Timer0,
+    Source::Timer1,
+    Source::DspEnd,
+    Source::SoundRequest,
+    Source::Smpc,
+    Source::Pad,
+    Source::Level2DmaEnd,
+    Source::Level1DmaEnd,
+    Source::Level0DmaEnd,
+    Source::DmaIllegal,
+    Source::SpriteDrawEnd,
+];
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DmaChannel {
     pub read_addr: u32,
@@ -75,6 +143,13 @@ pub struct Scu {
     /// DSP control register window (0x80..0x9C). Plain storage in M3;
     /// task #17 (`scu_dsp` crate) interprets it.
     pub dsp_ctrl: [u32; 8],
+    /// Sources that have been asserted since the last drain. The
+    /// Saturn aggregate's `drain_scu_intc` pops one per call and
+    /// raises it on the master SH-2's INTC. Distinct from `ist`: `ist`
+    /// is software-visible state (cleared by W1C from a handler);
+    /// `fresh_assertions` tracks edges so we don't re-fire on the SH-2
+    /// every batch while software is still handling the previous one.
+    fresh_assertions: u32,
 }
 
 /// Snapshot of a queued DMA request handed to the bus drainer.
@@ -124,7 +199,9 @@ impl Scu {
             0xA4 => self.t1s = val,
             0xA8 => self.t1md = val,
             0xB0 => self.ims = val,
-            0xB4 => self.ist = val,
+            // IST is write-1-to-clear: software acknowledges interrupts
+            // by writing the bit it wants to clear.
+            0xB4 => self.ist &= !val,
             0xB8 => self.aiack = val,
             0xC4 => self.asr0 = val,
             0xC8 => self.asr1 = val,
@@ -259,14 +336,53 @@ impl Scu {
         None
     }
 
-    /// Mark a DMA channel as having completed: zero its remaining count
-    /// and store the post-transfer source / destination so software
-    /// reading `D*R` / `D*W` sees the addresses past the moved block.
+    /// Mark a DMA channel as having completed: zero its remaining count,
+    /// store the post-transfer source / destination so software reading
+    /// `D*R` / `D*W` sees the addresses past the moved block, and raise
+    /// the channel's "DMA end" interrupt source.
     pub fn finish_dma(&mut self, channel: usize, final_src: u32, final_dst: u32) {
         let c = &mut self.channels[channel];
         c.read_addr = final_src;
         c.write_addr = final_dst;
         c.transfer_count = 0;
+        let source = match channel {
+            0 => Source::Level0DmaEnd,
+            1 => Source::Level1DmaEnd,
+            2 => Source::Level2DmaEnd,
+            _ => return,
+        };
+        self.raise(source);
+    }
+
+    /// Assert an interrupt source: set its IST bit and mark it as a
+    /// fresh assertion the Saturn drainer should forward to the master
+    /// SH-2. Software clears IST manually via the standard W1C path.
+    pub fn raise(&mut self, source: Source) {
+        let bit = 1 << source.bit();
+        self.ist |= bit;
+        self.fresh_assertions |= bit;
+    }
+
+    /// Pop the highest-priority freshly-asserted source whose IMS bit
+    /// is clear and whose priority exceeds `sh2_imask`. Returns
+    /// `Some((source, level))` if any; clears the fresh-assertion bit
+    /// for that source so we don't re-fire on the SH-2 on the next
+    /// drain (re-firing only happens after a new `raise`).
+    pub fn take_pending_interrupt(&mut self, sh2_imask: u8) -> Option<(Source, u8)> {
+        let unmasked = self.fresh_assertions & !self.ims;
+        for &source in ALL_SOURCES {
+            let bit = 1 << source.bit();
+            if unmasked & bit == 0 {
+                continue;
+            }
+            let lvl = source.priority();
+            if lvl <= sh2_imask {
+                continue;
+            }
+            self.fresh_assertions &= !bit;
+            return Some((source, lvl));
+        }
+        None
     }
 }
 
@@ -362,5 +478,81 @@ mod tests {
         assert_eq!(s.channels[0].read_addr, 0x0600_0100);
         assert_eq!(s.channels[0].write_addr, 0x0020_0100);
         assert_eq!(s.channels[0].transfer_count, 0);
+    }
+
+    #[test]
+    fn finish_dma_raises_the_channel_specific_end_source() {
+        let mut s = Scu::new();
+        s.channels[1].transfer_count = 0x10;
+        s.finish_dma(1, 0, 0);
+        // IST bit set, fresh assertion ready, take_pending returns it.
+        assert_ne!(s.ist & (1 << Source::Level1DmaEnd.bit()), 0);
+        let (src, lvl) = s.take_pending_interrupt(0).unwrap();
+        assert_eq!(src, Source::Level1DmaEnd);
+        assert_eq!(lvl, 6);
+    }
+
+    #[test]
+    fn take_pending_interrupt_resolves_by_priority() {
+        let mut s = Scu::new();
+        s.raise(Source::SpriteDrawEnd); // prio 2
+        s.raise(Source::VBlankIn);       // prio 15
+        s.raise(Source::DmaIllegal);     // prio 3
+        let (src, _) = s.take_pending_interrupt(0).unwrap();
+        assert_eq!(src, Source::VBlankIn, "highest priority wins");
+        let (src, _) = s.take_pending_interrupt(0).unwrap();
+        assert_eq!(src, Source::DmaIllegal);
+        let (src, _) = s.take_pending_interrupt(0).unwrap();
+        assert_eq!(src, Source::SpriteDrawEnd);
+        assert!(s.take_pending_interrupt(0).is_none());
+    }
+
+    #[test]
+    fn take_pending_interrupt_honours_sh2_imask() {
+        let mut s = Scu::new();
+        s.raise(Source::Smpc); // priority 8
+        assert!(s.take_pending_interrupt(8).is_none(), "imask 8 blocks level 8");
+        assert!(s.take_pending_interrupt(7).is_some(), "imask 7 allows level 8");
+    }
+
+    #[test]
+    fn take_pending_interrupt_honours_ims_per_source() {
+        let mut s = Scu::new();
+        s.ims = 1 << Source::VBlankIn.bit();
+        s.raise(Source::VBlankIn);
+        s.raise(Source::HBlankIn);
+        let (src, _) = s.take_pending_interrupt(0).unwrap();
+        assert_eq!(src, Source::HBlankIn, "VBlankIn masked, HBlankIn allowed");
+    }
+
+    #[test]
+    fn taking_an_interrupt_does_not_clear_ist_only_fresh_assertion() {
+        let mut s = Scu::new();
+        s.raise(Source::DspEnd);
+        let _ = s.take_pending_interrupt(0).unwrap();
+        // IST stays set until software W1Cs.
+        assert_ne!(s.ist & (1 << Source::DspEnd.bit()), 0);
+        // Re-draining without a fresh raise returns nothing.
+        assert!(s.take_pending_interrupt(0).is_none());
+        // After a new raise, the same source fires again.
+        s.raise(Source::DspEnd);
+        assert!(s.take_pending_interrupt(0).is_some());
+    }
+
+    #[test]
+    fn ist_writes_are_write_one_to_clear() {
+        let mut s = Scu::new();
+        s.raise(Source::Timer0);
+        s.raise(Source::SoundRequest);
+        assert_eq!(
+            s.ist,
+            (1 << Source::Timer0.bit()) | (1 << Source::SoundRequest.bit())
+        );
+        // W1C bit Timer0.
+        s.write32(0xB4, 1 << Source::Timer0.bit());
+        assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
+        // Writing 0 doesn't clear anything.
+        s.write32(0xB4, 0);
+        assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
     }
 }

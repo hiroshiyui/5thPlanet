@@ -115,6 +115,7 @@ impl Saturn {
             self.scheduler.run_for(batch, &mut self.bus);
             self.drain_smpc();
             self.drain_scu_dma();
+            self.drain_scu_intc();
         }
     }
 
@@ -161,6 +162,22 @@ impl Saturn {
                 remaining -= 1;
             }
             self.bus.scu.finish_dma(req.channel, src, dst);
+        }
+    }
+
+    /// Surface any fresh SCU interrupt assertion to the master SH-2.
+    /// One source per drain (the highest-priority unmasked one); the
+    /// `fresh_assertions` bit clears as part of `take_pending_interrupt`
+    /// so we don't re-fire the same source every batch while the SH-2
+    /// is still handling it. New raises after the SH-2 acks will fire
+    /// the source again because the SCU's `raise()` re-sets the bit.
+    fn drain_scu_intc(&mut self) {
+        let imask = self.master().regs.sr.imask();
+        if let Some((_, level)) = self.bus.scu.take_pending_interrupt(imask) {
+            self.master_mut()
+                .onchip
+                .intc
+                .raise(sh2::InterruptSource::External(level));
         }
     }
 

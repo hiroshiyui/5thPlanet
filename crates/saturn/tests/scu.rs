@@ -4,6 +4,7 @@
 //! the real bus once Saturn's `run_for` drains the queue.
 
 use saturn::Saturn;
+use saturn::ScuSource;
 use saturn::scu::SCU_BASE;
 use sh2::bus::{AccessKind, Bus};
 
@@ -113,4 +114,76 @@ fn channels_1_and_2_have_independent_state() {
         let (b2, _) = sat.bus.read8(0x0020_5000 + i, AccessKind::Data);
         assert_eq!(b2, (0x30 + i) as u8, "ch2 byte {i:#x}");
     }
+}
+
+#[test]
+fn dma_completion_raises_level0_dma_end_through_the_drainer() {
+    let mut sat = build();
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_3000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x40, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+    // IST bit for Level0DmaEnd should be set; software hasn't W1C'd it yet.
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    assert_ne!(ist & (1 << ScuSource::Level0DmaEnd.bit()), 0);
+}
+
+#[test]
+fn ist_is_w1c_via_bus_write() {
+    let mut sat = build();
+    sat.bus.scu.raise(ScuSource::Timer0);
+    sat.bus.scu.raise(ScuSource::HBlankIn);
+    // Acknowledge only Timer0 via W1C.
+    sat.bus.write32(SCU_BASE + 0xB4, 1 << ScuSource::Timer0.bit(), AccessKind::Data);
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    assert_eq!(ist, 1 << ScuSource::HBlankIn.bit(), "Timer0 cleared, HBlankIn retained");
+}
+
+#[test]
+fn dma_end_propagates_into_master_sh2_intc_as_external_level5() {
+    // Configure: SR.imask = 0 so the master accepts any IRL; install a
+    // recognisable vector for External(5) (= vector 64+5 = 69); trigger
+    // a Level-0 DMA; run; assert the master vectored to the handler.
+    let mut sat = build();
+    sat.master_mut().regs.sr.set_imask(0);
+    let handler_addr: u32 = 0x0020_6000;
+    // VBR is 0 after reset; install handler at VBR + 69*4 = 0x114.
+    // (The vector table lives in BIOS at offset 0, but our test BIOS
+    // is just a pattern — we write directly into the bus's BIOS image.
+    // The bus drops writes to BIOS, so install via the bus's bios slot.)
+    let vec_offset = 69usize * 4;
+    sat.bus.bios = saturn::BiosRom::new({
+        let mut img = vec![0u8; 512 * 1024];
+        for (i, b) in img.iter_mut().take(0x100).enumerate() {
+            *b = i as u8;
+        }
+        img[vec_offset..vec_offset + 4].copy_from_slice(&handler_addr.to_be_bytes());
+        img
+    });
+    // Re-reset so the master picks PC/SP from the (now patterned-anew) BIOS.
+    sat.reset();
+    sat.release_slave(); // we don't care about the slave here
+
+    // Trigger a DMA so SCU raises Level0DmaEnd.
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_3000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x10, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+
+    // Give the system several Saturn::run_for batches to drain.
+    sat.run_for(2048);
+
+    // Master should have vectored into the handler at handler_addr OR
+    // its PC should be progressing inside it. We can't easily tell from
+    // outside which exact instruction it's on, but pc != 0 (BIOS reset
+    // vector area was empty so master would have hit illegal instruction
+    // there too — but the External should have fired first and pushed
+    // SR.imask up to 5).
+    assert!(
+        sat.master().regs.sr.imask() >= 5,
+        "master's SR.imask should be raised by an accepted level-5 interrupt; \
+         actual = {}",
+        sat.master().regs.sr.imask(),
+    );
 }
