@@ -18,8 +18,8 @@ tests and ROM regressions, ready to be wired into a bus/scheduler later.
 | 4 | Remaining ~120 opcodes, group by group, with tests alongside | ✅ done |
 | 5 | Pipeline / cycle model: 5-stage scoreboard, load-use stalls, multiply latency, branch costs, interlock timing tests | ✅ done |
 | 6 | Cache (4 KiB 4-way LRU) + on-chip peripherals (INTC, DMAC, DIVU, FRT; BSC/WDT/SCI/UBC as register stubs) | ✅ done |
-| 7 | Exception + interrupt dispatch (reset, illegal, slot-illegal, address error, NMI, TRAPA, external via INTC) | pending |
-| 8 | ROM regression harness + committed golden state hashes | pending |
+| 7 | Exception + interrupt dispatch (reset, illegal, slot-illegal, address error, NMI, TRAPA, external via INTC) | ✅ done |
+| 8 | ROM regression harness + committed golden state hashes | ✅ done |
 
 ### Verification gates (all must pass to call M1 done)
 
