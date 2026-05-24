@@ -1,0 +1,116 @@
+//! SCU integration through the Saturn aggregate (M3 task #2).
+//!
+//! Verifies that a software-triggered DMA actually moves bytes through
+//! the real bus once Saturn's `run_for` drains the queue.
+
+use saturn::Saturn;
+use saturn::scu::SCU_BASE;
+use sh2::bus::{AccessKind, Bus};
+
+/// Channel-0 register addresses on the bus (cache-through alias).
+const D0R: u32 = SCU_BASE; // 0x05FE_0000
+const D0W: u32 = SCU_BASE + 0x04;
+const D0C: u32 = SCU_BASE + 0x08;
+const D0EN: u32 = SCU_BASE + 0x10;
+const DGO: u32 = 1 << 8;
+
+fn build() -> Saturn {
+    let mut bios = vec![0u8; 512 * 1024];
+    // Plant a recognisable byte pattern inside the BIOS image so the
+    // DMA can transfer it into work RAM and we can fingerprint it.
+    // 256 bytes is enough for the largest M3 DMA test below.
+    for (i, slot) in bios.iter_mut().take(0x100).enumerate() {
+        *slot = i as u8;
+    }
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat
+}
+
+#[test]
+fn version_register_is_read_through_the_bus() {
+    let mut sat = build();
+    let (v, _) = sat.bus.read32(SCU_BASE + 0xF8, AccessKind::Data);
+    assert_eq!(v, 0x0000_0004);
+}
+
+#[test]
+fn dma_channel0_copies_bios_bytes_into_low_wram() {
+    let mut sat = build();
+    // Set up channel 0: copy 64 bytes from BIOS+0x10 to low WRAM 0x1000.
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data); // source: BIOS+0x10
+    sat.bus.write32(D0W, 0x0020_1000, AccessKind::Data); // dest: low WRAM
+    sat.bus.write32(D0C, 0x40, AccessKind::Data); // count: 64 bytes
+    sat.bus.write32(D0EN, DGO, AccessKind::Data); // trigger
+
+    // Drain runs inside the next run_for batch.
+    sat.run_for(512);
+
+    // Verify 64 bytes landed at the destination and match the source.
+    for i in 0..0x40u32 {
+        let (b, _) = sat.bus.read8(0x0020_1000 + i, AccessKind::Data);
+        assert_eq!(b, (0x10 + i) as u8, "byte {i:#x} mismatch");
+    }
+    // SCU should report the channel done (count zeroed, addresses past the block).
+    let (cnt, _) = sat.bus.read32(D0C, AccessKind::Data);
+    assert_eq!(cnt, 0, "transfer_count zeroed after DMA");
+    let (read_after, _) = sat.bus.read32(D0R, AccessKind::Data);
+    let (write_after, _) = sat.bus.read32(D0W, AccessKind::Data);
+    assert_eq!(read_after, 0x0010 + 0x40);
+    assert_eq!(write_after, 0x0020_1000 + 0x40);
+}
+
+#[test]
+fn dma_with_non_multiple_of_four_bytes_handles_tail_correctly() {
+    let mut sat = build();
+    // 7 bytes — exercises the tail-loop after the 4-byte fast path.
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_2000, AccessKind::Data);
+    sat.bus.write32(D0C, 7, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+    for i in 0..7u32 {
+        let (b, _) = sat.bus.read8(0x0020_2000 + i, AccessKind::Data);
+        assert_eq!(b, (0x10 + i) as u8);
+    }
+    // Untouched byte beyond the count remains 0.
+    let (b8, _) = sat.bus.read8(0x0020_2000 + 7, AccessKind::Data);
+    assert_eq!(b8, 0);
+}
+
+#[test]
+fn dma_with_zero_count_does_not_trigger() {
+    let mut sat = build();
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_3000, AccessKind::Data);
+    sat.bus.write32(D0C, 0, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+    // Destination still zero.
+    let (b, _) = sat.bus.read8(0x0020_3000, AccessKind::Data);
+    assert_eq!(b, 0);
+}
+
+#[test]
+fn channels_1_and_2_have_independent_state() {
+    let mut sat = build();
+    // Channel 1 — base 0x20.
+    sat.bus.write32(SCU_BASE + 0x20, 0x0000_0020, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x24, 0x0020_4000, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x28, 0x10, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x30, DGO, AccessKind::Data);
+    // Channel 2 — base 0x40.
+    sat.bus.write32(SCU_BASE + 0x40, 0x0000_0030, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x44, 0x0020_5000, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x48, 0x10, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x50, DGO, AccessKind::Data);
+
+    sat.run_for(512);
+
+    for i in 0..0x10u32 {
+        let (b1, _) = sat.bus.read8(0x0020_4000 + i, AccessKind::Data);
+        assert_eq!(b1, (0x20 + i) as u8, "ch1 byte {i:#x}");
+        let (b2, _) = sat.bus.read8(0x0020_5000 + i, AccessKind::Data);
+        assert_eq!(b2, (0x30 + i) as u8, "ch2 byte {i:#x}");
+    }
+}

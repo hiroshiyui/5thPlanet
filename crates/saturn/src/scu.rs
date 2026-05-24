@@ -1,0 +1,366 @@
+//! System Control Unit (SCU) — Saturn's bus bridge and DMA engine.
+//!
+//! Memory-mapped at `0x05FE_0000..=0x05FE_00FF` (cache-through alias of
+//! `0x25FE_0000`, which is the canonical address). Holds three DMA
+//! channels, three timers, an interrupt-mask / status pair, A-bus
+//! configuration, a DSP-control window (task #17 wires it up), and a
+//! read-only version register.
+//!
+//! Register map (offsets from `SCU_BASE`):
+//!
+//! ```text
+//!   0x00..0x14   DMA channel 0 — D0R / D0W / D0C / D0AD / D0EN / D0MD
+//!   0x20..0x34   DMA channel 1
+//!   0x40..0x54   DMA channel 2
+//!   0x60         DSTP — DMA force stop
+//!   0x7C         DSTA — DMA status
+//!   0x80..0x9C   DSP control (task #17)
+//!   0xA0         T0C  — timer 0 compare
+//!   0xA4         T1S  — timer 1 set value
+//!   0xA8         T1MD — timer 1 mode
+//!   0xB0         IMS  — interrupt mask (1 = masked)
+//!   0xB4         IST  — interrupt status (W1C in hardware; raw in M3)
+//!   0xB8         AIACK — A-bus interrupt acknowledge
+//!   0xC4         ASR0 — A-bus set 0
+//!   0xC8         ASR1 — A-bus set 1
+//!   0xCC         AREF — A-bus refresh
+//!   0xF4         RSEL — SCU register select
+//!   0xF8         VER  — version, reads 0x0000_0004 (read-only)
+//! ```
+//!
+//! DMA triggering for M3: a 32-bit write to `D*EN` with bit 8 (DGO) set
+//! while the channel's transfer count is non-zero queues a synchronous
+//! block-transfer for the next [`Scu::take_pending_dma`] call. The
+//! Saturn aggregate's `run_for` loop drains pending DMAs after each
+//! scheduler batch and performs the actual byte movement through
+//! `SaturnBus`. Cycle-stealing accuracy, indirect-mode DMA, and start
+//! factors other than "manual" are out of M3 scope.
+
+pub const SCU_BASE: u32 = 0x05FE_0000;
+pub const SCU_END: u32 = 0x05FE_00FF;
+
+const NUM_CHANNELS: usize = 3;
+const CHANNEL_STRIDE: u32 = 0x20;
+/// DGO ("DMA Go") enable bit in D*EN.
+const DGO_BIT: u32 = 1 << 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DmaChannel {
+    pub read_addr: u32,
+    pub write_addr: u32,
+    pub transfer_count: u32,
+    pub add_value: u32,
+    pub enable: u32,
+    pub mode: u32,
+    /// Set when a `D*EN` write triggered a block move. Picked up by
+    /// [`Scu::take_pending_dma`] and cleared.
+    triggered: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Scu {
+    pub channels: [DmaChannel; NUM_CHANNELS],
+    pub dstp: u32,
+    pub dsta: u32,
+    pub t0c: u32,
+    pub t1s: u32,
+    pub t1md: u32,
+    pub ims: u32,
+    pub ist: u32,
+    pub aiack: u32,
+    pub asr0: u32,
+    pub asr1: u32,
+    pub aref: u32,
+    pub rsel: u32,
+    /// DSP control register window (0x80..0x9C). Plain storage in M3;
+    /// task #17 (`scu_dsp` crate) interprets it.
+    pub dsp_ctrl: [u32; 8],
+}
+
+/// Snapshot of a queued DMA request handed to the bus drainer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaRequest {
+    pub channel: usize,
+    pub src: u32,
+    pub dst: u32,
+    pub bytes: u32,
+}
+
+impl Scu {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn read32(&self, offset: u32) -> u32 {
+        match offset {
+            o if o < 0x60 => self.read_channel(o),
+            0x60 => self.dstp,
+            0x7C => self.dsta,
+            0x80..=0x9C => self.dsp_ctrl[((offset - 0x80) / 4) as usize],
+            0xA0 => self.t0c,
+            0xA4 => self.t1s,
+            0xA8 => self.t1md,
+            0xB0 => self.ims,
+            0xB4 => self.ist,
+            0xB8 => self.aiack,
+            0xC4 => self.asr0,
+            0xC8 => self.asr1,
+            0xCC => self.aref,
+            0xF4 => self.rsel,
+            0xF8 => 0x0000_0004, // version: SCU revision
+            _ => 0,
+        }
+    }
+
+    pub fn write32(&mut self, offset: u32, val: u32) {
+        match offset {
+            o if o < 0x60 => self.write_channel(o, val),
+            0x60 => self.dstp = val,
+            0x7C => self.dsta = val,
+            0x80..=0x9C => {
+                self.dsp_ctrl[((offset - 0x80) / 4) as usize] = val;
+            }
+            0xA0 => self.t0c = val,
+            0xA4 => self.t1s = val,
+            0xA8 => self.t1md = val,
+            0xB0 => self.ims = val,
+            0xB4 => self.ist = val,
+            0xB8 => self.aiack = val,
+            0xC4 => self.asr0 = val,
+            0xC8 => self.asr1 = val,
+            0xCC => self.aref = val,
+            0xF4 => self.rsel = val,
+            // 0xF8 VER is read-only.
+            _ => {}
+        }
+    }
+
+    fn read_channel(&self, offset: u32) -> u32 {
+        let ch = (offset / CHANNEL_STRIDE) as usize;
+        let in_ch = offset % CHANNEL_STRIDE;
+        if ch >= NUM_CHANNELS {
+            return 0;
+        }
+        let c = &self.channels[ch];
+        match in_ch {
+            0x00 => c.read_addr,
+            0x04 => c.write_addr,
+            0x08 => c.transfer_count,
+            0x0C => c.add_value,
+            0x10 => c.enable,
+            0x14 => c.mode,
+            _ => 0,
+        }
+    }
+
+    fn write_channel(&mut self, offset: u32, val: u32) {
+        let ch = (offset / CHANNEL_STRIDE) as usize;
+        let in_ch = offset % CHANNEL_STRIDE;
+        if ch >= NUM_CHANNELS {
+            return;
+        }
+        let c = &mut self.channels[ch];
+        match in_ch {
+            0x00 => c.read_addr = val,
+            0x04 => c.write_addr = val,
+            // Channel 0 carries a 20-bit count; channels 1 and 2 carry
+            // 12 bits. Mask conservatively to the wider one — software
+            // writing larger values to ch1/2 would have been clipped
+            // by hardware anyway and we'd surface a real-world bug if
+            // we silently let it through unmasked.
+            0x08 => {
+                c.transfer_count = if ch == 0 {
+                    val & 0x000F_FFFF
+                } else {
+                    val & 0x0000_0FFF
+                };
+            }
+            0x0C => c.add_value = val,
+            0x10 => {
+                c.enable = val;
+                if val & DGO_BIT != 0 && c.transfer_count > 0 {
+                    c.triggered = true;
+                }
+            }
+            0x14 => c.mode = val,
+            _ => {}
+        }
+    }
+
+    pub fn read8(&self, offset: u32) -> u8 {
+        let word = self.read32(offset & !3);
+        (word >> (8 * (3 - (offset & 3)))) as u8
+    }
+    pub fn read16(&self, offset: u32) -> u16 {
+        ((self.read8(offset) as u16) << 8) | self.read8(offset + 1) as u16
+    }
+    pub fn write8(&mut self, offset: u32, val: u8) {
+        let aligned = offset & !3;
+        let shift = 8 * (3 - (offset & 3));
+        let cur = self.read32(aligned);
+        let mask = !(0xFFu32 << shift);
+        // Byte writes can't trigger DMA — the DGO check lives in the
+        // 32-bit write path. RMW just patches the byte without going
+        // through write32's side-effect logic.
+        let new = (cur & mask) | ((val as u32) << shift);
+        match aligned {
+            o if o < 0x60 => self.write_channel_raw(o, new),
+            _ => self.write32(aligned, new),
+        }
+    }
+    pub fn write16(&mut self, offset: u32, val: u16) {
+        self.write8(offset, (val >> 8) as u8);
+        self.write8(offset + 1, val as u8);
+    }
+
+    /// Channel register write that does NOT honour the DGO trigger.
+    /// Used by byte / halfword writes (which build up a 32-bit value
+    /// piece-by-piece and shouldn't fire DMA mid-construction).
+    fn write_channel_raw(&mut self, offset: u32, val: u32) {
+        let ch = (offset / CHANNEL_STRIDE) as usize;
+        let in_ch = offset % CHANNEL_STRIDE;
+        if ch >= NUM_CHANNELS {
+            return;
+        }
+        let c = &mut self.channels[ch];
+        match in_ch {
+            0x00 => c.read_addr = val,
+            0x04 => c.write_addr = val,
+            0x08 => {
+                c.transfer_count = if ch == 0 {
+                    val & 0x000F_FFFF
+                } else {
+                    val & 0x0000_0FFF
+                };
+            }
+            0x0C => c.add_value = val,
+            0x10 => c.enable = val, // no trigger
+            0x14 => c.mode = val,
+            _ => {}
+        }
+    }
+
+    /// Pop the next channel that has a queued DMA. The caller is
+    /// expected to perform the actual bus transfer and then update
+    /// the channel's `read_addr` / `write_addr` / `transfer_count` to
+    /// reflect completion via [`finish_dma`].
+    pub fn take_pending_dma(&mut self) -> Option<DmaRequest> {
+        for (i, ch) in self.channels.iter_mut().enumerate() {
+            if ch.triggered {
+                ch.triggered = false;
+                return Some(DmaRequest {
+                    channel: i,
+                    src: ch.read_addr,
+                    dst: ch.write_addr,
+                    bytes: ch.transfer_count,
+                });
+            }
+        }
+        None
+    }
+
+    /// Mark a DMA channel as having completed: zero its remaining count
+    /// and store the post-transfer source / destination so software
+    /// reading `D*R` / `D*W` sees the addresses past the moved block.
+    pub fn finish_dma(&mut self, channel: usize, final_src: u32, final_dst: u32) {
+        let c = &mut self.channels[channel];
+        c.read_addr = final_src;
+        c.write_addr = final_dst;
+        c.transfer_count = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_register_is_read_only_and_returns_four() {
+        let mut s = Scu::new();
+        assert_eq!(s.read32(0xF8), 0x04);
+        s.write32(0xF8, 0xDEAD_BEEF);
+        assert_eq!(s.read32(0xF8), 0x04, "VER ignores writes");
+    }
+
+    #[test]
+    fn channel_registers_round_trip() {
+        let mut s = Scu::new();
+        s.write32(0x20, 0x0600_1000); // D1R
+        s.write32(0x24, 0x0020_2000); // D1W
+        s.write32(0x28, 0x0000_0040); // D1C
+        assert_eq!(s.channels[1].read_addr, 0x0600_1000);
+        assert_eq!(s.channels[1].write_addr, 0x0020_2000);
+        assert_eq!(s.channels[1].transfer_count, 0x40);
+    }
+
+    #[test]
+    fn channel0_count_is_20_bit_and_channel12_count_is_12_bit() {
+        let mut s = Scu::new();
+        s.write32(0x08, 0xFFFF_FFFF); // D0C
+        s.write32(0x28, 0xFFFF_FFFF); // D1C
+        s.write32(0x48, 0xFFFF_FFFF); // D2C
+        assert_eq!(s.channels[0].transfer_count, 0x000F_FFFF);
+        assert_eq!(s.channels[1].transfer_count, 0x0000_0FFF);
+        assert_eq!(s.channels[2].transfer_count, 0x0000_0FFF);
+    }
+
+    #[test]
+    fn dgo_write_with_nonzero_count_queues_a_dma_request() {
+        let mut s = Scu::new();
+        s.write32(0x00, 0x0600_0000); // D0R
+        s.write32(0x04, 0x0020_0000); // D0W
+        s.write32(0x08, 0x100); // D0C
+        s.write32(0x10, DGO_BIT); // D0EN with DGO set
+        let req = s.take_pending_dma().expect("DMA should be queued");
+        assert_eq!(req.channel, 0);
+        assert_eq!(req.src, 0x0600_0000);
+        assert_eq!(req.dst, 0x0020_0000);
+        assert_eq!(req.bytes, 0x100);
+        assert!(s.take_pending_dma().is_none(), "queue is single-shot");
+    }
+
+    #[test]
+    fn dgo_with_zero_count_does_not_trigger() {
+        let mut s = Scu::new();
+        s.write32(0x10, DGO_BIT);
+        assert!(s.take_pending_dma().is_none());
+    }
+
+    #[test]
+    fn byte_writes_to_d0en_do_not_trigger_mid_construction() {
+        let mut s = Scu::new();
+        s.write32(0x08, 0x100); // non-zero count
+        // Build up DGO-bit via 4 byte writes — the high byte of the
+        // big-endian 0x0000_0100 lands at offset 0x12. We must not
+        // fire DMA partway through.
+        s.write8(0x10, 0x00);
+        s.write8(0x11, 0x00);
+        s.write8(0x12, 0x01);
+        s.write8(0x13, 0x00);
+        assert!(
+            s.take_pending_dma().is_none(),
+            "byte writes must not fire DMA — software is expected to use word writes"
+        );
+    }
+
+    #[test]
+    fn dsp_ctrl_window_round_trips() {
+        let mut s = Scu::new();
+        s.write32(0x80, 0xAAAA_BBBB);
+        s.write32(0x9C, 0xCCCC_DDDD);
+        assert_eq!(s.read32(0x80), 0xAAAA_BBBB);
+        assert_eq!(s.read32(0x9C), 0xCCCC_DDDD);
+    }
+
+    #[test]
+    fn finish_dma_writes_back_final_addresses_and_zero_count() {
+        let mut s = Scu::new();
+        s.channels[0].read_addr = 0x0600_0000;
+        s.channels[0].write_addr = 0x0020_0000;
+        s.channels[0].transfer_count = 0x100;
+        s.finish_dma(0, 0x0600_0100, 0x0020_0100);
+        assert_eq!(s.channels[0].read_addr, 0x0600_0100);
+        assert_eq!(s.channels[0].write_addr, 0x0020_0100);
+        assert_eq!(s.channels[0].transfer_count, 0);
+    }
+}

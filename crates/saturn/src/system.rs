@@ -7,6 +7,7 @@
 //! lands, so the frontend doesn't have to reach across module boundaries.
 
 use sh2::Cpu;
+use sh2::bus::{AccessKind, Bus};
 
 use crate::SaturnBus;
 use crate::scheduler::{EntityId, Scheduler, Sh2Entity};
@@ -104,8 +105,8 @@ impl Saturn {
     }
 
     /// Advance global time by at least `cycles` cycles, interleaving
-    /// the two CPUs by deadline order and polling SMPC for queued
-    /// commands every [`SMPC_POLL_QUANTUM`] cycles.
+    /// the two CPUs by deadline order and polling SMPC + SCU between
+    /// scheduler batches.
     pub fn run_for(&mut self, cycles: u64) {
         let target = self.now().saturating_add(cycles);
         while self.now() < target {
@@ -113,6 +114,7 @@ impl Saturn {
             let batch = remaining.min(SMPC_POLL_QUANTUM);
             self.scheduler.run_for(batch, &mut self.bus);
             self.drain_smpc();
+            self.drain_scu_dma();
         }
     }
 
@@ -129,6 +131,36 @@ impl Saturn {
                 _ => {}
             }
             self.bus.smpc.mark_command_done();
+        }
+    }
+
+    /// Run any DMA transfers that the SCU queued during the last
+    /// scheduler batch. For M3 each transfer is synchronous: we move
+    /// the full byte count in 32-bit chunks (plus a byte tail) via
+    /// `self.bus`, then write back the post-transfer state. Cycle-
+    /// stealing accuracy and start factors other than "manual" are
+    /// out of M3 scope; whichever later milestone surfaces a game
+    /// that needs them will refine this.
+    fn drain_scu_dma(&mut self) {
+        while let Some(req) = self.bus.scu.take_pending_dma() {
+            let mut src = req.src;
+            let mut dst = req.dst;
+            let mut remaining = req.bytes;
+            while remaining >= 4 {
+                let (val, _) = self.bus.read32(src, AccessKind::Dma);
+                self.bus.write32(dst, val, AccessKind::Dma);
+                src = src.wrapping_add(4);
+                dst = dst.wrapping_add(4);
+                remaining -= 4;
+            }
+            while remaining > 0 {
+                let (val, _) = self.bus.read8(src, AccessKind::Dma);
+                self.bus.write8(dst, val, AccessKind::Dma);
+                src = src.wrapping_add(1);
+                dst = dst.wrapping_add(1);
+                remaining -= 1;
+            }
+            self.bus.scu.finish_dma(req.channel, src, dst);
         }
     }
 

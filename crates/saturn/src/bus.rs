@@ -25,6 +25,7 @@
 use sh2::bus::{AccessKind, Bus};
 
 use crate::memory::{BiosRom, Ram, StubRegisterBank};
+use crate::scu::{SCU_BASE, SCU_END, Scu};
 use crate::smpc::Smpc;
 
 pub const BIOS_BASE: u32 = 0x0000_0000;
@@ -57,6 +58,7 @@ pub struct SaturnBus {
     pub backup: Ram,
     pub low_wram: Ram,
     pub sound: StubRegisterBank,
+    pub scu: Scu,
     pub abus_bbus: StubRegisterBank,
     pub high_wram: Ram,
 }
@@ -71,6 +73,7 @@ impl SaturnBus {
             backup: Ram::new(32 * 1024),
             low_wram: Ram::new(1024 * 1024),
             sound: StubRegisterBank::new("SOUND"),
+            scu: Scu::new(),
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
         }
@@ -102,6 +105,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read8(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read8(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read8(addr - SOUND_BASE),
+            SCU_BASE..=SCU_END => self.scu.read8(addr - SCU_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read8(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read8(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -116,6 +120,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read16(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
+            SCU_BASE..=SCU_END => self.scu.read16(addr - SCU_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read16(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read16(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -130,6 +135,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read32(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read32(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read32(addr - SOUND_BASE),
+            SCU_BASE..=SCU_END => self.scu.read32(addr - SCU_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read32(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read32(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -144,6 +150,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write8(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write8(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write8(addr - SOUND_BASE, val),
+            SCU_BASE..=SCU_END => self.scu.write8(addr - SCU_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write8(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
             _ => {}
@@ -158,6 +165,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write16(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write16(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write16(addr - SOUND_BASE, val),
+            SCU_BASE..=SCU_END => self.scu.write16(addr - SCU_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write16(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write16(addr - HIGH_WRAM_BASE, val),
             _ => {}
@@ -172,6 +180,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write32(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write32(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write32(addr - SOUND_BASE, val),
+            SCU_BASE..=SCU_END => self.scu.write32(addr - SCU_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write32(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
             _ => {}
