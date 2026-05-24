@@ -11,6 +11,7 @@ use crate::bus::{AccessKind, Bus};
 use crate::cache::Cache;
 use crate::decoder::decode;
 use crate::isa::Op;
+use crate::onchip::OnChip;
 use crate::pipeline::Pipeline;
 use crate::regs::{Registers, Sr};
 
@@ -20,6 +21,10 @@ pub struct Cpu {
     pub regs: Registers,
     pub pipeline: Pipeline,
     pub cache: Cache,
+    /// SH7604 on-chip peripherals (FFFFFE00..FFFFFFFF). Memory accesses
+    /// to that range are routed here by [`Cpu::mem_read32`] et al. before
+    /// reaching the external [`Bus`].
+    pub onchip: OnChip,
     /// When `Some`, the next instruction is a delay-slot fetch; after it
     /// executes PC is overwritten with the contained target.
     pub(crate) pending_branch: Option<u32>,
@@ -43,6 +48,7 @@ impl Cpu {
             regs: Registers::new_at_reset(),
             pipeline: Pipeline::new(),
             cache: Cache::new(),
+            onchip: OnChip::new(),
             pending_branch: None,
             in_delay_slot: false,
             load_dest_pending: None,
@@ -56,8 +62,8 @@ impl Cpu {
         self.pending_branch = None;
         self.in_delay_slot = false;
         self.load_dest_pending = None;
-        let (pc, _) = bus.read32(0x0000_0000, AccessKind::Data);
-        let (sp, _) = bus.read32(0x0000_0004, AccessKind::Data);
+        let (pc, _) = self.mem_read32(0x0000_0000, AccessKind::Data, bus);
+        let (sp, _) = self.mem_read32(0x0000_0004, AccessKind::Data, bus);
         self.regs.pc = pc;
         self.regs.r[15] = sp;
     }
@@ -66,7 +72,7 @@ impl Cpu {
     /// (instruction issue cost + bus stalls + interlock stalls).
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         let instr_pc = self.regs.pc;
-        let (word, fetch_stall) = bus.read16(instr_pc, AccessKind::Fetch);
+        let (word, fetch_stall) = self.mem_read16(instr_pc, AccessKind::Fetch, bus);
         self.regs.pc = instr_pc.wrapping_add(2);
         let op = decode(word);
 
@@ -152,13 +158,13 @@ impl Cpu {
             }
             MovWPcRel { rn, disp } => {
                 let addr = instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 1);
-                let (val, s) = bus.read16(addr, AccessKind::Data);
+                let (val, s) = self.mem_read16(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLPcRel { rn, disp } => {
                 let addr = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
@@ -168,64 +174,58 @@ impl Cpu {
             }
 
             MovBS { rn, rm } => {
-                let s = bus.write8(
-                    self.regs.r[rn as usize],
-                    self.regs.r[rm as usize] as u8,
-                    AccessKind::Data,
-                );
+                let addr = self.regs.r[rn as usize];
+                let val = self.regs.r[rm as usize] as u8;
+                let s = self.mem_write8(addr, val, AccessKind::Data, bus);
                 1 + s
             }
             MovWS { rn, rm } => {
-                let s = bus.write16(
-                    self.regs.r[rn as usize],
-                    self.regs.r[rm as usize] as u16,
-                    AccessKind::Data,
-                );
+                let addr = self.regs.r[rn as usize];
+                let val = self.regs.r[rm as usize] as u16;
+                let s = self.mem_write16(addr, val, AccessKind::Data, bus);
                 1 + s
             }
             MovLS { rn, rm } => {
-                let s = bus.write32(
-                    self.regs.r[rn as usize],
-                    self.regs.r[rm as usize],
-                    AccessKind::Data,
-                );
+                let addr = self.regs.r[rn as usize];
+                let val = self.regs.r[rm as usize];
+                let s = self.mem_write32(addr, val, AccessKind::Data, bus);
                 1 + s
             }
             MovBL { rn, rm } => {
-                let (val, s) = bus.read8(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read8(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i8 as i32 as u32;
                 1 + s
             }
             MovWL { rn, rm } => {
-                let (val, s) = bus.read16(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read16(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLL { rn, rm } => {
-                let (val, s) = bus.read32(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read32(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
             MovBM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(1);
-                let s = bus.write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data);
+                let s = self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             MovWM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(2);
-                let s = bus.write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data);
+                let s = self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             MovLM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             MovBP { rn, rm } => {
-                let (val, s) = bus.read8(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read8(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i8 as i32 as u32;
                 if rn != rm {
                     self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(1);
@@ -233,7 +233,7 @@ impl Cpu {
                 1 + s
             }
             MovWP { rn, rm } => {
-                let (val, s) = bus.read16(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read16(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 if rn != rm {
                     self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(2);
@@ -241,7 +241,7 @@ impl Cpu {
                 1 + s
             }
             MovLP { rn, rm } => {
-                let (val, s) = bus.read32(self.regs.r[rm as usize], AccessKind::Data);
+                let (val, s) = self.mem_read32(self.regs.r[rm as usize], AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 if rn != rm {
                     self.regs.r[rm as usize] = self.regs.r[rm as usize].wrapping_add(4);
@@ -251,102 +251,102 @@ impl Cpu {
 
             MovBS0 { rn, disp } => {
                 let addr = self.regs.r[rn as usize].wrapping_add(disp as u32);
-                let s = bus.write8(addr, self.regs.r[0] as u8, AccessKind::Data);
+                let s = self.mem_write8(addr, self.regs.r[0] as u8, AccessKind::Data, bus);
                 1 + s
             }
             MovWS0 { rn, disp } => {
                 let addr = self.regs.r[rn as usize].wrapping_add((disp as u32) << 1);
-                let s = bus.write16(addr, self.regs.r[0] as u16, AccessKind::Data);
+                let s = self.mem_write16(addr, self.regs.r[0] as u16, AccessKind::Data, bus);
                 1 + s
             }
             MovLS4 { rn, rm, disp } => {
                 let addr = self.regs.r[rn as usize].wrapping_add((disp as u32) << 2);
-                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.r[rm as usize], AccessKind::Data, bus);
                 1 + s
             }
             MovBL0 { rm, disp } => {
                 let addr = self.regs.r[rm as usize].wrapping_add(disp as u32);
-                let (val, s) = bus.read8(addr, AccessKind::Data);
+                let (val, s) = self.mem_read8(addr, AccessKind::Data, bus);
                 self.regs.r[0] = val as i8 as i32 as u32;
                 1 + s
             }
             MovWL0 { rm, disp } => {
                 let addr = self.regs.r[rm as usize].wrapping_add((disp as u32) << 1);
-                let (val, s) = bus.read16(addr, AccessKind::Data);
+                let (val, s) = self.mem_read16(addr, AccessKind::Data, bus);
                 self.regs.r[0] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLL4 { rn, rm, disp } => {
                 let addr = self.regs.r[rm as usize].wrapping_add((disp as u32) << 2);
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
 
             MovBSX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
-                let s = bus.write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data);
+                let s = self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
                 1 + s
             }
             MovWSX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
-                let s = bus.write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data);
+                let s = self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
                 1 + s
             }
             MovLSX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
-                let s = bus.write32(addr, self.regs.r[rm as usize], AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.r[rm as usize], AccessKind::Data, bus);
                 1 + s
             }
             MovBLX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
-                let (val, s) = bus.read8(addr, AccessKind::Data);
+                let (val, s) = self.mem_read8(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i8 as i32 as u32;
                 1 + s
             }
             MovWLX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
-                let (val, s) = bus.read16(addr, AccessKind::Data);
+                let (val, s) = self.mem_read16(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLLX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rm as usize]);
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 1 + s
             }
 
             MovBSG { disp } => {
                 let addr = self.regs.gbr.wrapping_add(disp as u32);
-                let s = bus.write8(addr, self.regs.r[0] as u8, AccessKind::Data);
+                let s = self.mem_write8(addr, self.regs.r[0] as u8, AccessKind::Data, bus);
                 1 + s
             }
             MovWSG { disp } => {
                 let addr = self.regs.gbr.wrapping_add((disp as u32) << 1);
-                let s = bus.write16(addr, self.regs.r[0] as u16, AccessKind::Data);
+                let s = self.mem_write16(addr, self.regs.r[0] as u16, AccessKind::Data, bus);
                 1 + s
             }
             MovLSG { disp } => {
                 let addr = self.regs.gbr.wrapping_add((disp as u32) << 2);
-                let s = bus.write32(addr, self.regs.r[0], AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.r[0], AccessKind::Data, bus);
                 1 + s
             }
             MovBLG { disp } => {
                 let addr = self.regs.gbr.wrapping_add(disp as u32);
-                let (val, s) = bus.read8(addr, AccessKind::Data);
+                let (val, s) = self.mem_read8(addr, AccessKind::Data, bus);
                 self.regs.r[0] = val as i8 as i32 as u32;
                 1 + s
             }
             MovWLG { disp } => {
                 let addr = self.regs.gbr.wrapping_add((disp as u32) << 1);
-                let (val, s) = bus.read16(addr, AccessKind::Data);
+                let (val, s) = self.mem_read16(addr, AccessKind::Data, bus);
                 self.regs.r[0] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLLG { disp } => {
                 let addr = self.regs.gbr.wrapping_add((disp as u32) << 2);
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[0] = val;
                 1 + s
             }
@@ -615,15 +615,15 @@ impl Cpu {
             }
             TstBG { imm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.gbr);
-                let (val, s) = bus.read8(addr, AccessKind::Data);
+                let (val, s) = self.mem_read8(addr, AccessKind::Data, bus);
                 self.regs.sr.set_t((val & imm) == 0);
                 3 + s
             }
             Tas { rn } => {
                 let addr = self.regs.r[rn as usize];
-                let (val, sr) = bus.read8(addr, AccessKind::Data);
+                let (val, sr) = self.mem_read8(addr, AccessKind::Data, bus);
                 self.regs.sr.set_t(val == 0);
-                let sw = bus.write8(addr, val | 0x80, AccessKind::Data);
+                let sw = self.mem_write8(addr, val | 0x80, AccessKind::Data, bus);
                 4 + sr + sw
             }
 
@@ -805,21 +805,21 @@ impl Cpu {
             }
             LdcLSr { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.sr.0 = val & Sr::WRITE_MASK;
                 3 + s
             }
             LdcLGbr { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.gbr = val;
                 3 + s
             }
             LdcLVbr { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.vbr = val;
                 3 + s
@@ -838,19 +838,19 @@ impl Cpu {
             }
             StcLSr { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.sr.0, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.sr.0, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 2 + s
             }
             StcLGbr { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.gbr, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.gbr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 2 + s
             }
             StcLVbr { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.vbr, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.vbr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 2 + s
             }
@@ -868,21 +868,21 @@ impl Cpu {
             }
             LdsLMach { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.mach = val;
                 1 + s
             }
             LdsLMacl { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.macl = val;
                 1 + s
             }
             LdsLPr { rm } => {
                 let addr = self.regs.r[rm as usize];
-                let (val, s) = bus.read32(addr, AccessKind::Data);
+                let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rm as usize] = addr.wrapping_add(4);
                 self.regs.pr = val;
                 1 + s
@@ -901,19 +901,19 @@ impl Cpu {
             }
             StsLMach { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.mach, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.mach, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             StsLMacl { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.macl, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.macl, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             StsLPr { rn } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(4);
-                let s = bus.write32(addr, self.regs.pr, AccessKind::Data);
+                let s = self.mem_write32(addr, self.regs.pr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
@@ -926,12 +926,12 @@ impl Cpu {
                 // vector through VBR + imm*4.
                 let mut sp = self.regs.r[15];
                 sp = sp.wrapping_sub(4);
-                let s1 = bus.write32(sp, self.regs.sr.0, AccessKind::Data);
+                let s1 = self.mem_write32(sp, self.regs.sr.0, AccessKind::Data, bus);
                 sp = sp.wrapping_sub(4);
-                let s2 = bus.write32(sp, instr_pc.wrapping_add(2), AccessKind::Data);
+                let s2 = self.mem_write32(sp, instr_pc.wrapping_add(2), AccessKind::Data, bus);
                 self.regs.r[15] = sp;
                 let vec_addr = self.regs.vbr.wrapping_add((imm as u32) << 2);
-                let (target, s3) = bus.read32(vec_addr, AccessKind::Data);
+                let (target, s3) = self.mem_read32(vec_addr, AccessKind::Data, bus);
                 self.regs.pc = target;
                 8 + s1 + s2 + s3
             }
@@ -941,8 +941,8 @@ impl Cpu {
                 // executes *before* the popped PC takes effect, so we mirror
                 // the branch path: set pending_branch to the popped PC.
                 let sp = self.regs.r[15];
-                let (new_pc, s1) = bus.read32(sp, AccessKind::Data);
-                let (new_sr, s2) = bus.read32(sp.wrapping_add(4), AccessKind::Data);
+                let (new_pc, s1) = self.mem_read32(sp, AccessKind::Data, bus);
+                let (new_sr, s2) = self.mem_read32(sp.wrapping_add(4), AccessKind::Data, bus);
                 self.regs.r[15] = sp.wrapping_add(8);
                 self.regs.sr.0 = new_sr & Sr::WRITE_MASK;
                 self.pending_branch = Some(new_pc);
@@ -960,6 +960,67 @@ impl Cpu {
     }
 
     // ----------------------------------------------------------------------
+    // Memory routing
+    // ----------------------------------------------------------------------
+    //
+    // Every CPU memory access goes through these helpers. Addresses
+    // covered by SH7604 on-chip peripherals (FFFFFE00..FFFFFFFF) are
+    // serviced internally and reported as 0-stall; everything else
+    // delegates to the external [`Bus`] with its wait-state count.
+
+    #[inline]
+    pub(crate) fn mem_read8(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u8, u32) {
+        if OnChip::owns(addr) {
+            (self.onchip.read8(addr), 0)
+        } else {
+            bus.read8(addr, kind)
+        }
+    }
+    #[inline]
+    pub(crate) fn mem_read16(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u16, u32) {
+        if OnChip::owns(addr) {
+            (self.onchip.read16(addr), 0)
+        } else {
+            bus.read16(addr, kind)
+        }
+    }
+    #[inline]
+    pub(crate) fn mem_read32(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u32, u32) {
+        if OnChip::owns(addr) {
+            (self.onchip.read32(addr), 0)
+        } else {
+            bus.read32(addr, kind)
+        }
+    }
+    #[inline]
+    pub(crate) fn mem_write8(&mut self, addr: u32, val: u8, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+        if OnChip::owns(addr) {
+            self.onchip.write8(addr, val);
+            0
+        } else {
+            bus.write8(addr, val, kind)
+        }
+    }
+    #[inline]
+    pub(crate) fn mem_write16(&mut self, addr: u32, val: u16, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+        if OnChip::owns(addr) {
+            self.onchip.write16(addr, val);
+            0
+        } else {
+            bus.write16(addr, val, kind)
+        }
+    }
+    #[inline]
+    pub(crate) fn mem_write32(&mut self, addr: u32, val: u32, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+        if OnChip::owns(addr) {
+            self.onchip.write32(addr, val);
+            0
+        } else {
+            bus.write32(addr, val, kind)
+        }
+    }
+
+    // ----------------------------------------------------------------------
     // Helpers
     // ----------------------------------------------------------------------
 
@@ -971,8 +1032,8 @@ impl Cpu {
         f: fn(u8, u8) -> u8,
     ) -> u32 {
         let addr = self.regs.r[0].wrapping_add(self.regs.gbr);
-        let (val, sr) = bus.read8(addr, AccessKind::Data);
-        let sw = bus.write8(addr, f(val, imm), AccessKind::Data);
+        let (val, sr) = self.mem_read8(addr, AccessKind::Data, bus);
+        let sw = self.mem_write8(addr, f(val, imm), AccessKind::Data, bus);
         3 + sr + sw
     }
 
@@ -1023,11 +1084,11 @@ impl Cpu {
     /// DSP-heavy code paths.
     fn exec_mac_l(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
         let addr_m = self.regs.r[rm as usize];
-        let (sm, s1) = bus.read32(addr_m, AccessKind::Data);
+        let (sm, s1) = self.mem_read32(addr_m, AccessKind::Data, bus);
         self.regs.r[rm as usize] = addr_m.wrapping_add(4);
 
         let addr_n = self.regs.r[rn as usize];
-        let (sn, s2) = bus.read32(addr_n, AccessKind::Data);
+        let (sn, s2) = self.mem_read32(addr_n, AccessKind::Data, bus);
         self.regs.r[rn as usize] = addr_n.wrapping_add(4);
 
         let prod = (sm as i32 as i64).wrapping_mul(sn as i32 as i64);
@@ -1052,11 +1113,11 @@ impl Cpu {
     /// "overflow occurred" indicator in bit 0, per the SH7604 manual).
     fn exec_mac_w(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
         let addr_m = self.regs.r[rm as usize];
-        let (sm, s1) = bus.read16(addr_m, AccessKind::Data);
+        let (sm, s1) = self.mem_read16(addr_m, AccessKind::Data, bus);
         self.regs.r[rm as usize] = addr_m.wrapping_add(2);
 
         let addr_n = self.regs.r[rn as usize];
-        let (sn, s2) = bus.read16(addr_n, AccessKind::Data);
+        let (sn, s2) = self.mem_read16(addr_n, AccessKind::Data, bus);
         self.regs.r[rn as usize] = addr_n.wrapping_add(2);
 
         let prod = (sm as i16 as i32).wrapping_mul(sn as i16 as i32);
