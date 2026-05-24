@@ -143,7 +143,7 @@ scope tight matches the project's one-chip-at-a-time discipline.
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | SMPC `INTBACK` — full response (no-controller status, OREG fill, raise SCU SMPC source) | pending |
+| 1 | SMPC `INTBACK` — full response (no-controller status, OREG fill, raise SCU SMPC source) | ✅ done (incl. NMIREQ + 0x1A) |
 | 2 | CD-block presence stub at `0x05_8980_00+` — defined "no disc, ready" reads, OK command responses | pending |
 | 3 | VDP1 register + VRAM + framebuffer stub at `0x05_C000_00`/`0x05_D000_00` (no rendering) | pending |
 | 4 | VDP2 register-decode fidelity — renderer reads `MPOFN`/`MPABN0..MPCDR0`/scroll from regs instead of constants | pending |
