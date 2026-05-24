@@ -3,6 +3,10 @@
 //! Mirrors a flat 32-bit address space backed by a single `Vec<u8>`. Wait
 //! states are always zero; for cycle-accurate Saturn bus modeling use the
 //! `saturn` crate's bus instead.
+//!
+//! Also exposes [`state_digest`] — a 64-bit FNV-1a fingerprint of CPU
+//! state plus selected memory regions. Used by the ROM regression suite
+//! to detect silent behavioural drift across refactors.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -103,5 +107,60 @@ impl Bus for MemBus {
         self.mem[i + 2] = b[2];
         self.mem[i + 3] = b[3];
         0
+    }
+}
+
+/// Memory region (`start..end`) included in a state digest.
+pub type Region = core::ops::Range<u32>;
+
+/// 64-bit FNV-1a fingerprint of CPU architectural state plus the union of
+/// the named memory regions, in the order supplied. Stable across runs
+/// and platforms; safe to commit as a golden value.
+///
+/// Hashes (in order): R0..R15, PC, PR, GBR, VBR, MACH, MACL, SR, then the
+/// byte slice for each region read via `MemBus`.
+pub fn state_digest(cpu: &crate::Cpu, bus: &MemBus, regions: &[Region]) -> u64 {
+    let mut h = Fnv64::new();
+    for r in &cpu.regs.r {
+        h.eat_u32(*r);
+    }
+    h.eat_u32(cpu.regs.pc);
+    h.eat_u32(cpu.regs.pr);
+    h.eat_u32(cpu.regs.gbr);
+    h.eat_u32(cpu.regs.vbr);
+    h.eat_u32(cpu.regs.mach);
+    h.eat_u32(cpu.regs.macl);
+    h.eat_u32(cpu.regs.sr.0);
+    for region in regions {
+        let mem = bus.as_slice();
+        for addr in region.clone() {
+            let idx = (addr as usize) % mem.len();
+            h.eat_u8(mem[idx]);
+        }
+    }
+    h.finish()
+}
+
+/// 64-bit FNV-1a hash.
+struct Fnv64(u64);
+
+impl Fnv64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+    fn eat_u8(&mut self, b: u8) {
+        self.0 ^= b as u64;
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+    fn eat_u32(&mut self, v: u32) {
+        for b in v.to_be_bytes() {
+            self.eat_u8(b);
+        }
+    }
+    fn finish(self) -> u64 {
+        self.0
     }
 }
