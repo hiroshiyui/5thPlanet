@@ -39,7 +39,7 @@ The "SingleStepTests vector corpus" originally proposed as a gate was dropped:
 no public SH-2 corpus exists yet, and the per-opcode unit tests + ROM hashes
 cover the same ground without the generator infrastructure overhead.
 
-## Milestone 2 — Saturn bus, dual SH-2, event-driven scheduler 🚧 active
+## Milestone 2 — Saturn bus, dual SH-2, event-driven scheduler ✅ complete
 
 Pairs the M1 SH-2 with a Saturn-shaped memory map, a second SH-2 (slave), and
 an event-driven scheduler that decides which CPU advances next. Wires the M1
@@ -50,19 +50,23 @@ there's something to render.
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | Extend `sh2::Cache` with line data storage + write-through update API | pending |
-| 2 | Wire cache into `Cpu::mem_read*/mem_write*` (cached vs cache-through dispatch) | pending |
-| 3 | Saturn bus + typed region structs + memory-map dispatch | pending |
-| 4 | Event-driven `Scheduler` with `SchedEntity` trait | pending |
-| 5 | `Saturn` system aggregate + dual SH-2 integration test | pending |
+| 1 | Extend `sh2::Cache` with line data storage + write-through update API | ✅ done |
+| 2 | Wire cache into `Cpu::mem_read*/mem_write*` (cached vs cache-through dispatch) | ✅ done |
+| 3 | Saturn bus + typed region structs + memory-map dispatch | ✅ done |
+| 4 | Event-driven `Scheduler` with `SchedEntity` trait | ✅ done |
+| 5 | `Saturn` system aggregate + dual SH-2 integration test | ✅ done |
 
-### Verification gates
+### What landed (`cargo test --workspace` → 156 tests, 0 failures)
 
-1. `cargo test -p sh2` — all 131 M1 tests still green (cache wiring must not regress).
-2. `cargo test -p saturn --test bus_routing` — every memory region round-trips; BIOS mirroring works; on-chip range stays with the SH-2.
-3. `cargo test -p saturn --test cache_wiring` — second read of a BIOS address from master costs fewer cycles than the first (proves the hit path).
-4. `cargo test -p saturn --test scheduler` — `Saturn::run_for(N)` produces identical per-CPU `pipeline.cycles` across two runs from the same seed state.
-5. `cargo test -p saturn --test dual_sh2` — master writes a sentinel into high work RAM; slave reads it within a bounded cycle budget.
+- 137 `sh2` tests (M1's 131 + 1 cache-storage + 5 cache-wiring)
+- 9 `saturn::bus_routing` — every region round-trips, BIOS mirrors, unmapped is open bus
+- 7 `saturn::scheduler` — determinism, fairness, real-`Sh2Entity` cosched on `SaturnBus`
+- 3 `saturn::dual_sh2` — master writes sentinel → slave observes within budget;
+  fairness drift bounded; reset-vector load from BIOS image works
+
+The cache-wiring tests serve double-duty as both "task #2 done" and the M2
+verification gate "second read of the same address from master costs fewer
+cycles" — the `CountingBus` directly proves the hit path.
 
 ## Later milestones (queued)
 
