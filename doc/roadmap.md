@@ -15,7 +15,7 @@ tests and ROM regressions, ready to be wired into a bus/scheduler later.
 | 1 | Workspace + `sh2` skeleton + `Bus` trait + `Cpu` struct | ✅ done |
 | 2 | Full SH-2 ISA table (~142 ops) + decoder + decoder unit tests | ✅ done |
 | 3 | Interpreter — first batch of ~20 core opcodes (MOV/ALU/CMP/branches with delay slots) + integration tests | ✅ done |
-| 4 | Remaining ~120 opcodes, group by group, with tests alongside | pending |
+| 4 | Remaining ~120 opcodes, group by group, with tests alongside | ✅ done |
 | 5 | Pipeline / cycle model: 5-stage scoreboard, load-use stalls, multiply latency, branch costs, interlock timing tests | pending |
 | 6 | Cache (4 KiB 4-way LRU) + on-chip peripherals (INTC, DMAC, DIVU, FRT; BSC/WDT/SCI/UBC as register stubs) | pending |
 | 7 | Exception + interrupt dispatch (reset, illegal, slot-illegal, address error, NMI, TRAPA, external via INTC) | pending |
