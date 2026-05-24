@@ -25,6 +25,10 @@ pub struct Cpu {
     pub(crate) pending_branch: Option<u32>,
     /// True only while the slot instruction itself is executing.
     pub(crate) in_delay_slot: bool,
+    /// The destination register of the most recently retired load. The
+    /// very next instruction that reads it pays a 1-cycle stall, then
+    /// this is cleared regardless.
+    pub(crate) load_dest_pending: Option<u8>,
 }
 
 impl Default for Cpu {
@@ -41,6 +45,7 @@ impl Cpu {
             cache: Cache::new(),
             pending_branch: None,
             in_delay_slot: false,
+            load_dest_pending: None,
         }
     }
 
@@ -50,6 +55,7 @@ impl Cpu {
         self.pipeline = Pipeline::new();
         self.pending_branch = None;
         self.in_delay_slot = false;
+        self.load_dest_pending = None;
         let (pc, _) = bus.read32(0x0000_0000, AccessKind::Data);
         let (sp, _) = bus.read32(0x0000_0004, AccessKind::Data);
         self.regs.pc = pc;
@@ -57,12 +63,27 @@ impl Cpu {
     }
 
     /// Fetch + decode + execute one instruction. Returns total cycles
-    /// (instruction issue cost + bus stalls).
+    /// (instruction issue cost + bus stalls + interlock stalls).
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         let instr_pc = self.regs.pc;
         let (word, fetch_stall) = bus.read16(instr_pc, AccessKind::Fetch);
         self.regs.pc = instr_pc.wrapping_add(2);
         let op = decode(word);
+
+        // ---- Pre-dispatch interlocks ----
+        // Load-use: 1-cycle stall if the previous instruction's loaded reg
+        // is read here. Consumed by any one instruction (or simply expires
+        // on the next, whichever comes first).
+        let mut interlock_stall = 0u32;
+        if let Some(loaded) = self.load_dest_pending.take()
+            && op.reads_reg(loaded)
+        {
+            interlock_stall += 1;
+        }
+        // MAC read: stall a STS until the multiplier has retired.
+        if op.reads_mac() {
+            interlock_stall += self.pipeline.stall_for_mac();
+        }
 
         let was_pending = self.pending_branch.is_some();
         self.in_delay_slot = was_pending;
@@ -82,7 +103,18 @@ impl Cpu {
         }
         self.in_delay_slot = false;
 
-        let total = fetch_stall + exec_cycles;
+        // ---- Post-dispatch scoreboard updates ----
+        if let Some(rn) = op.load_dest() {
+            self.load_dest_pending = Some(rn);
+        }
+        if let Some(lat) = op.multiply_latency() {
+            // Schedule against the cycle the multiplier *finishes issuing*,
+            // i.e. after `exec_cycles` have already been booked.
+            self.pipeline
+                .schedule_mac(lat + exec_cycles + interlock_stall);
+        }
+
+        let total = interlock_stall + fetch_stall + exec_cycles;
         self.pipeline.advance(total);
         total
     }

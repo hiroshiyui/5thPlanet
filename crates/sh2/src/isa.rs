@@ -186,6 +186,150 @@ pub enum Op {
 }
 
 impl Op {
+    /// True iff this op reads architectural register `R[r]` as an input
+    /// (compute input, address base, post-modified base, or implicit R0).
+    /// Used by the pipeline interlock to detect load-use stalls.
+    pub fn reads_reg(&self, r: Reg) -> bool {
+        use Op::*;
+        let n = |x: &Reg| *x == r;
+        let m = |x: &Reg| *x == r;
+        let r0 = || r == 0;
+        match self {
+            // Pure no-read or branch-target arithmetic only.
+            Nop | Clrt | Sett | Clrmac | Sleep | Div0u | Rte | Rts
+            | Bra { .. } | Bsr { .. }
+            | Bf { .. } | Bt { .. } | BfS { .. } | BtS { .. }
+            | Trapa { .. } | Mova { .. } | MovI { .. }
+            | MovWPcRel { .. } | MovLPcRel { .. } | Movt { .. }
+            | Illegal(_) => false,
+
+            // Both rn and rm read (compute-style 2-op).
+            Add { rn, rm } | Sub { rn, rm } | Addc { rn, rm } | Addv { rn, rm }
+            | Subc { rn, rm } | Subv { rn, rm } | And { rn, rm } | Or { rn, rm }
+            | Xor { rn, rm } | Tst { rn, rm } | CmpEq { rn, rm } | CmpHs { rn, rm }
+            | CmpGe { rn, rm } | CmpHi { rn, rm } | CmpGt { rn, rm } | CmpStr { rn, rm }
+            | MulL { rn, rm } | DmulsL { rn, rm } | DmuluL { rn, rm }
+            | Div1 { rn, rm } | Div0s { rn, rm }
+            | MulsW { rn, rm } | MuluW { rn, rm }
+            | Xtrct { rn, rm }
+            | MacL { rn, rm } | MacW { rn, rm }
+            | MovRR { rn, rm } => n(rn) || m(rm),
+
+            // rn read-modify-write (add-immediate).
+            AddI { rn, .. } => n(rn),
+            CmpEqI { .. } => r0(),
+
+            // Single-source rn (cmp/test, shift/rotate, decrement, TAS).
+            CmpPl { rn } | CmpPz { rn } | Dt { rn }
+            | Shll { rn } | Shlr { rn } | Shal { rn } | Shar { rn }
+            | Rotl { rn } | Rotr { rn } | Rotcl { rn } | Rotcr { rn }
+            | Shll2 { rn } | Shlr2 { rn } | Shll8 { rn } | Shlr8 { rn }
+            | Shll16 { rn } | Shlr16 { rn } | Tas { rn } => n(rn),
+
+            // Loads read rm (and possibly post-modify it); write rn.
+            MovBL { rm, .. } | MovWL { rm, .. } | MovLL { rm, .. }
+            | MovBP { rm, .. } | MovWP { rm, .. } | MovLP { rm, .. }
+            | MovLL4 { rm, .. }
+            | MovBL0 { rm, .. } | MovWL0 { rm, .. } => m(rm),
+
+            // R0-indexed loads read R0 and rm; write rn.
+            MovBLX { rm, .. } | MovWLX { rm, .. } | MovLLX { rm, .. } => r0() || m(rm),
+
+            // GBR-disp loads target R0 only — no GP read.
+            MovBLG { .. } | MovWLG { .. } | MovLLG { .. } => false,
+
+            // Stores read rn (addr base, possibly pre-modified) and rm (data).
+            MovBS { rn, rm } | MovWS { rn, rm } | MovLS { rn, rm }
+            | MovBM { rn, rm } | MovWM { rn, rm } | MovLM { rn, rm }
+            | MovLS4 { rn, rm, .. } => n(rn) || m(rm),
+
+            // R0-disp stores: read R0 (data) + rn (base).
+            MovBS0 { rn, .. } | MovWS0 { rn, .. } => r0() || n(rn),
+
+            // R0-indexed stores: read R0 (idx) + rn (base) + rm (data).
+            MovBSX { rn, rm } | MovWSX { rn, rm } | MovLSX { rn, rm } => {
+                r0() || n(rn) || m(rm)
+            }
+
+            // GBR-disp stores: read R0 only.
+            MovBSG { .. } | MovWSG { .. } | MovLSG { .. } => r0(),
+
+            // Unary register transforms (write rn from rm).
+            SwapB { rm, .. } | SwapW { rm, .. }
+            | ExtsB { rm, .. } | ExtsW { rm, .. } | ExtuB { rm, .. } | ExtuW { rm, .. }
+            | Neg { rm, .. } | Negc { rm, .. } | Not { rm, .. } => m(rm),
+
+            // Logical R0-immediate / GBR-byte: read R0.
+            AndI { .. } | OrI { .. } | XorI { .. } | TstI { .. }
+            | AndBG { .. } | OrBG { .. } | XorBG { .. } | TstBG { .. } => r0(),
+
+            // Branches with register targets.
+            Braf { rm } | Bsrf { rm } | Jmp { rm } | Jsr { rm } => m(rm),
+
+            // LDC/LDS register forms: read rm.
+            LdcSr { rm } | LdcGbr { rm } | LdcVbr { rm }
+            | LdsMach { rm } | LdsMacl { rm } | LdsPr { rm } => m(rm),
+
+            // LDC.L/LDS.L: read rm (the post-inc base).
+            LdcLSr { rm } | LdcLGbr { rm } | LdcLVbr { rm }
+            | LdsLMach { rm } | LdsLMacl { rm } | LdsLPr { rm } => m(rm),
+
+            // STC/STS register forms: write rn only.
+            StcSr { .. } | StcGbr { .. } | StcVbr { .. }
+            | StsMach { .. } | StsMacl { .. } | StsPr { .. } => false,
+
+            // STC.L/STS.L: read rn (pre-decrement base).
+            StcLSr { rn } | StcLGbr { rn } | StcLVbr { rn }
+            | StsLMach { rn } | StsLMacl { rn } | StsLPr { rn } => n(rn),
+        }
+    }
+
+    /// If this op is a load whose result lands in a GP register, return
+    /// that register. The instruction immediately following stalls 1 cycle
+    /// if it reads the same register (SH-2 1-cycle load-use latency).
+    pub fn load_dest(&self) -> Option<Reg> {
+        use Op::*;
+        match self {
+            MovBL { rn, .. } | MovWL { rn, .. } | MovLL { rn, .. }
+            | MovBP { rn, .. } | MovWP { rn, .. } | MovLP { rn, .. }
+            | MovLL4 { rn, .. }
+            | MovWPcRel { rn, .. } | MovLPcRel { rn, .. }
+            | MovBLX { rn, .. } | MovWLX { rn, .. } | MovLLX { rn, .. } => Some(*rn),
+            // Loads with implicit R0 destination.
+            MovBL0 { .. } | MovWL0 { .. }
+            | MovBLG { .. } | MovWLG { .. } | MovLLG { .. } => Some(0),
+            _ => None,
+        }
+    }
+
+    /// If this op starts a multiplier operation, return the *additional*
+    /// cycles past instruction retire before MACH/MACL is committed.
+    ///
+    /// For M1 every multiply returns `Some(0)` — the SH7604 multiplier
+    /// pipeline's full latency is folded into the base issue cost we
+    /// already charge (`MUL.L` = 2 cycles, `MAC.L` = 3 cycles, etc.), so
+    /// back-to-back `MUL → STS` doesn't add an extra stall on top.
+    /// The scoreboard hook stays in place so a future refinement can
+    /// model multiplier–consumer overlap without re-plumbing the dispatch.
+    pub fn multiply_latency(&self) -> Option<u32> {
+        use Op::*;
+        match self {
+            MulL { .. } | DmulsL { .. } | DmuluL { .. }
+            | MulsW { .. } | MuluW { .. }
+            | MacL { .. } | MacW { .. } => Some(0),
+            _ => None,
+        }
+    }
+
+    /// True iff this op reads MACH or MACL as an architectural source.
+    pub fn reads_mac(&self) -> bool {
+        use Op::*;
+        matches!(
+            self,
+            StsMach { .. } | StsMacl { .. } | StsLMach { .. } | StsLMacl { .. }
+        )
+    }
+
     /// True if this instruction must not appear in a delay slot
     /// (SH-2 software manual §6, "Delayed Branch Instructions").
     /// Branches, jumps, returns, TRAPA, and instructions that modify SR
