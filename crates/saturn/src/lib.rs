@@ -32,6 +32,7 @@
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 
 pub mod bus;
+pub mod cd_block;
 pub mod memory;
 pub mod scheduler;
 pub mod scu;
@@ -40,6 +41,7 @@ pub mod system;
 pub mod vdp2;
 
 pub use bus::SaturnBus;
+pub use cd_block::CdBlock;
 pub use memory::{BiosRom, Ram, StubRegisterBank};
 pub use scheduler::{EntityId, SchedEntity, Scheduler, Sh2Entity};
 pub use scu::{DmaRequest, Scu, Source as ScuSource};
