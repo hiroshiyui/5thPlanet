@@ -80,7 +80,7 @@ frontend shell.
 |---|------|--------|
 | 1 | SMPC — registers + `SETSL`/`SETSM` slave hold-release | ✅ done |
 | 2 | SCU registers + DMA channels (3 channels, synchronous transfer) | ✅ done |
-| 3 | SCU interrupt aggregator + wiring into SH-2 master INTC | pending |
+| 3 | SCU interrupt aggregator + wiring into SH-2 master INTC | ✅ done |
 | 4 | `scu_dsp` crate — 32-bit DSP core (ISA, decoder, interpreter, opcode tests) | pending |
 | 5 | VDP2 register bank + VRAM (512 KiB) + CRAM (4 KiB) | pending |
 | 6 | VDP2 minimal renderer — one NBG layer (bitmap + 4-cell tile, 8/16/32 bpp via CRAM) | pending |
