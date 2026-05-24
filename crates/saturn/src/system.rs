@@ -186,18 +186,43 @@ impl Saturn {
         self.scheduler.now()
     }
 
-    /// Run one NTSC frame worth of cycles and produce the rendered
-    /// framebuffer. Cycle count is the SH-2 master clock (28.6 MHz)
-    /// divided by 60 Hz ≈ 476 932 cycles per frame.
+    /// Run one NTSC frame worth of cycles, raise the VBlank-IN
+    /// interrupt source on the SCU (so BIOS init code that waits on
+    /// it advances), and produce the rendered framebuffer. Cycle
+    /// count is the SH-2 master clock (28.6 MHz) divided by 60 Hz ≈
+    /// 476 932 cycles per frame.
+    ///
+    /// VBlank-IN is raised *before* the second run-for chunk that
+    /// flushes the interrupt through the SCU's drainer into the
+    /// master SH-2. On real hardware the interrupt fires at the
+    /// start of vertical blanking (≈ line 224 of 263); M3 fires it
+    /// at end-of-frame as a coarse approximation. The split run
+    /// (most of the frame → render → raise → small drain run) is
+    /// what lets the interrupt actually get acknowledged by the
+    /// master before we return.
     ///
     /// Writes into `out`, which must be exactly
     /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes (RGBA8888 320×224).
-    /// VBlank-IN generation lands in a follow-up — for M3 task #6
-    /// this is just "run the system, then snapshot the framebuffer";
-    /// task #7 (SDL2 frontend) consumes it as-is.
     pub fn run_frame(&mut self, out: &mut [u8]) {
         const CYCLES_PER_FRAME: u64 = 476_932;
-        self.run_for(CYCLES_PER_FRAME);
+        // 95% of the cycles before VBlank fires; the remainder gives
+        // the interrupt a chance to be picked up and dispatched.
+        const ACTIVE_CYCLES: u64 = 453_085;
+        const VBLANK_CYCLES: u64 = CYCLES_PER_FRAME - ACTIVE_CYCLES;
+
+        // Active display: clear TVSTAT.VBLANK (bit 3) so polling code
+        // sees "currently scanning out".
+        let tvstat = self.bus.vdp2.regs.read16(0x004);
+        self.bus.vdp2.regs.write16(0x004, tvstat & !0x0008);
+
+        self.run_for(ACTIVE_CYCLES);
         crate::vdp2::render_frame(&self.bus.vdp2, out);
+
+        // Enter VBLANK: set TVSTAT.VBLANK and fire the SCU interrupt.
+        let tvstat = self.bus.vdp2.regs.read16(0x004);
+        self.bus.vdp2.regs.write16(0x004, tvstat | 0x0008);
+        self.bus.scu.raise(crate::scu::Source::VBlankIn);
+
+        self.run_for(VBLANK_CYCLES);
     }
 }
