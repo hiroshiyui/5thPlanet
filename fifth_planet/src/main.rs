@@ -88,10 +88,22 @@ fn run(bios: Vec<u8>) -> ExitCode {
         )
         .expect("create streaming texture");
 
+    let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
 
     'main: loop {
+        // The host SDL2 library on a modern Linux desktop emits event
+        // codes 0.37's binding doesn't recognise — notably 0x207
+        // (SDL_DISPLAYEVENT_MOVED on SDL ≥ 2.28). `poll_iter` panics
+        // (non-unwinding, because the call originates inside an
+        // `extern "C"` callback) when it sees one, aborting the
+        // process. Flushing the whole 0x201..=0x20F range from the
+        // queue before each poll drops them safely without needing
+        // raw FFI. Range covers all the post-2.28 top-level display
+        // events; widen if a future SDL adds more.
+        event_subsystem.flush_events(0x201, 0x20F);
+
         for ev in events.poll_iter() {
             match ev {
                 Event::Quit { .. }
