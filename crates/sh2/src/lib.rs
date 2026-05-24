@@ -20,7 +20,7 @@ pub mod pipeline;
 pub mod regs;
 
 pub use bus::{AccessKind, Bus};
-pub use cache::{Cache, Probe};
+pub use cache::{Cache, Lookup};
 pub use interpreter::Cpu;
 pub use isa::Op;
 pub use onchip::{OnChip, Source as InterruptSource};

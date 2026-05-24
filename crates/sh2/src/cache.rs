@@ -18,21 +18,39 @@
 //!   bit 4  CP   cache purge (write-only one-shot; invalidates all entries)
 //! ```
 //!
-//! M1 implements geometry, hit/miss probe, LRU replacement, CCR, and CP
-//! purge. The cache is *not* yet wired into the interpreter's fetch and
-//! data paths — that integration arrives with the Saturn bus in M2 so the
-//! cached vs cache-through address regions can be honoured properly.
+//! Lines store their 16 bytes of data alongside the tag, so a hit can
+//! satisfy a read without touching the bus. The write policy is
+//! write-through (matches SH7604): writes always reach the bus and, if
+//! the line is resident, the cached copy is updated in place via
+//! [`Cache::write_through_u8`] et al.
+//!
+//! **Miss handling is a two-step protocol with the caller**: [`lookup_*`]
+//! returns [`Lookup::Miss`] without installing anything, and the caller
+//! is then responsible for fetching the 16-byte line from the bus and
+//! handing it back via [`install`]. Splitting it this way keeps the
+//! cache pure (no Bus dependency) and makes the line-fill timing visible
+//! to the interpreter's cycle accounting.
 
-/// Bytes per cache line. Only referenced via the bit slicing in
-/// [`decompose`] — kept named for documentation, hence `pub`.
+/// Bytes per cache line.
 pub const LINE_BYTES: usize = 16;
 const WAYS: usize = 4;
 const SETS: usize = 64; // 4096 / (16 * 4)
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Line {
     tag: u32,
     valid: bool,
+    data: [u8; LINE_BYTES],
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self {
+            tag: 0,
+            valid: false,
+            data: [0; LINE_BYTES],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,12 +68,17 @@ impl Default for Cache {
     }
 }
 
+/// Outcome of a cache lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Probe {
-    Hit,
+pub enum Lookup {
+    /// Line is resident; here are its 16 bytes (caller extracts the
+    /// access-sized slice based on the address offset).
+    Hit([u8; LINE_BYTES]),
+    /// Line is not resident. Caller must fetch from the bus and call
+    /// [`Cache::install`] before the data is observable here.
     Miss,
-    /// Cache is disabled or the access kind is masked off by ID/OD —
-    /// the request bypasses the cache and goes straight to the bus.
+    /// Cache is disabled or this access kind is masked off (ID/OD).
+    /// Caller should go straight to the bus and skip [`install`].
     Bypass,
 }
 
@@ -116,36 +139,86 @@ impl Cache {
     }
 
     /// Probe the cache for `addr` on behalf of an instruction fetch.
-    /// On a miss, install the line and evict the LRU way.
-    pub fn probe_fetch(&mut self, addr: u32) -> Probe {
+    pub fn lookup_fetch(&mut self, addr: u32) -> Lookup {
         if !self.enabled() || self.inst_disabled() {
-            return Probe::Bypass;
+            return Lookup::Bypass;
         }
-        self.probe(addr)
+        self.lookup(addr)
     }
 
     /// Probe the cache for `addr` on behalf of a data access.
-    pub fn probe_data(&mut self, addr: u32) -> Probe {
+    pub fn lookup_data(&mut self, addr: u32) -> Lookup {
         if !self.enabled() || self.data_disabled() {
-            return Probe::Bypass;
+            return Lookup::Bypass;
         }
-        self.probe(addr)
+        self.lookup(addr)
     }
 
-    fn probe(&mut self, addr: u32) -> Probe {
+    fn lookup(&mut self, addr: u32) -> Lookup {
         let (tag, set_idx) = decompose(addr);
         let active_ways = if self.two_way() { 2 } else { WAYS };
         for way in 0..active_ways {
             if self.sets[set_idx][way].valid && self.sets[set_idx][way].tag == tag {
+                let data = self.sets[set_idx][way].data;
                 self.touch(set_idx, way as u8);
-                return Probe::Hit;
+                return Lookup::Hit(data);
             }
         }
-        // Miss: install into the LRU way (within active set).
+        Lookup::Miss
+    }
+
+    /// Install a freshly-fetched line. Called by the bus-miss path after
+    /// the caller has obtained the 16-byte line from external memory.
+    /// Picks the LRU way of the line's set, evicts it, and marks the new
+    /// way most-recently used.
+    pub fn install(&mut self, addr: u32, data: [u8; LINE_BYTES]) {
+        let (tag, set_idx) = decompose(addr);
+        let active_ways = if self.two_way() { 2 } else { WAYS };
         let victim = self.pick_victim(set_idx, active_ways);
-        self.sets[set_idx][victim as usize] = Line { tag, valid: true };
+        self.sets[set_idx][victim as usize] = Line {
+            tag,
+            valid: true,
+            data,
+        };
         self.touch(set_idx, victim);
-        Probe::Miss
+    }
+
+    /// Write-through: if the line containing `addr` is currently resident,
+    /// update the byte in place. No-op otherwise. Used by SH-2 stores to
+    /// keep cached copies coherent with the write that also went to bus.
+    pub fn write_through_u8(&mut self, addr: u32, val: u8) {
+        if let Some((set_idx, way)) = self.locate(addr) {
+            self.sets[set_idx][way].data[(addr & 0xF) as usize] = val;
+        }
+    }
+    pub fn write_through_u16(&mut self, addr: u32, val: u16) {
+        if let Some((set_idx, way)) = self.locate(addr) {
+            let off = (addr & 0xF) as usize;
+            let b = val.to_be_bytes();
+            self.sets[set_idx][way].data[off] = b[0];
+            self.sets[set_idx][way].data[off + 1] = b[1];
+        }
+    }
+    pub fn write_through_u32(&mut self, addr: u32, val: u32) {
+        if let Some((set_idx, way)) = self.locate(addr) {
+            let off = (addr & 0xF) as usize;
+            let b = val.to_be_bytes();
+            self.sets[set_idx][way].data[off..off + 4].copy_from_slice(&b);
+        }
+    }
+
+    fn locate(&self, addr: u32) -> Option<(usize, usize)> {
+        if !self.enabled() {
+            return None;
+        }
+        let (tag, set_idx) = decompose(addr);
+        let active_ways = if self.two_way() { 2 } else { WAYS };
+        for way in 0..active_ways {
+            if self.sets[set_idx][way].valid && self.sets[set_idx][way].tag == tag {
+                return Some((set_idx, way));
+            }
+        }
+        None
     }
 
     fn pick_victim(&self, set_idx: usize, active_ways: usize) -> u8 {
@@ -166,6 +239,23 @@ impl Cache {
     }
 }
 
+/// Extract a big-endian `u8` / `u16` / `u32` at `addr` from a 16-byte
+/// line returned by [`Lookup::Hit`].
+#[inline]
+pub fn extract_u8(line: &[u8; LINE_BYTES], addr: u32) -> u8 {
+    line[(addr & 0xF) as usize]
+}
+#[inline]
+pub fn extract_u16(line: &[u8; LINE_BYTES], addr: u32) -> u16 {
+    let o = (addr & 0xF) as usize;
+    u16::from_be_bytes([line[o], line[o + 1]])
+}
+#[inline]
+pub fn extract_u32(line: &[u8; LINE_BYTES], addr: u32) -> u32 {
+    let o = (addr & 0xF) as usize;
+    u32::from_be_bytes([line[o], line[o + 1], line[o + 2], line[o + 3]])
+}
+
 #[inline]
 fn decompose(addr: u32) -> (u32, usize) {
     let set_idx = ((addr >> 4) & 0x3F) as usize;
@@ -177,39 +267,89 @@ fn decompose(addr: u32) -> (u32, usize) {
 mod tests {
     use super::*;
 
+    fn line_with(start_byte: u8) -> [u8; 16] {
+        core::array::from_fn(|i| start_byte.wrapping_add(i as u8))
+    }
+
     #[test]
     fn cache_starts_disabled_and_bypasses() {
         let mut c = Cache::new();
-        assert_eq!(c.probe_fetch(0x1234), Probe::Bypass);
+        assert_eq!(c.lookup_fetch(0x1234), Lookup::Bypass);
     }
 
     #[test]
-    fn enabled_cache_first_access_is_miss_second_is_hit() {
+    fn enabled_cache_first_lookup_misses_install_then_hits() {
         let mut c = Cache::new();
         c.set_ccr(0x01);
-        assert_eq!(c.probe_data(0x6000_0040), Probe::Miss);
-        assert_eq!(c.probe_data(0x6000_0040), Probe::Hit);
-        // Same line, different offset within the 16-byte line — still a hit.
-        assert_eq!(c.probe_data(0x6000_004C), Probe::Hit);
+        let addr = 0x6000_0040;
+        assert_eq!(c.lookup_data(addr), Lookup::Miss);
+        c.install(addr, line_with(0x10));
+        let Lookup::Hit(data) = c.lookup_data(addr) else {
+            panic!("expected hit after install");
+        };
+        assert_eq!(data[0], 0x10);
+        // Same line, different offset within 16-byte line → still a hit,
+        // and extract_* reads the right byte.
+        let Lookup::Hit(data2) = c.lookup_data(addr | 0xC) else {
+            panic!("expected hit on same line different offset");
+        };
+        assert_eq!(extract_u32(&data2, addr | 0xC), 0x1C1D1E1F);
     }
 
     #[test]
-    fn lru_evicts_least_recently_used_way() {
+    fn install_evicts_lru_and_returns_new_data() {
         let mut c = Cache::new();
         c.set_ccr(0x01);
-        // All four addresses map to the same set (set 0, varying tags).
         let base: u32 = 0x6000_0000;
+        // Fill all four ways of set 0 with distinguishable line data.
         for i in 0..4u32 {
-            // Each address bumps the tag by 1 (bit 10+).
-            assert_eq!(c.probe_data(base | (i << 10)), Probe::Miss);
+            let addr = base | (i << 10);
+            c.lookup_data(addr); // miss
+            c.install(addr, line_with(i as u8 * 0x10));
         }
-        // Set is now full. Touching way 0 (tag 0) marks it MRU.
-        assert_eq!(c.probe_data(base), Probe::Hit);
-        // A new tag should evict the least-recently-used way (tag 1).
-        let new_addr = base | (4 << 10);
-        assert_eq!(c.probe_data(new_addr), Probe::Miss);
-        assert_eq!(c.probe_data(base | (1 << 10)), Probe::Miss, "tag 1 evicted");
-        assert_eq!(c.probe_data(base), Probe::Hit, "tag 0 retained");
+        // Way containing tag 0 is now the LRU (it was filled first and
+        // never touched again). Touching tag 0 demotes tag 1 to LRU.
+        let Lookup::Hit(d0) = c.lookup_data(base) else {
+            panic!();
+        };
+        assert_eq!(d0[0], 0x00);
+        // New install at tag 4 must evict tag 1.
+        let evict_addr = base | (4 << 10);
+        c.lookup_data(evict_addr); // miss
+        c.install(evict_addr, line_with(0xC0));
+        assert_eq!(
+            c.lookup_data(base | (1 << 10)),
+            Lookup::Miss,
+            "tag 1 evicted"
+        );
+        let Lookup::Hit(d0_after) = c.lookup_data(base) else {
+            panic!("tag 0 still resident");
+        };
+        assert_eq!(d0_after[0], 0x00);
+    }
+
+    #[test]
+    fn write_through_updates_resident_line_only() {
+        let mut c = Cache::new();
+        c.set_ccr(0x01);
+        let addr = 0x6000_0080;
+        // Not resident yet — write-through is a silent no-op.
+        c.write_through_u8(addr, 0xAA);
+        assert_eq!(c.lookup_data(addr), Lookup::Miss);
+
+        // Now install and write-through, then re-read.
+        c.install(addr, line_with(0));
+        c.write_through_u32(addr, 0xDEAD_BEEF);
+        let Lookup::Hit(d) = c.lookup_data(addr) else {
+            panic!();
+        };
+        assert_eq!(extract_u32(&d, addr), 0xDEAD_BEEF);
+        // Byte writes land at the correct offset.
+        c.write_through_u8(addr | 5, 0x99);
+        let Lookup::Hit(d) = c.lookup_data(addr) else {
+            panic!();
+        };
+        assert_eq!(extract_u8(&d, addr | 5), 0x99);
     }
 
     #[test]
@@ -217,39 +357,48 @@ mod tests {
         let mut c = Cache::new();
         c.set_ccr(0x01 | 0x08); // CE + TW
         let base: u32 = 0x6000_0000;
-        // First two distinct tags miss and install into ways 0 and 1.
-        assert_eq!(c.probe_data(base), Probe::Miss);
-        assert_eq!(c.probe_data(base | (1 << 10)), Probe::Miss);
-        // Both should hit now.
-        assert_eq!(c.probe_data(base), Probe::Hit);
-        assert_eq!(c.probe_data(base | (1 << 10)), Probe::Hit);
-        // A third distinct tag must evict whichever of {0,1} is older —
-        // in our case tag 0 (we touched tag 1 most recently).
-        assert_eq!(c.probe_data(base | (2 << 10)), Probe::Miss);
-        assert_eq!(c.probe_data(base), Probe::Miss, "tag 0 evicted from active set");
+        for i in 0..2u32 {
+            let a = base | (i << 10);
+            c.lookup_data(a);
+            c.install(a, line_with(i as u8));
+        }
+        assert!(matches!(c.lookup_data(base), Lookup::Hit(_)));
+        assert!(matches!(c.lookup_data(base | (1 << 10)), Lookup::Hit(_)));
+        // Touching tag 1 most recently → tag 0 is LRU within the active 2 ways.
+        let a2 = base | (2 << 10);
+        c.lookup_data(a2);
+        c.install(a2, line_with(2));
+        assert_eq!(c.lookup_data(base), Lookup::Miss, "tag 0 evicted in TW mode");
     }
 
     #[test]
     fn cp_bit_purges_and_is_write_only() {
         let mut c = Cache::new();
         c.set_ccr(0x01);
-        assert_eq!(c.probe_data(0x6000_0000), Probe::Miss);
-        assert_eq!(c.probe_data(0x6000_0000), Probe::Hit);
+        let addr = 0x6000_0000;
+        c.lookup_data(addr);
+        c.install(addr, line_with(0x55));
+        assert!(matches!(c.lookup_data(addr), Lookup::Hit(_)));
         c.set_ccr(0x01 | 0x10); // CE + CP
         assert_eq!(c.ccr() & 0x10, 0, "CP reads back as 0");
-        assert_eq!(c.probe_data(0x6000_0000), Probe::Miss, "purge invalidated lines");
+        assert_eq!(c.lookup_data(addr), Lookup::Miss, "purge invalidated lines");
     }
 
     #[test]
     fn instruction_and_data_masks_route_independently() {
         let mut c = Cache::new();
         c.set_ccr(0x01 | 0x02); // CE + ID
-        assert_eq!(c.probe_fetch(0x6000_0000), Probe::Bypass);
-        assert_eq!(c.probe_data(0x6000_0000), Probe::Miss);
+        let addr = 0x6000_0000;
+        assert_eq!(c.lookup_fetch(addr), Lookup::Bypass);
+        assert_eq!(c.lookup_data(addr), Lookup::Miss);
+        c.install(addr, line_with(0));
+        // Data sees the install, fetch still bypasses.
+        assert!(matches!(c.lookup_data(addr), Lookup::Hit(_)));
+        assert_eq!(c.lookup_fetch(addr), Lookup::Bypass);
 
         let mut c = Cache::new();
         c.set_ccr(0x01 | 0x04); // CE + OD
-        assert_eq!(c.probe_data(0x6000_0000), Probe::Bypass);
-        assert_eq!(c.probe_fetch(0x6000_0000), Probe::Miss);
+        assert_eq!(c.lookup_data(addr), Lookup::Bypass);
+        assert_eq!(c.lookup_fetch(addr), Lookup::Miss);
     }
 }
