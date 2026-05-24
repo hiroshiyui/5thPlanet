@@ -1,0 +1,12 @@
+[package]
+name = "saturn"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sh2 = { path = "../sh2" }
+
+[lints]
+workspace = true

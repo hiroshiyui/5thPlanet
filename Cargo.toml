@@ -1,6 +1,16 @@
-[package]
-name = "fifth_planet"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/sh2",
+    "crates/saturn",
+    "fifth_planet",
+]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["Hui-Hong You"]
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

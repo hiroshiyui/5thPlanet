@@ -1,0 +1,12 @@
+[package]
+name = "fifth_planet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sh2 = { path = "../crates/sh2" }
+
+[lints]
+workspace = true
