@@ -88,6 +88,13 @@ impl Cpu {
         self.regs.r[15] = sp;
     }
 
+    /// True when the next [`step`] will execute a branch delay slot
+    /// (a branch is pending). Used by trace tooling to match reference
+    /// emulators that execute the delay slot inside the branch handler.
+    pub fn next_is_delay_slot(&self) -> bool {
+        self.pending_branch.is_some()
+    }
+
     /// Fetch + decode + execute one instruction. Returns total cycles
     /// (instruction issue cost + bus stalls + interlock stalls).
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {

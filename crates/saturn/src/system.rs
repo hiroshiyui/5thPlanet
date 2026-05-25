@@ -104,6 +104,25 @@ impl Saturn {
         &mut self.scheduler.entity_mut(self.slave_id).cpu
     }
 
+    /// Debug-only: step the master SH-2 exactly one instruction, then
+    /// drain SMPC/SCU side effects. Used by the reference-emulator PC
+    /// trace diff (M4 task #5). Returns the cycles the instruction took.
+    pub fn debug_step_master(&mut self) -> u32 {
+        let cycles = {
+            let Self {
+                bus,
+                scheduler,
+                master_id,
+                ..
+            } = self;
+            scheduler.entity_mut(*master_id).cpu.step(bus)
+        };
+        self.drain_smpc();
+        self.drain_scu_dma();
+        self.drain_scu_intc();
+        cycles
+    }
+
     /// Advance global time by at least `cycles` cycles, interleaving
     /// the two CPUs by deadline order and polling SMPC + SCU between
     /// scheduler batches.
