@@ -1,10 +1,10 @@
 //! SEGA Saturn system: bus, scheduler, peripherals.
 //!
-//! This crate is the layer between the chip cores (currently just
-//! [`sh2`], later `scu_dsp` / future VDP / SCSP / CD crates) and a
-//! frontend. It owns the Saturn-shaped memory map ([`SaturnBus`]), the
-//! event-driven [`Scheduler`] that decides which chip advances next,
-//! and the on-board peripherals modeled so far.
+//! This crate is the layer between the chip cores ([`sh2`], and the
+//! standalone `scu_dsp`) and a frontend. It owns the Saturn-shaped
+//! memory map ([`SaturnBus`]), the event-driven [`Scheduler`] that
+//! decides which chip advances next, and the on-board peripherals
+//! modeled so far.
 //!
 //! # Quick tour
 //!
@@ -12,22 +12,26 @@
 //!   address to the typed regions in [`memory`] and the peripherals.
 //! - [`memory`] — `BiosRom`, `Ram`, `StubRegisterBank` region backings.
 //! - [`smpc`] — System Manager + Peripheral Control. Slave SH-2
-//!   hold/release lives here.
+//!   hold/release and the INTBACK/NMIREQ command set live here.
 //! - [`scu`] — System Control Unit: three DMA channels, timers, IMS/
-//!   IST, A-bus configuration, version. SCU-DSP control window storage
-//!   is here; the DSP itself moves to its own crate in M3 task #4.
+//!   IST interrupt aggregator, A-bus configuration, version. The DSP
+//!   itself is the standalone `scu_dsp` crate.
+//! - [`vdp2`] — background generator: registers + VRAM + CRAM + a
+//!   minimal NBG0 renderer. [`vdp1`] and [`cd_block`] are address-space
+//!   presence stubs (no plotter / no SH-1 yet).
 //! - [`scheduler`] — `SchedEntity` trait + linear-scan `Scheduler`.
 //!   `Sh2Entity` is the concrete adapter wrapping `sh2::Cpu`.
 //! - [`system`] — `Saturn` aggregate: owns bus + scheduler, runs the
-//!   headless main loop, drains queued peripheral commands between
-//!   scheduler batches.
+//!   headless main loop / `run_frame`, maintains VDP2 raster timing,
+//!   and drains queued peripheral commands between scheduler batches.
 //!
 //! # Milestone status
 //!
-//! - M2 (bus + scheduler + dual SH-2) complete.
-//! - M3 (SCU + SMPC + VDP2 + SDL2 + BIOS-to-splash) active. SMPC and
-//!   SCU DMA done; SCU INTC, SCU-DSP, VDP2, and the frontend wiring
-//!   land in the remaining M3 tasks.
+//! - M2 (bus + scheduler + dual SH-2) and M3 (SCU + SMPC + VDP2
+//!   minimal + SCU-DSP + SDL2 scaffolding) complete.
+//! - M4 (BIOS-to-splash) active: SMPC INTBACK timing, VDP1/CD-block
+//!   presence stubs, VDP2 register-decode fidelity, and VDP2 raster
+//!   timing have landed; remaining is raster-timing precision.
 //!
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 

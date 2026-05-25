@@ -30,8 +30,9 @@
 //! "start" bit; `Dsp::run_until_stopped` runs the program to its `END`
 //! or `ENDI` instruction; if `ENDI`, the host sees
 //! `end_interrupt_pending` and forwards the DSP-end source to the SCU
-//! INTC. The host-side glue is deferred to a later M3 refinement;
-//! this crate stands alone in the interim.
+//! INTC. That host-side glue is deferred to a later milestone (when a
+//! target microcode program surfaces); this crate stands alone in the
+//! interim.
 
 #![no_std]
 

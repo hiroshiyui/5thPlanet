@@ -12,15 +12,21 @@ foundation stays solid.
 
 ## Status
 
-| Milestone | Goal                                                    | State        |
-| --------- | ------------------------------------------------------- | ------------ |
-| M1        | Cycle-accurate SH-2 (SH7604) core                       | ✅ complete  |
-| M2        | Saturn bus, dual SH-2, event-driven scheduler           | ✅ complete  |
-| M3        | SCU, SMPC, VDP2 minimal, SDL2 window: BIOS to splash    | 🚧 active   |
-| M4+       | VDP1, audio, save states, CD block, first game booting  | queued       |
+| Milestone | Goal                                                        | State        |
+| --------- | ----------------------------------------------------------- | ------------ |
+| M1        | Cycle-accurate SH-2 (SH7604) core                           | ✅ complete  |
+| M2        | Saturn bus, dual SH-2, event-driven scheduler               | ✅ complete  |
+| M3        | SCU, SMPC, VDP2 minimal, SCU-DSP, SDL2 window (scaffolding)  | ✅ complete  |
+| M4        | Finish the M3 stretch — SEGA splash on screen               | 🚧 active   |
+| M5+       | VDP1 rendering, audio (SCSP+M68k), save states, CD-block     | queued       |
 
-Current test count: **210 workspace-wide, 0 failures.** Task-by-task
+Current test count: **278 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
+
+M4 is the splash push. A real BIOS now boots far past M3's early init —
+verified bit-for-bit against a reference emulator (see
+[Acknowledgements](#acknowledgements)) — onto the genuine boot path;
+the remaining gap is VDP2 raster-timing precision.
 
 ## Quick start
 
@@ -35,9 +41,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Run a single test
 cargo test -p sh2 -- decoder::tests::decodes_branches
 
-# The SDL2 frontend isn't wired yet (M3 task #7); `cargo run` is
-# currently a placeholder.
-cargo run -p fifth_planet
+# SDL2 frontend (default-on `sdl2-frontend` feature): opens a window and
+# runs the supplied BIOS. Use --no-default-features for a headless run.
+cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
 ```
 
 ## Workspace
@@ -45,13 +51,14 @@ cargo run -p fifth_planet
 - [`crates/sh2`](crates/sh2) — cycle-accurate SH-2 (SH7604) CPU core.
   `no_std` + `alloc`, no I/O.
 - [`crates/saturn`](crates/saturn) — Saturn system: memory map, dual
-  SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator. VDP1/2,
-  SCSP, CD-block to follow.
+  SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator, VDP2 (minimal
+  NBG0 renderer + live raster timing), and address-space stubs for VDP1
+  and the CD-block. SCSP and full VDP1 rendering to follow.
 - [`crates/scu_dsp`](crates/scu_dsp) — SCU's embedded 32-bit DSP.
-  Standalone for now; wired into the SCU host as M3+/M4 microcode
+  Standalone for now; wired into the SCU host as later microcode
   needs surface.
-- [`fifth_planet`](fifth_planet) — frontend binary. Gets an SDL2
-  window in M3 task #7.
+- [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
+  framebuffer upload, or headless), behind a default-on feature.
 
 ## BIOS
 
