@@ -41,7 +41,7 @@ fn bitmap_nbg0_through_run_frame_picks_up_synthetic_scene() {
     // Program VDP2: DISP on, NBG0 on, bitmap mode.
     sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
     sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data);
-    sat.bus.write16(REG_CHCTLA, 0x0004, AccessKind::Data);
+    sat.bus.write16(REG_CHCTLA, 0x0002, AccessKind::Data); // N0BMEN (bit 1)
     // CRAM: index 0 = black, index 7 = pure red.
     sat.bus.vdp2.cram.write16(0, 0x0000);
     sat.bus.vdp2.cram.write16(7 * 2, 0x001F);

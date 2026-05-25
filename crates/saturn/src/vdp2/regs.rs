@@ -146,6 +146,71 @@ impl Vdp2Regs {
     pub fn chctlb(&self) -> u16 {
         self.read16(0x02A)
     }
+
+    /// NBG0 bitmap enable — CHCTLA bit 1 (`N0BMEN`). 0 = cell/tile
+    /// format, 1 = bitmap format. (VDP2 manual, CHCTLA bit layout:
+    /// bit0 N0CHSZ, bit1 N0BMEN, bits3..2 N0BMSZ, bits6..4 N0CHCN.)
+    pub fn nbg0_bitmap_enabled(&self) -> bool {
+        self.chctla() & 0x0002 != 0
+    }
+    /// NBG0 bitmap size — CHCTLA bits 3..2 (`N0BMSZ`): 0 = 512×256,
+    /// 1 = 512×512, 2 = 1024×256, 3 = 1024×512.
+    pub fn nbg0_bitmap_size(&self) -> u8 {
+        ((self.chctla() >> 2) & 0x3) as u8
+    }
+
+    // ---- Map-offset and plane registers (NBG0) ----
+    //
+    // The pattern-name-table address of each plane is
+    // `((map_offset << 6) | plane_number) × plane_size`. The map-offset
+    // register (MPOFN) supplies the upper 3 bits; the per-plane map
+    // registers (MPABN0 / MPCDN0) supply the lower 6. (VDP2 manual,
+    // "Map" register group.)
+
+    /// MPOFN (0x03E) — Map Offset for NBG0..3. Bits 2..0 = NBG0 (`N0MP`).
+    pub fn mpofn(&self) -> u16 {
+        self.read16(0x03E)
+    }
+    /// `N0MP` — NBG0 map offset (high 3 bits of each NBG0 plane address).
+    pub fn nbg0_map_offset(&self) -> u32 {
+        (self.mpofn() & 0x7) as u32
+    }
+    /// MPABN0 (0x040) — NBG0 plane A/B map numbers (bits 5..0 = A,
+    /// 13..8 = B).
+    pub fn mpabn0(&self) -> u16 {
+        self.read16(0x040)
+    }
+    /// MPCDN0 (0x042) — NBG0 plane C/D map numbers (bits 5..0 = C,
+    /// 13..8 = D).
+    pub fn mpcdn0(&self) -> u16 {
+        self.read16(0x042)
+    }
+    /// NBG0 plane-A pattern-name-table number = `(N0MP << 6) | N0MPA`.
+    pub fn nbg0_plane_a_number(&self) -> u32 {
+        (self.nbg0_map_offset() << 6) | (self.mpabn0() & 0x3F) as u32
+    }
+    /// NBG0 bitmap base address: bitmap data starts at `N0MP × 0x20000`.
+    pub fn nbg0_bitmap_base(&self) -> u32 {
+        self.nbg0_map_offset() * 0x2_0000
+    }
+    /// NBG0 pattern-name-table base (plane A), in bytes. The minimal
+    /// renderer assumes plane size 0x2000 (64×64 cells, 1-word entries).
+    pub fn nbg0_pattern_table_base(&self) -> u32 {
+        self.nbg0_plane_a_number() * 0x2000
+    }
+
+    // ---- Scroll registers (NBG0) ----
+
+    /// SCXIN0 (0x070) — NBG0 horizontal scroll, integer part (11 bits).
+    /// The fractional part (SCXDN0 at 0x072) is ignored by the minimal
+    /// renderer.
+    pub fn nbg0_scroll_x(&self) -> u32 {
+        (self.read16(0x070) & 0x07FF) as u32
+    }
+    /// SCYIN0 (0x074) — NBG0 vertical scroll, integer part (11 bits).
+    pub fn nbg0_scroll_y(&self) -> u32 {
+        (self.read16(0x074) & 0x07FF) as u32
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +267,50 @@ mod tests {
         let mut r = Vdp2Regs::new();
         r.write16(0x004, 0x1234);
         assert_eq!(r.read16(0x004 + 0x200), 0x1234);
+    }
+
+    #[test]
+    fn chctla_bitmap_enable_is_bit_one() {
+        let mut r = Vdp2Regs::new();
+        assert!(!r.nbg0_bitmap_enabled());
+        r.write16(0x028, 0x0002); // N0BMEN
+        assert!(r.nbg0_bitmap_enabled());
+        // Bit 2 is the low N0BMSZ bit, NOT enable.
+        r.write16(0x028, 0x0004);
+        assert!(!r.nbg0_bitmap_enabled());
+        assert_eq!(r.nbg0_bitmap_size(), 1);
+    }
+
+    #[test]
+    fn map_offset_and_plane_compose_pattern_table_base() {
+        let mut r = Vdp2Regs::new();
+        // N0MP = 1 (high 3 bits), N0MPA = 5 (low 6 bits).
+        r.write16(0x03E, 0x0001); // MPOFN.N0MP = 1
+        r.write16(0x040, 0x0005); // MPABN0.N0MPA = 5
+        assert_eq!(r.nbg0_map_offset(), 1);
+        // plane number = (1 << 6) | 5 = 69.
+        assert_eq!(r.nbg0_plane_a_number(), 69);
+        assert_eq!(r.nbg0_pattern_table_base(), 69 * 0x2000);
+        // Bitmap base keys only on the map offset.
+        assert_eq!(r.nbg0_bitmap_base(), 0x2_0000);
+    }
+
+    #[test]
+    fn zero_map_registers_keep_bases_at_origin() {
+        let r = Vdp2Regs::new();
+        assert_eq!(r.nbg0_bitmap_base(), 0);
+        assert_eq!(r.nbg0_pattern_table_base(), 0);
+    }
+
+    #[test]
+    fn scroll_integer_parts_decode() {
+        let mut r = Vdp2Regs::new();
+        r.write16(0x070, 0x0040); // SCXIN0 = 64
+        r.write16(0x074, 0x0010); // SCYIN0 = 16
+        assert_eq!(r.nbg0_scroll_x(), 64);
+        assert_eq!(r.nbg0_scroll_y(), 16);
+        // Only the low 11 bits are the integer part.
+        r.write16(0x070, 0xF801);
+        assert_eq!(r.nbg0_scroll_x(), 1);
     }
 }
