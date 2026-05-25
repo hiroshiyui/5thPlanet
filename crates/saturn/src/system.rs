@@ -148,48 +148,60 @@ impl Saturn {
         }
     }
 
-    /// Populate OREG0..31 with a status response describing "no
-    /// controller in either port, USA region, valid RTC". Then raise
-    /// the SCU's SMPC interrupt source so a BIOS handler can read it.
+    /// Populate OREG0..31 with an INTBACK status response describing
+    /// "no controller in either port, North-America region, valid RTC".
+    /// Then raise the SCU's SMPC interrupt source so a BIOS handler can
+    /// read it.
     ///
-    /// The fields and layout follow the SMPC IO Manual §4 (INTBACK
-    /// response format). For M4 the values are static — keyboard input
-    /// and a real peripheral protocol are M5.
+    /// Layout follows the SMPC manual's INTBACK status-response format:
+    ///
+    /// ```text
+    ///   OREG0      status: bit7 STE (RTC valid), bit6 RESD (reset disabled)
+    ///   OREG1..7   RTC, BCD: year-hi, year-lo, weekday<<4|month, day,
+    ///              hour, minute, second  (SEVEN bytes — OREG7 is seconds)
+    ///   OREG8      cartridge code
+    ///   OREG9      area code (region)    — 0x04 = North America
+    ///   OREG10..11 system status 1 / 2
+    ///   OREG12..   peripheral data (per-port headers)
+    /// ```
+    ///
+    /// Getting OREG9 right matters: the BIOS reads it as the hardware
+    /// area code and halts (imask=15 spin) on a region mismatch.
     fn respond_to_intback(&mut self) {
         let s = &mut self.bus.smpc;
-        // OREG0 — STE (set-time-enable) = 0 → time field valid;
-        // RESD (reset-disabled) = 0 → reset button enabled.
-        s.oreg[0] = 0x00;
-        // OREG1..6 — BCD time. Year hi / year lo / month / day-of-week+day
-        // / hour / minute. Values arbitrary; BIOS just needs them to be
-        // BCD-parseable.
-        s.oreg[1] = 0x20;
-        s.oreg[2] = 0x26;
-        s.oreg[3] = 0x05;
-        s.oreg[4] = 0x18;
-        s.oreg[5] = 0x12;
-        s.oreg[6] = 0x00;
-        // OREG7 — cartridge code (none).
-        s.oreg[7] = 0x00;
-        // OREG8 — area code. 0x06 = USA; matches the BIOS image variant
-        // we're testing against. PAL / JP variants would set 0x05 / 0x01.
-        s.oreg[8] = 0x06;
-        // OREG9 — system status.
-        s.oreg[9] = 0x00;
-        // OREG10 — SMPC status.
+        // OREG0 — STE = 1 (RTC valid), RESD = 0 (reset button enabled).
+        s.oreg[0] = 0x80;
+        // OREG1..7 — BCD RTC, seven bytes. Values arbitrary but BCD-valid;
+        // OREG3 packs weekday (bits 7..4) and month (bits 3..0).
+        s.oreg[1] = 0x20; // year hi
+        s.oreg[2] = 0x26; // year lo
+        s.oreg[3] = 0x05; // weekday 0, month 5
+        s.oreg[4] = 0x18; // day
+        s.oreg[5] = 0x12; // hour
+        s.oreg[6] = 0x00; // minute
+        s.oreg[7] = 0x00; // second
+        // OREG8 — cartridge code (no cartridge).
+        s.oreg[8] = 0x00;
+        // OREG9 — area code. 0x04 = North America (NTSC), matching the
+        // USA BIOS image. Japan = 0x01, Europe PAL = 0x0C.
+        s.oreg[9] = 0x04;
+        // OREG10..11 — system status 1 / 2. Nominal: no special state.
         s.oreg[10] = 0x00;
-        // OREG11..30 — peripheral data slots. M4 reports no peripheral
-        // in either port via SMPC's 0xF0 "port empty" tag in the port
-        // headers.
-        s.oreg[11] = 0xF0; // port 1 header: no peripheral
-        s.oreg[12] = 0xF0; // port 2 header: no peripheral
-        for i in 13..31 {
+        s.oreg[11] = 0x00;
+        // OREG12.. — peripheral data. Report no peripheral in either
+        // port via the 0xF0 "port empty" header tag.
+        s.oreg[12] = 0xF0; // port 1 header: no peripheral
+        s.oreg[13] = 0xF0; // port 2 header: no peripheral
+        for i in 14..31 {
             s.oreg[i] = 0;
         }
         // OREG31 — end-of-data marker per the manual.
         s.oreg[31] = 0xF0;
 
-        // Surface the SMPC interrupt so the BIOS's SMPC handler runs.
+        // Surface the SMPC interrupt (maskable, via the SCU). INTBACK
+        // signals completion on the maskable MIRQ line, NOT an NMI —
+        // verified against the srg320 Saturn HW model (INTBACK uses
+        // MIRQ_N; only SRES/NMIREQ/CKCHG assert the master NMI).
         self.bus.scu.raise(crate::scu::Source::Smpc);
     }
 

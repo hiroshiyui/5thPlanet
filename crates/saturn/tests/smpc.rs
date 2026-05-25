@@ -165,11 +165,13 @@ fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
     let mut sat = build();
     sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
     sat.run_for(512);
-    // OREG8 = area code (USA = 0x06).
-    assert_eq!(sat.bus.smpc.oreg[8], 0x06);
-    // OREG11 / OREG12 = port 1 / port 2 peripheral headers (no peripheral).
-    assert_eq!(sat.bus.smpc.oreg[11], 0xF0);
+    // RTC is OREG1..7 (7 bytes); OREG7 is the seconds byte.
+    assert_eq!(sat.bus.smpc.oreg[7], 0x00);
+    // OREG9 = area code (North America NTSC = 0x04).
+    assert_eq!(sat.bus.smpc.oreg[9], 0x04);
+    // OREG12 / OREG13 = port 1 / port 2 peripheral headers (no peripheral).
     assert_eq!(sat.bus.smpc.oreg[12], 0xF0);
+    assert_eq!(sat.bus.smpc.oreg[13], 0xF0);
     // OREG31 = end marker.
     assert_eq!(sat.bus.smpc.oreg[31], 0xF0);
     // SCU's SMPC source is the path BIOS handlers wait on.
