@@ -25,6 +25,14 @@ const SMPC_POLL_QUANTUM: u64 = 256;
 /// and only proceeds correctly once it clears at the right time.
 const INTBACK_EXEC_CYCLES: u64 = 7150;
 
+/// NTSC raster timing at the 28.6 MHz SH-2 master clock. One 60 Hz
+/// frame is 263 lines; the BIOS polls VDP2 `VCNT`/`TVSTAT` to track the
+/// raster, so these registers must move with the global cycle.
+const CYCLES_PER_FRAME: u64 = 476_932;
+const LINES_PER_FRAME: u64 = 263;
+const ACTIVE_LINES: u64 = 224;
+const CYCLES_PER_LINE: u64 = CYCLES_PER_FRAME / LINES_PER_FRAME; // ≈1813
+
 /// One emulated SEGA Saturn — a Saturn-shaped memory map populated with
 /// a caller-supplied BIOS image, plus master and slave SH-2 cores wired
 /// into a shared event-driven scheduler.
@@ -135,9 +143,45 @@ impl Saturn {
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
     /// performs between scheduler batches).
     pub fn debug_drain(&mut self) {
+        self.update_video_timing();
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_intc();
+    }
+
+    /// Recompute the VDP2 raster-timing registers — `VCNT` and the
+    /// `TVSTAT` VBLANK/HBLANK/ODD-field bits — from the global cycle,
+    /// and raise the SCU VBlank-IN interrupt on the active→VBLANK edge.
+    /// The BIOS polls these to synchronize with the display; a static
+    /// stub leaves it unable to sync (it spins after INTBACK). Called
+    /// between scheduler batches, so the registers track the raster to
+    /// ~`SMPC_POLL_QUANTUM` granularity.
+    fn update_video_timing(&mut self) {
+        let now = self.now();
+        let frame = now / CYCLES_PER_FRAME;
+        let frame_cycle = now % CYCLES_PER_FRAME;
+        let line = (frame_cycle / CYCLES_PER_LINE).min(LINES_PER_FRAME - 1);
+        let line_cycle = frame_cycle % CYCLES_PER_LINE;
+
+        let prev = self.bus.vdp2.regs.read16(0x004);
+        let vblank = line >= ACTIVE_LINES;
+        let mut tvstat = prev & !0x000E; // clear VBLANK | HBLANK | ODD
+        if vblank {
+            tvstat |= 0x0008; // VBLANK
+        }
+        if line_cycle * 5 >= CYCLES_PER_LINE * 4 {
+            tvstat |= 0x0004; // HBLANK — approx: last ~20% of each line
+        }
+        if frame & 1 == 1 {
+            tvstat |= 0x0002; // ODD field
+        }
+        self.bus.vdp2.regs.write16(0x00A, line as u16); // VCNT
+        self.bus.vdp2.regs.write16(0x004, tvstat);
+
+        // Raise VBlank-IN once, on the transition into the VBLANK region.
+        if vblank && (prev & 0x0008) == 0 {
+            self.bus.scu.raise(crate::scu::Source::VBlankIn);
+        }
     }
 
     /// Advance global time by at least `cycles` cycles, interleaving
@@ -149,6 +193,7 @@ impl Saturn {
             let remaining = target - self.now();
             let batch = remaining.min(SMPC_POLL_QUANTUM);
             self.scheduler.run_for(batch, &mut self.bus);
+            self.update_video_timing();
             self.drain_smpc();
             self.drain_scu_dma();
             self.drain_scu_intc();
@@ -309,43 +354,21 @@ impl Saturn {
         self.scheduler.now()
     }
 
-    /// Run one NTSC frame worth of cycles, raise the VBlank-IN
-    /// interrupt source on the SCU (so BIOS init code that waits on
-    /// it advances), and produce the rendered framebuffer. Cycle
-    /// count is the SH-2 master clock (28.6 MHz) divided by 60 Hz ≈
-    /// 476 932 cycles per frame.
-    ///
-    /// VBlank-IN is raised *before* the second run-for chunk that
-    /// flushes the interrupt through the SCU's drainer into the
-    /// master SH-2. On real hardware the interrupt fires at the
-    /// start of vertical blanking (≈ line 224 of 263); M3 fires it
-    /// at end-of-frame as a coarse approximation. The split run
-    /// (most of the frame → render → raise → small drain run) is
-    /// what lets the interrupt actually get acknowledged by the
-    /// master before we return.
+    /// Run one NTSC frame (≈476 932 SH-2 cycles at 60 Hz) and produce
+    /// the rendered framebuffer. The VDP2 raster registers (VCNT /
+    /// TVSTAT) and the VBlank-IN interrupt are maintained by
+    /// [`Self::update_video_timing`] from the run loop, so this just
+    /// runs the active region, snapshots the frame at the active→VBLANK
+    /// boundary, and runs the VBLANK region.
     ///
     /// Writes into `out`, which must be exactly
     /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes (RGBA8888 320×224).
     pub fn run_frame(&mut self, out: &mut [u8]) {
-        const CYCLES_PER_FRAME: u64 = 476_932;
-        // 95% of the cycles before VBlank fires; the remainder gives
-        // the interrupt a chance to be picked up and dispatched.
-        const ACTIVE_CYCLES: u64 = 453_085;
+        const ACTIVE_CYCLES: u64 = ACTIVE_LINES * CYCLES_PER_LINE;
         const VBLANK_CYCLES: u64 = CYCLES_PER_FRAME - ACTIVE_CYCLES;
-
-        // Active display: clear TVSTAT.VBLANK (bit 3) so polling code
-        // sees "currently scanning out".
-        let tvstat = self.bus.vdp2.regs.read16(0x004);
-        self.bus.vdp2.regs.write16(0x004, tvstat & !0x0008);
 
         self.run_for(ACTIVE_CYCLES);
         crate::vdp2::render_frame(&self.bus.vdp2, out);
-
-        // Enter VBLANK: set TVSTAT.VBLANK and fire the SCU interrupt.
-        let tvstat = self.bus.vdp2.regs.read16(0x004);
-        self.bus.vdp2.regs.write16(0x004, tvstat | 0x0008);
-        self.bus.scu.raise(crate::scu::Source::VBlankIn);
-
         self.run_for(VBLANK_CYCLES);
     }
 }
