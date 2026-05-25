@@ -152,7 +152,6 @@ impl Saturn {
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_intc();
-        self.bus.cd_block.tick(self.now());
     }
 
     /// Recompute the VDP2 raster-timing registers — `VCNT` and the
@@ -184,9 +183,13 @@ impl Saturn {
         self.bus.vdp2.regs.write16(0x00A, line as u16); // VCNT
         self.bus.vdp2.regs.write16(0x004, tvstat);
 
-        // Raise VBlank-IN once, on the transition into the VBLANK region.
+        // Raise VBlank-IN once, on the transition into the VBLANK region,
+        // and let the CD-block emit its once-per-frame periodic status
+        // report on the same edge (the reference drives the CD-block once
+        // per frame; frame-locking the report keeps its cadence matched).
         if vblank && (prev & 0x0008) == 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankIn);
+            self.bus.cd_block.frame_tick();
         }
     }
 
@@ -203,7 +206,6 @@ impl Saturn {
             self.drain_smpc();
             self.drain_scu_dma();
             self.drain_scu_intc();
-            self.bus.cd_block.tick(self.now());
         }
     }
 

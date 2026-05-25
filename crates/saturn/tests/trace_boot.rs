@@ -119,7 +119,10 @@ fn disasm_post_poll_caller() {
         sat.debug_step_master();
         steps += 1;
     }
-    println!("stopped after {steps} steps at pc=0x{:08X}", sat.master().regs.pc);
+    println!(
+        "stopped after {steps} steps at pc=0x{:08X}",
+        sat.master().regs.pc
+    );
     // Disassemble the caller around the SF-poll return point 0x0600112E.
     disasm_range(&mut sat, "post-poll caller", 0x0600_1100, 0x80, 0x0600_112E);
     // Dump the literal pool the MOV.L @(disp,PC) loads point into, so we
@@ -187,7 +190,9 @@ fn trace_master_pc_during_boot() {
     println!("  first reached at coarse chunk {c_first:?}");
 
     if let Some(c) = c_first {
-        let Some((bios2, _)) = load_bios() else { return };
+        let Some((bios2, _)) = load_bios() else {
+            return;
+        };
         let mut sat2 = Saturn::new(bios2);
         sat2.reset();
         for _ in 0..c.saturating_sub(2) {
@@ -207,7 +212,10 @@ fn trace_master_pc_during_boot() {
                 break;
             }
         }
-        println!("  fine window: {steps} steps, {} distinct PCs into the loop:", ring.len());
+        println!(
+            "  fine window: {steps} steps, {} distinct PCs into the loop:",
+            ring.len()
+        );
         for pc in ring.iter().rev().take(60).rev() {
             print!(" {pc:06X}");
         }
@@ -376,8 +384,7 @@ fn disasm_wram_poll_loop() {
     // SCU interrupt state — this loop may be waiting on a handler.
     println!(
         "\n  SCU: ist=0x{:08X} ims=0x{:08X}",
-        sat.bus.scu.ist,
-        sat.bus.scu.ims
+        sat.bus.scu.ist, sat.bus.scu.ims
     );
     // Step past the RTS and watch where we actually land (interrupt?).
     println!("\n  === stepping past the RTS ===");
@@ -445,7 +452,13 @@ fn watch_display() {
         sat.master().regs.pc,
         sat.bus.scu.ist,
     );
-    disasm_range(&mut sat, "VBlank-IN handler", VBLANK_HANDLER, 0x10, u32::MAX);
+    disasm_range(
+        &mut sat,
+        "VBlank-IN handler",
+        VBLANK_HANDLER,
+        0x10,
+        u32::MAX,
+    );
     // Common interrupt dispatcher the per-vector stubs branch to.
     disasm_range(&mut sat, "common dispatch", 0x0600_08F2, 0x60, u32::MAX);
     // The dispatcher indexes a callback table; dump a chunk of low WRAM
@@ -512,8 +525,14 @@ fn catch_divergent_probe() {
         let b = row * 4;
         println!(
             "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
-            b, m.regs.r[b], b + 1, m.regs.r[b + 1],
-            b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+            b,
+            m.regs.r[b],
+            b + 1,
+            m.regs.r[b + 1],
+            b + 2,
+            m.regs.r[b + 2],
+            b + 3,
+            m.regs.r[b + 3],
         );
     }
     disasm_range(&mut sat, "probe subroutine @R12", last_r12, 0x50, u32::MAX);
@@ -546,7 +565,9 @@ fn catch_divergent_memcmp() {
     }
     let m = sat.master();
     let (r5, r6, r7, pr) = (m.regs.r[5], m.regs.r[6], m.regs.r[7], m.regs.pr);
-    println!("memcmp entry at step {steps}: R7=0x{r7:08X} R5=0x{r5:08X} len R6=0x{r6:08X} PR=0x{pr:08X}");
+    println!(
+        "memcmp entry at step {steps}: R7=0x{r7:08X} R5=0x{r5:08X} len R6=0x{r6:08X} PR=0x{pr:08X}"
+    );
     let n = (r6.min(24)) as u32;
     let dump = |sat: &mut Saturn, base: u32, label: &str| {
         let mut s = String::new();
@@ -558,6 +579,62 @@ fn catch_divergent_memcmp() {
     };
     dump(&mut sat, r7, "buf A (R7)");
     dump(&mut sat, r5, "buf B (R5)");
+}
+
+#[test]
+#[ignore = "manual: catch the HIRQ-bit poll at 0x32EC and dump arg + HIRQ"]
+fn catch_hirq_poll() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let skip: u64 = std::env::var("SKIP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000_000);
+    for _ in 0..skip {
+        sat.debug_step_master();
+    }
+    let mut steps = skip;
+    // 0x32EC: TST R0,R0 where R0 = HIRQ & arg, R2 = arg.
+    while sat.master().regs.pc != 0x0000_32EC && steps < skip + 2_000_000 {
+        sat.debug_step_master();
+        steps += 1;
+    }
+    let m = sat.master();
+    println!(
+        "step {steps}: pc=0x{:08X}  R0 (HIRQ & arg)=0x{:08X}  R2 (arg)=0x{:08X}",
+        m.regs.pc, m.regs.r[0], m.regs.r[2]
+    );
+    let (hirq, _) = sat.bus.read16(0x0589_0008, sh2::bus::AccessKind::Data);
+    println!("  CD HIRQ now = 0x{hirq:04X}");
+}
+
+#[test]
+#[ignore = "manual: dump CD-block register state after boot (vs Yabause)"]
+fn dump_cd_state() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..100u32 {
+        sat.run_frame(&mut fb);
+    }
+    let rd = |sat: &mut Saturn, a: u32| sat.bus.read16(a, sh2::bus::AccessKind::Data).0;
+    println!(
+        "CD after 100 frames: HIRQ=0x{:04X} CR1=0x{:04X} CR2=0x{:04X} CR3=0x{:04X} CR4=0x{:04X}",
+        rd(&mut sat, 0x0589_0008),
+        rd(&mut sat, 0x0589_0018),
+        rd(&mut sat, 0x0589_001C),
+        rd(&mut sat, 0x0589_0020),
+        rd(&mut sat, 0x0589_0024),
+    );
+    println!("  (Yabause reference: HIRQ=0xFFF7 CR1=0x2100 CR2=0x4101 CR3=0x0100 CR4=0x0096)");
 }
 
 #[test]
@@ -586,6 +663,9 @@ fn disasm_range(sat: &mut Saturn, label: &str, start: u32, len: u32, mark: u32) 
         let (w, _) = sat.bus.read16(addr, sh2::bus::AccessKind::Fetch);
         let op = sh2::decoder::decode(w);
         let marker = if addr == mark { " <== park" } else { "" };
-        println!("  0x{addr:08X}: {w:04X}  {}{marker}", sh2::debug::disasm(op));
+        println!(
+            "  0x{addr:08X}: {w:04X}  {}{marker}",
+            sh2::debug::disasm(op)
+        );
     }
 }

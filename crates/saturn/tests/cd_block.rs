@@ -20,7 +20,9 @@ const CR4: u32 = CD_BLOCK_BASE + 0x24;
 fn power_on_hirq_and_cdblock_signature_via_the_bus() {
     let mut sat = Saturn::with_blank_bios();
     let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
-    assert_eq!(hirq, 0xFFFF, "power-on HIRQ");
+    // Power-on HIRQ is 0xFFFF, but the read recomputes buffer state and
+    // clears BFUL (buffer never full) → 0xFFF7.
+    assert_eq!(hirq, 0xFFF7, "power-on HIRQ with BFUL cleared on read");
     // The BIOS reads CR1..CR4 for the ASCII "CDBLOCK" identity string.
     let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
     let (cr2, _) = sat.bus.read16(CR2, AccessKind::Data);
@@ -63,7 +65,8 @@ fn hirq_write_and_to_clear_then_command_relatches_cmok_via_the_bus() {
 fn cd_block_does_not_collide_with_scu_or_vdp2() {
     let mut sat = Saturn::with_blank_bios();
     sat.bus.write32(0x05FE_0000, 0xAAAA_BBBB, AccessKind::Data); // SCU D0R
-    sat.bus.write32(0x05E0_0000 + 0x100, 0xCCCC_DDDD, AccessKind::Data); // VDP2 VRAM
+    sat.bus
+        .write32(0x05E0_0000 + 0x100, 0xCCCC_DDDD, AccessKind::Data); // VDP2 VRAM
     // Writing CR1 alone (no CR4) does not trigger a command, so it holds.
     sat.bus.write16(CR1, 0xEEEE, AccessKind::Data);
 

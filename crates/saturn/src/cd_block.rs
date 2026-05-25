@@ -40,6 +40,7 @@ const DATA_FIFO: u32 = 0x8000;
 // HIRQ status bits (cs2.c).
 const HIRQ_CMOK: u16 = 0x0001; // command dispatch OK / ready for next
 const HIRQ_DRDY: u16 = 0x0002; // data transfer ready
+const HIRQ_BFUL: u16 = 0x0008; // CD buffer full
 const HIRQ_DCHG: u16 = 0x0020; // disc changed
 const HIRQ_ESEL: u16 = 0x0040; // soft-reset / selector settings done
 const HIRQ_EHST: u16 = 0x0080; // host I/O done
@@ -48,14 +49,6 @@ const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
 // CD status codes (cs2.c).
 const STAT_PAUSE: u8 = 0x01; // drive ready, disc present, not playing
 const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
-
-/// SH-2 cycles between unsolicited periodic status reports. The CD-block
-/// firmware emits a status report roughly once per sector period; with no
-/// disc Yabause uses `_periodictiming = 50000` against a ×3 clock, i.e.
-/// ~16 667 SH-2 cycles. The BIOS relies on these reports appearing (the
-/// CR registers transitioning from the power-on signature to a live
-/// status report) to confirm the CD-block firmware is running.
-const PERIODIC_CYCLES: u64 = 16_667;
 
 #[derive(Clone, Debug)]
 pub struct CdBlock {
@@ -77,8 +70,6 @@ pub struct CdBlock {
     fad: u32,
     disk_changed: bool,
 
-    /// Global cycle of the last periodic status report (see `tick`).
-    last_periodic: u64,
     /// A command's response sits in CR1..CR4 awaiting a host read; periodic
     /// reports are suppressed until then so they don't clobber it. Set when
     /// the host writes CR1 (begins a command), cleared when it reads CR4
@@ -118,7 +109,6 @@ impl CdBlock {
             index: 0x01,
             fad: 150,
             disk_changed: true,
-            last_periodic: 0,
             command_pending: false,
         }
     }
@@ -134,7 +124,21 @@ impl CdBlock {
             return 0; // no disc → no data
         }
         match Self::slot(offset & 0xFFFF) {
-            0x0008 => self.hirq,
+            0x0008 => {
+                // The CD-block recomputes the buffer/disc-state flags
+                // whenever HIRQ is read and latches them (cs2.c). With no
+                // data buffered, BFUL ("buffer full") is always clear.
+                // DCHG ("disc changed") is re-asserted from the drive's
+                // disc-changed state, so a software write-1-to-clear of
+                // DCHG only sticks until the next read — without this the
+                // BIOS's "wait for disc-change to clear" poll exits a frame
+                // early and diverges from the reference.
+                self.hirq &= !HIRQ_BFUL;
+                if self.disk_changed {
+                    self.hirq |= HIRQ_DCHG;
+                }
+                self.hirq
+            }
             0x000C => self.hirq_mask,
             0x0018 => self.cr1,
             0x001C => self.cr2,
@@ -237,6 +241,10 @@ impl CdBlock {
             }
             0x01 => {
                 // Get hardware info: status, CD/MPEG version, drive rev.
+                // Acknowledges the disc-change (cs2.c clears isdiskchanged
+                // here when a disc is present), so DCHG stops being
+                // re-asserted on subsequent HIRQ reads.
+                self.disk_changed = false;
                 self.cr1 = (self.status as u16) << 8;
                 self.cr2 = 0x0201; // MPEG card present / CD version
                 self.cr3 = 0x0000; // MPEG not authenticated
@@ -287,27 +295,25 @@ impl CdBlock {
         }
     }
 
-    /// Advance the CD-block's free-running clock to global cycle `now` and,
-    /// once a periodic interval has elapsed with no command response
-    /// outstanding, emit an unsolicited periodic status report: status
-    /// gains the `PERI` flag, CR1..CR4 are refreshed via `doCDReport`, and
-    /// `HIRQ.SCDQ` is raised. The BIOS watches CR1..CR4 transition from the
+    /// Emit one unsolicited periodic status report: the status gains the
+    /// `PERI` flag, CR1..CR4 are refreshed via `doCDReport`, and `HIRQ.SCDQ`
+    /// is raised. The CD-block firmware sends one such report per periodic
+    /// interval (~16.67 ms with no disc / not playing — one per 60 Hz
+    /// frame); the reference (Yabause) drives `Cs2Exec` once per frame and
+    /// fires exactly one report each time. We mirror that by calling this
+    /// once per frame at the VBlank edge, which keeps the report cadence
+    /// frame-locked instead of drifting against an approximate cycle count.
+    /// Suppressed while a command response is still unread so it doesn't
+    /// clobber CR1..CR4. The BIOS watches CR1..CR4 transition from the
     /// power-on signature to a live status report to confirm the CD-block
-    /// firmware is running. Called from the Saturn run loop between batches.
-    pub fn tick(&mut self, now: u64) {
+    /// firmware is running.
+    pub fn frame_tick(&mut self) {
         if self.command_pending {
-            // Don't clobber a command response the host hasn't read yet;
-            // hold the periodic clock so the first report lands a full
-            // interval after the response is consumed.
-            self.last_periodic = now;
             return;
         }
-        if now.wrapping_sub(self.last_periodic) >= PERIODIC_CYCLES {
-            self.last_periodic = now;
-            self.status |= STAT_PERI;
-            self.cd_report();
-            self.hirq |= HIRQ_SCDQ;
-        }
+        self.status |= STAT_PERI;
+        self.cd_report();
+        self.hirq |= HIRQ_SCDQ;
     }
 }
 
@@ -373,11 +379,30 @@ mod tests {
     #[test]
     fn periodic_tick_refreshes_cr_with_a_peri_status_report() {
         let mut c = CdBlock::new();
-        // No command pending; advance past the periodic interval.
-        c.tick(PERIODIC_CYCLES + 1);
+        c.frame_tick();
         // PERI (0x20) is OR'd into the status byte of CR1; SCDQ is raised.
         assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
         assert_eq!(c.hirq & HIRQ_SCDQ, HIRQ_SCDQ);
+    }
+
+    #[test]
+    fn periodic_tick_is_suppressed_while_a_command_response_is_unread() {
+        let mut c = CdBlock::new();
+        // Issue a command (CR1 write sets command_pending); the response
+        // must not be clobbered by a periodic report until CR4 is read.
+        c.write16(0x0018, 0x0000);
+        c.write16(0x0024, 0x0000); // execute Get Status → response in CR1..4
+        let cr1_after_cmd = c.read16(0x0018);
+        c.frame_tick(); // should be suppressed (CR4 not yet read)
+        assert_eq!(
+            c.read16(0x0018),
+            cr1_after_cmd,
+            "response held until CR4 read"
+        );
+        // Read CR4 (consumes response), then a periodic may land.
+        let _ = c.read16(0x0024);
+        c.frame_tick();
+        assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
     }
 
     #[test]
