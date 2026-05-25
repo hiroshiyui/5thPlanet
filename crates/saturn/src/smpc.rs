@@ -56,22 +56,18 @@ pub enum Command {
     /// CKCHG352 / CKCHG320 — clock change (PAL / NTSC). M3 no-op.
     CkChg352 = 0x0E,
     CkChg320 = 0x0F,
-    /// NMIREQ — assert NMI to master SH-2. Routed via INTC.
-    NmiReq = 0x10,
-    /// RESENAB / RESDISA — reset button enable/disable. M3 no-op.
-    ResEnab = 0x11,
-    ResDisa = 0x12,
-    /// INTBACK — peripheral data fetch. M3 returns "no controller".
-    IntBack = 0x16,
+    /// INTBACK — peripheral data fetch. M4 returns "no controller"
+    /// (see [`crate::system::Saturn`] INTBACK handling).
+    IntBack = 0x10,
+    /// SETTIME — initialise the clock. M3 stores the request and clears SF.
+    SetTime = 0x16,
     /// SETSMEM — set saved memory. M3 no-op.
     SetSMem = 0x17,
-    /// SETTIME — initialise the clock. M3 stores the request and clears SF.
-    SetTime = 0x18,
-    /// Undocumented SMPC command observed at USA BIOS boot. Probably
-    /// a hardware self-test or selftest-related call; behaviour is
-    /// not in the published manual. Recognised as a no-op so the
-    /// trace doesn't flag it as `last_unknown_command`.
-    Unknown1A = 0x1A,
+    /// NMIREQ — assert NMI to master SH-2. Routed via INTC.
+    NmiReq = 0x18,
+    /// RESENAB / RESDISA — reset button enable/disable. M3 no-op.
+    ResEnab = 0x19,
+    ResDisa = 0x1A,
 }
 
 impl Command {
@@ -88,13 +84,12 @@ impl Command {
             0x0D => Self::SysRes,
             0x0E => Self::CkChg352,
             0x0F => Self::CkChg320,
-            0x10 => Self::NmiReq,
-            0x11 => Self::ResEnab,
-            0x12 => Self::ResDisa,
-            0x16 => Self::IntBack,
+            0x10 => Self::IntBack,
+            0x16 => Self::SetTime,
             0x17 => Self::SetSMem,
-            0x18 => Self::SetTime,
-            0x1A => Self::Unknown1A,
+            0x18 => Self::NmiReq,
+            0x19 => Self::ResEnab,
+            0x1A => Self::ResDisa,
             _ => return None,
         })
     }
@@ -277,7 +272,7 @@ mod tests {
     #[test]
     fn mark_command_done_drops_sf() {
         let mut s = Smpc::new();
-        s.write8(0x1F, 0x18); // SETTIME
+        s.write8(0x1F, 0x16); // SETTIME
         assert_eq!(s.sf, 1);
         let _ = s.take_pending();
         s.mark_command_done();
@@ -290,9 +285,12 @@ mod tests {
             (0x00, Command::MshOn),
             (0x02, Command::SshOn),
             (0x03, Command::SshOff),
-            (0x10, Command::NmiReq),
-            (0x16, Command::IntBack),
-            (0x18, Command::SetTime),
+            (0x10, Command::IntBack),
+            (0x16, Command::SetTime),
+            (0x17, Command::SetSMem),
+            (0x18, Command::NmiReq),
+            (0x19, Command::ResEnab),
+            (0x1A, Command::ResDisa),
         ];
         for (raw, expected) in cases {
             assert_eq!(Command::from_raw(raw), Some(expected));

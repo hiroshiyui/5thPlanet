@@ -99,7 +99,7 @@ fn unknown_comreg_command_does_not_set_sf() {
 #[test]
 fn settime_recognised_as_no_op_but_sf_drops_correctly() {
     let mut sat = build();
-    sat.bus.write8(COMREG, 0x18, AccessKind::Data); // SETTIME
+    sat.bus.write8(COMREG, 0x16, AccessKind::Data); // SETTIME
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 1, "SF goes busy on queue");
     sat.run_for(512);
@@ -139,7 +139,7 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
     sat.bus.write16(handler + 2, 0x0009, AccessKind::Data);
 
     let sp_before = sat.master().regs.r[15];
-    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // NMIREQ
+    sat.bus.write8(COMREG, 0x18, AccessKind::Data); // NMIREQ
     sat.run_for(512);
     let sp_after = sat.master().regs.r[15];
 
@@ -163,7 +163,7 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
 #[test]
 fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
     let mut sat = build();
-    sat.bus.write8(COMREG, 0x16, AccessKind::Data); // INTBACK
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
     sat.run_for(512);
     // OREG8 = area code (USA = 0x06).
     assert_eq!(sat.bus.smpc.oreg[8], 0x06);
@@ -178,13 +178,13 @@ fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
 }
 
 #[test]
-fn undocumented_command_1a_is_no_longer_an_unknown_event() {
+fn resdisa_command_0x1a_is_recognised_and_drops_sf() {
     let mut sat = build();
-    sat.bus.write8(COMREG, 0x1A, AccessKind::Data);
+    sat.bus.write8(COMREG, 0x1A, AccessKind::Data); // RESDISA
     sat.run_for(512);
     assert!(
         sat.bus.smpc.last_unknown_command.is_none(),
-        "0x1A was observed at USA BIOS boot — it must be recognised as a no-op rather than logged as unknown"
+        "0x1A is RESDISA (reset-button disable) — a known command, not unknown"
     );
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF drops after processing");
