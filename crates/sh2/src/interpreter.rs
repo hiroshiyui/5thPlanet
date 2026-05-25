@@ -29,6 +29,12 @@ const fn classify(addr: u32) -> (u32, bool) {
     }
 }
 
+/// SH7604 Cache Control Register. 8-bit, byte-accessed. It lives in the
+/// on-chip address window but controls [`Cache`], not [`OnChip`], so the
+/// memory path routes it here explicitly rather than letting the generic
+/// `OnChip::owns` dispatch swallow it. (*SH7604 Hardware Manual* §8, CCR.)
+const CCR_ADDR: u32 = 0xFFFF_FE92;
+
 /// One Hitachi SH-2 (SH7604) core.
 #[derive(Clone, Debug)]
 pub struct Cpu {
@@ -1037,6 +1043,9 @@ impl Cpu {
 
     #[inline]
     pub(crate) fn mem_read8(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u8, u32) {
+        if addr == CCR_ADDR {
+            return (self.cache.ccr(), 0);
+        }
         if OnChip::owns(addr) {
             return (self.onchip.read8(addr), 0);
         }
@@ -1079,6 +1088,10 @@ impl Cpu {
 
     #[inline]
     pub(crate) fn mem_write8(&mut self, addr: u32, val: u8, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+        if addr == CCR_ADDR {
+            self.cache.set_ccr(val);
+            return 0;
+        }
         if OnChip::owns(addr) {
             self.onchip.write8(addr, val);
             return 0;
