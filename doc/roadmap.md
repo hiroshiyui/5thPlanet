@@ -145,7 +145,7 @@ scope tight matches the project's one-chip-at-a-time discipline.
 |---|------|--------|
 | 1 | SMPC `INTBACK` — full response (no-controller status, OREG fill, raise SCU SMPC source) | ✅ done (incl. NMIREQ + 0x1A) |
 | 2 | CD-block presence stub at `0x05_8980_00+` — defined "no disc, ready" reads, OK command responses | ✅ done |
-| 3 | VDP1 register + VRAM + framebuffer stub at `0x05_C000_00`/`0x05_D000_00` (no rendering) | pending |
+| 3 | VDP1 register + VRAM + framebuffer stub at `0x05_C000_00`/`0x05_D000_00` (no rendering) | ✅ done |
 | 4 | VDP2 register-decode fidelity — renderer reads `MPOFN`/`MPABN0..MPCDR0`/scroll from regs instead of constants | pending |
 | 5 | Iterate-to-splash — trace BIOS, fix the next blocker, repeat until splash renders | pending |
 | 6 | Commit splash framebuffer hash as the new golden + visual confirmation via SDL2 | pending |
