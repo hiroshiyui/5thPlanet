@@ -202,29 +202,47 @@ sat at the `0x0589_8000` data FIFO and left the command registers as
 open bus), the power-on `"CDBLOCK"` signature, write-AND-to-clear `HIRQ`,
 command dispatch (Get Status / Get Hardware Info / Get TOC / Init / End
 Transfer, with a status-report default + `CMOK`), unsolicited periodic
-status reports (`PERI` + `SCDQ`, every ~16667 cycles), and a
-disc-present (`PAUSE`) status — matching Yabause's dummy CD core, which
-returns "disc present, spinning" so BIOS init proceeds. With it the
-master clears the CD probe and matches the reference to **~19.6M
-instructions**.
+status reports, and a disc-present (`PAUSE`) status — matching Yabause's
+dummy CD core, which returns "disc present, spinning" so BIOS init
+proceeds.
 
-**Next blocker (precisely localized):** the master still parks at the
-high-WRAM VBlank-wait loop `0x060108BA` (spinning on a flag at
-`0x060408A4` that never changes), display still disabled (`TVMD=0`). The
-first genuine divergence upstream of the park is now the CD-command
-**retry/status loop** at BIOS `0x000025F4..0x0000263C`: each iteration
-issues a CD operation (`BSR` to `0x00002D38`) and checks the returned
-status (against `0x06` OPEN / `0x0A` FATAL), and the loop count /
-per-iteration sub-path diverge from the reference — our CD-block's
-command-*sequence* responses don't yet match Yabause's across the BIOS's
-multi-command init handshake. The CD-data path (TOC/session processing)
-the BIOS runs after this loop is what eventually arms the `0x060408A4`
-frame flag and enables the display. Closing the gap is a CD-command-
-sequence fidelity task, not a single register fix.
+A follow-up pass (`feat(saturn)`) matched the CD-block's **register and
+report behavior** to the reference exactly. Instrumenting Yabause's CD
+events showed the BIOS issues **no CD commands during boot** — it only
+reads the periodic status reports + HIRQ. Fixes:
+- HIRQ reads recompute buffer/disc state: `BFUL` is always clear (no data
+  buffered) → HIRQ reads `0xFFF7` not `0xFFFF`; `DCHG` is re-asserted from
+  the disc-changed flag so a write-1-to-clear only sticks until the next
+  read.
+- Periodic reports are **frame-locked** (one per VBlank edge), matching
+  the reference's once-per-frame `Cs2Exec` cadence — the earlier
+  ~16667-*cycle* interval was ~28× too fast (the real interval is ~16.67
+  *ms* = one frame).
+- Get Hardware Info clears the disc-changed flag.
+
+Verified: in steady state our `CR1=0x2100 CR2=0x4101 CR3=0x0100
+CR4=0x0096 HIRQ=0xFFF7` match the reference bit-for-bit. The master now
+tracks the reference to **~20M instructions**.
+
+**Next blocker — a timing-phase divergence, not a register mismatch.**
+The master still parks at the high-WRAM VBlank-wait `0x060108BA`
+(spinning on a flag at `0x060408A4`), display disabled (`TVMD=0`). The
+first divergence upstream is a CD-firmware **liveness poll loop** at BIOS
+`0x000025F4..0x0000263C` that polls `HIRQ.DCHG` (via `0x000032DC` →
+`0x000040D6`, which reads HIRQ at `0x2589_0008`). The loop's
+`DCHG`-clear-vs-set outcome diverges by one iteration — but the
+divergence is **unmoved by every CD register/timing change**, i.e. it is
+a frame-precise *timing-phase* difference: when the BIOS's `DCHG`
+write-clears land relative to our coarse per-frame CD-event timing vs the
+reference's cycle-exact CD/SH-2 co-timing. The CD-data path the BIOS runs
+after this loop is what eventually arms the `0x060408A4` frame flag and
+enables the display. Closing it needs cycle-exact CD-block event timing
+(ticking the CD-block on its own scheduler entity at sub-frame
+granularity), not further register-value work.
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 284 tests green.
+1. `cargo test --workspace` — all 285 tests green.
 2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
 3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
