@@ -75,7 +75,9 @@ The repository ships with project-tailored Claude Code skills under
 `security-audit`). [`CLAUDE.md`](CLAUDE.md) documents the architecture
 in depth and the conventions a contributor needs to follow. The
 Saturn-specific vocabulary used throughout the codebase and commits
-is collected in [`doc/glossary.md`](doc/glossary.md).
+is collected in [`doc/glossary.md`](doc/glossary.md), and significant
+design decisions and their rationale are recorded as Architecture
+Decision Records in [`doc/adr/`](doc/adr/).
 
 ## Acknowledgements
 
