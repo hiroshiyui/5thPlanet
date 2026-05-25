@@ -147,14 +147,43 @@ scope tight matches the project's one-chip-at-a-time discipline.
 | 2 | CD-block presence stub at `0x05_8980_00+` — defined "no disc, ready" reads, OK command responses | ✅ done |
 | 3 | VDP1 register + VRAM + framebuffer stub at `0x05_C000_00`/`0x05_D000_00` (no rendering) | ✅ done |
 | 4 | VDP2 register-decode fidelity — renderer reads `MPOFN`/`MPABN0..MPCDR0`/scroll from regs instead of constants | ✅ done |
-| 5 | Iterate-to-splash — trace BIOS, fix the next blocker, repeat until splash renders | pending |
+| 5 | Iterate-to-splash — trace BIOS, fix the next blocker, repeat until splash renders | 🚧 in progress |
 | 6 | Commit splash framebuffer hash as the new golden + visual confirmation via SDL2 | pending |
+
+### Task #5 progress (iterate-to-splash)
+
+This task became a deep BIOS-boot debug. A headless build of the
+**Yabause** reference emulator (kept locally, never committed) was
+patched to log the master SH-2 PC stream, and our trace was diffed
+against it instruction-by-instruction. That **proved the SH-2 core,
+cache, SMPC, SCU, and bus correct** (bit-exact for 8.7M instructions)
+and pinpointed each boot blocker to the exact instruction. Fixes that
+landed from it:
+
+- `fix(sh2)` — route `CCR` (`0xFFFFFE92`) to the cache; the BIOS could
+  not enable the I-cache, so all cached code ran ~8× slow.
+- `fix(saturn)` — correct the SMPC command codes (INTBACK=0x10,
+  NMIREQ=0x18, SETTIME=0x16, RESENAB/RESDISA=0x19/0x1A); the swapped
+  codes made INTBACK fire a spurious NMI.
+- `fix(saturn)` — correct the INTBACK OREG status layout (7-byte RTC,
+  area code at OREG9 = 0x04).
+- `fix(saturn)` — model INTBACK execution time (~250 µs) instead of
+  clearing SF instantly; the early SF-clear made the BIOS's poll exit
+  a frame too soon.
+- `feat(saturn)` — model VDP2 raster timing (`VCNT`/`TVSTAT`) live from
+  the global cycle, so the BIOS can synchronize with the display.
+
+With these the BIOS now follows the **genuine boot path** (reaching the
+same PCs as the reference). Remaining: **VDP2 raster-timing precision**
+— compute `VCNT`/`TVSTAT` on read from the exact cycle (not a
+256-cycle-stale snapshot), model HBLANK per-dot, and align INTBACK's
+SF-clear to a scanline boundary.
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 240+ prior tests still green.
-2. `cargo test -p saturn --test intback` — INTBACK populates OREG0..31 with a no-controller response and raises the SMPC interrupt.
-3. `cargo test -p saturn --test bios_boot` — hash matches the new splash golden (replaces the current all-black baseline).
+1. `cargo test --workspace` — all 278 tests green.
+2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
+3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
 
 ### Explicitly out of scope for M4
