@@ -4,7 +4,8 @@
 
 use saturn::SaturnBus;
 use saturn::bus::{
-    ABUS_BBUS_BASE, BACKUP_BASE, BIOS_BASE, HIGH_WRAM_BASE, LOW_WRAM_BASE, SMPC_BASE, SOUND_BASE,
+    ABUS_BBUS_BASE, BACKUP_BASE, BIOS_BASE, HIGH_WRAM_BASE, LOW_WRAM_BASE, SCSP_RAM_BASE, SMPC_BASE,
+    SOUND_BASE,
 };
 use sh2::bus::{AccessKind, Bus};
 
@@ -65,6 +66,19 @@ fn backup_ram_round_trip_and_mirrors() {
     // 32 KiB region mirrored within the 512 KiB window.
     let (mirror, _) = bus.read8(BACKUP_BASE + 0x8000 + 0x10, AccessKind::Data);
     assert_eq!(mirror, 0x77);
+}
+
+#[test]
+fn scsp_ram_round_trip_and_mirrors() {
+    let mut bus = fresh();
+    // The BIOS sound-RAM init write-verifies this region; it must hold
+    // writes (unlike the open-bus A/B-bus stub).
+    bus.write32(SCSP_RAM_BASE, 0x0000_A000, AccessKind::Data);
+    let (v, _) = bus.read32(SCSP_RAM_BASE, AccessKind::Data);
+    assert_eq!(v, 0x0000_A000);
+    // 512 KiB RAM mirrored within the 1 MiB window.
+    let (mirror, _) = bus.read32(SCSP_RAM_BASE + 0x8_0000, AccessKind::Data);
+    assert_eq!(mirror, 0x0000_A000);
 }
 
 #[test]

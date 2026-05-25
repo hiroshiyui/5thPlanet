@@ -330,9 +330,9 @@ fn disasm_wram_poll_loop() {
     let mut sat = Saturn::new(bios);
     sat.reset();
     // Step until the master reaches the new park loop (or a cap).
-    const TARGET: u32 = 0x0600_07E2;
+    const TARGET: u32 = 0x0601_08C0;
     let mut steps = 0u64;
-    while sat.master().regs.pc != TARGET && steps < 12_000_000 {
+    while sat.master().regs.pc != TARGET && steps < 120_000_000 {
         sat.debug_step_master();
         steps += 1;
     }
@@ -357,7 +357,16 @@ fn disasm_wram_poll_loop() {
             m.regs.r[b + 3],
         );
     }
-    disasm_range(&mut sat, "0x60007B0 routine", 0x0600_07B0, 0x40, TARGET);
+    disasm_range(&mut sat, "park loop", 0x0601_08B0, 0x20, TARGET);
+    // Dereference the polled pointer: R3 := [0x06010970], then poll [R3].
+    let (ptr, _) = sat.bus.read32(0x0601_0970, sh2::bus::AccessKind::Data);
+    let (val16, _) = sat.bus.read16(ptr, sh2::bus::AccessKind::Data);
+    println!("\n  polled ptr [0x06010970]=0x{ptr:08X}  [ptr](16)=0x{val16:04X}");
+    println!("  literal pool 0x06010960..0x060109A0:");
+    for a in (0x0601_0960u32..0x0601_09A0).step_by(4) {
+        let (v, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
+        println!("    0x{a:08X}: 0x{v:08X}");
+    }
     // SCU interrupt state — this loop may be waiting on a handler.
     println!(
         "\n  SCU: ist=0x{:08X} ims=0x{:08X}",
