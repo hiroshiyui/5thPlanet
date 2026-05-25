@@ -332,8 +332,12 @@ impl Op {
 
     /// True if this instruction must not appear in a delay slot
     /// (SH-2 software manual §6, "Delayed Branch Instructions").
-    /// Branches, jumps, returns, TRAPA, and instructions that modify SR
-    /// or cross-fetch from PC all qualify.
+    /// Only instructions that *rewrite PC* qualify: the branch/jump
+    /// family, TRAPA, and the PC-relative fetches (whose PC base is
+    /// undefined in a slot). Notably `LDC Rm,SR` / `LDC.L @Rm+,SR` are
+    /// **legal** in a delay slot — `RTS; LDC Rm,SR` is the standard
+    /// "restore SR on return" idiom the Saturn BIOS relies on; flagging
+    /// it as illegal vectors the BIOS into its dead-wait handler.
     pub fn is_illegal_in_slot(&self) -> bool {
         use Op::*;
         matches!(
@@ -351,8 +355,6 @@ impl Op {
                 | Rts
                 | Rte
                 | Trapa { .. }
-                | LdcSr { .. }
-                | LdcLSr { .. }
                 | MovWPcRel { .. }
                 | MovLPcRel { .. }
                 | Mova { .. }
