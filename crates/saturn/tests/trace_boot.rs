@@ -520,6 +520,47 @@ fn catch_divergent_probe() {
 }
 
 #[test]
+#[ignore = "manual: dump the diverging memcmp (0x22F0) buffers + caller"]
+fn catch_divergent_memcmp() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // The divergence is at line ~8.78M ≈ step ~9.7M. Skip to just before
+    // it, then dump the next memcmp(R7, R5, R6) entry (pc == 0x22F0).
+    let skip: u64 = std::env::var("SKIP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8_600_000);
+    for _ in 0..skip {
+        sat.debug_step_master();
+    }
+    let mut steps = skip;
+    while !(sat.master().regs.pc == 0x0000_22F0 && sat.master().regs.r[6] != 0)
+        && steps < skip + 2_000_000
+    {
+        sat.debug_step_master();
+        steps += 1;
+    }
+    let m = sat.master();
+    let (r5, r6, r7, pr) = (m.regs.r[5], m.regs.r[6], m.regs.r[7], m.regs.pr);
+    println!("memcmp entry at step {steps}: R7=0x{r7:08X} R5=0x{r5:08X} len R6=0x{r6:08X} PR=0x{pr:08X}");
+    let n = (r6.min(24)) as u32;
+    let dump = |sat: &mut Saturn, base: u32, label: &str| {
+        let mut s = String::new();
+        for i in 0..n {
+            let (b, _) = sat.bus.read8(base + i, sh2::bus::AccessKind::Data);
+            s.push_str(&format!("{b:02X} "));
+        }
+        println!("  {label} @0x{base:08X}: {s}");
+    };
+    dump(&mut sat, r7, "buf A (R7)");
+    dump(&mut sat, r5, "buf B (R5)");
+}
+
+#[test]
 #[ignore = "manual: disassemble a BIOS ROM range (no boot needed)"]
 fn disasm_bios() {
     let Some((bios, _)) = load_bios() else {
