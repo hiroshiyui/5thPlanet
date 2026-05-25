@@ -362,6 +362,12 @@ fn disasm_wram_poll_loop() {
     let (ptr, _) = sat.bus.read32(0x0601_0970, sh2::bus::AccessKind::Data);
     let (val16, _) = sat.bus.read16(ptr, sh2::bus::AccessKind::Data);
     println!("\n  polled ptr [0x06010970]=0x{ptr:08X}  [ptr](16)=0x{val16:04X}");
+    let vbr = sat.master().regs.vbr;
+    println!("  vbr=0x{vbr:08X}  SCU interrupt vectors (0x40..0x50):");
+    for vec in 0x40u32..0x50 {
+        let (h, _) = sat.bus.read32(vbr + vec * 4, sh2::bus::AccessKind::Data);
+        println!("    vec 0x{vec:02X} @0x{:08X} -> 0x{h:08X}", vbr + vec * 4);
+    }
     println!("  literal pool 0x06010960..0x060109A0:");
     for a in (0x0601_0960u32..0x0601_09A0).step_by(4) {
         let (v, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
@@ -391,6 +397,145 @@ fn disasm_wram_poll_loop() {
         sat.bus.vdp2.regs.read16(0x004),
         sat.bus.vdp2.regs.read16(0x00A),
     );
+}
+
+#[test]
+#[ignore = "manual: watch display-enable + frame counter over many frames"]
+fn watch_display() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..160u32 {
+        sat.run_frame(&mut fb);
+    }
+    let ctr0 = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data).0;
+    let (mpc, mimask) = (sat.master().regs.pc, sat.master().regs.sr.imask());
+    println!("after 160 frames: pc=0x{mpc:08X} imask={mimask} [0x060408A4]=0x{ctr0:08X}");
+    // Single-step ~2 frames worth, counting VBlank-handler (0x06000840)
+    // entries and whether the counter the wait-loop polls ever moves.
+    const VBLANK_HANDLER: u32 = 0x0600_0840;
+    let mut handler_entries = 0u64;
+    let mut vblank_raises = 0u64;
+    let mut prev_pc = 0u32;
+    let mut last_ctr = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data).0;
+    for _ in 0..1_000_000u64 {
+        let pc = sat.master().regs.pc;
+        if pc == VBLANK_HANDLER && prev_pc != VBLANK_HANDLER {
+            handler_entries += 1;
+        }
+        prev_pc = pc;
+        let ist_before = sat.bus.scu.ist;
+        sat.debug_step_master();
+        if sat.bus.scu.ist & 1 != 0 && ist_before & 1 == 0 {
+            vblank_raises += 1;
+        }
+        let ctr = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data).0;
+        if ctr != last_ctr {
+            println!("  [0x060408A4] changed 0x{last_ctr:08X} -> 0x{ctr:08X}");
+            last_ctr = ctr;
+        }
+    }
+    println!(
+        "over ~1M steps: vblank IST raises={vblank_raises}, VBlank-handler entries={handler_entries}, \
+         final pc=0x{:08X}, SCU ist=0x{:08X}",
+        sat.master().regs.pc,
+        sat.bus.scu.ist,
+    );
+    disasm_range(&mut sat, "VBlank-IN handler", VBLANK_HANDLER, 0x10, u32::MAX);
+    // Common interrupt dispatcher the per-vector stubs branch to.
+    disasm_range(&mut sat, "common dispatch", 0x0600_08F2, 0x60, u32::MAX);
+    // The dispatcher indexes a callback table; dump a chunk of low WRAM
+    // around where user handlers are typically registered.
+    let (tbl_base, _) = sat.bus.read32(0x0600_0960, sh2::bus::AccessKind::Data);
+    println!("\n  callback table base [0x06000960]=0x{tbl_base:08X}");
+    for (name, vec) in [("VBlankIn", 0x40u32), ("VBlankOut", 0x41), ("Sound", 0x46)] {
+        let (cb, _) = sat
+            .bus
+            .read32(tbl_base.wrapping_add(vec * 4), sh2::bus::AccessKind::Data);
+        println!("    {name} (vec 0x{vec:02X}) callback = 0x{cb:08X}");
+    }
+    // Experiment: is the still-halted slave the writer of [0x060408A4]?
+    println!("\n  slave halted = {}", sat.slave_is_halted());
+    sat.release_slave();
+    for _ in 0..40u32 {
+        sat.run_frame(&mut fb);
+    }
+    let (ctr_after, _) = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data);
+    println!(
+        "  after releasing slave + 40 frames: [0x060408A4]=0x{ctr_after:08X} master pc=0x{:08X} slave pc=0x{:08X}",
+        sat.master().regs.pc,
+        sat.slave().regs.pc,
+    );
+}
+
+#[test]
+#[ignore = "manual: catch the JSR @R12 probe that returns non-zero (divergence)"]
+fn catch_divergent_probe() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // The diverging branch is `TST R4,R4; BF` at 0x337C: it falls through
+    // (success) while R4==0 and branches (error) when R4!=0. Catch the
+    // first invocation where R4 != 0 — the call to @R12 that we get wrong.
+    let mut steps = 0u64;
+    let mut last_r12 = 0u32;
+    let mut last_r4_at_jsr = 0u32;
+    loop {
+        let m = sat.master();
+        if m.regs.pc == 0x0000_3374 {
+            last_r12 = m.regs.r[12];
+            last_r4_at_jsr = m.regs.r[4];
+        }
+        if m.regs.pc == 0x0000_337C && m.regs.r[4] != 0 {
+            break;
+        }
+        if steps > 40_000_000 {
+            println!("never caught a non-zero R4 at 0x337C in {steps} steps");
+            return;
+        }
+        sat.debug_step_master();
+        steps += 1;
+    }
+    let m = sat.master();
+    println!(
+        "caught at step {steps}: pc=0x337C result R4=0x{:08X}; at JSR R12=0x{last_r12:08X} R4=0x{last_r4_at_jsr:08X}",
+        m.regs.r[4]
+    );
+    for row in 0..4 {
+        let b = row * 4;
+        println!(
+            "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+            b, m.regs.r[b], b + 1, m.regs.r[b + 1],
+            b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+        );
+    }
+    disasm_range(&mut sat, "probe subroutine @R12", last_r12, 0x50, u32::MAX);
+}
+
+#[test]
+#[ignore = "manual: disassemble a BIOS ROM range (no boot needed)"]
+fn disasm_bios() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    let start: u32 = std::env::var("DA_START")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x0000_3360);
+    let len: u32 = std::env::var("DA_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x60);
+    disasm_range(&mut sat, "bios", start, len, u32::MAX);
 }
 
 fn disasm_range(sat: &mut Saturn, label: &str, start: u32, len: u32, mark: u32) {
