@@ -173,15 +173,44 @@ landed from it:
 - `feat(saturn)` — model VDP2 raster timing (`VCNT`/`TVSTAT`) live from
   the global cycle, so the BIOS can synchronize with the display.
 
-With these the BIOS now follows the **genuine boot path** (reaching the
-same PCs as the reference). Remaining: **VDP2 raster-timing precision**
-— compute `VCNT`/`TVSTAT` on read from the exact cycle (not a
-256-cycle-stale snapshot), model HBLANK per-dot, and align INTBACK's
-SF-clear to a scanline boundary.
+Further fixes that landed (second debug pass, reference-diffed against a
+60M-instruction Yabause trace):
+
+- `feat(saturn)` — settle the INTBACK `SF` flag **on read** at the exact
+  completion cycle (bus gains a per-instruction `cycle` field), so the
+  BIOS's tight per-instruction SF-poll exits at the right instant rather
+  than at the 256-cycle drain quantum.
+- `fix(sh2)` — `LDC Rm,SR` / `LDC.L @Rm+,SR` are **not** illegal in a
+  delay slot (only PC-rewriting ops are). `RTS; LDC Rm,SR` is the
+  BIOS's "restore SR on return" idiom; flagging it illegal vectored the
+  master into its `imask=15` dead-wait at `0x06000952`.
+- `feat(saturn)` — back **SCSP sound RAM** (512 KiB at `0x05A00000`) so
+  the BIOS's sound-RAM write-verify init completes (was open bus).
+- `fix(saturn)` — the SCU presents **fixed interrupt vectors** (`0x40 +
+  source index`) via external-vector-fetch, not the SH-2 auto-vector
+  `64+level`. VBlank-IN was vectoring to `0x4F` (a stub) instead of
+  `0x40` (the real handler), so the BIOS's per-frame work never ran.
+
+The master now completes full BIOS init, runs the real VBlank handler
+each frame, and its PC trace matches the Yabause reference **bit-exact
+(modulo poll-loop iteration counts) for ~23.7M instructions**.
+
+**Next blocker (precisely localized):** at BIOS `0x0000337C` the master
+diverges from the reference — a probe subroutine (`0x00003B6E` →
+`0x00003BC4` → leaf `0x000042EC`) reads the **CD-block command registers
+CR1..CR4 at `0x2589_0018..0x2589_0026`** (cache-through → `0x0589_0018`)
+to detect the CD subsystem. On power-on a real CD-block returns the
+ASCII signature `"CDBLOCK"` there (`CR1=0x0043`, `CR2=0x4442`,
+`CR3=0x4C4F`, `CR4=0x434B`); our CD-block stub only covers the data port
+at `0x0589_8000`, so the command/`HIRQ` registers (`0x0589_0008..26`)
+are open bus and the probe fails (returns `-8`). Closing this needs a
+minimal CD-block **command/HIRQ interface** at `0x0589_0008+` (power-on
+signature + the handful of init commands the BIOS issues), in the spirit
+of the other M4 presence stubs.
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 278 tests green.
+1. `cargo test --workspace` — all 281 tests green.
 2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
 3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
