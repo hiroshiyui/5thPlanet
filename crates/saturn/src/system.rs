@@ -152,6 +152,7 @@ impl Saturn {
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_intc();
+        self.bus.cd_block.tick(self.now());
     }
 
     /// Recompute the VDP2 raster-timing registers — `VCNT` and the
@@ -202,6 +203,7 @@ impl Saturn {
             self.drain_smpc();
             self.drain_scu_dma();
             self.drain_scu_intc();
+            self.bus.cd_block.tick(self.now());
         }
     }
 

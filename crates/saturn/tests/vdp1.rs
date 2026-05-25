@@ -45,11 +45,11 @@ fn status_register_modr_reports_version() {
 #[test]
 fn vdp1_does_not_collide_with_cd_block_or_vdp2() {
     let mut sat = Saturn::with_blank_bios();
-    sat.bus.write16(0x0589_8000 + 0x18, 0xEEEE, AccessKind::Data); // CD CR1
+    sat.bus.write16(0x0589_0018, 0xEEEE, AccessKind::Data); // CD CR1
     sat.bus.write32(0x05E0_0000 + 0x100, 0xCCCC_DDDD, AccessKind::Data); // VDP2 VRAM
     sat.bus.write32(VRAM_BASE + 0x100, 0xAAAA_BBBB, AccessKind::Data); // VDP1 VRAM
 
-    let (cd_cr1, _) = sat.bus.read16(0x0589_8000 + 0x18, AccessKind::Data);
+    let (cd_cr1, _) = sat.bus.read16(0x0589_0018, AccessKind::Data);
     let (vdp2_vram, _) = sat.bus.read32(0x05E0_0000 + 0x100, AccessKind::Data);
     let (vdp1_vram, _) = sat.bus.read32(VRAM_BASE + 0x100, AccessKind::Data);
     assert_eq!(cd_cr1, 0xEEEE);
