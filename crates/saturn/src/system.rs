@@ -137,7 +137,12 @@ impl Saturn {
             master_id,
             ..
         } = self;
-        scheduler.entity_mut(*master_id).cpu.step(bus)
+        let cpu = &mut scheduler.entity_mut(*master_id).cpu;
+        // Mirror Sh2Entity::step: publish the current cycle to the bus so
+        // time-varying peripheral reads (SMPC SF INTBACK completion) settle
+        // at the exact instruction that reads them.
+        bus.cycle = cpu.pipeline.cycles;
+        cpu.step(bus)
     }
 
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
@@ -203,15 +208,9 @@ impl Saturn {
     /// Pop any command queued by SMPC and apply its emulator-wide side
     /// effect. Called from `run_for` between scheduler batches.
     fn drain_smpc(&mut self) {
-        // Complete a delayed INTBACK once its ~250 µs execution time has
-        // elapsed: fill OREG, raise the SMPC interrupt, and clear SF.
-        if let Some(done_at) = self.bus.smpc.intback_complete_at
-            && self.now() >= done_at
-        {
-            self.bus.smpc.intback_complete_at = None;
-            self.respond_to_intback();
-            self.bus.smpc.mark_command_done();
-        }
+        // Fallback: drop SF once a pending INTBACK's execution time has
+        // elapsed, in case nothing read SMPC to settle it on-access.
+        self.bus.smpc.settle_intback(self.now());
         while let Some(cmd) = self.bus.smpc.take_pending() {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
@@ -228,10 +227,15 @@ impl Saturn {
                         .raise(sh2::InterruptSource::Nmi);
                 }
                 SmpcCommand::IntBack => {
-                    // INTBACK takes ~250 µs to execute on hardware. Keep
-                    // SF busy until then (completed by the check above);
-                    // clearing it now makes the BIOS's SF-poll return too
-                    // early and derail (Yabause reference-diff, 0x1D64).
+                    // Fill OREG and raise the SMPC interrupt now, so the
+                    // response is ready the moment SF drops. But INTBACK
+                    // takes ~250 µs to execute on hardware, so keep SF busy
+                    // until then — `settle_intback` clears it on the exact
+                    // instruction that reads SMPC past the completion cycle.
+                    // Clearing SF immediately makes the BIOS's tight SF-poll
+                    // (0x1D5A..0x1D64) exit too early and derail (Yabause
+                    // reference-diff).
+                    self.respond_to_intback();
                     let done_at = self.now().saturating_add(INTBACK_EXEC_CYCLES);
                     self.bus.smpc.intback_complete_at = Some(done_at);
                     continue; // do NOT mark_command_done (SF stays busy)

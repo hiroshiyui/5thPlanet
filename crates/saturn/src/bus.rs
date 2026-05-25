@@ -67,6 +67,12 @@ pub struct SaturnBus {
     pub cd_block: CdBlock,
     pub abus_bbus: StubRegisterBank,
     pub high_wram: Ram,
+    /// Current global cycle, refreshed by the scheduler before each CPU
+    /// step (see `Sh2Entity::step`). Lets time-varying peripheral reads —
+    /// notably the SMPC `SF` flag's INTBACK completion — resolve at the
+    /// exact instruction that reads them, rather than at a coarse drain
+    /// boundary.
+    pub cycle: u64,
 }
 
 impl SaturnBus {
@@ -85,6 +91,7 @@ impl SaturnBus {
             cd_block: CdBlock::new(),
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
+            cycle: 0,
         }
     }
 
@@ -110,7 +117,10 @@ impl Bus for SaturnBus {
     fn read8(&mut self, addr: u32, _k: AccessKind) -> (u8, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read8(addr - BIOS_BASE),
-            SMPC_BASE..=SMPC_END => self.smpc.read8(addr - SMPC_BASE),
+            SMPC_BASE..=SMPC_END => {
+                self.smpc.settle_intback(self.cycle);
+                self.smpc.read8(addr - SMPC_BASE)
+            }
             BACKUP_BASE..=BACKUP_END => self.backup.read8(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read8(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read8(addr - SOUND_BASE),
@@ -128,7 +138,10 @@ impl Bus for SaturnBus {
     fn read16(&mut self, addr: u32, _k: AccessKind) -> (u16, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read16(addr - BIOS_BASE),
-            SMPC_BASE..=SMPC_END => self.smpc.read16(addr - SMPC_BASE),
+            SMPC_BASE..=SMPC_END => {
+                self.smpc.settle_intback(self.cycle);
+                self.smpc.read16(addr - SMPC_BASE)
+            }
             BACKUP_BASE..=BACKUP_END => self.backup.read16(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
@@ -146,7 +159,10 @@ impl Bus for SaturnBus {
     fn read32(&mut self, addr: u32, _k: AccessKind) -> (u32, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read32(addr - BIOS_BASE),
-            SMPC_BASE..=SMPC_END => self.smpc.read32(addr - SMPC_BASE),
+            SMPC_BASE..=SMPC_END => {
+                self.smpc.settle_intback(self.cycle);
+                self.smpc.read32(addr - SMPC_BASE)
+            }
             BACKUP_BASE..=BACKUP_END => self.backup.read32(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read32(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read32(addr - SOUND_BASE),

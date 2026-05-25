@@ -230,6 +230,23 @@ impl Smpc {
     pub fn mark_command_done(&mut self) {
         self.sf = 0;
     }
+
+    /// Resolve a pending INTBACK against the current global cycle: once
+    /// the command's execution time has elapsed (`intback_complete_at`),
+    /// drop SF so the BIOS's poll loop sees "done". Called on every SMPC
+    /// access so SF clears at the *exact* instruction that reads it,
+    /// rather than at a coarse drain boundary — the BIOS polls SF tightly
+    /// and a late clear desyncs it from the raster (Yabause reference-diff
+    /// at the 0x1D64 SF poll). OREG and the SMPC interrupt are filled when
+    /// the command is dequeued, so the response is ready before SF drops.
+    pub fn settle_intback(&mut self, cycle: u64) {
+        if let Some(done_at) = self.intback_complete_at
+            && cycle >= done_at
+        {
+            self.intback_complete_at = None;
+            self.sf = 0;
+        }
+    }
 }
 
 #[cfg(test)]

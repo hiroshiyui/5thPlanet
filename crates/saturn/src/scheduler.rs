@@ -164,6 +164,10 @@ impl SchedEntity for Sh2Entity {
 
     fn step(&mut self, ctx: &mut Self::Context) {
         if !self.halted {
+            // Publish the current global cycle to the bus so time-varying
+            // peripheral reads (SMPC SF INTBACK completion) resolve at the
+            // exact instruction that reads them.
+            ctx.cycle = self.cpu.pipeline.cycles;
             self.cpu.step(ctx);
         }
     }

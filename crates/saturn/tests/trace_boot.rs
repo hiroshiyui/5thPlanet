@@ -320,6 +320,70 @@ fn trace_master_pc_during_boot() {
     disasm_range(&mut sat, "NMI handler", handler, 0x60, u32::MAX);
 }
 
+#[test]
+#[ignore = "manual: inspect the high-WRAM poll loop at 0x06001150"]
+fn disasm_wram_poll_loop() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // Step until the master reaches the new park loop (or a cap).
+    const TARGET: u32 = 0x0600_07E2;
+    let mut steps = 0u64;
+    while sat.master().regs.pc != TARGET && steps < 12_000_000 {
+        sat.debug_step_master();
+        steps += 1;
+    }
+    let m = sat.master();
+    println!(
+        "stopped after {steps} steps at pc=0x{:08X} pr=0x{:08X} sr.imask={}",
+        m.regs.pc,
+        m.regs.pr,
+        m.regs.sr.imask()
+    );
+    for row in 0..4 {
+        let b = row * 4;
+        println!(
+            "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+            b,
+            m.regs.r[b],
+            b + 1,
+            m.regs.r[b + 1],
+            b + 2,
+            m.regs.r[b + 2],
+            b + 3,
+            m.regs.r[b + 3],
+        );
+    }
+    disasm_range(&mut sat, "0x60007B0 routine", 0x0600_07B0, 0x40, TARGET);
+    // SCU interrupt state — this loop may be waiting on a handler.
+    println!(
+        "\n  SCU: ist=0x{:08X} ims=0x{:08X}",
+        sat.bus.scu.ist,
+        sat.bus.scu.ims
+    );
+    // Step past the RTS and watch where we actually land (interrupt?).
+    println!("\n  === stepping past the RTS ===");
+    for _ in 0..16 {
+        let m = sat.master();
+        let pend = m.onchip.intc.next_pending(m.regs.sr.imask());
+        println!(
+            "    pc=0x{:08X} imask={} pending={:?}",
+            m.regs.pc,
+            m.regs.sr.imask(),
+            pend
+        );
+        sat.debug_step_master();
+    }
+    println!(
+        "  VDP2 TVSTAT=0x{:04X} VCNT=0x{:04X}",
+        sat.bus.vdp2.regs.read16(0x004),
+        sat.bus.vdp2.regs.read16(0x00A),
+    );
+}
+
 fn disasm_range(sat: &mut Saturn, label: &str, start: u32, len: u32, mark: u32) {
     println!("\n=== disassembly: {label} @0x{start:08X} ===");
     for off in (0..len).step_by(2) {
