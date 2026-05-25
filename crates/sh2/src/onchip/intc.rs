@@ -61,6 +61,12 @@ pub struct Intc {
     /// Level for [`Source::External`]; only valid when the External slot
     /// is set in `pending`. SH-2 IRL inputs are level-triggered.
     ext_level: u8,
+    /// Vector latched for the pending [`Source::External`]. In auto-vector
+    /// mode this is `64 + level`; in external-vector-fetch mode (how the
+    /// Saturn drives the SH-2 — the SCU presents a fixed vector per source
+    /// during the interrupt-acknowledge cycle) it is whatever the asserting
+    /// device supplied via [`Intc::raise_external`].
+    ext_vector: u8,
 }
 
 impl Intc {
@@ -70,9 +76,25 @@ impl Intc {
 
     pub fn raise(&mut self, src: Source) {
         if let Source::External(level) = src {
+            // Auto-vector mode: vector = 64 + level (SH7604 default for IRL
+            // inputs). Devices that present their own vector use
+            // [`Intc::raise_external`] instead.
             self.ext_level = level.min(15);
+            self.ext_vector = 64 + level.min(15);
         }
         self.pending |= 1 << src.ord();
+    }
+
+    /// Assert an external (IRL) interrupt at `level`, latching an explicit
+    /// `vector` rather than the auto-vector `64 + level`. This models the
+    /// SH7604's external-vector-fetch mode: the asserting device (on the
+    /// Saturn, the SCU) presents the vector number during the
+    /// interrupt-acknowledge cycle. The Saturn SCU's vectors are fixed at
+    /// 0x40 + source index, independent of priority level.
+    pub fn raise_external(&mut self, level: u8, vector: u8) {
+        self.ext_level = level.min(15);
+        self.ext_vector = vector;
+        self.pending |= 1 << Source::External(0).ord();
     }
 
     pub fn acknowledge(&mut self, src: Source) {
@@ -125,12 +147,13 @@ impl Intc {
     }
 
     /// Vector number for `src`. NMI is fixed at 11; UserBreak at 12;
-    /// external auto-vectors live at 64+level.
+    /// external interrupts use the latched `ext_vector` (auto-vector
+    /// `64+level`, or the device-supplied vector from [`raise_external`]).
     pub fn vector_for(&self, src: Source) -> u8 {
         match src {
             Source::Nmi => 11,
             Source::UserBreak => 12,
-            Source::External(level) => 64 + level,
+            Source::External(_) => self.ext_vector,
             Source::DivuOvf => self.vcrdiv as u8,
             Source::DmacCh0 => self.vcrdma0 as u8,
             Source::DmacCh1 => self.vcrdma1 as u8,
@@ -247,6 +270,25 @@ mod tests {
         let (src, lvl) = i.next_pending(5).unwrap();
         assert_eq!(src, Source::External(9));
         assert_eq!(lvl, 9);
+    }
+
+    #[test]
+    fn external_auto_vector_is_64_plus_level() {
+        let mut i = Intc::new();
+        i.raise(Source::External(9));
+        let (src, _) = i.next_pending(0).unwrap();
+        assert_eq!(i.vector_for(src), 64 + 9);
+    }
+
+    #[test]
+    fn raise_external_latches_an_explicit_vector() {
+        // External-vector-fetch mode: the device supplies a vector that is
+        // not 64+level (e.g. the Saturn SCU's VBlank-IN: level 15, vec 0x40).
+        let mut i = Intc::new();
+        i.raise_external(15, 0x40);
+        let (src, lvl) = i.next_pending(0).unwrap();
+        assert_eq!(lvl, 15);
+        assert_eq!(i.vector_for(src), 0x40);
     }
 
     #[test]

@@ -345,11 +345,15 @@ impl Saturn {
     /// the source again because the SCU's `raise()` re-sets the bit.
     fn drain_scu_intc(&mut self) {
         let imask = self.master().regs.sr.imask();
-        if let Some((_, level)) = self.bus.scu.take_pending_interrupt(imask) {
+        if let Some((source, level)) = self.bus.scu.take_pending_interrupt(imask) {
+            // The SCU presents a fixed vector (0x40 + index) per source
+            // during interrupt-acknowledge — not the SH-2 auto-vector
+            // 64+level. Vectoring VBlank-IN to 64+15=0x4F would run the
+            // generic stub handler instead of the real one at 0x40.
             self.master_mut()
                 .onchip
                 .intc
-                .raise(sh2::InterruptSource::External(level));
+                .raise_external(level, source.vector());
         }
     }
 

@@ -143,16 +143,17 @@ fn ist_is_w1c_via_bus_write() {
 #[test]
 fn dma_end_propagates_into_master_sh2_intc_as_external_level5() {
     // Configure: SR.imask = 0 so the master accepts any IRL; install a
-    // recognisable vector for External(5) (= vector 64+5 = 69); trigger
-    // a Level-0 DMA; run; assert the master vectored to the handler.
+    // recognisable handler at Level-0 DMA's SCU vector (0x4B, fixed at
+    // 0x40 + source index — not the auto-vector 64+level); trigger a
+    // Level-0 DMA; run; assert the master vectored to the handler.
     let mut sat = build();
     sat.master_mut().regs.sr.set_imask(0);
     let handler_addr: u32 = 0x0020_6000;
-    // VBR is 0 after reset; install handler at VBR + 69*4 = 0x114.
+    // VBR is 0 after reset; install the handler at VBR + vector*4.
     // (The vector table lives in BIOS at offset 0, but our test BIOS
     // is just a pattern — we write directly into the bus's BIOS image.
     // The bus drops writes to BIOS, so install via the bus's bios slot.)
-    let vec_offset = 69usize * 4;
+    let vec_offset = ScuSource::Level0DmaEnd.vector() as usize * 4;
     sat.bus.bios = saturn::BiosRom::new({
         let mut img = vec![0u8; 512 * 1024];
         for (i, b) in img.iter_mut().take(0x100).enumerate() {

@@ -73,6 +73,14 @@ impl Source {
         self as u32
     }
 
+    /// SH-2 exception vector number the SCU presents for this source
+    /// during the interrupt-acknowledge cycle. Fixed at `0x40 + index`
+    /// per the SCU manual's interrupt table — independent of priority
+    /// level (e.g. SMPC and PAD share level 8 but use 0x47 / 0x48).
+    pub const fn vector(self) -> u8 {
+        0x40 + self as u8
+    }
+
     /// Hardware-fixed priority level (1..=15) asserted on the SH-2's
     /// IRL lines when this source fires.
     pub const fn priority(self) -> u8 {
