@@ -70,6 +70,18 @@ in depth and the conventions a contributor needs to follow. The
 Saturn-specific vocabulary used throughout the codebase and commits
 is collected in [`doc/glossary.md`](doc/glossary.md).
 
+## Acknowledgements
+
+During early development the open-source
+[Yabause](https://github.com/Yabause/yabause) emulator was leaned on
+heavily as a **reference oracle for verifying system architecture**: a
+patched, headless Yabause was run against the same BIOS and its master
+SH-2 instruction trace diffed against ours, which let us confirm the
+SH-2 core, cache, SMPC, SCU, and bus reproduce known-good behavior
+bit-for-bit and pinpoint boot-sequence bugs down to the exact
+instruction. No Yabause code is included in or derived by this project —
+it served purely as a behavioral reference for cross-checking.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
