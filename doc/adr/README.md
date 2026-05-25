@@ -41,14 +41,13 @@ We use Michael Nygard's lightweight format — see
 |-----|-------|--------|
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0002](0002-accuracy-over-performance.md) | Accuracy over performance (no JIT/dynarec) | Accepted |
+| [0003](0003-bus-returns-stall-cycles.md) | `Bus` returns stall cycles; host owns wait-state math | Accepted |
 
 ### Decisions worth recording (backlog)
 
 Significant choices already made in code/`CLAUDE.md` that are good
 candidates for retroactive ADRs:
 
-- `Bus` trait returns `(value, stall_cycles)` — the host owns wait-state
-  math, the CPU just accumulates.
 - Event-driven scheduler with "smallest `next_deadline` wins" and
   insertion-order tie-breaking as the determinism contract.
 - Queue-a-side-effect / drain-at-the-aggregate pattern (SMPC, SCU) to
