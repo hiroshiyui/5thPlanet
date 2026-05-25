@@ -42,16 +42,14 @@ We use Michael Nygard's lightweight format — see
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0002](0002-accuracy-over-performance.md) | Accuracy over performance (no JIT/dynarec) | Accepted |
 | [0003](0003-bus-returns-stall-cycles.md) | `Bus` returns stall cycles; host owns wait-state math | Accepted |
+| [0004](0004-deterministic-deadline-scheduler.md) | Event-driven scheduler with deterministic "smallest deadline wins" | Accepted |
+| [0005](0005-queue-and-drain-side-effects.md) | Queue a side effect, drain it at the aggregate | Accepted |
+| [0006](0006-scu-dsp-standalone-crate.md) | SCU-DSP is a standalone crate, not a `saturn` module | Accepted |
+| [0007](0007-forbid-unsafe-code.md) | Workspace-wide `unsafe_code = "forbid"` | Accepted |
 
 ### Decisions worth recording (backlog)
 
 Significant choices already made in code/`CLAUDE.md` that are good
 candidates for retroactive ADRs:
 
-- Event-driven scheduler with "smallest `next_deadline` wins" and
-  insertion-order tie-breaking as the determinism contract.
-- Queue-a-side-effect / drain-at-the-aggregate pattern (SMPC, SCU) to
-  sidestep the bus-self-borrow problem.
-- SCU-DSP as a standalone `scu_dsp` crate rather than a `saturn` module.
-- Workspace-wide `unsafe_code = "forbid"`.
 - Yabause as a reference oracle for cross-verification (no code derived).
