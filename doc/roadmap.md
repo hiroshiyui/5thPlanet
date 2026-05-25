@@ -195,22 +195,36 @@ The master now completes full BIOS init, runs the real VBlank handler
 each frame, and its PC trace matches the Yabause reference **bit-exact
 (modulo poll-loop iteration counts) for ~23.7M instructions**.
 
-**Next blocker (precisely localized):** at BIOS `0x0000337C` the master
-diverges from the reference — a probe subroutine (`0x00003B6E` →
-`0x00003BC4` → leaf `0x000042EC`) reads the **CD-block command registers
-CR1..CR4 at `0x2589_0018..0x2589_0026`** (cache-through → `0x0589_0018`)
-to detect the CD subsystem. On power-on a real CD-block returns the
-ASCII signature `"CDBLOCK"` there (`CR1=0x0043`, `CR2=0x4442`,
-`CR3=0x4C4F`, `CR4=0x434B`); our CD-block stub only covers the data port
-at `0x0589_8000`, so the command/`HIRQ` registers (`0x0589_0008..26`)
-are open bus and the probe fails (returns `-8`). Closing this needs a
-minimal CD-block **command/HIRQ interface** at `0x0589_0008+` (power-on
-signature + the handful of init commands the BIOS issues), in the spirit
-of the other M4 presence stubs.
+Then the **CD-block host-interface command protocol** landed
+(`feat(saturn)`), replacing the data-port-only presence stub: correct
+register base/offsets (`HIRQ@0x08`, `CR1..CR4@0x18..0x24`; the old stub
+sat at the `0x0589_8000` data FIFO and left the command registers as
+open bus), the power-on `"CDBLOCK"` signature, write-AND-to-clear `HIRQ`,
+command dispatch (Get Status / Get Hardware Info / Get TOC / Init / End
+Transfer, with a status-report default + `CMOK`), unsolicited periodic
+status reports (`PERI` + `SCDQ`, every ~16667 cycles), and a
+disc-present (`PAUSE`) status — matching Yabause's dummy CD core, which
+returns "disc present, spinning" so BIOS init proceeds. With it the
+master clears the CD probe and matches the reference to **~19.6M
+instructions**.
+
+**Next blocker (precisely localized):** the master still parks at the
+high-WRAM VBlank-wait loop `0x060108BA` (spinning on a flag at
+`0x060408A4` that never changes), display still disabled (`TVMD=0`). The
+first genuine divergence upstream of the park is now the CD-command
+**retry/status loop** at BIOS `0x000025F4..0x0000263C`: each iteration
+issues a CD operation (`BSR` to `0x00002D38`) and checks the returned
+status (against `0x06` OPEN / `0x0A` FATAL), and the loop count /
+per-iteration sub-path diverge from the reference — our CD-block's
+command-*sequence* responses don't yet match Yabause's across the BIOS's
+multi-command init handshake. The CD-data path (TOC/session processing)
+the BIOS runs after this loop is what eventually arms the `0x060408A4`
+frame flag and enables the display. Closing the gap is a CD-command-
+sequence fidelity task, not a single register fix.
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 281 tests green.
+1. `cargo test --workspace` — all 284 tests green.
 2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
 3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
