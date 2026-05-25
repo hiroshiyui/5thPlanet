@@ -19,6 +19,12 @@ use crate::smpc::Command as SmpcCommand;
 /// poking SMPC every tick isn't paid 28 million times per second.
 const SMPC_POLL_QUANTUM: u64 = 256;
 
+/// INTBACK status-command execution time. Hardware (and Yabause) keep
+/// SF busy ~250 µs before the response is ready; at the 28.6 MHz SH-2
+/// master clock that's ≈7150 cycles. The BIOS polls SF in a wait loop
+/// and only proceeds correctly once it clears at the right time.
+const INTBACK_EXEC_CYCLES: u64 = 7150;
+
 /// One emulated SEGA Saturn — a Saturn-shaped memory map populated with
 /// a caller-supplied BIOS image, plus master and slave SH-2 cores wired
 /// into a shared event-driven scheduler.
@@ -108,19 +114,30 @@ impl Saturn {
     /// drain SMPC/SCU side effects. Used by the reference-emulator PC
     /// trace diff (M4 task #5). Returns the cycles the instruction took.
     pub fn debug_step_master(&mut self) -> u32 {
-        let cycles = {
-            let Self {
-                bus,
-                scheduler,
-                master_id,
-                ..
-            } = self;
-            scheduler.entity_mut(*master_id).cpu.step(bus)
-        };
+        let cycles = self.debug_step_master_nodrain();
+        self.debug_drain();
+        cycles
+    }
+
+    /// Debug-only: step the master one instruction WITHOUT draining
+    /// SMPC/SCU. Lets trace tooling control drain granularity to
+    /// reproduce `run_for`'s batched draining.
+    pub fn debug_step_master_nodrain(&mut self) -> u32 {
+        let Self {
+            bus,
+            scheduler,
+            master_id,
+            ..
+        } = self;
+        scheduler.entity_mut(*master_id).cpu.step(bus)
+    }
+
+    /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
+    /// performs between scheduler batches).
+    pub fn debug_drain(&mut self) {
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_intc();
-        cycles
     }
 
     /// Advance global time by at least `cycles` cycles, interleaving
@@ -141,6 +158,15 @@ impl Saturn {
     /// Pop any command queued by SMPC and apply its emulator-wide side
     /// effect. Called from `run_for` between scheduler batches.
     fn drain_smpc(&mut self) {
+        // Complete a delayed INTBACK once its ~250 µs execution time has
+        // elapsed: fill OREG, raise the SMPC interrupt, and clear SF.
+        if let Some(done_at) = self.bus.smpc.intback_complete_at
+            && self.now() >= done_at
+        {
+            self.bus.smpc.intback_complete_at = None;
+            self.respond_to_intback();
+            self.bus.smpc.mark_command_done();
+        }
         while let Some(cmd) = self.bus.smpc.take_pending() {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
@@ -156,7 +182,15 @@ impl Saturn {
                         .intc
                         .raise(sh2::InterruptSource::Nmi);
                 }
-                SmpcCommand::IntBack => self.respond_to_intback(),
+                SmpcCommand::IntBack => {
+                    // INTBACK takes ~250 µs to execute on hardware. Keep
+                    // SF busy until then (completed by the check above);
+                    // clearing it now makes the BIOS's SF-poll return too
+                    // early and derail (Yabause reference-diff, 0x1D64).
+                    let done_at = self.now().saturating_add(INTBACK_EXEC_CYCLES);
+                    self.bus.smpc.intback_complete_at = Some(done_at);
+                    continue; // do NOT mark_command_done (SF stays busy)
+                }
                 // Other commands are recognised but have no
                 // emulator-side effect yet (SETTIME / SETSMEM / etc.)
                 // — they get real implementations as the corresponding

@@ -164,7 +164,12 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
 fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
     let mut sat = build();
     sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
-    sat.run_for(512);
+    // INTBACK has a ~7150-cycle execution time before SF clears and OREG
+    // is populated; run well past it.
+    sat.run_for(16_000);
+    // SF clears once the command completes.
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF clears after INTBACK completes");
     // RTC is OREG1..7 (7 bytes); OREG7 is the seconds byte.
     assert_eq!(sat.bus.smpc.oreg[7], 0x00);
     // OREG9 = area code (North America NTSC = 0x04).

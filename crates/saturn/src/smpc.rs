@@ -114,6 +114,16 @@ pub struct Smpc {
     /// Command queued by a write to COMREG, waiting for the Saturn
     /// aggregate to process it. SF stays at 1 while this is `Some`.
     pending: Option<Command>,
+    /// INTBACK has a non-trivial execution time: the SMPC keeps SF busy
+    /// for ~250 µs (≈7150 SH-2 cycles) before it collects status data,
+    /// fills OREG, clears SF, and raises its interrupt. While a dequeued
+    /// INTBACK is still "executing", this holds the global cycle at which
+    /// it completes; the Saturn aggregate finishes it once `now()` passes
+    /// it. Clearing SF immediately makes the BIOS's SF-poll return too
+    /// early and derail the boot (verified by a Yabause reference-diff at
+    /// the 0x1D64 SF poll). Yabause models the same delay (`timing=250`
+    /// µs for INTBACK status).
+    pub intback_complete_at: Option<u64>,
 }
 
 impl Smpc {
