@@ -424,6 +424,20 @@ is correct and stays as-is. Closing the splash from here is a question of
 finding any genuine *spec* deviation (peripheral behavior / interrupt
 delivery vs the hardware manuals), not of bending cycle costs to mirror MAME.
 
+**Reference-magic audit (`REVIEW(magic)`).** Values that were tuned to a
+reference emulator rather than a hardware datasheet are tagged inline with
+`REVIEW(magic)` — `grep -rn "REVIEW(magic)" crates` enumerates them, each
+with a one-line grounding note. Currently: INTBACK SF-busy timings
+(MAME's 8/8/700 µs, 700 a MAME guess), `CYCLES_PER_FRAME` dot/line counts
+(MAME `set_raw`; 59.76 vs nominal 59.94 Hz), the HBLANK "last ~20% of line"
+approximation, the placeholder RTC bytes, INTBACK `OREG10 = 0x34`, and the
+CD Get-HW-Info `CR2/CR4` literals. None gate boot today; revisit a tag only
+if a divergence implicates it. Two former magic values were defects and
+were fixed (not just tagged): the CD `PERIODIC_CYCLES` stale-duplicate of
+the old frame length, and the rounded `CYCLES_PER_US`. Spec-grounded values
+(SCU vectors/priorities, SH-2 cycle costs, region code) are deliberately
+*not* tagged.
+
 ### Verification gates
 
 1. `cargo test --workspace` — all 288 tests green.
