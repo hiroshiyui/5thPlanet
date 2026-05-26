@@ -247,10 +247,21 @@ condition the handler checks before arming the frame flag), not the CD
 periodic. That handler indexes a callback table (`[0x06000960]`); the next
 step is to trace why its `0x060408A4` store is skipped — candidates are an
 unsatisfied SMPC/region check, an INTBACK-phase dependency, or a
-still-missing VDP1/VDP2 status the handler gates on. **A second reference
-(MAME's accuracy-focused Saturn driver) is being added to cross-check this
-path**, since the local Yabause harness binary was lost (only its
-instrumented source survives).
+still-missing VDP1/VDP2 status the handler gates on.
+
+**Second reference added: MAME** (`mameref/`, never committed, alongside
+`yabref/`). MAME v0.287's Saturn driver is built BIOS-only on its HLE CD
+core (we lack the low-level CD-block SH-1 firmware) and runs headless; its
+master-SH-2 PC trace (`mameref/pctrace.sh` → `/tmp/mame_pc.log`) diffs
+against ours just like Yabause's. The Yabause harness binary was lost (only
+its instrumented source survives), so MAME is now the live runnable
+cross-check. First lead it surfaced for the `0x060408A4` park: MAME's
+INTBACK status reply (`smpc.cpp resolve_intback`) sets `OREG10`
+system-status bits (≈`0x34`: MSHNMI/SYSRES/SOUNDRES + dot-select) and packs
+SMEM into `OREG12..15`, whereas our `respond_to_intback` zeroes `OREG10` and
+writes port-empty headers there — a candidate dependency for the
+display-enable path. See `mameref/README-5thplanet.md` for build/run/trace
+details and the Saturn source map.
 
 ### Verification gates
 
