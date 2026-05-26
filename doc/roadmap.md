@@ -331,14 +331,27 @@ per-instruction SH-2 cycle costs exactly (memory wait states, pipeline
 interlocks), which is deep and of uncertain value (MAME's cycle model is
 not itself ground truth). Diminishing returns from MAME PC-diffing here.
 
-**Caveat — drain granularity / `run_frame` park.** The single-step trace
-(master-only) now tracks MAME to ~15.63M instructions, but `run_frame`
-(full scheduler: master + slave + CD) still parks (now `~0x060108C2`). The
-two paths differ because `run_frame` interleaves the **slave**, perturbing
-the master's interrupt phase. `run_frame` is the real splash path, so the
-next productive target is its park specifically — likely needs a
-full-system (not master-only) trace to diff against MAME, and/or auditing
-slave/scheduler interleave timing — rather than more master-only PC-diffing.
+**`run_frame` park — full-system trace built; it's the same phase wall.**
+A full-system tracer now records the master PC in *scheduler* order (master
++ slave + CD-block interleaved — the real `run_frame` path), via
+`Scheduler::run_for_traced` + `Saturn::run_for_traced` +
+`gen_fullsystem_pc_trace`. Diffing it against MAME: the full-system path
+tracks MAME for **~10M instructions (frame ~39)**, then hits the **same
+VBlank interrupt-phase divergence** (ours → handler `0x06000840`, MAME
+continues) as the master-only path. So `run_frame`'s park (`~0x060108C2`) is
+**not** a discrete control-flow bug — it's the accumulated interrupt-phase
+error from cycle-count drift vs MAME, the same cycle-accuracy frontier.
+
+PC-trace diffing has reached its limit: it can't align across an async
+interrupt landing on a different instruction (a larger resync window to skip
+handler excursions is O(window) per mismatch and too slow). **Next options,
+both substantial:** (a) an interrupt-aware resync that skips matched handler
+excursions on each side to confirm whether *any* real control-flow
+divergence hides past the phase noise; or (b) SH-2 per-instruction
+cycle-cost / wait-state fidelity work to close the drift — of uncertain
+value, since MAME's cycle model is not ground truth either. A pragmatic
+alternative is to stop chasing exact MAME-match and instead check whether
+the boot *recovers* and renders the splash despite phase differences.
 
 ### Verification gates
 
