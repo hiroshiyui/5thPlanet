@@ -13,6 +13,7 @@ use sh2::bus::{AccessKind, Bus};
 
 // SMPC register absolute addresses (SMPC_BASE = 0x00100000).
 const COMREG: u32 = 0x0010_001F;
+const SR: u32 = 0x0010_0061;
 const SF: u32 = 0x0010_0063;
 
 fn build() -> Saturn {
@@ -161,27 +162,51 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
 }
 
 #[test]
-fn intback_fills_oreg_with_a_no_controller_status_and_raises_smpc_source() {
+fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     let mut sat = build();
+    // Status-only INTBACK (IREG1 & 8 == 0 → no peripheral phase).
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: request status
     sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
-    // INTBACK has a ~7150-cycle execution time before SF clears and OREG
-    // is populated; run well past it.
     sat.run_for(16_000);
-    // SF clears once the command completes.
+    // SF clears once the status phase completes.
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
-    assert_eq!(sf, 0, "SF clears after INTBACK completes");
-    // RTC is OREG1..7 (7 bytes); OREG7 is the seconds byte.
+    assert_eq!(sf, 0, "SF clears after INTBACK status phase");
+    // RTC is OREG1..7; OREG9 = area code (North America NTSC = 0x04);
+    // OREG10 = system status 1 (0x34, MAME); OREG31 = command echo (0x10).
     assert_eq!(sat.bus.smpc.oreg[7], 0x00);
-    // OREG9 = area code (North America NTSC = 0x04).
     assert_eq!(sat.bus.smpc.oreg[9], 0x04);
-    // OREG12 / OREG13 = port 1 / port 2 peripheral headers (no peripheral).
-    assert_eq!(sat.bus.smpc.oreg[12], 0xF0);
-    assert_eq!(sat.bus.smpc.oreg[13], 0xF0);
-    // OREG31 = end marker.
-    assert_eq!(sat.bus.smpc.oreg[31], 0xF0);
+    assert_eq!(sat.bus.smpc.oreg[10], 0x34);
+    assert_eq!(sat.bus.smpc.oreg[31], 0x10);
+    // Status SR with no peripheral requested = 0x40 (MAME `0x40 | stage<<5`).
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr, 0x40);
     // SCU's SMPC source is the path BIOS handlers wait on.
     let pending = sat.bus.scu.take_pending_interrupt(0);
     assert_eq!(pending.map(|(s, _)| s), Some(saturn::ScuSource::Smpc));
+}
+
+#[test]
+fn intback_peripheral_continuation_reports_no_controller() {
+    let mut sat = build();
+    // Request status + peripheral data (IREG1 bit 3 set).
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    // Status phase done: SR = 0x40 | (1<<5) = 0x60 (peripheral pending).
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr, 0x60, "status SR signals peripheral data pending");
+    // Host requests CONTINUE (IREG0 bit 0x80) → peripheral phase.
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data);
+    sat.run_for(40_000);
+    // Peripheral phase: both ports report no controller (0xF0); first
+    // continuation is "more data" → SR high bits 0xC0.
+    assert_eq!(sat.bus.smpc.oreg[0], 0xF0, "port 1: no peripheral");
+    assert_eq!(sat.bus.smpc.oreg[1], 0xF0, "port 2: no peripheral");
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr & 0xC0, 0xC0, "first peripheral phase: more data");
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF clears after the peripheral phase completes");
 }
 
 #[test]

@@ -124,6 +124,18 @@ pub struct Smpc {
     /// the 0x1D64 SF poll). Yabause models the same delay (`timing=250`
     /// µs for INTBACK status).
     pub intback_complete_at: Option<u64>,
+    /// INTBACK staged-peripheral protocol state (matches MAME `smpc.cpp`).
+    /// 0 = not in an INTBACK peripheral sequence; non-zero = a peripheral
+    /// transfer phase is in progress (the value drives the next `SR`). The
+    /// status phase sets it to `(IREG1 & 8) >> 3`; each CONTINUE advances it
+    /// (1 → 2 → 0), and BREAK clears it.
+    pub intback_stage: u8,
+    /// Pad mode echoed back in the peripheral-phase `SR` (`IREG0 >> 4`).
+    pub pmode: u8,
+    /// Set when the host writes IREG0 with the CONTINUE bit (0x80) during an
+    /// INTBACK peripheral sequence; the Saturn aggregate drains it to run the
+    /// next peripheral phase. Mirrors MAME scheduling `intback_continue_request`.
+    intback_continue: bool,
 }
 
 impl Smpc {
@@ -158,7 +170,22 @@ impl Smpc {
 
     pub fn write8(&mut self, offset: u32, val: u8) {
         match offset {
-            0x01 => self.ireg[0] = val,
+            0x01 => {
+                self.ireg[0] = val;
+                // During an INTBACK peripheral sequence, a write to IREG0
+                // is the host's CONTINUE/BREAK request (MAME `ireg_w`,
+                // `offset == 1`): bit 0x40 = BREAK (end now), bit 0x80 =
+                // CONTINUE (fetch the next peripheral phase).
+                if self.intback_stage != 0 {
+                    if val & 0x40 != 0 {
+                        self.sr &= 0x0F; // BREAK: ack, end the sequence
+                        self.intback_stage = 0;
+                    } else if val & 0x80 != 0 {
+                        self.intback_continue = true;
+                        self.sf = 1; // busy until the phase completes
+                    }
+                }
+            }
             0x03 => self.ireg[1] = val,
             0x05 => self.ireg[2] = val,
             0x07 => self.ireg[3] = val,
@@ -215,6 +242,13 @@ impl Smpc {
                 self.last_unknown_command = Some(raw);
             }
         }
+    }
+
+    /// Pop a pending INTBACK CONTINUE request (set when the host wrote the
+    /// CONTINUE bit to IREG0 mid-sequence). The Saturn aggregate runs the
+    /// next peripheral phase when this returns `true`.
+    pub fn take_intback_continue(&mut self) -> bool {
+        core::mem::take(&mut self.intback_continue)
     }
 
     /// Pop the queued command, if any. The caller is expected to apply

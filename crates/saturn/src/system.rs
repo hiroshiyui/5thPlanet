@@ -359,18 +359,25 @@ impl Saturn {
                         .raise(sh2::InterruptSource::Nmi);
                 }
                 SmpcCommand::IntBack => {
-                    // Fill OREG and raise the SMPC interrupt now, so the
-                    // response is ready the moment SF drops. Keep SF busy for
-                    // the request-dependent execution time (see
-                    // `intback_busy_us`); `settle_intback` clears it on the
-                    // exact instruction that reads SMPC past the completion
-                    // cycle. Clearing SF immediately makes the BIOS's tight
-                    // SF-poll (0x1D5A..0x1D64) exit too early and derail.
-                    self.respond_to_intback();
-                    let busy = intback_busy_us(self.bus.smpc.ireg[0], self.bus.smpc.ireg[1])
-                        * CYCLES_PER_US;
-                    let done_at = self.now().saturating_add(busy);
-                    self.bus.smpc.intback_complete_at = Some(done_at);
+                    // INTBACK status phase (MAME `resolve_intback`). Fill the
+                    // status OREG and arm the staged-peripheral protocol:
+                    // `intback_stage = (IREG1 & 8) >> 3` (1 if peripheral data
+                    // was requested), `pmode = IREG0 >> 4`, `SR = 0x40 |
+                    // (stage << 5)`. Raise the SMPC interrupt now so the
+                    // response is ready the moment SF drops, and keep SF busy
+                    // for the request-dependent execution time
+                    // (`intback_busy_us`); `settle_intback` clears it on the
+                    // exact instruction that reads SMPC past completion.
+                    let ireg0 = self.bus.smpc.ireg[0];
+                    let ireg1 = self.bus.smpc.ireg[1];
+                    self.respond_to_intback_status();
+                    let stage = (ireg1 & 0x08) >> 3;
+                    self.bus.smpc.intback_stage = stage;
+                    self.bus.smpc.pmode = ireg0 >> 4;
+                    self.bus.smpc.sr = 0x40 | (stage << 5);
+                    let busy = intback_busy_us(ireg0, ireg1) * CYCLES_PER_US;
+                    self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
+                    self.bus.scu.raise(crate::scu::Source::Smpc);
                     continue; // do NOT mark_command_done (SF stays busy)
                 }
                 // Other commands are recognised but have no
@@ -381,33 +388,47 @@ impl Saturn {
             }
             self.bus.smpc.mark_command_done();
         }
+
+        // INTBACK peripheral continuation (MAME `intback_continue_request`),
+        // requested by the host writing the CONTINUE bit to IREG0. Fill the
+        // peripheral OREG and advance the staged SR: `0xC0 | pmode` ("more
+        // data", stage 1 → 2) then `0x80 | pmode` ("last", stage 2 → 0).
+        if self.bus.smpc.take_intback_continue() {
+            self.respond_to_intback_peripheral();
+            let pmode = self.bus.smpc.pmode;
+            if self.bus.smpc.intback_stage == 2 {
+                self.bus.smpc.sr = 0x80 | pmode;
+                self.bus.smpc.intback_stage = 0;
+            } else {
+                self.bus.smpc.sr = 0xC0 | pmode;
+                self.bus.smpc.intback_stage += 1;
+            }
+            let busy = 700 * CYCLES_PER_US;
+            self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
+            self.bus.scu.raise(crate::scu::Source::Smpc);
+        }
     }
 
-    /// Populate OREG0..31 with an INTBACK status response describing
-    /// "no controller in either port, North-America region, valid RTC".
-    /// Then raise the SCU's SMPC interrupt source so a BIOS handler can
-    /// read it.
-    ///
-    /// Layout follows the SMPC manual's INTBACK status-response format:
+    /// Fill OREG0..31 with the INTBACK **status** response (MAME
+    /// `resolve_intback`): "North-America region, valid RTC, no special
+    /// system state". Peripheral data is *not* here — it comes in the
+    /// separate continuation phase ([`respond_to_intback_peripheral`]).
     ///
     /// ```text
-    ///   OREG0      status: bit7 STE (RTC valid), bit6 RESD (reset disabled)
+    ///   OREG0      bit7 STE (RTC valid) | bit6 RESD (reset disabled)
     ///   OREG1..7   RTC, BCD: year-hi, year-lo, weekday<<4|month, day,
-    ///              hour, minute, second  (SEVEN bytes — OREG7 is seconds)
-    ///   OREG8      cartridge code
-    ///   OREG9      area code (region)    — 0x04 = North America
-    ///   OREG10..11 system status 1 / 2
-    ///   OREG12..   peripheral data (per-port headers)
+    ///              hour, minute, second
+    ///   OREG8      cartridge code (none)
+    ///   OREG9      area code — 0x04 = North America (BIOS halts on mismatch)
+    ///   OREG10     system status 1 — 0x34 (MSHNMI/SYSRES/SOUNDRES)
+    ///   OREG11     system status 2 (CDRES) — 0
+    ///   OREG12..15 SMEM (SMPC backup memory) — 0 (none stored)
+    ///   OREG16..30 undefined — 0xFF (MAME)
+    ///   OREG31     0x10 — echo of the issued command (INTBACK)
     /// ```
-    ///
-    /// Getting OREG9 right matters: the BIOS reads it as the hardware
-    /// area code and halts (imask=15 spin) on a region mismatch.
-    fn respond_to_intback(&mut self) {
+    fn respond_to_intback_status(&mut self) {
         let s = &mut self.bus.smpc;
-        // OREG0 — STE = 1 (RTC valid), RESD = 0 (reset button enabled).
         s.oreg[0] = 0x80;
-        // OREG1..7 — BCD RTC, seven bytes. Values arbitrary but BCD-valid;
-        // OREG3 packs weekday (bits 7..4) and month (bits 3..0).
         s.oreg[1] = 0x20; // year hi
         s.oreg[2] = 0x26; // year lo
         s.oreg[3] = 0x05; // weekday 0, month 5
@@ -415,39 +436,30 @@ impl Saturn {
         s.oreg[5] = 0x12; // hour
         s.oreg[6] = 0x00; // minute
         s.oreg[7] = 0x00; // second
-        // OREG8 — cartridge code (no cartridge).
-        s.oreg[8] = 0x00;
-        // OREG9 — area code. 0x04 = North America (NTSC), matching the
-        // USA BIOS image. Japan = 0x01, Europe PAL = 0x0C.
-        s.oreg[9] = 0x04;
-        // OREG10 — system status 1 (MAME `resolve_intback`): bit5 MSHNMI,
-        // bit4 SYSRES, bit2 SOUNDRES, bit6 = current VDP2 dot-select (0). That
-        // is 0x34. (Was 0x00.) OREG11 — system status 2 (CDRES), nominal 0.
-        s.oreg[10] = 0x34;
-        s.oreg[11] = 0x00;
-        // OREG12.. — peripheral data. Report no peripheral in either
-        // port via the 0xF0 "port empty" header tag.
-        //
-        // NOTE — divergence from MAME still pending: MAME's INTBACK *status*
-        // response puts the 4 SMEM (backup-memory) bytes in OREG12..15 and
-        // delivers peripheral data in a separate continuation phase
-        // (`intback_continue_request`), with OREG31 = 0x10 (the command echo).
-        // We return peripheral data inline in this single response, which is
-        // enough for the BIOS to see "no controller" and proceed; aligning to
-        // MAME's staged protocol is a larger follow-up.
-        s.oreg[12] = 0xF0; // port 1 header: no peripheral
-        s.oreg[13] = 0xF0; // port 2 header: no peripheral
-        for i in 14..31 {
-            s.oreg[i] = 0;
+        s.oreg[8] = 0x00; // cartridge
+        s.oreg[9] = 0x04; // area code (North America)
+        s.oreg[10] = 0x34; // system status 1
+        s.oreg[11] = 0x00; // system status 2
+        // OREG12..15 — SMEM backup memory (none stored → 0). MAME copies its
+        // 4 SMEM bytes here; we don't model SMPC backup memory yet.
+        for o in s.oreg.iter_mut().take(16).skip(12) {
+            *o = 0x00;
         }
-        // OREG31 — end-of-data marker per the manual.
-        s.oreg[31] = 0xF0;
+        // OREG16..30 — undefined; MAME writes 0xFF.
+        for o in s.oreg.iter_mut().take(31).skip(16) {
+            *o = 0xFF;
+        }
+        s.oreg[31] = 0x10; // issued-command echo
+    }
 
-        // Surface the SMPC interrupt (maskable, via the SCU). INTBACK
-        // signals completion on the maskable MIRQ line, NOT an NMI —
-        // verified against the srg320 Saturn HW model (INTBACK uses
-        // MIRQ_N; only SRES/NMIREQ/CKCHG assert the master NMI).
-        self.bus.scu.raise(crate::scu::Source::Smpc);
+    /// Fill OREG with one INTBACK **peripheral** phase (MAME
+    /// `read_saturn_ports`): with no controller connected, both port-status
+    /// bytes are `0xF0` (peripheral count 0). OREG31 echoes the command.
+    fn respond_to_intback_peripheral(&mut self) {
+        let s = &mut self.bus.smpc;
+        s.oreg[0] = 0xF0; // port 1 status: no peripheral
+        s.oreg[1] = 0xF0; // port 2 status: no peripheral
+        s.oreg[31] = 0x10;
     }
 
     /// Run any DMA transfers that the SCU queued during the last
