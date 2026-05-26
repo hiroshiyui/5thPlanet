@@ -9,6 +9,13 @@
 
 pub const FRAMEBUFFER_BYTES: usize = 256 * 1024;
 
+/// Pixel stride and height of the 16-bit (RGB555) frame buffer in the
+/// default TVM=0 configuration: 512 × 256 × 2 bytes = 256 KiB. The
+/// plotter addresses pixels as `(y * STRIDE + x) * 2`, matching the
+/// hardware layout VDP2 later reads back as the sprite layer.
+pub const FB_STRIDE: i32 = 512;
+pub const FB_HEIGHT: i32 = 256;
+
 #[derive(Clone, Debug)]
 pub struct Framebuffer {
     bytes: Vec<u8>,
@@ -33,6 +40,18 @@ impl Framebuffer {
 
     fn idx(&self, offset: u32) -> usize {
         (offset as usize) % self.bytes.len()
+    }
+
+    /// Read the 16-bit pixel at `(x, y)` in the 512×256 RGB555 buffer.
+    /// Callers must keep `0 <= x < 512` and `0 <= y < 256`.
+    pub fn pixel(&self, x: i32, y: i32) -> u16 {
+        self.read16(((y * FB_STRIDE + x) as u32) * 2)
+    }
+
+    /// Write the 16-bit pixel at `(x, y)`. Bounds are the caller's
+    /// responsibility (the plotter clips before calling).
+    pub fn set_pixel(&mut self, x: i32, y: i32, val: u16) {
+        self.write16(((y * FB_STRIDE + x) as u32) * 2, val);
     }
 
     pub fn read8(&self, offset: u32) -> u8 {

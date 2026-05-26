@@ -17,24 +17,29 @@
 //!   0x16  MODR   Mode Status                   (R: version/mode)
 //! ```
 //!
-//! **NOT a VDP1 emulation.** There is no plotter (M5). The one piece
-//! of behaviour modeled here is the draw-end handshake: BIOS init
-//! writes `PTMR` to kick a plot, then polls `EDSR` for the end flag.
-//! Since we don't actually plot, we set `EDSR.CEF` (current-end-flag)
-//! synchronously on a `PTMR` write so the poll completes instead of
-//! spinning forever.
+//! The plotter (see [`super::plotter`]) drives the status registers:
+//! `EDSR.CEF` (current-frame draw end), `COPR` (current command-table
+//! address) and `LOPR` (last command-table address). BIOS/game code
+//! writes `PTMR` to kick a plot then polls `EDSR` for the end flag;
+//! the [`super::Vdp1`] aggregate runs the command list on that write
+//! and calls the mutators here. This module is now pure register
+//! state — the draw logic lives in the plotter.
 
 const REG_BYTES: usize = 0x18;
 
-/// EDSR.CEF — current-frame draw end. Set when a plot "finishes".
-const EDSR_CEF: u16 = 0x0002;
+/// EDSR.CEF — current-frame draw end. Set when a plot finishes.
+pub const EDSR_CEF: u16 = 0x0002;
 
 #[derive(Clone, Debug)]
 pub struct Vdp1Regs {
     /// Writeable control registers, flat big-endian (offsets 0x00..0x0E).
     raw: [u8; REG_BYTES],
-    /// Synthesized EDSR draw-end status (read at 0x10).
+    /// EDSR draw-end status (read at 0x10): bit1 CEF, bit0 BEF.
     edsr: u16,
+    /// LOPR (0x12) — last-operation command-table address (>>3).
+    lopr: u16,
+    /// COPR (0x14) — current-operation command-table address (>>3).
+    copr: u16,
 }
 
 impl Default for Vdp1Regs {
@@ -49,6 +54,8 @@ impl Vdp1Regs {
             raw: [0; REG_BYTES],
             // Power-on: no draw has run, so no end flag yet.
             edsr: 0,
+            lopr: 0,
+            copr: 0,
         }
     }
 
@@ -56,14 +63,31 @@ impl Vdp1Regs {
         (offset as usize) % REG_BYTES
     }
 
+    /// Clear EDSR.CEF — the plotter calls this at the start of a list.
+    pub fn cef_clear(&mut self) {
+        self.edsr &= !EDSR_CEF;
+    }
+    /// Set EDSR.CEF — the plotter calls this when the list finishes.
+    pub fn cef_set(&mut self) {
+        self.edsr |= EDSR_CEF;
+    }
+    /// Latch the last/current command-table addresses (already >>3).
+    pub fn set_command_addrs(&mut self, lopr: u16, copr: u16) {
+        self.lopr = lopr;
+        self.copr = copr;
+    }
+    /// Current PTMR value (plot-trigger mode bits live in 1:0).
+    pub fn ptmr(&self) -> u16 {
+        self.read16(0x04)
+    }
+
     /// Read-only status registers are synthesized; everything else is
     /// flat storage.
     pub fn read16(&self, offset: u32) -> u16 {
         match offset & 0xFF {
             0x10 => self.edsr,
-            // LOPR / COPR — last & current command-table addresses. No
-            // plotter, so both read as 0 (table start).
-            0x12 | 0x14 => 0,
+            0x12 => self.lopr,
+            0x14 => self.copr,
             // MODR — mode/version. Bits 15..12 are a fixed version (1).
             0x16 => 0x1000,
             other => {
@@ -77,18 +101,9 @@ impl Vdp1Regs {
         match offset & 0xFF {
             // Read-only status window: writes ignored.
             0x10 | 0x12 | 0x14 | 0x16 => {}
-            0x04 => {
-                // PTMR — plot trigger. Latch storage and ack the draw
-                // immediately (no real plotter; see module docs).
-                self.store16(0x04, val);
-                self.edsr |= EDSR_CEF;
-            }
-            0x0C => {
-                // ENDR — forced draw termination. Also raises the end
-                // flag so a waiting poll completes.
-                self.store16(0x0C, val);
-                self.edsr |= EDSR_CEF;
-            }
+            // PTMR (0x04) and ENDR (0x0C) are stored here; the Vdp1
+            // aggregate inspects them after the write to drive the
+            // plotter, since the command list lives in VRAM.
             other => self.store16(other, val),
         }
     }
@@ -141,18 +156,30 @@ mod tests {
     }
 
     #[test]
-    fn plot_trigger_sets_edsr_end_flag() {
+    fn cef_set_and_clear_drive_edsr() {
         let mut r = Vdp1Regs::new();
         assert_eq!(r.read16(0x10) & EDSR_CEF, 0, "no draw yet");
-        r.write16(0x04, 0x0001); // PTMR — start plot
-        assert_eq!(r.read16(0x10) & EDSR_CEF, EDSR_CEF, "draw must ack");
+        r.cef_set();
+        assert_eq!(r.read16(0x10) & EDSR_CEF, EDSR_CEF, "draw acked");
+        r.cef_clear();
+        assert_eq!(r.read16(0x10) & EDSR_CEF, 0, "cleared at list start");
     }
 
     #[test]
-    fn forced_termination_also_acks() {
+    fn ptmr_round_trips_for_the_aggregate_to_inspect() {
         let mut r = Vdp1Regs::new();
-        r.write16(0x0C, 0x0000); // ENDR
-        assert_eq!(r.read16(0x10) & EDSR_CEF, EDSR_CEF);
+        r.write16(0x04, 0x0002); // PTMR — immediate plot
+        assert_eq!(r.ptmr() & 0x03, 0x02);
+        // Writing PTMR no longer auto-acks; the plotter owns CEF now.
+        assert_eq!(r.read16(0x10) & EDSR_CEF, 0);
+    }
+
+    #[test]
+    fn command_addr_registers_report_plotter_progress() {
+        let mut r = Vdp1Regs::new();
+        r.set_command_addrs(0x0040, 0x0080);
+        assert_eq!(r.read16(0x12), 0x0040, "LOPR");
+        assert_eq!(r.read16(0x14), 0x0080, "COPR");
     }
 
     #[test]

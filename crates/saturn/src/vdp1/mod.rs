@@ -19,11 +19,15 @@
 //! See [`regs`] for the draw-end handshake — the one behaviour beyond
 //! flat storage that this stub models.
 
+pub mod command;
 pub mod framebuffer;
+pub mod plotter;
 pub mod regs;
 pub mod vram;
 
+pub use command::Command;
 pub use framebuffer::Framebuffer;
+pub use plotter::Plotter;
 pub use regs::Vdp1Regs;
 pub use vram::Vram;
 
@@ -94,7 +98,11 @@ impl Vdp1 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write8(addr - VRAM_BASE, val),
             FB_BASE..=FB_END => self.fb.write8(addr - FB_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write8(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => {
+                let off = addr - REGS_BASE;
+                self.regs.write8(off, val);
+                self.after_reg_write(off & 0xFE);
+            }
             _ => {}
         }
     }
@@ -102,7 +110,11 @@ impl Vdp1 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write16(addr - VRAM_BASE, val),
             FB_BASE..=FB_END => self.fb.write16(addr - FB_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write16(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => {
+                let off = addr - REGS_BASE;
+                self.regs.write16(off, val);
+                self.after_reg_write(off & 0xFF);
+            }
             _ => {}
         }
     }
@@ -110,9 +122,40 @@ impl Vdp1 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write32(addr - VRAM_BASE, val),
             FB_BASE..=FB_END => self.fb.write32(addr - FB_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write32(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => {
+                let off = addr - REGS_BASE;
+                self.regs.write32(off, val);
+                self.after_reg_write(off & 0xFF);
+                self.after_reg_write((off & 0xFF) + 2);
+            }
             _ => {}
         }
+    }
+
+    /// React to a control-register write. `PTMR` (0x04) kicks the
+    /// plotter when its mode bits are set; `ENDR` (0x0C) force-terminates
+    /// the current draw, which (since our plot is synchronous) simply
+    /// raises the draw-end flag for a waiting poll.
+    fn after_reg_write(&mut self, off: u32) {
+        match off {
+            0x04 if self.regs.ptmr() & 0x03 != 0 => self.process_list(),
+            0x0C => self.regs.cef_set(),
+            _ => {}
+        }
+    }
+
+    /// Run the VDP1 command list now: clear the draw-end flag, walk the
+    /// table in VRAM rendering into the frame buffer, then latch COPR and
+    /// raise the draw-end flag. The draw is synchronous (timing-exact
+    /// draw-end + the SCU sprite-end interrupt are the next increment).
+    pub fn process_list(&mut self) {
+        let prev_copr = self.regs.read16(0x14);
+        self.regs.cef_clear();
+        let Vdp1 { vram, fb, regs } = self;
+        let mut plotter = Plotter::new(&*vram, fb);
+        let result = plotter.process_list();
+        regs.set_command_addrs(prev_copr, result.copr);
+        regs.cef_set();
     }
 }
 
