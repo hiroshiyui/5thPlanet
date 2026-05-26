@@ -363,12 +363,18 @@ SF-busy is request-derived (~16 µs status / +700 µs peripheral, was a fixed
 250 µs); INTBACK `OREG10 = 0x34`. Verified consistent (no change needed):
 SMPC command codes, region code `OREG9 = 0x04`, HIRQ init/read, signature
 persistence, status-byte values. The full-system resync advanced
-9.98M → 10.58M with these. **One deferred structural item:** MAME delivers
-INTBACK peripheral data in a *staged continuation* (`intback_continue_request`)
-with SMEM in `OREG12..15` and `OREG31 = 0x10`; we still return peripheral
-data inline in the single status response (enough for the BIOS to read "no
-controller" and proceed). Aligning to MAME's staged protocol is a separate
-follow-up.
+9.98M → 10.58M with these.
+
+The one deferred structural item is now **done** (`feat(saturn): staged
+INTBACK peripheral protocol`): INTBACK uses MAME's staged sequence — a
+status phase (RTC/region/system-status/SMEM/`OREG31=0x10`, `SR = 0x40 |
+(stage<<5)`) followed by host-driven CONTINUE/BREAK on IREG0 and peripheral
+phases (`OREG0/1 = 0xF0` no-controller, `SR = 0xC0|pmode` then `0x80|pmode`),
+replacing the inline single-shot response. No boot regression (the BIOS path
+is insensitive — divergence still the VBlank phase at 10.58M), but the
+protocol is now correct for controller reads. The CD-block and SMPC
+host-interface fidelity is now aligned to MAME across the board; the only
+open frontier is cycle-exact interrupt timing.
 
 ### Verification gates
 
