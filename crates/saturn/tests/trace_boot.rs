@@ -486,6 +486,48 @@ fn watch_display() {
 }
 
 #[test]
+#[ignore = "manual: dump master state at the 0x4216 CMOK-handshake divergence"]
+fn catch_4216() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // Step with drain every 256 cycles (matches run_for/gen_master_pc_trace,
+    // the path the resync diff used) and stop at the first 0x4216 whose R14
+    // points at the WRAM var MAME reads as 0 (0x060003A4).
+    let mut drain_cyc: u64 = 0;
+    let mut steps = 0u64;
+    loop {
+        let m = sat.master();
+        if m.regs.pc == 0x0000_4216 {
+            break;
+        }
+        if steps > 40_000_000 {
+            println!("never reached 0x4216 in {steps} steps");
+            return;
+        }
+        let c = sat.debug_step_master_nodrain() as u64;
+        drain_cyc += c;
+        if drain_cyc >= 256 {
+            sat.debug_drain();
+            drain_cyc = 0;
+        }
+        steps += 1;
+    }
+    let (r2, r12, r14, pr) = {
+        let m = sat.master();
+        (m.regs.r[2], m.regs.r[12], m.regs.r[14], m.regs.pr)
+    };
+    let (val, _) = sat.bus.read16(r14, sh2::bus::AccessKind::Data);
+    println!(
+        "at 0x4216 (step {steps}): R14=0x{r14:08X} *(R14)=0x{val:04X} R2=0x{r2:08X} R12=0x{r12:08X} PR=0x{pr:08X}"
+    );
+    println!("  MAME reference: R14=0x060003A4 *(R14)=0x0000 R2=0x0000 R12=0x0000 PR=0x000041C2");
+}
+
+#[test]
 #[ignore = "manual: catch the JSR @R12 probe that returns non-zero (divergence)"]
 fn catch_divergent_probe() {
     let Some((bios, _)) = load_bios() else {

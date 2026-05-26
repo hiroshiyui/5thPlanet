@@ -292,13 +292,35 @@ unsolicited periodics from power-on (now gated behind the first command,
 matching MAME's HLE), and `execute()` firing on a lone CR4 write (now
 requires all four CRs, MAME's `cmd_pending == 0xf`).
 
-After the fix the first divergence moves to BIOS **`0x00004216`** — a
-CD-block HIRQ-style handshake (`0x4200: MOV.W R2,@R14` write-readback;
-`0x4214: TST #1,R0; 0x4216: BF`) testing **bit 0 (CMOK)** of `*(R14)`: ours
-has it set, MAME clear. That's the next blocker. (The single-step trace and
-`run_frame` still both end in the WRAM park because divergences remain
-downstream; the fix is validated by the *trace* divergence advancing
-`0x2304 → 0x4216`, not yet by reaching splash.)
+After the fix the divergence moved to BIOS **`0x00004216`** — the BIOS ORs
+the CD-block **HIRQ** (`*(0x4264) == 0x25890008`) into a WRAM accumulator
+(`0x060003A4`) and tests **CMOK (bit 0)**. MAME read `HIRQ = 0`; we read
+`0x0BE1`. Root cause: our HIRQ power-on/read model, fixed (see
+`fix(saturn): power-on HIRQ all-clear + clear DCHG on read`):
+
+- We initialized HIRQ to `0xFFFF`; MAME inits `hirqreg = 0` — every flag
+  (incl. CMOK) clear at power-on, set only by events.
+- Our HIRQ read *re-asserted* DCHG from `disk_changed` (a Yabause guess);
+  MAME's `hirq_r` *always clears* DCHG and clears BFUL/CSCT from buffer
+  state. Matched that.
+
+That advanced the first divergence to BIOS **`0x00003398`**, with matched
+instructions jumping **8.78M → 15.84M** (nearly 2×, through all of CD
+init). The new divergence is a different class: ours takes a **VBlank-IN
+interrupt** (→ handler `0x06000840`) one instruction before MAME does — a
+timing *phase* difference (our `update_video_timing` raises VBlank on
+256-cycle batch boundaries; MAME is cycle-exact), not a control-flow bug.
+PC-trace diffing can't align across an async interrupt landing on a
+different instruction, so this is the practical limit of the trace-diff
+method; closing it needs cycle-exact VBlank timing (raise on the exact
+raster cycle, not the batch edge).
+
+**Caveat — drain granularity.** The single-step trace path (drain=256) now
+tracks MAME to ~15.84M instructions, but `run_frame` still parks at
+`0x060108BA`. The two paths differ because the trace drains/raises
+interrupts at different granularity than the scheduler; reconciling them
+(so the park reproduces identically under both) is part of the cycle-exact
+timing work above.
 
 ### Verification gates
 
