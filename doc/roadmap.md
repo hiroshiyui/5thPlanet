@@ -255,13 +255,35 @@ core (we lack the low-level CD-block SH-1 firmware) and runs headless; its
 master-SH-2 PC trace (`mameref/pctrace.sh` → `/tmp/mame_pc.log`) diffs
 against ours just like Yabause's. The Yabause harness binary was lost (only
 its instrumented source survives), so MAME is now the live runnable
-cross-check. First lead it surfaced for the `0x060408A4` park: MAME's
-INTBACK status reply (`smpc.cpp resolve_intback`) sets `OREG10`
-system-status bits (≈`0x34`: MSHNMI/SYSRES/SOUNDRES + dot-select) and packs
-SMEM into `OREG12..15`, whereas our `respond_to_intback` zeroes `OREG10` and
-writes port-empty headers there — a candidate dependency for the
-display-enable path. See `mameref/README-5thplanet.md` for build/run/trace
-details and the Saturn source map.
+cross-check. See `mameref/README-5thplanet.md` for build/run/trace details
+and the Saturn source map.
+
+**OREG10 lead — disproven; the park is a wrong-path symptom.** MAME's
+INTBACK status reply (`smpc.cpp resolve_intback`) sets `OREG10` ≈ `0x34`
+(MSHNMI/SYSRES/SOUNDRES) and packs SMEM into `OREG12..15`, vs our `0x00` /
+port-empty headers. Setting our `OREG10 = 0x34` does **not** move the park
+(still `0x060108BA`, flag still 0), so `OREG10` is not the gate. The far
+more useful finding came from watch/breakpoint experiments in MAME:
+
+- MAME's master **never executes any `0x0601xxxx` high-WRAM code** in ~19M
+  instructions — it stays in **low BIOS**, looping a routine at `0x00002364`
+  (called from `0x2094`/`0x20CE`, in both normal `sr=0x01` and interrupt
+  `sr=0xF1` context) that **is what writes `[0x060408A4]`** (values like
+  `0x2F`/`0xE6`/`0xD6`, after an initial `0` clear at `0x2B0`).
+- A breakpoint at `0x060108BA` in MAME **never fires** — so our park is a
+  dead-end branch our master takes that the reference never does. The true
+  divergence is **upstream**: our master wrongly leaves the low-BIOS path
+  into a WRAM loop, never calling the `0x2364` routine that would feed the
+  flag it then waits on.
+
+Both masters run identical low-BIOS code for at least the first ~12M
+instructions, so the divergence is later. **Next step:** a resync PC-stream
+diff (`/tmp/our_pc.log` vs `/tmp/mame_pc.log`, both masked to physical
+addresses) to pin the first divergent branch — note our single-step trace
+path drains per-instruction, so it must be reconciled with `run_frame`'s
+batched draining (the park only reproduces under the latter), and the trace
+must reach ~frame 30–80 (≈40–80M instructions). The lost resync-diff tool
+needs rebuilding.
 
 ### Verification gates
 
