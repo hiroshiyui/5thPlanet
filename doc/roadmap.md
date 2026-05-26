@@ -479,7 +479,7 @@ reference only; the hardware manuals stay authoritative.
 | # | Task | Status |
 |---|------|--------|
 | 1 | **VDP1 plotter** — command-list walker (END/jump/skip/call/return), local/clip coordinate commands, quad rasteriser (polygon/distorted/scaled/normal sprite + line/polyline), all six colour modes, SPD/mesh/end-code, colour-calc modes, render into the VDP1 framebuffer | ✅ done |
-| 2 | VDP1 finish — gouraud shading, framebuffer erase (EWDR/EWLR/EWRR) + double-buffer swap (FBCR), draw-end timing + SCU sprite-draw-end interrupt, VDP2 sprite-layer compositing hook | pending |
+| 2 | VDP1 finish — framebuffer erase (EWDR/EWLR/EWRR) ✅ + SCU sprite-draw-end interrupt ✅; remaining: gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end timing, VDP2 sprite-layer compositing hook | 🚧 partial |
 | 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU): register file, ~80 instruction families, BCD, exception model, cycle timing; structured like `sh2` | pending |
 | 4 | **VDP2 build-out** — NBG1–3, RBG0/1 rotation, per-layer priority compositing, windows, line-scroll, colour calculation, beyond the current NBG0-only renderer | pending |
 
