@@ -276,18 +276,33 @@ more useful finding came from watch/breakpoint experiments in MAME:
   into a WRAM loop, never calling the `0x2364` routine that would feed the
   flag it then waits on.
 
-Both masters run identical low-BIOS code for at least the first ~12M
-instructions, so the divergence is later. **Next step:** a resync PC-stream
-diff (`/tmp/our_pc.log` vs `/tmp/mame_pc.log`, both masked to physical
-addresses) to pin the first divergent branch — note our single-step trace
-path drains per-instruction, so it must be reconciled with `run_frame`'s
-batched draining (the park only reproduces under the latter), and the trace
-must reach ~frame 30–80 (≈40–80M instructions). The lost resync-diff tool
-needs rebuilding.
+Both masters run identical low-BIOS code for ~8.78M instructions.
+
+**Resync diff built + first divergence pinned and fixed.**
+`mameref/resync_diff.py` walks our master PC trace against MAME's (both
+masked to physical addresses), resyncing across poll-loop count differences
+(and isolated reset-logging off-by-ones) to report the first genuine branch
+divergence. It pinned BIOS **`0x00002304`**: a `memcmp` of the CD-block
+`CR1..CR4` (copied to WRAM `0x06001FD8`) against the expected `"CDBLOCK"`
+signature at BIOS `0x4DB0`. MAME still read the signature there; we read a
+periodic status report (`21 00 41 01 01 00 00 96`) and derailed. Two
+CD-block bugs clobbered the signature too early — fixed (see
+`fix(saturn): hold the CD-block signature until a real command`):
+unsolicited periodics from power-on (now gated behind the first command,
+matching MAME's HLE), and `execute()` firing on a lone CR4 write (now
+requires all four CRs, MAME's `cmd_pending == 0xf`).
+
+After the fix the first divergence moves to BIOS **`0x00004216`** — a
+CD-block HIRQ-style handshake (`0x4200: MOV.W R2,@R14` write-readback;
+`0x4214: TST #1,R0; 0x4216: BF`) testing **bit 0 (CMOK)** of `*(R14)`: ours
+has it set, MAME clear. That's the next blocker. (The single-step trace and
+`run_frame` still both end in the WRAM park because divergences remain
+downstream; the fix is validated by the *trace* divergence advancing
+`0x2304 → 0x4216`, not yet by reaching splash.)
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 287 tests green.
+1. `cargo test --workspace` — all 288 tests green.
 2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
 3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
