@@ -10,7 +10,7 @@ use sh2::Cpu;
 use sh2::bus::{AccessKind, Bus};
 
 use crate::SaturnBus;
-use crate::scheduler::{EntityId, Scheduler, Sh2Entity};
+use crate::scheduler::{CdBlockEntity, EntityId, SaturnEntity, SchedEntity, Scheduler, Sh2Entity};
 use crate::smpc::Command as SmpcCommand;
 
 /// Max scheduler cycles between SMPC-pending checks. Small enough that
@@ -33,14 +33,21 @@ const LINES_PER_FRAME: u64 = 263;
 const ACTIVE_LINES: u64 = 224;
 const CYCLES_PER_LINE: u64 = CYCLES_PER_FRAME / LINES_PER_FRAME; // ≈1813
 
+/// Sub-frame granularity at which the CD-block periodic-firmware timer
+/// ticks. One scanline matches the reference (Yabause drives `Cs2Exec`
+/// per scanline); the CD-block's own accumulator carries the remainder, so
+/// this sets the *phase resolution* of the periodic report, not its cadence.
+const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
+
 /// One emulated SEGA Saturn — a Saturn-shaped memory map populated with
 /// a caller-supplied BIOS image, plus master and slave SH-2 cores wired
 /// into a shared event-driven scheduler.
 pub struct Saturn {
     pub bus: SaturnBus,
-    pub scheduler: Scheduler<Sh2Entity>,
+    pub scheduler: Scheduler<SaturnEntity>,
     master_id: EntityId,
     slave_id: EntityId,
+    cd_id: EntityId,
 }
 
 impl Saturn {
@@ -50,13 +57,18 @@ impl Saturn {
     pub fn new(bios: Vec<u8>) -> Self {
         let bus = SaturnBus::new(bios);
         let mut scheduler = Scheduler::new();
-        let master_id = scheduler.add(Sh2Entity::new(Cpu::new()));
-        let slave_id = scheduler.add(Sh2Entity::new(Cpu::new()));
+        // Insertion order is the determinism tie-break: master, then slave,
+        // then the CD-block timer. The CD entity goes last so that on a tie
+        // (its deadline equal to a CPU's) the CPU steps first.
+        let master_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
+        let slave_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
+        let cd_id = scheduler.add(SaturnEntity::CdBlock(CdBlockEntity::new(CD_TICK_CYCLES)));
         Self {
             bus,
             scheduler,
             master_id,
             slave_id,
+            cd_id,
         }
     }
 
@@ -79,18 +91,22 @@ impl Saturn {
             scheduler,
             master_id,
             slave_id,
+            ..
         } = self;
-        scheduler.entity_mut(*master_id).cpu.reset(bus);
-        scheduler.entity_mut(*slave_id).cpu.reset(bus);
+        scheduler.entity_mut(*master_id).sh2_mut().cpu.reset(bus);
+        scheduler.entity_mut(*slave_id).sh2_mut().cpu.reset(bus);
         // Real Saturn power-on: slave is held in reset until the BIOS
         // sends SMPC SETSL. Mirror that here.
-        scheduler.entity_mut(*slave_id).set_halted(true);
-        scheduler.entity_mut(*master_id).set_halted(false);
+        scheduler.entity_mut(*slave_id).sh2_mut().set_halted(true);
+        scheduler.entity_mut(*master_id).sh2_mut().set_halted(false);
     }
 
     /// Halt the slave SH-2. Triggered by SMPC `SSHOFF`.
     pub fn halt_slave(&mut self) {
-        self.scheduler.entity_mut(self.slave_id).set_halted(true);
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_halted(true);
     }
 
     /// Release the slave SH-2 from halt. Triggered by SMPC `SSHON`.
@@ -98,24 +114,27 @@ impl Saturn {
     /// real hardware this is the BIOS reset vector, which is also what
     /// our [`reset`] sets up.
     pub fn release_slave(&mut self) {
-        self.scheduler.entity_mut(self.slave_id).set_halted(false);
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_halted(false);
     }
 
     pub fn slave_is_halted(&self) -> bool {
-        self.scheduler.entity(self.slave_id).is_halted()
+        self.scheduler.entity(self.slave_id).sh2().is_halted()
     }
 
     pub fn master(&self) -> &Cpu {
-        &self.scheduler.entity(self.master_id).cpu
+        &self.scheduler.entity(self.master_id).sh2().cpu
     }
     pub fn master_mut(&mut self) -> &mut Cpu {
-        &mut self.scheduler.entity_mut(self.master_id).cpu
+        &mut self.scheduler.entity_mut(self.master_id).sh2_mut().cpu
     }
     pub fn slave(&self) -> &Cpu {
-        &self.scheduler.entity(self.slave_id).cpu
+        &self.scheduler.entity(self.slave_id).sh2().cpu
     }
     pub fn slave_mut(&mut self) -> &mut Cpu {
-        &mut self.scheduler.entity_mut(self.slave_id).cpu
+        &mut self.scheduler.entity_mut(self.slave_id).sh2_mut().cpu
     }
 
     /// Debug-only: step the master SH-2 exactly one instruction, then
@@ -137,7 +156,7 @@ impl Saturn {
             master_id,
             ..
         } = self;
-        let cpu = &mut scheduler.entity_mut(*master_id).cpu;
+        let cpu = &mut scheduler.entity_mut(*master_id).sh2_mut().cpu;
         // Mirror Sh2Entity::step: publish the current cycle to the bus so
         // time-varying peripheral reads (SMPC SF INTBACK completion) settle
         // at the exact instruction that reads them.
@@ -148,10 +167,34 @@ impl Saturn {
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
     /// performs between scheduler batches).
     pub fn debug_drain(&mut self) {
+        // The CD-block runs on its own scheduler entity, but the single-step
+        // debug path drives only the master CPU and never enters the
+        // scheduler, so advance the CD timer here to track the master's
+        // cycle (what `run_for`'s scheduler does automatically). This also
+        // keeps `now()` pinned to the master — otherwise the CD entity's
+        // un-advanced deadline would become the global-clock minimum.
+        self.catch_up_cd_block();
         self.update_video_timing();
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_intc();
+    }
+
+    /// Step the CD-block timer entity until its deadline passes the master's
+    /// current cycle. Used only by the single-step debug path; `run_for`
+    /// advances the CD entity through the scheduler instead.
+    fn catch_up_cd_block(&mut self) {
+        let Self {
+            bus,
+            scheduler,
+            master_id,
+            cd_id,
+            ..
+        } = self;
+        let master_cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+        while scheduler.entity(*cd_id).next_deadline() <= master_cycle {
+            scheduler.entity_mut(*cd_id).step(bus);
+        }
     }
 
     /// Recompute the VDP2 raster-timing registers — `VCNT` and the
@@ -183,13 +226,14 @@ impl Saturn {
         self.bus.vdp2.regs.write16(0x00A, line as u16); // VCNT
         self.bus.vdp2.regs.write16(0x004, tvstat);
 
-        // Raise VBlank-IN once, on the transition into the VBLANK region,
-        // and let the CD-block emit its once-per-frame periodic status
-        // report on the same edge (the reference drives the CD-block once
-        // per frame; frame-locking the report keeps its cadence matched).
+        // Raise VBlank-IN once, on the transition into the VBLANK region.
+        // The CD-block's periodic status report is no longer fired here —
+        // it runs on its own scheduler entity ([`CdBlockEntity`]) at
+        // sub-frame granularity, so the report lands at the cycle-exact
+        // point within the frame the reference produces it rather than being
+        // pinned to this edge.
         if vblank && (prev & 0x0008) == 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankIn);
-            self.bus.cd_block.frame_tick();
         }
     }
 

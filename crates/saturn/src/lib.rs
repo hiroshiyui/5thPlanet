@@ -20,7 +20,9 @@
 //!   minimal NBG0 renderer. [`vdp1`] and [`cd_block`] are address-space
 //!   presence stubs (no plotter / no SH-1 yet).
 //! - [`scheduler`] — `SchedEntity` trait + linear-scan `Scheduler`.
-//!   `Sh2Entity` is the concrete adapter wrapping `sh2::Cpu`.
+//!   `Sh2Entity` wraps `sh2::Cpu`; `CdBlockEntity` is the CD-block's
+//!   sub-frame periodic-firmware timer; `SaturnEntity` is the
+//!   heterogeneous enum the live scheduler runs.
 //! - [`system`] — `Saturn` aggregate: owns bus + scheduler, runs the
 //!   headless main loop / `run_frame`, maintains VDP2 raster timing,
 //!   and drains queued peripheral commands between scheduler batches.
@@ -48,7 +50,7 @@ pub mod vdp2;
 pub use bus::SaturnBus;
 pub use cd_block::CdBlock;
 pub use memory::{BiosRom, Ram, StubRegisterBank};
-pub use scheduler::{EntityId, SchedEntity, Scheduler, Sh2Entity};
+pub use scheduler::{CdBlockEntity, EntityId, SaturnEntity, SchedEntity, Scheduler, Sh2Entity};
 pub use scu::{DmaRequest, Scu, Source as ScuSource};
 pub use smpc::{Command as SmpcCommand, Smpc};
 pub use system::Saturn;

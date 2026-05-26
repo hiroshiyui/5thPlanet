@@ -172,3 +172,111 @@ impl SchedEntity for Sh2Entity {
         }
     }
 }
+
+// ---- Concrete entity: CD-block periodic-firmware timer. ------------------
+
+/// Schedulable timer that drives the CD-block's periodic firmware
+/// behaviour. The CD-block is not (yet) a CPU — the real SH-1 + CD-ROM
+/// firmware lands in a later milestone — so for now its only time-varying
+/// behaviour is the periodic status report it emits roughly once per frame.
+///
+/// Modelling it as a scheduler entity (rather than a single poke at the
+/// VBlank edge) ticks [`CdBlock::tick`](crate::cd_block::CdBlock::tick) on a
+/// sub-frame granularity, so the report lands at the cycle-exact point
+/// *within* the frame that the reference produces it — which the BIOS's
+/// phase-sensitive CD-firmware liveness poll depends on. The entity itself
+/// owns no CD state: it holds only its tick cadence and reaches the CD-block
+/// through the shared bus context. When the full CD-block arrives, a proper
+/// SH-1 core entity replaces this timer.
+#[derive(Clone, Debug)]
+pub struct CdBlockEntity {
+    /// Global cycle of the next tick.
+    next: u64,
+    /// Cycles between ticks (the sub-frame granularity, e.g. one scanline).
+    interval: u64,
+}
+
+impl CdBlockEntity {
+    /// `interval` is the tick granularity in SH-2 master cycles. Finer
+    /// intervals place the periodic report more precisely within the frame;
+    /// the CD-block's own accumulator carries the remainder, so the report
+    /// cadence is independent of this value (only its phase resolution is).
+    pub fn new(interval: u64) -> Self {
+        Self {
+            next: interval,
+            interval,
+        }
+    }
+}
+
+impl SchedEntity for CdBlockEntity {
+    type Context = crate::SaturnBus;
+
+    fn next_deadline(&self) -> u64 {
+        self.next
+    }
+
+    fn step(&mut self, ctx: &mut Self::Context) {
+        ctx.cd_block.tick(self.interval);
+        self.next += self.interval;
+    }
+}
+
+// ---- Heterogeneous Saturn entity. ----------------------------------------
+
+/// The Saturn scheduler runs a heterogeneous set of entities — today the
+/// two SH-2 cores plus the CD-block periodic timer; as more time-driven
+/// chips land (SCSP M68k, the real CD-block SH-1) they join here. Wrapping
+/// them in one enum keeps [`Scheduler`] a single generic over one entity
+/// type, so the determinism contract (ties broken by insertion order) has
+/// exactly one definition. Dispatch is a thin match.
+///
+/// The `Sh2` variant is far larger than `CdBlock` (it embeds a whole
+/// `sh2::Cpu`), but it's also the hot one — the scheduler steps the CPUs
+/// millions of times per second — and there are only a handful of entities,
+/// so boxing the SH-2 to equalise variant size would add an indirection on
+/// the hottest path to save a few KB. Not worth it; the lint is allowed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum SaturnEntity {
+    Sh2(Sh2Entity),
+    CdBlock(CdBlockEntity),
+}
+
+impl SaturnEntity {
+    /// Borrow the wrapped SH-2 entity. Panics if this entity is not an
+    /// SH-2: callers hold an [`EntityId`] obtained when they added a
+    /// known-SH-2 entity, so the variant is fixed at the call site even
+    /// though the entity `Vec` is heterogeneous.
+    pub fn sh2(&self) -> &Sh2Entity {
+        match self {
+            SaturnEntity::Sh2(e) => e,
+            _ => panic!("scheduler entity is not an SH-2"),
+        }
+    }
+
+    pub fn sh2_mut(&mut self) -> &mut Sh2Entity {
+        match self {
+            SaturnEntity::Sh2(e) => e,
+            _ => panic!("scheduler entity is not an SH-2"),
+        }
+    }
+}
+
+impl SchedEntity for SaturnEntity {
+    type Context = crate::SaturnBus;
+
+    fn next_deadline(&self) -> u64 {
+        match self {
+            SaturnEntity::Sh2(e) => e.next_deadline(),
+            SaturnEntity::CdBlock(e) => e.next_deadline(),
+        }
+    }
+
+    fn step(&mut self, ctx: &mut Self::Context) {
+        match self {
+            SaturnEntity::Sh2(e) => e.step(ctx),
+            SaturnEntity::CdBlock(e) => e.step(ctx),
+        }
+    }
+}

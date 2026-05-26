@@ -50,6 +50,16 @@ const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
 const STAT_PAUSE: u8 = 0x01; // drive ready, disc present, not playing
 const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
 
+/// SH-2 master cycles between periodic status reports. The CD-block
+/// firmware emits one report per periodic interval; with no disc playing
+/// that interval is ~16.67 ms — Yabause's `_periodictiming = 50000` against
+/// a µs×3 clock (50000/3 ≈ 16667 µs), i.e. one 60 Hz frame. At the 28.6 MHz
+/// SH-2 master clock that is ≈476 932 cycles (matching the run loop's
+/// `CYCLES_PER_FRAME`). [`CdBlock::tick`] carries the remainder across
+/// intervals, so the long-run cadence averages exactly this many cycles
+/// per report regardless of the sub-frame tick granularity it's driven at.
+const PERIODIC_CYCLES: u64 = 476_932;
+
 #[derive(Clone, Debug)]
 pub struct CdBlock {
     pub hirq: u16,
@@ -75,6 +85,12 @@ pub struct CdBlock {
     /// the host writes CR1 (begins a command), cleared when it reads CR4
     /// (consumes the response) — matching cs2.c's `_command` flag.
     command_pending: bool,
+
+    /// Free-running accumulator (SH-2 master cycles) toward the next
+    /// periodic report, advanced by [`tick`](Self::tick). Mirrors cs2.c's
+    /// `_periodiccycles`: each interval crossing fires one report and the
+    /// overshoot is carried forward, keeping the average cadence exact.
+    periodic_accum: u64,
 }
 
 impl Default for CdBlock {
@@ -110,6 +126,7 @@ impl CdBlock {
             fad: 150,
             disk_changed: true,
             command_pending: false,
+            periodic_accum: 0,
         }
     }
 
@@ -295,19 +312,42 @@ impl CdBlock {
         }
     }
 
+    /// Advance the CD-block's internal clock by `cycles` SH-2 master cycles,
+    /// emitting one periodic status report for each periodic interval that
+    /// elapses (carrying the overshoot forward — see [`PERIODIC_CYCLES`]).
+    ///
+    /// This mirrors Yabause's `Cs2Exec`, which the reference drives every
+    /// scanline from its main loop and which fires a report when its
+    /// `_periodiccycles` accumulator crosses `_periodictiming`. Driving this
+    /// *sub-frame* — as a scheduler entity ticking on a scanline granularity
+    /// — rather than once at the VBlank edge lands the report at the
+    /// cycle-exact point *within* the frame that the reference produces it.
+    /// The BIOS's CD-firmware liveness poll is phase-sensitive to exactly
+    /// when, inside the frame, CR1..CR4 flip to a live `PERI` status report,
+    /// so the sub-frame phase — not just the once-per-frame cadence — has to
+    /// match for the boot to track the reference.
+    ///
+    /// (Yabause's companion `_statuscycles` drive-status poll, which can flip
+    /// a no-disc/open drive to PAUSE and flag a disc change, is a no-op for
+    /// our always-present dummy disc — status is already PAUSE — so it is not
+    /// modelled here. It returns when the real CD-block / disc swapping does.)
+    pub fn tick(&mut self, cycles: u64) {
+        self.periodic_accum += cycles;
+        while self.periodic_accum >= PERIODIC_CYCLES {
+            self.periodic_accum -= PERIODIC_CYCLES;
+            self.emit_periodic();
+        }
+    }
+
     /// Emit one unsolicited periodic status report: the status gains the
     /// `PERI` flag, CR1..CR4 are refreshed via `doCDReport`, and `HIRQ.SCDQ`
-    /// is raised. The CD-block firmware sends one such report per periodic
-    /// interval (~16.67 ms with no disc / not playing — one per 60 Hz
-    /// frame); the reference (Yabause) drives `Cs2Exec` once per frame and
-    /// fires exactly one report each time. We mirror that by calling this
-    /// once per frame at the VBlank edge, which keeps the report cadence
-    /// frame-locked instead of drifting against an approximate cycle count.
-    /// Suppressed while a command response is still unread so it doesn't
-    /// clobber CR1..CR4. The BIOS watches CR1..CR4 transition from the
-    /// power-on signature to a live status report to confirm the CD-block
-    /// firmware is running.
-    pub fn frame_tick(&mut self) {
+    /// is raised. The BIOS watches CR1..CR4 transition from the power-on
+    /// signature to a live status report to confirm the CD-block firmware is
+    /// running. Suppressed while a command response is still unread so it
+    /// doesn't clobber CR1..CR4 — matching cs2.c, which still decrements its
+    /// periodic accumulator (the cadence keeps ticking) but returns before
+    /// the report when `_command` is set.
+    fn emit_periodic(&mut self) {
         if self.command_pending {
             return;
         }
@@ -379,10 +419,39 @@ mod tests {
     #[test]
     fn periodic_tick_refreshes_cr_with_a_peri_status_report() {
         let mut c = CdBlock::new();
-        c.frame_tick();
+        c.tick(PERIODIC_CYCLES);
         // PERI (0x20) is OR'd into the status byte of CR1; SCDQ is raised.
         assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
         assert_eq!(c.hirq & HIRQ_SCDQ, HIRQ_SCDQ);
+    }
+
+    #[test]
+    fn periodic_report_only_fires_once_the_interval_elapses() {
+        let mut c = CdBlock::new();
+        // A partial interval accumulates but emits nothing yet — the
+        // power-on signature is still in CR1.
+        c.tick(PERIODIC_CYCLES - 1);
+        assert_eq!(c.read16(0x0018), (0 << 8) | b'C' as u16);
+        // One more cycle crosses the interval; the report lands. The
+        // accumulator carries the overshoot forward (cadence stays exact).
+        c.tick(1);
+        assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+    }
+
+    #[test]
+    fn periodic_cadence_is_independent_of_tick_granularity() {
+        // Ticking one interval in many small sub-frame steps fires exactly
+        // one report — the accumulator, not the call count, drives cadence.
+        let mut fine = CdBlock::new();
+        let step = PERIODIC_CYCLES / 263; // ~one scanline
+        let mut acc = 0;
+        while acc < PERIODIC_CYCLES {
+            fine.tick(step);
+            acc += step;
+        }
+        // Exactly one PERI report so far (status byte has PERI, SCDQ set).
+        assert_eq!(fine.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+        assert_eq!(fine.hirq & HIRQ_SCDQ, HIRQ_SCDQ);
     }
 
     #[test]
@@ -393,7 +462,7 @@ mod tests {
         c.write16(0x0018, 0x0000);
         c.write16(0x0024, 0x0000); // execute Get Status → response in CR1..4
         let cr1_after_cmd = c.read16(0x0018);
-        c.frame_tick(); // should be suppressed (CR4 not yet read)
+        c.tick(PERIODIC_CYCLES); // should be suppressed (CR4 not yet read)
         assert_eq!(
             c.read16(0x0018),
             cr1_after_cmd,
@@ -401,7 +470,7 @@ mod tests {
         );
         // Read CR4 (consumes response), then a periodic may land.
         let _ = c.read16(0x0024);
-        c.frame_tick();
+        c.tick(PERIODIC_CYCLES);
         assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
     }
 
