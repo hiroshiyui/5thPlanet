@@ -1,0 +1,14 @@
+[package]
+name = "m68k"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cycle-accurate Motorola MC68EC000 CPU core (Saturn SCSP sound CPU)."
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true
