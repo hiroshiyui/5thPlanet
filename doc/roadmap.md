@@ -353,6 +353,23 @@ value, since MAME's cycle model is not ground truth either. A pragmatic
 alternative is to stop chasing exact MAME-match and instead check whether
 the boot *recovers* and renders the splash despite phase differences.
 
+**3-way back-review (ours ↔ Yabause ↔ MAME).** With MAME the primary
+reference, the originally-Yabause-derived code was cross-reviewed and the
+divergences aligned to MAME (`fix(saturn): align CD-block + SMPC INTBACK to
+MAME`): no-disc CD report returns zero geometry (was FAD-150 disc-present);
+Get TOC sets the TRANS status bit; Get Session Info returns `0x0100/0`
+(was `0xFFFF/0xFFFF`); Get HW Info no longer touches disc-changed; INTBACK
+SF-busy is request-derived (~16 µs status / +700 µs peripheral, was a fixed
+250 µs); INTBACK `OREG10 = 0x34`. Verified consistent (no change needed):
+SMPC command codes, region code `OREG9 = 0x04`, HIRQ init/read, signature
+persistence, status-byte values. The full-system resync advanced
+9.98M → 10.58M with these. **One deferred structural item:** MAME delivers
+INTBACK peripheral data in a *staged continuation* (`intback_continue_request`)
+with SMEM in `OREG12..15` and `OREG31 = 0x10`; we still return peripheral
+data inline in the single status response (enough for the BIOS to read "no
+controller" and proceed). Aligning to MAME's staged protocol is a separate
+follow-up.
+
 ### Verification gates
 
 1. `cargo test --workspace` — all 288 tests green.
