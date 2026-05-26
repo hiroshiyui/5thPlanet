@@ -291,6 +291,37 @@ impl Saturn {
         }
     }
 
+    /// Debug-only: like [`run_for`](Self::run_for), but append the master
+    /// SH-2's PC (skipping delay slots, to match reference traces) to `pcs`
+    /// as the scheduler steps it. Unlike the master-only single-step tracer,
+    /// this runs the *full* scheduler (master + slave + CD-block), so the
+    /// master's interrupt phase reflects the real `run_frame` path — needed
+    /// to diff the `run_frame` boot park against a reference.
+    pub fn run_for_traced(&mut self, cycles: u64, pcs: &mut Vec<u32>) {
+        let master_id = self.master_id;
+        let target = self.now().saturating_add(cycles);
+        while self.now() < target {
+            let now = self.now();
+            let remaining = target - now;
+            let batch = remaining
+                .min(SMPC_POLL_QUANTUM)
+                .min(Self::cycles_to_next_vblank_in(now).max(1));
+            self.scheduler
+                .run_for_traced(batch, &mut self.bus, |entity, id| {
+                    if id == master_id {
+                        let cpu = &entity.sh2().cpu;
+                        if !cpu.next_is_delay_slot() {
+                            pcs.push(cpu.regs.pc);
+                        }
+                    }
+                });
+            self.update_video_timing();
+            self.drain_smpc();
+            self.drain_scu_dma();
+            self.drain_scu_intc();
+        }
+    }
+
     /// Pop any command queued by SMPC and apply its emulator-wide side
     /// effect. Called from `run_for` between scheduler batches.
     fn drain_smpc(&mut self) {

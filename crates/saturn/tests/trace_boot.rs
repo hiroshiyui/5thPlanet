@@ -486,6 +486,38 @@ fn watch_display() {
 }
 
 #[test]
+#[ignore = "manual: full-system master PC trace (scheduler order, with slave) for ref diff"]
+fn gen_fullsystem_pc_trace() {
+    use std::io::Write;
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // Trace the master PC as the *full* scheduler steps it (master + slave +
+    // CD-block interleaved) — the real run_frame path, where the slave
+    // perturbs the master's interrupt phase. Default ~60 NTSC frames.
+    let frames: u64 = std::env::var("PCTRACE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let cycles = frames * 479_151;
+    let mut pcs: Vec<u32> = Vec::with_capacity(20_000_000);
+    sat.run_for_traced(cycles, &mut pcs);
+    let f = std::fs::File::create("/tmp/our_pc.log").expect("create trace");
+    let mut w = std::io::BufWriter::new(f);
+    for pc in &pcs {
+        writeln!(w, "{pc:08X}").unwrap();
+    }
+    w.flush().unwrap();
+    println!(
+        "wrote {} full-system master PCs ({frames} frames) to /tmp/our_pc.log",
+        pcs.len()
+    );
+}
+
+#[test]
 #[ignore = "manual: dump master state at the 0x4216 CMOK-handshake divergence"]
 fn catch_4216() {
     let Some((bios, _)) = load_bios() else {
