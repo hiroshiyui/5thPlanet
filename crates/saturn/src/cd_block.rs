@@ -25,11 +25,12 @@
 //!
 //! On power-on the CD-block presents the ASCII identity `"CDBLOCK"` in
 //! CR1..CR4 (`CR1=0x0043 'C'`, `CR2=0x4442 "DB"`, `CR3=0x4C4F "LO"`,
-//! `CR4=0x434B "CK"`) and `HIRQ=0xFFFF`; the BIOS reads this signature to
-//! detect the subsystem. Thereafter the host drives commands by writing
-//! CR1..CR4 — writing CR4 latches the command (`CR1 >> 8`) and the block
-//! processes it, writing a response back into CR1..CR4 and setting
-//! `HIRQ.CMOK`. With no disc the status is always `NODISC`.
+//! `CR4=0x434B "CK"`) and `HIRQ=0x0000` (all flags clear; MAME's
+//! `hirqreg = 0`); the BIOS reads this signature to detect the subsystem.
+//! Thereafter the host drives commands by writing all four of CR1..CR4 —
+//! the block processes the command (`CR1 >> 8`), writes a response back
+//! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
+//! status is `PAUSE`.
 
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
 pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
@@ -40,8 +41,9 @@ const DATA_FIFO: u32 = 0x8000;
 // HIRQ status bits (cs2.c).
 const HIRQ_CMOK: u16 = 0x0001; // command dispatch OK / ready for next
 const HIRQ_DRDY: u16 = 0x0002; // data transfer ready
+const HIRQ_CSCT: u16 = 0x0004; // finished reading one sector
 const HIRQ_BFUL: u16 = 0x0008; // CD buffer full
-const HIRQ_DCHG: u16 = 0x0020; // disc changed
+const HIRQ_DCHG: u16 = 0x0020; // disc change / tray open
 const HIRQ_ESEL: u16 = 0x0040; // soft-reset / selector settings done
 const HIRQ_EHST: u16 = 0x0080; // host I/O done
 const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
@@ -122,7 +124,11 @@ impl Default for CdBlock {
 impl CdBlock {
     pub fn new() -> Self {
         Self {
-            hirq: 0xFFFF,
+            // Power-on HIRQ is all-clear (MAME's `hirqreg = 0`): CMOK and the
+            // rest are set only by events (commands, periodics). The BIOS
+            // ORs HIRQ into a WRAM accumulator and tests CMOK (bit 0) early
+            // in boot — a spuriously-set CMOK derails it.
+            hirq: 0x0000,
             hirq_mask: 0xFFFF,
             // Power-on identity string "CDBLOCK" — the BIOS reads CR1..CR4
             // to confirm the CD subsystem is present.
@@ -164,18 +170,15 @@ impl CdBlock {
         }
         match Self::slot(offset & 0xFFFF) {
             0x0008 => {
-                // The CD-block recomputes the buffer/disc-state flags
-                // whenever HIRQ is read and latches them (cs2.c). With no
-                // data buffered, BFUL ("buffer full") is always clear.
-                // DCHG ("disc changed") is re-asserted from the drive's
-                // disc-changed state, so a software write-1-to-clear of
-                // DCHG only sticks until the next read — without this the
-                // BIOS's "wait for disc-change to clear" poll exits a frame
-                // early and diverges from the reference.
-                self.hirq &= !HIRQ_BFUL;
-                if self.disk_changed {
-                    self.hirq |= HIRQ_DCHG;
-                }
+                // Recompute the buffer/disc-state flags on read and latch
+                // them, matching MAME's `hirq_r`: DCHG ("disc change / tray
+                // open") is **always cleared**, and BFUL/CSCT are set from
+                // the buffer state — both clear in our no-disc model (no data
+                // buffered, no sector stored). (This replaces the earlier
+                // Yabause-derived DCHG *re-assert*, which is the opposite and
+                // left CMOK/DCHG bits set that derailed the BIOS — see the
+                // MAME reference diff at BIOS 0x4216.)
+                self.hirq &= !(HIRQ_DCHG | HIRQ_BFUL | HIRQ_CSCT);
                 self.hirq
             }
             0x000C => self.hirq_mask,
