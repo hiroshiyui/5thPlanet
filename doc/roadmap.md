@@ -97,18 +97,14 @@ frontend shell.
   full VLIW operation word (ALU + X/Y/D1 data-move buses + multiplier),
   correct ALU op map, MVI/JMP/LPS/BTM with delay slots, END/ENDI, and DMA
   decoded into a queued request (`feat(scu_dsp): complete the DSP core`).
-  2 decoder + 19 opcode tests. **Increment 2 — 🚧 in progress** (SCU host
-  wiring), tasks:
-  1. Own a `Dsp` in the SCU; replace the `dsp_ctrl[8]` storage stub.
-  2. PPAF (0x80) — program control/address: write sets PC + control bits
-     (LEF load-PC, EXF execute-start); read returns `(PC+1) | flags`.
-  3. PPD (0x84) — program-RAM data port: write loads microcode at PC, PC++.
-  4. PDA (0x88) / PDD (0x8C) — data-RAM address + data ports (host RA access,
-     auto-increment).
-  5. Run the DSP from the SCU when EXF is set (drained at the Saturn
-     aggregate so DSP DMA can reach the system bus).
-  6. Execute DSP `DmaRequest`s over the bus; raise the SCU DSP-end interrupt
-     (`Source::DspEnd`) on ENDI. SCU-level integration tests.
+  2 decoder + 19 opcode tests. **Increment 2 — ✅ done** (`feat(saturn): wire
+  the SCU-DSP into the SCU host`): the SCU owns the `Dsp`; the PPAF/PPD/PDA/PDD
+  ports (0x80..0x8C) drive program-load / start (LEF/EXF) / data-RAM access
+  (SCU reads are now `&mut self` for the ports' read side-effects); the Saturn
+  aggregate runs the DSP (`drain_scu_dsp`) and performs its DMA over the system
+  bus (`exec_dsp_dma`), raising `Source::DspEnd` on ENDI. 3 SCU unit + 2
+  end-to-end `run_for` tests (DspEnd interrupt; A/B-bus → data-RAM DMA). **The
+  SCU-DSP is now fully implemented and integrated.**
 - 14 VDP2 unit tests + 6 integration through the bus + 6 renderer unit tests + 3 `Saturn::run_frame` integration
 - 1 BIOS-boot regression test (gated on BIOS presence; asserts against committed golden hash)
 
