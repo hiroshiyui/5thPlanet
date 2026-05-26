@@ -1,23 +1,23 @@
 //! Video Display Processor 1 (VDP1) — Saturn's sprite/polygon engine.
 //!
-//! VDP1 draws textured/gouraud-shaded quads and lines into a frame
-//! buffer that VDP2 then composites as the sprite layer. **M4 stubs
-//! the address space only — there is no plotter.** The renderer for
-//! sprites and polygons is M5. M4 needs just enough that BIOS init
-//! code, which stages a display list and pokes the control registers
-//! during power-on, sees defined storage and a draw-end handshake
-//! instead of open bus.
+//! VDP1 walks a command table in VRAM and rasterises textured sprites,
+//! polygons and lines into a frame buffer that VDP2 then composites as
+//! the sprite layer. The list walker and pixel pipeline live in
+//! [`plotter`]; [`command`] decodes one command-table entry. A `PTMR`
+//! write runs the list synchronously, latching the draw-end status and
+//! flagging the SCU sprite-draw-end interrupt for the aggregate to
+//! forward.
 //!
 //! Memory map (post-`classify` physical addresses):
 //!
 //! ```text
 //!   0x05C0_0000..0x05C7_FFFF   VRAM         (512 KiB — command table + chars)
-//!   0x05C8_0000..0x05CB_FFFF   Frame buffer (256 KiB — visible window)
+//!   0x05C8_0000..0x05CB_FFFF   Frame buffer (256 KiB — 512×256 RGB555)
 //!   0x05D0_0000..0x05D0_0017   Registers    (11 × 16-bit)
 //! ```
 //!
-//! See [`regs`] for the draw-end handshake — the one behaviour beyond
-//! flat storage that this stub models.
+//! Still to come (M5 task #2): gouraud shading, double-buffer swap, and
+//! cycle-accurate draw-end timing.
 
 pub mod command;
 pub mod framebuffer;
@@ -43,6 +43,9 @@ pub struct Vdp1 {
     pub vram: Vram,
     pub fb: Framebuffer,
     pub regs: Vdp1Regs,
+    /// Set when a plot finishes; the Saturn aggregate drains this and
+    /// raises the SCU sprite-draw-end interrupt (drain-at-aggregate).
+    draw_end_pending: bool,
 }
 
 impl Default for Vdp1 {
@@ -57,7 +60,14 @@ impl Vdp1 {
             vram: Vram::new(),
             fb: Framebuffer::new(),
             regs: Vdp1Regs::new(),
+            draw_end_pending: false,
         }
+    }
+
+    /// Pop the pending draw-end notification. The aggregate calls this
+    /// each drain and forwards it to `Scu::raise(SpriteDrawEnd)`.
+    pub fn take_draw_end(&mut self) -> bool {
+        core::mem::take(&mut self.draw_end_pending)
     }
 
     /// True iff `addr` lies in any VDP1-owned address window. Used by
@@ -150,12 +160,37 @@ impl Vdp1 {
     /// draw-end + the SCU sprite-end interrupt are the next increment).
     pub fn process_list(&mut self) {
         let prev_copr = self.regs.read16(0x14);
+        self.erase_framebuffer();
         self.regs.cef_clear();
-        let Vdp1 { vram, fb, regs } = self;
+        let Vdp1 { vram, fb, regs, .. } = self;
         let mut plotter = Plotter::new(&*vram, fb);
         let result = plotter.process_list();
         regs.set_command_addrs(prev_copr, result.copr);
         regs.cef_set();
+        self.draw_end_pending = true;
+    }
+
+    /// Clear the erase region (EWLR..EWRR) to the erase colour (EWDR).
+    ///
+    /// On hardware the erase happens at the frame-buffer swap for the
+    /// buffer about to be drawn. We run a single buffer (swap is a later
+    /// increment), so the equivalent observable behaviour is to clear
+    /// the region right before plotting. EWLR/EWRR carry the rectangle
+    /// (X in 8-pixel units, Y in lines); a zero EWRR — the power-on and
+    /// test default — leaves the buffer untouched.
+    fn erase_framebuffer(&mut self) {
+        let ewdr = self.regs.read16(0x06);
+        let ewlr = self.regs.read16(0x08);
+        let ewrr = self.regs.read16(0x0A);
+        let x1 = ((ewlr >> 9) & 0x3F) as i32 * 8;
+        let y1 = (ewlr & 0x1FF) as i32;
+        let x3 = ((ewrr >> 9) & 0x7F) as i32 * 8;
+        let y3 = (ewrr & 0x1FF) as i32 + 1;
+        for y in y1..y3.min(framebuffer::FB_HEIGHT) {
+            for x in x1..x3.min(framebuffer::FB_STRIDE) {
+                self.fb.set_pixel(x, y, ewdr);
+            }
+        }
     }
 }
 

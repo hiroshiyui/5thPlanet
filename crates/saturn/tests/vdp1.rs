@@ -395,3 +395,49 @@ fn distorted_sprite_maps_a_texture_onto_a_skewed_quad() {
     assert_eq!(v.fb.pixel(30, 25), 0x6318, "inside the distorted quad");
     assert_eq!(v.fb.pixel(5, 5), 0, "outside the quad");
 }
+
+#[test]
+fn erase_clears_the_ewrr_region_to_the_erase_colour() {
+    let mut v = Vdp1::new();
+    // Pre-dirty a pixel that lies inside the erase rectangle.
+    v.fb.set_pixel(5, 5, 0x7FFF);
+    // EWDR = fill colour; EWLR upper-left (0,0); EWRR lower-right such
+    // that end_x = 2*8 = 16, end_y = 7+1 = 8.
+    v.write16(REGS_BASE + 0x06, 0x1234); // EWDR
+    v.write16(REGS_BASE + 0x08, 0x0000); // EWLR (X1=0, Y1=0)
+    v.write16(REGS_BASE + 0x0A, (2 << 9) | 7); // EWRR (X3=2, Y3=7)
+    // Empty list: erase runs, nothing is drawn over it.
+    put(&mut v, 0, END);
+    v.process_list();
+
+    assert_eq!(v.fb.pixel(5, 5), 0x1234, "inside erase region cleared");
+    assert_eq!(v.fb.pixel(15, 7), 0x1234, "far corner of region cleared");
+    assert_eq!(v.fb.pixel(16, 8), 0, "just outside the region untouched");
+}
+
+#[test]
+fn draw_end_flag_pops_once_per_plot() {
+    let mut v = Vdp1::new();
+    put(&mut v, 0, END);
+    assert!(!v.take_draw_end(), "no plot yet");
+    v.process_list();
+    assert!(v.take_draw_end(), "plot finished — draw-end pending");
+    assert!(!v.take_draw_end(), "draw-end is consumed on read");
+}
+
+#[test]
+fn plot_raises_the_scu_sprite_draw_end_interrupt() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    // Stage an (empty) command list and kick the plot through the bus.
+    sat.bus.write32(VRAM_BASE, 0x8000_0000, AccessKind::Data); // END
+    sat.bus.write16(REGS_BASE + 0x04, 0x0002, AccessKind::Data); // PTMR
+    // The aggregate drains the VDP1 draw-end into the SCU here.
+    sat.debug_drain();
+    // SCU IST bit 13 = SpriteDrawEnd (sticky until software clears it).
+    assert_ne!(
+        sat.bus.scu.ist & (1 << 13),
+        0,
+        "VDP1 draw-end must raise the SCU sprite-draw-end source"
+    );
+}

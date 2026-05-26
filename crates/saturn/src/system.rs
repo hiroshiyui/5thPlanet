@@ -216,6 +216,7 @@ impl Saturn {
         self.drain_smpc();
         self.drain_scu_dma();
         self.drain_scu_dsp();
+        self.drain_vdp1();
         self.drain_scu_intc();
     }
 
@@ -322,6 +323,7 @@ impl Saturn {
             self.drain_smpc();
             self.drain_scu_dma();
             self.drain_scu_dsp();
+            self.drain_vdp1();
             self.drain_scu_intc();
         }
     }
@@ -354,6 +356,7 @@ impl Saturn {
             self.drain_smpc();
             self.drain_scu_dma();
             self.drain_scu_dsp();
+            self.drain_vdp1();
             self.drain_scu_intc();
         }
     }
@@ -546,6 +549,16 @@ impl Saturn {
         if self.bus.scu.dsp.end_interrupt_pending {
             self.bus.scu.dsp.end_interrupt_pending = false;
             self.bus.scu.raise(crate::scu::Source::DspEnd);
+        }
+    }
+
+    /// Forward a finished VDP1 plot to the SCU as the sprite-draw-end
+    /// interrupt. The plotter runs synchronously inside the PTMR bus
+    /// write and flags completion; we drain it here (drain-at-aggregate),
+    /// matching how SMPC/SCU side effects are surfaced.
+    fn drain_vdp1(&mut self) {
+        if self.bus.vdp1.take_draw_end() {
+            self.bus.scu.raise(crate::scu::Source::SpriteDrawEnd);
         }
     }
 
