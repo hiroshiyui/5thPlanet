@@ -19,16 +19,24 @@ use crate::smpc::Command as SmpcCommand;
 /// poking SMPC every tick isn't paid 28 million times per second.
 const SMPC_POLL_QUANTUM: u64 = 256;
 
-/// SH-2 master cycles per microsecond (28.6364 MHz). Used to convert
-/// MAME's µs-based SMPC command timings into our cycle clock.
-const CYCLES_PER_US: u64 = 28;
+/// SH-2 master clock (NTSC): 14.318181 MHz crystal × 4 / 2 ≈ 28.6364 MHz.
+const SH2_CLOCK_HZ: u64 = 28_636_360;
 
-/// INTBACK SF-busy time in microseconds, computed from the request like
-/// MAME (`smpc.cpp`): a base 8 µs, +8 if status data is requested
-/// (`IREG0 != 0`), +700 if peripheral data is requested (`IREG1 & 8`). The
-/// BIOS polls SF after issuing INTBACK and only proceeds once it clears, so
-/// the duration must track the request. (Was a fixed ~250 µs, Yabause-style;
-/// MAME computes 16 µs for status-only, ~716 µs with peripheral data.)
+/// Convert microseconds to SH-2 master cycles at the master clock. (Was a
+/// rounded `CYCLES_PER_US = 28`, ~2.2% short; this keeps full precision.)
+fn us_to_cycles(us: u64) -> u64 {
+    us * SH2_CLOCK_HZ / 1_000_000
+}
+
+/// INTBACK SF-busy time in microseconds, computed from the request.
+///
+/// REVIEW(magic): these timings are reference-derived (MAME `smpc.cpp`), NOT
+/// from the SMPC datasheet — base 8 µs, +8 if status requested (`IREG0 != 0`),
+/// +700 if peripheral requested (`IREG1 & 8`). MAME's own source marks the
+/// 700 µs "TODO: is timing correct?", so it's a guess. The BIOS only needs SF
+/// to stay busy long enough that its poll loop sees "busy" at least once; the
+/// exact duration is unverified against hardware. (Was a fixed ~250 µs,
+/// Yabause-style.)
 fn intback_busy_us(ireg0: u8, ireg1: u8) -> u64 {
     let mut us = 8;
     if ireg0 != 0 {
@@ -50,6 +58,11 @@ fn intback_busy_us(ireg0: u8, ireg1: u8) -> u64 {
 /// frame length drifts our interrupts against the reference's by ~2200
 /// cycles/frame — visibly diverging the boot trace after ~20 frames.
 /// (Was 476_932; corrected against MAME's screen `set_raw`.)
+///
+/// REVIEW(magic): the 427×263 dot/line counts come from MAME's `set_raw`,
+/// not directly from a Saturn datasheet, and the implied 59.76 Hz differs
+/// from the nominal NTSC 59.94 Hz. The crystal-derived 64/15 cycles/dot is
+/// solid; the htotal/vtotal are the part to verify against VDP2 docs.
 const CYCLES_PER_FRAME: u64 = 479_151;
 const LINES_PER_FRAME: u64 = 263;
 const ACTIVE_LINES: u64 = 224;
@@ -244,8 +257,13 @@ impl Saturn {
         if vblank {
             tvstat |= 0x0008; // VBLANK
         }
+        // REVIEW(magic): HBLANK as "last ~20% of the scanline" is an
+        // invented approximation, not the real H-blank dot count (the VDP2
+        // H-blank period is a specific number of dots in the 427-dot line).
+        // Harmless unless the BIOS times something off HBLANK; revisit if a
+        // divergence points at TVSTAT.HBLANK.
         if line_cycle * 5 >= CYCLES_PER_LINE * 4 {
-            tvstat |= 0x0004; // HBLANK — approx: last ~20% of each line
+            tvstat |= 0x0004; // HBLANK
         }
         if frame & 1 == 1 {
             tvstat |= 0x0002; // ODD field
@@ -375,7 +393,7 @@ impl Saturn {
                     self.bus.smpc.intback_stage = stage;
                     self.bus.smpc.pmode = ireg0 >> 4;
                     self.bus.smpc.sr = 0x40 | (stage << 5);
-                    let busy = intback_busy_us(ireg0, ireg1) * CYCLES_PER_US;
+                    let busy = us_to_cycles(intback_busy_us(ireg0, ireg1));
                     self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
                     self.bus.scu.raise(crate::scu::Source::Smpc);
                     continue; // do NOT mark_command_done (SF stays busy)
@@ -403,7 +421,7 @@ impl Saturn {
                 self.bus.smpc.sr = 0xC0 | pmode;
                 self.bus.smpc.intback_stage += 1;
             }
-            let busy = 700 * CYCLES_PER_US;
+            let busy = us_to_cycles(700);
             self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
             self.bus.scu.raise(crate::scu::Source::Smpc);
         }
@@ -429,6 +447,10 @@ impl Saturn {
     fn respond_to_intback_status(&mut self) {
         let s = &mut self.bus.smpc;
         s.oreg[0] = 0x80;
+        // REVIEW(magic): OREG1..7 are a fixed, arbitrary (but BCD-valid) RTC
+        // stamp — we model no real-time clock source. The BIOS accepts any
+        // BCD-valid date; the exact value is not meaningful. (A real RTC /
+        // SETTIME persistence would replace this.)
         s.oreg[1] = 0x20; // year hi
         s.oreg[2] = 0x26; // year lo
         s.oreg[3] = 0x05; // weekday 0, month 5
@@ -437,7 +459,13 @@ impl Saturn {
         s.oreg[6] = 0x00; // minute
         s.oreg[7] = 0x00; // second
         s.oreg[8] = 0x00; // cartridge
-        s.oreg[9] = 0x04; // area code (North America)
+        // OREG9 area code 0x04 = North America: this IS meaningful — the BIOS
+        // halts on a region mismatch (verified). Spec-grounded (region table).
+        s.oreg[9] = 0x04;
+        // REVIEW(magic): OREG10 = 0x34 (MSHNMI|SYSRES|SOUNDRES, dot-select 0)
+        // is taken literally from MAME `resolve_intback`. The bit meanings are
+        // spec-defined (SMPC manual), but this exact post-reset value is
+        // unverified vs hardware and had no observed boot effect.
         s.oreg[10] = 0x34; // system status 1
         s.oreg[11] = 0x00; // system status 2
         // OREG12..15 — SMEM backup memory (none stored → 0). MAME copies its

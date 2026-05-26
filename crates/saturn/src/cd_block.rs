@@ -55,15 +55,20 @@ const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
 // 16-bit CR1 status bits that live above the status byte (MAME `CD_STAT_*`).
 const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
-/// SH-2 master cycles between periodic status reports. The CD-block
-/// firmware emits one report per periodic interval; with no disc playing
-/// that interval is ~16.67 ms — Yabause's `_periodictiming = 50000` against
-/// a µs×3 clock (50000/3 ≈ 16667 µs), i.e. one 60 Hz frame. At the 28.6 MHz
-/// SH-2 master clock that is ≈476 932 cycles (matching the run loop's
-/// `CYCLES_PER_FRAME`). [`CdBlock::tick`] carries the remainder across
-/// intervals, so the long-run cadence averages exactly this many cycles
-/// per report regardless of the sub-frame tick granularity it's driven at.
-const PERIODIC_CYCLES: u64 = 476_932;
+/// SH-2 master cycles between periodic CD status reports. The CD-block
+/// firmware emits one report per interval; with no disc playing that interval
+/// is ~16.67 ms (Yabause `_periodictiming = 50000` against its µs×3 clock →
+/// 50000/3 ≈ 16667 µs). At the 28.6364 MHz SH-2 master clock that is
+/// 16667 µs × 28.6364 ≈ 477_273 cycles. [`CdBlock::tick`] carries the
+/// remainder across intervals, so the long-run cadence averages exactly this.
+///
+/// REVIEW(magic): reference-derived, not from a hardware datasheet — the
+/// real CD-block (SH-1) firmware period isn't published, so the ~16.67 ms
+/// comes from Yabause. It's *deliberately independent* of the video frame
+/// (the CD clock is separate); a previous value (476_932) duplicated the old
+/// `system::CYCLES_PER_FRAME` and silently went stale when that was
+/// corrected to 479_151 — don't re-tie it to the frame length.
+const PERIODIC_CYCLES: u64 = 477_273;
 
 #[derive(Clone, Debug)]
 pub struct CdBlock {
@@ -305,6 +310,10 @@ impl CdBlock {
                 // Get hardware info: status, CD/MPEG version, drive rev
                 // (MAME `cmd_get_hw_info`). MAME does *not* touch the
                 // disc-changed state here, so we don't either.
+                // REVIEW(magic): CR2/CR4 (0x0201, 0x0400) are MAME's literal
+                // hardware-info bytes (CD-block version / drive revision),
+                // not from a datasheet. The BIOS doesn't gate boot on them
+                // (it just reads them); revisit if a game checks the revision.
                 self.cr1 = (self.status as u16) << 8;
                 self.cr2 = 0x0201; // MPEG card present / CD version
                 self.cr3 = 0x0000; // MPEG not authenticated
