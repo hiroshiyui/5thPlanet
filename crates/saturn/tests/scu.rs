@@ -96,13 +96,17 @@ fn dma_with_zero_count_does_not_trigger() {
 fn channels_1_and_2_have_independent_state() {
     let mut sat = build();
     // Channel 1 — base 0x20.
-    sat.bus.write32(SCU_BASE + 0x20, 0x0000_0020, AccessKind::Data);
-    sat.bus.write32(SCU_BASE + 0x24, 0x0020_4000, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x20, 0x0000_0020, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x24, 0x0020_4000, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x28, 0x10, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x30, DGO, AccessKind::Data);
     // Channel 2 — base 0x40.
-    sat.bus.write32(SCU_BASE + 0x40, 0x0000_0030, AccessKind::Data);
-    sat.bus.write32(SCU_BASE + 0x44, 0x0020_5000, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x40, 0x0000_0030, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x44, 0x0020_5000, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x48, 0x10, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x50, DGO, AccessKind::Data);
 
@@ -135,9 +139,17 @@ fn ist_is_w1c_via_bus_write() {
     sat.bus.scu.raise(ScuSource::Timer0);
     sat.bus.scu.raise(ScuSource::HBlankIn);
     // Acknowledge only Timer0 via W1C.
-    sat.bus.write32(SCU_BASE + 0xB4, 1 << ScuSource::Timer0.bit(), AccessKind::Data);
+    sat.bus.write32(
+        SCU_BASE + 0xB4,
+        1 << ScuSource::Timer0.bit(),
+        AccessKind::Data,
+    );
     let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
-    assert_eq!(ist, 1 << ScuSource::HBlankIn.bit(), "Timer0 cleared, HBlankIn retained");
+    assert_eq!(
+        ist,
+        1 << ScuSource::HBlankIn.bit(),
+        "Timer0 cleared, HBlankIn retained"
+    );
 }
 
 #[test]
@@ -187,4 +199,54 @@ fn dma_end_propagates_into_master_sh2_intc_as_external_level5() {
          actual = {}",
         sat.master().regs.sr.imask(),
     );
+}
+
+// ---- SCU-DSP host integration (increment 2) ----
+const PPAF: u32 = SCU_BASE + 0x80;
+const PPD: u32 = SCU_BASE + 0x84;
+
+/// Start the DSP at PC 0 via the PPAF control port (LEF loads PC, EXF runs).
+fn dsp_start_at_zero(sat: &mut Saturn) {
+    sat.bus
+        .write32(PPAF, (1 << 15) | (1 << 16), AccessKind::Data);
+}
+
+#[test]
+fn scu_dsp_runs_program_and_raises_dsp_end_interrupt() {
+    let mut sat = build();
+    // Program: just ENDI (stop + raise the program-end interrupt).
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    sat.bus.write32(PPD, endi, AccessKind::Data); // loaded at PC 0
+    dsp_start_at_zero(&mut sat);
+    sat.run_for(512);
+    assert!(sat.bus.scu.dsp.stopped(), "DSP halted at ENDI");
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    assert_ne!(
+        ist & (1 << ScuSource::DspEnd.bit()),
+        0,
+        "ENDI must raise the SCU DSP-end interrupt"
+    );
+}
+
+#[test]
+fn scu_dsp_dma_copies_work_ram_into_data_ram() {
+    let mut sat = build();
+    // Two source words in low work RAM.
+    sat.bus.write32(0x0020_1000, 0x1234_5678, AccessKind::Data);
+    sat.bus.write32(0x0020_1004, 0x9ABC_DEF0, AccessKind::Data);
+    // Microcode: RA0 = source word address; DMA 2 words A/B-bus→data RAM
+    // bank 0 (dir 0, add 4); ENDI.
+    let ra0 = 0x0020_1000u32 >> 2;
+    let mvi_ra0 = (0b10u32 << 30) | (6 << 26) | (ra0 & 0x01FF_FFFF);
+    let dma = (0b11u32 << 30) | (1 << 15) | 2; // add_sel=1(→4 bytes), size=2
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    for w in [mvi_ra0, dma, endi] {
+        sat.bus.write32(PPD, w, AccessKind::Data);
+    }
+    dsp_start_at_zero(&mut sat);
+    sat.run_for(2048);
+    assert_eq!(sat.bus.scu.dsp.data_ram[0][0], 0x1234_5678);
+    assert_eq!(sat.bus.scu.dsp.data_ram[0][1], 0x9ABC_DEF0);
+    // RA0 advanced by 2 words (hold=0 → write-back).
+    assert_eq!(sat.bus.scu.dsp.regs.ra0, ra0 + 2);
 }

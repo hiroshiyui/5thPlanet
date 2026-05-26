@@ -148,8 +148,14 @@ pub struct Scu {
     pub asr1: u32,
     pub aref: u32,
     pub rsel: u32,
-    /// DSP control register window (0x80..0x9C). Plain storage in M3;
-    /// task #17 (`scu_dsp` crate) interprets it.
+    /// The SCU's embedded 32-bit DSP. Host software drives it through the
+    /// PPAF/PPD/PDA/PDD ports at 0x80/0x84/0x88/0x8C; the upper part of the
+    /// 0x80..0x9C window (0x90..0x9C) is plain storage.
+    pub dsp: scu_dsp::Dsp,
+    /// Set when host software starts the DSP (PPAF EXF bit). The Saturn
+    /// aggregate drains this and runs the DSP at the top level, where its
+    /// DMA can reach the system bus (it can't from inside the bus).
+    dsp_run: bool,
     pub dsp_ctrl: [u32; 8],
     /// Sources that have been asserted since the last drain. The
     /// Saturn aggregate's `drain_scu_intc` pops one per call and
@@ -174,12 +180,16 @@ impl Scu {
         Self::default()
     }
 
-    pub fn read32(&self, offset: u32) -> u32 {
+    pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             o if o < 0x60 => self.read_channel(o),
             0x60 => self.dstp,
             0x7C => self.dsta,
-            0x80..=0x9C => self.dsp_ctrl[((offset - 0x80) / 4) as usize],
+            0x80 => self.dsp_ppaf_read(),    // program control / status
+            0x84 => self.dsp.regs.pc as u32, // PPD is write-only; report PC
+            0x88 => self.dsp.regs.ra as u32, // PDA is write-only; report RA
+            0x8C => self.dsp_pdd_read(),     // data-RAM data port (RA auto-inc)
+            0x90..=0x9C => self.dsp_ctrl[((offset - 0x80) / 4) as usize],
             0xA0 => self.t0c,
             0xA4 => self.t1s,
             0xA8 => self.t1md,
@@ -200,7 +210,11 @@ impl Scu {
             o if o < 0x60 => self.write_channel(o, val),
             0x60 => self.dstp = val,
             0x7C => self.dsta = val,
-            0x80..=0x9C => {
+            0x80 => self.dsp_ppaf_write(val), // program control: LEF / EXF
+            0x84 => self.dsp_ppd_write(val),  // program-RAM data port (PC++)
+            0x88 => self.dsp.regs.ra = val as u8, // data-RAM address port
+            0x8C => self.dsp_pdd_write(val),  // data-RAM data port (RA auto-inc)
+            0x90..=0x9C => {
                 self.dsp_ctrl[((offset - 0x80) / 4) as usize] = val;
             }
             0xA0 => self.t0c = val,
@@ -272,12 +286,82 @@ impl Scu {
         }
     }
 
-    pub fn read8(&self, offset: u32) -> u8 {
+    pub fn read8(&mut self, offset: u32) -> u8 {
         let word = self.read32(offset & !3);
         (word >> (8 * (3 - (offset & 3)))) as u8
     }
-    pub fn read16(&self, offset: u32) -> u16 {
+    pub fn read16(&mut self, offset: u32) -> u16 {
         ((self.read8(offset) as u16) << 8) | self.read8(offset + 1) as u16
+    }
+
+    // ---- SCU-DSP host ports (PPAF/PPD/PDA/PDD) ---------------------------
+    // Control-register (PPAF) bit layout per the SCU manual: bits 0..7 = PC,
+    // bit 15 LEF (load PC), 16 EXF (execute), 18 EF (end IRQ), 19 VF, 20 CF,
+    // 21 ZF, 22 SF, 23 T0F (DMA busy).
+
+    /// Pack the DSP flags into the PPAF status bits.
+    fn dsp_flags_bits(&self) -> u32 {
+        let f = &self.dsp.regs.flags;
+        (u32::from(f.exec) << 16)
+            | (u32::from(f.end) << 18)
+            | (u32::from(f.v) << 19)
+            | (u32::from(f.c) << 20)
+            | (u32::from(f.z) << 21)
+            | (u32::from(f.s) << 22)
+            | (u32::from(f.t0) << 23)
+    }
+
+    /// PPAF read: `(PC+1) | flags`. Reading clears the overflow (VF) and
+    /// program-end (EF) flags, matching the hardware's read-to-acknowledge.
+    fn dsp_ppaf_read(&mut self) -> u32 {
+        let v = ((self.dsp.regs.pc as u32).wrapping_add(1) & 0xFF) | self.dsp_flags_bits();
+        self.dsp.regs.flags.v = false;
+        self.dsp.regs.flags.end = false;
+        v
+    }
+
+    /// PPAF write: LEF (bit 15) loads the PC; EXF (bit 16) starts execution
+    /// (the run is performed at the Saturn aggregate). ZF/SF are writable.
+    fn dsp_ppaf_write(&mut self, val: u32) {
+        if val & (1 << 15) != 0 {
+            self.dsp.regs.pc = (val & 0xFF) as u8;
+        }
+        self.dsp.regs.flags.z = val & (1 << 21) != 0;
+        self.dsp.regs.flags.s = val & (1 << 22) != 0;
+        if val & (1 << 16) != 0 {
+            let pc = self.dsp.regs.pc;
+            self.dsp.start(pc);
+            self.dsp_run = true;
+        }
+    }
+
+    /// PPD write: load one microcode word at the current PC, then PC++.
+    fn dsp_ppd_write(&mut self, val: u32) {
+        let pc = self.dsp.regs.pc;
+        self.dsp.program[pc as usize] = val;
+        self.dsp.regs.pc = pc.wrapping_add(1);
+    }
+
+    /// PDD read: read the data-RAM word the RA pointer addresses, then RA++.
+    /// RA is a flat 8-bit index across the four 64-word banks.
+    fn dsp_pdd_read(&mut self) -> u32 {
+        let ra = self.dsp.regs.ra;
+        let v = self.dsp.data_ram[((ra >> 6) & 3) as usize][(ra & 0x3F) as usize];
+        self.dsp.regs.ra = ra.wrapping_add(1);
+        v
+    }
+
+    /// PDD write: write the data-RAM word the RA pointer addresses, then RA++.
+    fn dsp_pdd_write(&mut self, val: u32) {
+        let ra = self.dsp.regs.ra;
+        self.dsp.data_ram[((ra >> 6) & 3) as usize][(ra & 0x3F) as usize] = val;
+        self.dsp.regs.ra = ra.wrapping_add(1);
+    }
+
+    /// Pop the "DSP should run" request set by a PPAF EXF write. The Saturn
+    /// aggregate runs the DSP (so its DMA can reach the system bus).
+    pub fn take_dsp_run(&mut self) -> bool {
+        core::mem::take(&mut self.dsp_run)
     }
     pub fn write8(&mut self, offset: u32, val: u8) {
         let aligned = offset & !3;
@@ -468,12 +552,44 @@ mod tests {
     }
 
     #[test]
-    fn dsp_ctrl_window_round_trips() {
+    fn dsp_ctrl_storage_window_round_trips() {
+        // 0x80..0x8C are the live DSP ports now; 0x90..0x9C is plain storage.
         let mut s = Scu::new();
-        s.write32(0x80, 0xAAAA_BBBB);
+        s.write32(0x90, 0xAAAA_BBBB);
         s.write32(0x9C, 0xCCCC_DDDD);
-        assert_eq!(s.read32(0x80), 0xAAAA_BBBB);
+        assert_eq!(s.read32(0x90), 0xAAAA_BBBB);
         assert_eq!(s.read32(0x9C), 0xCCCC_DDDD);
+    }
+
+    #[test]
+    fn dsp_program_load_and_data_ram_ports_round_trip() {
+        let mut s = Scu::new();
+        // PPD (0x84): load two program words at PC 0/1.
+        s.write32(0x84, 0x1111_1111);
+        s.write32(0x84, 0x2222_2222);
+        assert_eq!(s.dsp.program[0], 0x1111_1111);
+        assert_eq!(s.dsp.program[1], 0x2222_2222);
+        // PDA (0x88) sets RA; PDD (0x8C) writes data RAM with auto-increment.
+        s.write32(0x88, 0x00);
+        s.write32(0x8C, 0xDEAD_0000);
+        s.write32(0x8C, 0xBEEF_0001);
+        assert_eq!(s.dsp.data_ram[0][0], 0xDEAD_0000);
+        assert_eq!(s.dsp.data_ram[0][1], 0xBEEF_0001);
+        // Read them back via PDA/PDD.
+        s.write32(0x88, 0x00);
+        assert_eq!(s.read32(0x8C), 0xDEAD_0000);
+        assert_eq!(s.read32(0x8C), 0xBEEF_0001);
+    }
+
+    #[test]
+    fn dsp_ppaf_start_sets_exec_and_run_request() {
+        let mut s = Scu::new();
+        // LEF (bit15) | EXF (bit16) | PC=0x05 → load PC and start.
+        s.write32(0x80, (1 << 15) | (1 << 16) | 0x05);
+        assert_eq!(s.dsp.regs.pc, 0x05);
+        assert!(s.dsp.regs.flags.exec, "EXF starts the DSP");
+        assert!(s.take_dsp_run(), "PPAF EXF raises the run request");
+        assert!(!s.take_dsp_run(), "run request is one-shot");
     }
 
     #[test]
@@ -504,8 +620,8 @@ mod tests {
     fn take_pending_interrupt_resolves_by_priority() {
         let mut s = Scu::new();
         s.raise(Source::SpriteDrawEnd); // prio 2
-        s.raise(Source::VBlankIn);       // prio 15
-        s.raise(Source::DmaIllegal);     // prio 3
+        s.raise(Source::VBlankIn); // prio 15
+        s.raise(Source::DmaIllegal); // prio 3
         let (src, _) = s.take_pending_interrupt(0).unwrap();
         assert_eq!(src, Source::VBlankIn, "highest priority wins");
         let (src, _) = s.take_pending_interrupt(0).unwrap();
@@ -519,8 +635,14 @@ mod tests {
     fn take_pending_interrupt_honours_sh2_imask() {
         let mut s = Scu::new();
         s.raise(Source::Smpc); // priority 8
-        assert!(s.take_pending_interrupt(8).is_none(), "imask 8 blocks level 8");
-        assert!(s.take_pending_interrupt(7).is_some(), "imask 7 allows level 8");
+        assert!(
+            s.take_pending_interrupt(8).is_none(),
+            "imask 8 blocks level 8"
+        );
+        assert!(
+            s.take_pending_interrupt(7).is_some(),
+            "imask 7 allows level 8"
+        );
     }
 
     #[test]

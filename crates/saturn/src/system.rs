@@ -215,6 +215,7 @@ impl Saturn {
         self.update_video_timing();
         self.drain_smpc();
         self.drain_scu_dma();
+        self.drain_scu_dsp();
         self.drain_scu_intc();
     }
 
@@ -320,6 +321,7 @@ impl Saturn {
             self.update_video_timing();
             self.drain_smpc();
             self.drain_scu_dma();
+            self.drain_scu_dsp();
             self.drain_scu_intc();
         }
     }
@@ -351,6 +353,7 @@ impl Saturn {
             self.update_video_timing();
             self.drain_smpc();
             self.drain_scu_dma();
+            self.drain_scu_dsp();
             self.drain_scu_intc();
         }
     }
@@ -517,6 +520,66 @@ impl Saturn {
                 remaining -= 1;
             }
             self.bus.scu.finish_dma(req.channel, src, dst);
+        }
+    }
+
+    /// Run the SCU-DSP when host software has started it (PPAF EXF). Run at
+    /// the aggregate, not inside the SCU, because the DSP's own DMA moves
+    /// data between its data RAM and the A/B-bus — which only reachable from
+    /// here. Steps to END (bounded), performing each requested DMA, then
+    /// raises the SCU DSP-end interrupt if the program ended with ENDI.
+    fn drain_scu_dsp(&mut self) {
+        if !self.bus.scu.take_dsp_run() {
+            return;
+        }
+        // Cap protects the host from a microcode bug that never reaches END.
+        const DSP_STEP_CAP: u32 = 100_000;
+        let mut steps = 0;
+        while !self.bus.scu.dsp.stopped() && steps < DSP_STEP_CAP {
+            self.bus.scu.dsp.step();
+            if let Some(dma) = self.bus.scu.dsp.take_dma() {
+                self.exec_dsp_dma(dma);
+                self.bus.scu.dsp.regs.flags.t0 = false;
+            }
+            steps += 1;
+        }
+        if self.bus.scu.dsp.end_interrupt_pending {
+            self.bus.scu.dsp.end_interrupt_pending = false;
+            self.bus.scu.raise(crate::scu::Source::DspEnd);
+        }
+    }
+
+    /// Perform a DSP-requested DMA over the system bus. Transfers `size`
+    /// 32-bit words between the DSP data-RAM bank (at its CT pointer) and the
+    /// A/B-bus addressed by RA0 (in) / WA0 (out), incrementing by `add` bytes
+    /// per word; RA0/WA0 are written back unless the request held them.
+    fn exec_dsp_dma(&mut self, dma: scu_dsp::DmaRequest) {
+        let bank = (dma.dsp_bank & 3) as usize;
+        let ct = self.bus.scu.dsp.regs.ct[bank];
+        if dma.from_dsp {
+            let mut dst = self.bus.scu.dsp.regs.wa0 << 2;
+            for i in 0..dma.size {
+                let idx = (ct.wrapping_add(i as u8) & 0x3F) as usize;
+                let word = self.bus.scu.dsp.data_ram[bank][idx];
+                self.bus.write32(dst, word, AccessKind::Dma);
+                dst = dst.wrapping_add(dma.add);
+            }
+            if dma.update_addr {
+                let wa0 = &mut self.bus.scu.dsp.regs.wa0;
+                *wa0 = wa0.wrapping_add(dma.size * (dma.add >> 2));
+            }
+        } else {
+            let mut src = self.bus.scu.dsp.regs.ra0 << 2;
+            for i in 0..dma.size {
+                let (word, _) = self.bus.read32(src, AccessKind::Dma);
+                let idx = (ct.wrapping_add(i as u8) & 0x3F) as usize;
+                self.bus.scu.dsp.data_ram[bank][idx] = word;
+                src = src.wrapping_add(dma.add);
+            }
+            if dma.update_addr {
+                let ra0 = &mut self.bus.scu.dsp.regs.ra0;
+                *ra0 = ra0.wrapping_add(dma.size * (dma.add >> 2));
+            }
         }
     }
 
