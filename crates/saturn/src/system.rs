@@ -25,13 +25,23 @@ const SMPC_POLL_QUANTUM: u64 = 256;
 /// and only proceeds correctly once it clears at the right time.
 const INTBACK_EXEC_CYCLES: u64 = 7150;
 
-/// NTSC raster timing at the 28.6 MHz SH-2 master clock. One 60 Hz
-/// frame is 263 lines; the BIOS polls VDP2 `VCNT`/`TVSTAT` to track the
-/// raster, so these registers must move with the global cycle.
-const CYCLES_PER_FRAME: u64 = 476_932;
+/// NTSC raster timing in SH-2 master-clock cycles, derived to match the
+/// reference (MAME): the SH-2 runs at `MASTER_CLOCK_352/2` and the 320-mode
+/// dot clock at `MASTER_CLOCK_320/8`, with `MASTER_CLOCK_352 = 14.318181 MHz
+/// × 4` and `MASTER_CLOCK_320 = × 3.75`. That makes SH-2 cycles per dot =
+/// `4 × 352/320 = 64/15`, and a 427-dot × 263-line frame =
+/// `427 × 263 × 64/15 ≈ 479_151` cycles (≈59.76 Hz). The BIOS polls VDP2
+/// `VCNT`/`TVSTAT` and takes VBlank-IN off this raster, so an inaccurate
+/// frame length drifts our interrupts against the reference's by ~2200
+/// cycles/frame — visibly diverging the boot trace after ~20 frames.
+/// (Was 476_932; corrected against MAME's screen `set_raw`.)
+const CYCLES_PER_FRAME: u64 = 479_151;
 const LINES_PER_FRAME: u64 = 263;
 const ACTIVE_LINES: u64 = 224;
-const CYCLES_PER_LINE: u64 = CYCLES_PER_FRAME / LINES_PER_FRAME; // ≈1813
+/// Cycles per scanline ≈ 1822. Used only for sub-frame granularity (CD
+/// tick, HBLANK approximation); precise raster edges are computed from
+/// `CYCLES_PER_FRAME` directly to avoid per-line integer-rounding drift.
+const CYCLES_PER_LINE: u64 = CYCLES_PER_FRAME / LINES_PER_FRAME;
 
 /// Sub-frame granularity at which the CD-block periodic-firmware timer
 /// ticks. One scanline matches the reference (Yabause drives `Cs2Exec`
@@ -212,7 +222,9 @@ impl Saturn {
         let line_cycle = frame_cycle % CYCLES_PER_LINE;
 
         let prev = self.bus.vdp2.regs.read16(0x004);
-        let vblank = line >= ACTIVE_LINES;
+        // Use the precise frame-derived edge (matches the `run_for` clamp and
+        // the reference) rather than the rounded per-line `line >= 224`.
+        let vblank = frame_cycle >= Self::VBLANK_IN_CYCLE;
         let mut tvstat = prev & !0x000E; // clear VBLANK | HBLANK | ODD
         if vblank {
             tvstat |= 0x0008; // VBLANK
@@ -237,14 +249,40 @@ impl Saturn {
         }
     }
 
+    /// Within-frame cycle of the active→VBLANK transition (start of line
+    /// [`ACTIVE_LINES`]) — where VBlank-IN is raised. Computed from the frame
+    /// length (not `ACTIVE_LINES * CYCLES_PER_LINE`) so per-line integer
+    /// rounding doesn't shift the edge off the reference's.
+    const VBLANK_IN_CYCLE: u64 = ACTIVE_LINES * CYCLES_PER_FRAME / LINES_PER_FRAME;
+
+    /// Cycles from `now` until the next active→VBLANK edge. `run_for` clamps
+    /// its batch to this so the scheduler stops at the edge and VBlank-IN is
+    /// raised within one instruction of the exact raster cycle (the master
+    /// then takes it at its first instruction boundary past the edge, as on
+    /// hardware) rather than up to a full `SMPC_POLL_QUANTUM` late.
+    fn cycles_to_next_vblank_in(now: u64) -> u64 {
+        let frame_cycle = now % CYCLES_PER_FRAME;
+        if frame_cycle < Self::VBLANK_IN_CYCLE {
+            Self::VBLANK_IN_CYCLE - frame_cycle
+        } else {
+            CYCLES_PER_FRAME - frame_cycle + Self::VBLANK_IN_CYCLE
+        }
+    }
+
     /// Advance global time by at least `cycles` cycles, interleaving
     /// the two CPUs by deadline order and polling SMPC + SCU between
     /// scheduler batches.
     pub fn run_for(&mut self, cycles: u64) {
         let target = self.now().saturating_add(cycles);
         while self.now() < target {
-            let remaining = target - self.now();
-            let batch = remaining.min(SMPC_POLL_QUANTUM);
+            let now = self.now();
+            let remaining = target - now;
+            // Clamp the batch to the next VBlank-IN edge so the interrupt is
+            // raised cycle-exactly (`.max(1)` so a batch is never zero when
+            // sitting exactly on the edge).
+            let batch = remaining
+                .min(SMPC_POLL_QUANTUM)
+                .min(Self::cycles_to_next_vblank_in(now).max(1));
             self.scheduler.run_for(batch, &mut self.bus);
             self.update_video_timing();
             self.drain_smpc();
