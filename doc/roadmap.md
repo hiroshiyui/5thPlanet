@@ -150,7 +150,32 @@ scope tight matches the project's one-chip-at-a-time discipline.
 | 5 | Iterate-to-splash — trace BIOS, fix the next blocker, repeat until splash renders | 🚧 in progress |
 | 6 | Commit splash framebuffer hash as the new golden + visual confirmation via SDL2 | pending |
 
-### Task #5 progress (iterate-to-splash)
+### Task #5 — REFOCUS: the goal is the SEGA splash *visible on screen*
+
+The reference-diff work below (Yabause then MAME) was valuable — it proved
+the SH-2 core/cache/SMPC/SCU/bus correct and fixed many real register/
+protocol bugs — but it drifted into chasing MAME's exact instruction stream
+and cycle phase, which is **not the goal and not ground truth**. Re-centering:
+
+- **Goal:** boot a real BIOS to the SEGA logo, confirmed visually via SDL2.
+- **Where we are:** the master parks at `0x060108BA` spinning on the WRAM
+  flag `[0x060408A4]`, with **VDP2 display off (`TVMD=0`)** — so the screen
+  is black (the current `bios_boot` golden is that black frame). The splash
+  graphics are never loaded because the BIOS never gets past this wait.
+- **The single concrete blocker:** `[0x060408A4]` is armed, on real hardware
+  / the references, from inside an **interrupt-handler path** (VBlank-IN
+  handler `0x06000840` → … → low-BIOS routine `0x2364`). Our VBlank handler
+  *runs* but doesn't reach the code that writes the flag, so the main loop
+  never proceeds to enable the display and draw the logo.
+- **How to attack it (spec-first, not MAME-matching):** our cycle model is
+  spec-correct (see the cycle-timing note below), so the fix is to find the
+  genuine divergence in the *interrupt-handler path* — why our handler takes
+  a different branch and skips the `[0x060408A4]` write — judged against the
+  hardware manuals (SH7604 / VDP2 / SCU / SMPC), using the references only as
+  a hint, never as the authority. Then: display-on → splash renders →
+  task #6 (golden + SDL2 visual confirmation).
+
+--- historical log (reference-diff narrative) ---
 
 This task became a deep BIOS-boot debug. A headless build of the
 **Yabause** reference emulator (kept locally, never committed) was
