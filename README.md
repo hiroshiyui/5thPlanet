@@ -81,15 +81,27 @@ Decision Records in [`doc/adr/`](doc/adr/).
 
 ## Acknowledgements
 
-During early development the open-source
-[Yabause](https://github.com/Yabause/yabause) emulator was leaned on
-heavily as a **reference oracle for verifying system architecture**: a
-patched, headless Yabause was run against the same BIOS and its master
-SH-2 instruction trace diffed against ours, which let us confirm the
-SH-2 core, cache, SMPC, SCU, and bus reproduce known-good behavior
-bit-for-bit and pinpoint boot-sequence bugs down to the exact
-instruction. No Yabause code is included in or derived by this project —
-it served purely as a behavioral reference for cross-checking.
+Two open-source emulators are leaned on as **reference oracles for
+verifying system architecture** — run headless against the same BIOS so
+their master SH-2 instruction traces can be diffed against ours,
+confirming the SH-2 core, cache, SMPC, SCU, and bus reproduce known-good
+behavior bit-for-bit and pinpointing boot-sequence bugs down to the exact
+instruction:
+
+- [Yabause](https://github.com/Yabause/yabause) — the primary reference
+  during early development; a patched, headless build emits the master
+  PC stream for diffing.
+- [MAME](https://github.com/mamedev/mame) — a second, accuracy-focused
+  reference (its Saturn driver models the chips closely, down to a
+  low-level CD-block SH-1). Used both to cross-check the PC trace and to
+  read its Saturn-subsystem logic when a divergence needs a second
+  opinion — e.g. it was MAME that showed a stuck boot was a wrong-path
+  symptom rather than the register mismatch first suspected.
+
+Each is set up as a local, **never-committed** build (gitignored
+`yabref/` and `mameref/`). **No emulator code is included in or derived
+by this project** — they serve purely as behavioral references for
+cross-checking.
 
 ## License
 
