@@ -91,7 +91,16 @@ frontend shell.
 
 - 8 unit + 7 integration tests for SMPC (slave halt-on-reset, SSHON release, SSHOFF re-halt, SF transitions, IREG/OREG round-trip)
 - 8 unit + 8 integration tests for SCU (DMA round-trips, INTC priority resolution, IST W1C semantics, DMA-end raising the right per-channel source, end-to-end DMA → master SH-2 vectors)
-- 6 unit + 13 integration tests for `scu_dsp` (decoder, ALU, MVI, JMP cond+uncond, END/ENDI, runaway-microcode step cap)
+- `scu_dsp` (decoder, ALU, MVI, JMP cond+uncond, END/ENDI, runaway-microcode
+  step cap). **Update (post-M4 coverage pivot):** M3's DSP was a placeholder
+  (ALU-only, partly-invented encoding). Now a complete, spec-correct core —
+  full VLIW operation word (ALU + X/Y/D1 data-move buses + multiplier),
+  correct ALU op map, MVI/JMP/LPS/BTM with delay slots, END/ENDI, and DMA
+  decoded into a queued request (`feat(scu_dsp): complete the DSP core`).
+  2 decoder + 19 opcode tests. **Remaining (increment 2):** wire the four SCU
+  host ports (PPAF/PPD/PDA/PDD) to drive program-load / start / data-RAM
+  access, run the DSP from the SCU, execute its DMA over the system bus, and
+  raise the SCU DSP-end interrupt on ENDI.
 - 14 VDP2 unit tests + 6 integration through the bus + 6 renderer unit tests + 3 `Saturn::run_frame` integration
 - 1 BIOS-boot regression test (gated on BIOS presence; asserts against committed golden hash)
 
