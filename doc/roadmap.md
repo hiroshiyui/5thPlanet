@@ -480,7 +480,7 @@ reference only; the hardware manuals stay authoritative.
 |---|------|--------|
 | 1 | **VDP1 plotter** — command-list walker (END/jump/skip/call/return), local/clip coordinate commands, quad rasteriser (polygon/distorted/scaled/normal sprite + line/polyline), all six colour modes, SPD/mesh/end-code, colour-calc modes, render into the VDP1 framebuffer | ✅ done |
 | 2 | VDP1 finish — framebuffer erase (EWDR/EWLR/EWRR) ✅ + SCU sprite-draw-end interrupt ✅; remaining: gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end timing, VDP2 sprite-layer compositing hook | 🚧 partial |
-| 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU): register file, ~80 instruction families, BCD, exception model, cycle timing; structured like `sh2` | pending |
+| 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU): register file, ~80 instruction families, BCD, exception model, cycle timing; structured like `sh2` | 🚧 foundation landed |
 | 4 | **VDP2 build-out** — NBG1–3, RBG0/1 rotation, per-layer priority compositing, windows, line-scroll, colour calculation, beyond the current NBG0-only renderer | pending |
 
 ### Task #1 — what landed (`cargo test -p saturn --test vdp1` → 15 tests)
@@ -504,6 +504,27 @@ rasterises every primitive into the 512×256 RGB555 frame buffer:
 Deferred to task #2: gouraud shading, frame-buffer erase + double-buffer
 swap, draw-end *timing* + the SCU sprite-end interrupt, and the VDP2
 sprite-layer compositing hook.
+
+### Task #3 — what landed (`cargo test -p m68k` → 21 tests)
+
+A new `m68k` crate scaffolds the MC68EC000 (SCSP sound CPU) the way `sh2`
+is built — `no_std` + alloc, big-endian, host-owned bus returning
+`(value, stall)`. The foundation:
+
+- **Registers** — D0-D7 / A0-A7 with USP↔SSP banking on the S bit, PC, and
+  a named SR (CCR + trace/supervisor/interrupt-mask) packing to the 16-bit
+  word.
+- **Effective addresses** — all twelve 68000 modes, including the
+  brief-format index word and PC-relative forms, resolved while executing.
+- **Instruction core** — reset (SSP/PC from the vector table),
+  MOVE/MOVEA/MOVEQ, ADD/SUB/ADDA/SUBA/ADDQ/SUBQ, CLR/TST, LEA, NOP,
+  BRA/BSR/Bcc, RTS, JMP/JSR, with correct NZVCX flag derivation.
+
+The cycle model counts the 68000's 4-clock bus cycle per word access;
+per-instruction timing tables are a later refinement. Remaining for the
+chip: the logical/immediate/shift/rotate/multiply/BCD groups, DBcc/Scc,
+the exception model (traps, privilege, address error, interrupts), and
+SCSP host wiring.
 
 ## Later milestones (queued)
 
