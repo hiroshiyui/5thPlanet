@@ -36,6 +36,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "m68k"
+version = "0.1.0"
+
+[[package]]
 name = "saturn"
 version = "0.1.0"
 dependencies = [
