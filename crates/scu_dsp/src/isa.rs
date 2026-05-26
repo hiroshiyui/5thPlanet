@@ -1,63 +1,85 @@
 //! Decoded SCU-DSP instruction representation.
 //!
-//! The real DSP word is a VLIW-style 32-bit format with parallel slots
-//! (ALU + bus + multiplier + jump). M3 only implements the *standalone*
-//! op forms that the BIOS init paths and most early test microcode use;
-//! parallel issue is queued for a later refinement.
-//!
-//! Instruction encoding summary (high 2 bits = major class):
+//! The DSP word is a 32-bit format. The top two bits select the class:
 //!
 //! ```text
-//!   00xx xxxx xxxx xxxx xxxx xxxx xxxx xxxx   Operation (ALU + bus + jump)
-//!   10xx xxxx xxxx xxxx xxxx xxxx xxxx xxxx   MVI (move immediate)
-//!   11xx xxxx xxxx xxxx xxxx xxxx xxxx xxxx   Specialized (END, JMP, DMA, etc.)
+//!   00  Operation — VLIW: parallel ALU + X-bus + Y-bus + D1-bus slots
+//!   01  (illegal)
+//!   10  MVI       — move immediate (optionally conditional)
+//!   11  Control   — sub-class in bits 29..28: 00 DMA, 01 JMP, 10 LPS/BTM, 11 END
 //! ```
+//!
+//! The Operation class is genuinely VLIW (up to four data moves issue in one
+//! word, and they interact — e.g. an X-bus `MOV [s],X` feeds the multiplier
+//! whose product a later `MOV MUL,P` reads). Rather than explode that into a
+//! product of sub-fields, [`Op::Operation`] carries the raw word and the
+//! interpreter walks the slots in hardware order. The control ops, which are
+//! single-purpose, are decoded into structured variants.
 
-/// ALU operation selected by an OPN-class instruction. Bits 31..26.
+/// Decoded SCU-DSP instruction class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Op {
+    /// VLIW operation word (class 00): ALU + X/Y/D1 data-move slots. Fields
+    /// are decoded in the interpreter (see `exec_operation`).
+    Operation(u32),
+    /// `MVI #imm,[d]` / `MVI #imm,[d],cond` — move (optionally conditional)
+    /// sign-extended immediate to a destination register / RAM pointer.
+    Mvi(u32),
+    /// DMA between DSP data RAM and the A/B-bus via RA0/WA0.
+    Dma(u32),
+    /// Conditional/unconditional jump to an 8-bit program address.
+    Jmp(u32),
+    /// `LPS` (repeat next) / `BTM` (branch to TOP) loop control.
+    Loop(u32),
+    /// `END` / `ENDI` — stop the DSP (ENDI also raises the DSP-end interrupt).
+    End(u32),
+    /// Class 01: no defined encoding. Treated as a halt-with-no-effect.
+    Illegal(u32),
+}
+
+/// ALU operation selector (operation-word bits 29..26). Encoding per the SCU
+/// manual / MAME `op_alu`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AluOp {
-    /// NOP — no ALU work.
     Nop,
     And,
     Or,
     Xor,
     Add,
     Sub,
-    /// AD2 — `ACH:ACL += P` (multiply-accumulate finalization).
+    /// AD2 — `ALU = PH:PL + ACH:ACL` (the only op that updates the full 48 bits).
     Ad2,
-    /// SR — shift ACL right 1, fill MSB with previous MSB (arithmetic).
+    /// SR — arithmetic shift ACL right 1 (MSB preserved).
     Sr,
-    /// SL — shift ACL left 1, fill LSB with 0.
-    Sl,
-    /// RR — rotate ACL right through C.
+    /// RR — rotate ACL right 1.
     Rr,
-    /// RL — rotate ACL left through C.
+    /// SL — shift ACL left 1.
+    Sl,
+    /// RL — rotate ACL left 1.
     Rl,
+    /// RL8 — rotate ACL left 8.
+    Rl8,
+    /// Unrecognised ALU code (no effect).
+    Unknown,
 }
 
-/// Decoded SCU-DSP instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Op {
-    /// Operation-class instruction with a standalone ALU op. Parallel
-    /// bus / multiplier / jump slots are not yet decoded — they read
-    /// as zero in M3.
-    Operation { alu: AluOp },
-    /// `MVI #imm, dest` — move sign-extended immediate to a register
-    /// or data-RAM pointer. `dest` is a 4-bit destination selector.
-    Mvi { dest: u8, imm: i32 },
-    /// `JMP cond, target` — conditional jump to an 8-bit program-RAM
-    /// address. `cond` is a 4-bit code; 0 = unconditional.
-    Jmp { cond: u8, target: u8 },
-    /// `END` — set the loop-end flag and stop the DSP.
-    End,
-    /// `ENDI` — `END` that also raises a DSP-end interrupt request
-    /// (the SCU INTC source).
-    Endi,
-    /// `NOP` — explicit no-op (distinct from Operation { alu: Nop }
-    /// because some encodings use the dedicated NOP form).
-    Nop,
-    /// Encoding the decoder did not recognise. The interpreter treats
-    /// it as a no-op for now; future revisions will surface it as an
-    /// illegal-instruction event.
-    Unknown(u32),
+impl AluOp {
+    /// Decode the 4-bit ALU field.
+    pub fn from_bits(bits: u32) -> Self {
+        match bits & 0xF {
+            0x0 => AluOp::Nop,
+            0x1 => AluOp::And,
+            0x2 => AluOp::Or,
+            0x3 => AluOp::Xor,
+            0x4 => AluOp::Add,
+            0x5 => AluOp::Sub,
+            0x6 => AluOp::Ad2,
+            0x8 => AluOp::Sr,
+            0x9 => AluOp::Rr,
+            0xA => AluOp::Sl,
+            0xB => AluOp::Rl,
+            0xF => AluOp::Rl8,
+            _ => AluOp::Unknown,
+        }
+    }
 }

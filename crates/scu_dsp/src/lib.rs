@@ -42,6 +42,6 @@ pub mod isa;
 pub mod regs;
 
 pub use decoder::decode;
-pub use interpreter::Dsp;
+pub use interpreter::{DmaRequest, Dsp};
 pub use isa::{AluOp, Op};
 pub use regs::{DATA_RAM_BANKS, DATA_RAM_WORDS_PER_BANK, Flags, PROGRAM_WORDS, Registers};
