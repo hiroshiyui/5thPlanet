@@ -214,35 +214,47 @@ reads the periodic status reports + HIRQ. Fixes:
   buffered) → HIRQ reads `0xFFF7` not `0xFFFF`; `DCHG` is re-asserted from
   the disc-changed flag so a write-1-to-clear only sticks until the next
   read.
-- Periodic reports are **frame-locked** (one per VBlank edge), matching
-  the reference's once-per-frame `Cs2Exec` cadence — the earlier
-  ~16667-*cycle* interval was ~28× too fast (the real interval is ~16.67
-  *ms* = one frame).
 - Get Hardware Info clears the disc-changed flag.
 
-Verified: in steady state our `CR1=0x2100 CR2=0x4101 CR3=0x0100
-CR4=0x0096 HIRQ=0xFFF7` match the reference bit-for-bit. The master now
-tracks the reference to **~20M instructions**.
+Then the periodic report was moved onto **sub-frame scheduler-entity
+timing** (`feat(saturn)`). The first cut frame-locked it to the VBlank
+edge, but the reference doesn't: Yabause drives `Cs2Exec` **every
+scanline** (yabause.c:798) and fires the report when its `_periodiccycles`
+accumulator crosses `_periodictiming` (cs2.c:980) — landing at a
+cycle-exact point *within* the frame, not at VBlank-IN. So `frame_tick`
+became `CdBlock::tick(cycles)`, a free-running accumulator that emits one
+report per `PERIODIC_CYCLES` (~one frame) and carries the remainder
+forward (exact long-run cadence). A new `CdBlockEntity` `SchedEntity` —
+wrapped with the SH-2s in a heterogeneous `SaturnEntity` enum — runs the
+timer at scanline granularity alongside the cores; it owns no CD state and
+reaches the CD-block through the bus. (This also future-proofs the
+scheduler for the real SH-1, which becomes a CPU entity in M6.)
 
-**Next blocker — a timing-phase divergence, not a register mismatch.**
-The master still parks at the high-WRAM VBlank-wait `0x060108BA`
-(spinning on a flag at `0x060408A4`), display disabled (`TVMD=0`). The
-first divergence upstream is a CD-firmware **liveness poll loop** at BIOS
-`0x000025F4..0x0000263C` that polls `HIRQ.DCHG` (via `0x000032DC` →
-`0x000040D6`, which reads HIRQ at `0x2589_0008`). The loop's
-`DCHG`-clear-vs-set outcome diverges by one iteration — but the
-divergence is **unmoved by every CD register/timing change**, i.e. it is
-a frame-precise *timing-phase* difference: when the BIOS's `DCHG`
-write-clears land relative to our coarse per-frame CD-event timing vs the
-reference's cycle-exact CD/SH-2 co-timing. The CD-data path the BIOS runs
-after this loop is what eventually arms the `0x060408A4` frame flag and
-enables the display. Closing it needs cycle-exact CD-block event timing
-(ticking the CD-block on its own scheduler entity at sub-frame
-granularity), not further register-value work.
+Verified: in steady state our `CR1=0x2100 CR2=0x4101 CR3=0x0100
+CR4=0x0096 HIRQ=0xFFF7` match the reference bit-for-bit, now with
+sub-frame report phase.
+
+**Next blocker — the VBlank-IN handler, NOT the CD periodic.** The master
+still parks at the high-WRAM VBlank-wait `0x060108BA`, spinning on a flag
+at `0x060408A4`, display disabled (`TVMD=0`). The sub-frame CD timing
+above was expected to unblock a CD-firmware liveness poll, but the park is
+**unchanged** by it — and a fresh probe shows the real gate clearly: over
+~1M single-steps the **VBlank-IN handler (`0x0600_0840`) does run** (it's
+entered several times, SCU `IST` shows VBlank pending) yet `[0x060408A4]`
+is **never armed**, so the wait loop never releases. The blocker is
+therefore inside the VBlank-IN handler / display-enable path (what
+condition the handler checks before arming the frame flag), not the CD
+periodic. That handler indexes a callback table (`[0x06000960]`); the next
+step is to trace why its `0x060408A4` store is skipped — candidates are an
+unsatisfied SMPC/region check, an INTBACK-phase dependency, or a
+still-missing VDP1/VDP2 status the handler gates on. **A second reference
+(MAME's accuracy-focused Saturn driver) is being added to cross-check this
+path**, since the local Yabause harness binary was lost (only its
+instrumented source survives).
 
 ### Verification gates
 
-1. `cargo test --workspace` — all 285 tests green.
+1. `cargo test --workspace` — all 287 tests green.
 2. `cargo test -p saturn --test smpc` — INTBACK populates OREG with a no-controller / North-America-region response and raises the SMPC interrupt; SF clears only after the execution delay.
 3. `cargo test -p saturn --test bios_boot` — hash matches the splash golden (currently still the all-black baseline).
 4. **Manual M4 exit criterion**: `cargo run -p fifth_planet -- BIOS.bin` shows the SEGA logo. The test suite can't confirm "looks right" — visual confirmation is the gate.
