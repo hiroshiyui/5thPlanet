@@ -54,8 +54,11 @@ fn hirq_write_and_to_clear_then_command_relatches_cmok_via_the_bus() {
     sat.bus.write16(HIRQ, !0x0001u16, AccessKind::Data);
     let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
     assert_eq!(hirq & 1, 0, "CMOK cleared");
-    // Issue a command; CR4 write executes it and re-sets CMOK.
+    // Issue a command; a command requires all four CRs written, and the
+    // CR4 write completes the set, executes, and re-sets CMOK.
     sat.bus.write16(CR1, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
     sat.bus.write16(CR4, 0x0000, AccessKind::Data);
     let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
     assert_eq!(hirq & 1, 1, "command must re-set CMOK");

@@ -82,15 +82,35 @@ pub struct CdBlock {
 
     /// A command's response sits in CR1..CR4 awaiting a host read; periodic
     /// reports are suppressed until then so they don't clobber it. Set when
-    /// the host writes CR1 (begins a command), cleared when it reads CR4
+    /// a command executes (response ready), cleared when the host reads CR4
     /// (consumes the response) — matching cs2.c's `_command` flag.
     command_pending: bool,
+
+    /// Which of CR1..CR4 the host has written since the last command
+    /// dispatch (bit 0 = CR1 … bit 3 = CR4). A command executes only once
+    /// **all four** are written (`0xF`), matching MAME's HLE
+    /// (`cmd_pending == 0xf`). Executing on a lone CR4 write — as we did
+    /// before — falsely processes partial register pokes as commands,
+    /// clobbering the power-on signature the BIOS later checks.
+    cr_written: u8,
 
     /// Free-running accumulator (SH-2 master cycles) toward the next
     /// periodic report, advanced by [`tick`](Self::tick). Mirrors cs2.c's
     /// `_periodiccycles`: each interval crossing fires one report and the
     /// overshoot is carried forward, keeping the average cadence exact.
     periodic_accum: u64,
+
+    /// Set once the host has issued its first command. Until then the
+    /// power-on `"CDBLOCK"` signature is held in CR1..CR4 and **no**
+    /// unsolicited periodic report is emitted — the BIOS reads that
+    /// signature (well into boot, ~frame 19) to confirm the CD-block is
+    /// present, and a periodic clobbering CR1..CR4 first derails it.
+    /// Matches MAME's HLE CD block, whose `sh1_command_cb` only touches
+    /// CR1..CR4 once a full command is queued (`cmd_pending == 0xf`); it
+    /// emits no unsolicited periodics. (This overrides the earlier
+    /// Yabause-derived "periodic from power-on" behaviour, which is what
+    /// broke the signature check — see the MAME reference diff.)
+    host_initialized: bool,
 }
 
 impl Default for CdBlock {
@@ -126,7 +146,9 @@ impl CdBlock {
             fad: 150,
             disk_changed: true,
             command_pending: false,
+            cr_written: 0,
             periodic_accum: 0,
+            host_initialized: false,
         }
     }
 
@@ -181,18 +203,29 @@ impl CdBlock {
             0x000C => self.hirq_mask = val,
             0x0018 => {
                 // Writing CR1 begins a command and ends any periodic
-                // (PERI) reporting state; periodic reports are suppressed
-                // until the host reads the response (CR4).
+                // (PERI) reporting state (matches MAME cr1_w).
                 self.status &= !STAT_PERI;
-                self.command_pending = true;
                 self.cr1 = val;
+                self.cr_written |= 1;
             }
-            0x001C => self.cr2 = val,
-            0x0020 => self.cr3 = val,
+            0x001C => {
+                self.cr2 = val;
+                self.cr_written |= 2;
+            }
+            0x0020 => {
+                self.cr3 = val;
+                self.cr_written |= 4;
+            }
             0x0024 => {
-                // CR4 is the last register written; latch and execute.
+                // CR4 is conventionally the last register written. Only
+                // dispatch once the host has written *all four* CRs
+                // (`cr_written == 0xF`) — a lone CR4 poke is not a command.
                 self.cr4 = val;
-                self.execute();
+                self.cr_written |= 8;
+                if self.cr_written == 0x0F {
+                    self.cr_written = 0;
+                    self.execute();
+                }
             }
             _ => {}
         }
@@ -247,6 +280,12 @@ impl CdBlock {
     /// which is what most CD-block commands return.
     fn execute(&mut self) {
         let command = (self.cr1 >> 8) as u8;
+        // The host has engaged the block; unsolicited periodic reports may
+        // now run (the signature no longer needs holding — see
+        // `host_initialized`). The response that follows sits in CR1..CR4
+        // until the host reads CR4, so guard it from periodic clobbering.
+        self.host_initialized = true;
+        self.command_pending = true;
         // Clear CMOK while "processing" (cs2.c clears it at entry).
         self.hirq &= !HIRQ_CMOK;
 
@@ -348,7 +387,10 @@ impl CdBlock {
     /// periodic accumulator (the cadence keeps ticking) but returns before
     /// the report when `_command` is set.
     fn emit_periodic(&mut self) {
-        if self.command_pending {
+        // Hold the power-on signature until the host has engaged the block
+        // with a command (see `host_initialized`); and never clobber an
+        // unread command response (`command_pending`, cs2.c's `_command`).
+        if !self.host_initialized || self.command_pending {
             return;
         }
         self.status |= STAT_PERI;
@@ -417,8 +459,44 @@ mod tests {
     }
 
     #[test]
-    fn periodic_tick_refreshes_cr_with_a_peri_status_report() {
+    fn signature_held_until_first_command() {
+        // The power-on "CDBLOCK" signature must survive many periodic
+        // intervals — no unsolicited periodic clobbers CR1..CR4 before the
+        // host engages the block (the BIOS reads the signature ~frame 19 to
+        // confirm the CD subsystem; a periodic there derails boot). Matches
+        // MAME's HLE CD block, which emits no unsolicited periodics.
         let mut c = CdBlock::new();
+        for _ in 0..10 {
+            c.tick(PERIODIC_CYCLES);
+        }
+        assert_eq!(c.read16(0x0018), (0 << 8) | b'C' as u16);
+        assert_eq!(c.read16(0x001C), ((b'D' as u16) << 8) | b'B' as u16);
+        assert_eq!(c.read16(0x0020), ((b'L' as u16) << 8) | b'O' as u16);
+        assert_eq!(c.read16(0x0024), ((b'C' as u16) << 8) | b'K' as u16);
+        // Status never gained the PERI flag — no periodic report ran.
+        assert_eq!(
+            c.read16(0x0018) >> 8,
+            0,
+            "CR1 status byte still 0 (no PERI)"
+        );
+    }
+
+    /// Engage the block with a Get Status command and consume the response,
+    /// leaving `host_initialized` set so periodics may run.
+    fn activated() -> CdBlock {
+        let mut c = CdBlock::new();
+        // A command requires all four CRs written (command 0x00 = Get Status).
+        c.write16(0x0018, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000); // CR4 completes the set → execute
+        let _ = c.read16(0x0024); // consume response (clears command_pending)
+        c
+    }
+
+    #[test]
+    fn periodic_fires_after_the_first_command() {
+        let mut c = activated();
         c.tick(PERIODIC_CYCLES);
         // PERI (0x20) is OR'd into the status byte of CR1; SCDQ is raised.
         assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
@@ -427,11 +505,11 @@ mod tests {
 
     #[test]
     fn periodic_report_only_fires_once_the_interval_elapses() {
-        let mut c = CdBlock::new();
-        // A partial interval accumulates but emits nothing yet — the
-        // power-on signature is still in CR1.
+        let mut c = activated();
+        let cr1_cmd = c.read16(0x0018); // command status report (no PERI yet)
+        // A partial interval accumulates but emits nothing yet.
         c.tick(PERIODIC_CYCLES - 1);
-        assert_eq!(c.read16(0x0018), (0 << 8) | b'C' as u16);
+        assert_eq!(c.read16(0x0018), cr1_cmd);
         // One more cycle crosses the interval; the report lands. The
         // accumulator carries the overshoot forward (cadence stays exact).
         c.tick(1);
@@ -442,7 +520,7 @@ mod tests {
     fn periodic_cadence_is_independent_of_tick_granularity() {
         // Ticking one interval in many small sub-frame steps fires exactly
         // one report — the accumulator, not the call count, drives cadence.
-        let mut fine = CdBlock::new();
+        let mut fine = activated();
         let step = PERIODIC_CYCLES / 263; // ~one scanline
         let mut acc = 0;
         while acc < PERIODIC_CYCLES {
@@ -460,6 +538,8 @@ mod tests {
         // Issue a command (CR1 write sets command_pending); the response
         // must not be clobbered by a periodic report until CR4 is read.
         c.write16(0x0018, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000); // execute Get Status → response in CR1..4
         let cr1_after_cmd = c.read16(0x0018);
         c.tick(PERIODIC_CYCLES); // should be suppressed (CR4 not yet read)
@@ -478,7 +558,9 @@ mod tests {
     fn get_hardware_info_reports_drive_revision() {
         let mut c = CdBlock::new();
         c.write16(0x0018, 0x0100); // command 0x01 in high byte
-        c.write16(0x0024, 0x0000); // trigger
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000); // CR4 completes the set → trigger
         assert_eq!(c.read16(0x001C), 0x0201);
         assert_eq!(c.read16(0x0024), 0x0400);
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
@@ -488,7 +570,9 @@ mod tests {
     fn initialize_cd_system_sets_esel_and_cmok() {
         let mut c = CdBlock::new();
         c.write16(0x0018, 0x0400); // command 0x04
-        c.write16(0x0024, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000); // CR4 completes the set
         assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_ESEL), HIRQ_CMOK | HIRQ_ESEL);
     }
 
