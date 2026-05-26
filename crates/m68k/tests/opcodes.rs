@@ -256,3 +256,182 @@ fn nop_only_advances_pc() {
     assert_eq!(cpu.regs.d[0], 0x42);
     assert_eq!(cyc, 4, "NOP is a single prefetch");
 }
+
+// ---- increment 2: logic / immediate / compare / shift / DBcc ----------
+
+#[test]
+fn and_l_register_to_register() {
+    // AND.L D1, D0 (<ea>,Dn) → 1100 000 010 000 001 = 0xC081
+    let (mut cpu, mut bus) = boot(&[0xC081], |c| {
+        c.regs.d[0] = 0xFF00_FF00;
+        c.regs.d[1] = 0x0F0F_0F0F;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0F00_0F00);
+    assert!(!cpu.regs.sr.v && !cpu.regs.sr.c);
+}
+
+#[test]
+fn or_w_to_memory() {
+    // OR.W D0, (A0) → 1000 000 101 010 000 = 0x8150
+    let (mut cpu, mut bus) = boot(&[0x8150], |c| {
+        c.regs.d[0] = 0x0000_0F0F;
+        c.regs.a[0] = 0x3000;
+    });
+    bus.write_word(0x3000, 0xF0F0);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, m68k::AccessKind::Data).0, 0xFFFF);
+}
+
+#[test]
+fn eor_l_data_register() {
+    // EOR.L D0, D1 (Dn,<ea>) → 1011 000 110 000 001 = 0xB181
+    let (mut cpu, mut bus) = boot(&[0xB181], |c| {
+        c.regs.d[0] = 0xFFFF_FFFF;
+        c.regs.d[1] = 0x0F0F_0F0F;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[1], 0xF0F0_F0F0);
+}
+
+#[test]
+fn cmp_w_sets_flags_without_writing() {
+    // CMP.W D1, D0 → 1011 000 001 000 001 = 0xB041 (D0 - D1)
+    let (mut cpu, mut bus) = boot(&[0xB041], |c| {
+        c.regs.d[0] = 0x0000_5000;
+        c.regs.d[1] = 0x0000_5000;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_5000, "CMP does not write");
+    assert!(cpu.regs.sr.z, "equal operands set Z");
+}
+
+#[test]
+fn addi_l_immediate_to_register() {
+    // ADDI.L #0x1000, D0 → 0000 011 0 10 000 000 = 0x0680 + long imm
+    let (mut cpu, mut bus) = boot(&[0x0680, 0x0000, 0x1000], |c| c.regs.d[0] = 0x2345);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_3345);
+}
+
+#[test]
+fn cmpi_w_compares_immediate() {
+    // CMPI.W #0x20, D0 → 0000 110 0 01 000 000 = 0x0C40 + word imm
+    let (mut cpu, mut bus) = boot(&[0x0C40, 0x0020], |c| c.regs.d[0] = 0x0000_0020);
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.z, "0x20 - 0x20 == 0");
+}
+
+#[test]
+fn andi_to_ccr_clears_flags() {
+    // ANDI #0x00, CCR → 0x023C + word imm (low byte = mask)
+    let (mut cpu, mut bus) = boot(&[0x023C, 0x0000], |c| {
+        c.regs.sr.c = true;
+        c.regs.sr.z = true;
+        c.regs.sr.n = true;
+    });
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.c && !cpu.regs.sr.z && !cpu.regs.sr.n);
+}
+
+#[test]
+fn swap_exchanges_register_halves() {
+    // SWAP D0 → 0x4840
+    let (mut cpu, mut bus) = boot(&[0x4840], |c| c.regs.d[0] = 0x1234_5678);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x5678_1234);
+}
+
+#[test]
+fn ext_w_sign_extends_byte() {
+    // EXT.W D0 → 0x4880
+    let (mut cpu, mut bus) = boot(&[0x4880], |c| c.regs.d[0] = 0x0000_0080);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0xFF80, "byte 0x80 → word 0xFF80");
+}
+
+#[test]
+fn neg_l_negates() {
+    // NEG.L D0 → 0100 0100 10 000 000 = 0x4480
+    let (mut cpu, mut bus) = boot(&[0x4480], |c| c.regs.d[0] = 0x0000_0001);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xFFFF_FFFF);
+    assert!(cpu.regs.sr.n && cpu.regs.sr.c);
+}
+
+#[test]
+fn not_w_complements() {
+    // NOT.W D0 → 0100 0110 01 000 000 = 0x4640
+    let (mut cpu, mut bus) = boot(&[0x4640], |c| c.regs.d[0] = 0x1111_0F0F);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x1111_F0F0, "only low word complemented");
+}
+
+#[test]
+fn exg_data_registers() {
+    // EXG D0, D1 → 0xC141
+    let (mut cpu, mut bus) = boot(&[0xC141], |c| {
+        c.regs.d[0] = 0xAAAA;
+        c.regs.d[1] = 0xBBBB;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xBBBB);
+    assert_eq!(cpu.regs.d[1], 0xAAAA);
+}
+
+#[test]
+fn lsl_l_immediate_count_sets_carry() {
+    // LSL.L #1, D0 → 1110 001 1 10 0 01 000 = 0xE388
+    let (mut cpu, mut bus) = boot(&[0xE388], |c| c.regs.d[0] = 0x8000_0000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0000);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "bit shifted out → C and X");
+    assert!(cpu.regs.sr.z);
+}
+
+#[test]
+fn asr_w_keeps_sign() {
+    // ASR.W #1, D0 → 1110 001 0 01 0 00 000 = 0xE240
+    let (mut cpu, mut bus) = boot(&[0xE240], |c| c.regs.d[0] = 0x0000_8000);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs.d[0] & 0xFFFF,
+        0xC000,
+        "arithmetic shift keeps sign"
+    );
+}
+
+#[test]
+fn ror_b_rotates() {
+    // ROR.B #1, D0 → 1110 001 0 00 0 11 000 = 0xE218
+    let (mut cpu, mut bus) = boot(&[0xE218], |c| c.regs.d[0] = 0x0000_0001);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x80, "LSB rotated to MSB");
+    assert!(cpu.regs.sr.c);
+}
+
+#[test]
+fn dbra_loops_until_counter_expires() {
+    // DBRA D0, * (loop to self): DBcc with cond F (false) = DBRA.
+    // 0101 0001 11001 000 = 0x51C8. The displacement is relative to the
+    // extension word at 0x1002, so -2 lands back on the DBRA opcode (0x1000).
+    let (mut cpu, mut bus) = boot(&[0x51C8, 0xFFFE], |c| c.regs.d[0] = 2);
+    // First iteration: 2 → 1, branch taken (counter != -1).
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 1);
+    assert_eq!(cpu.regs.pc, 0x1000, "branched back to the loop top");
+    // Re-run from the top a couple more times.
+    cpu.step(&mut bus); // 1 → 0, branch
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0);
+    cpu.step(&mut bus); // 0 → 0xFFFF, fall through
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0xFFFF);
+    assert_eq!(cpu.regs.pc, 0x1004, "fell through past the DBRA");
+}
+
+#[test]
+fn scc_sets_byte_on_condition() {
+    // SEQ D0 → 0101 0111 11 000 000 = 0x57C0 (cond Eq)
+    let (mut cpu, mut bus) = boot(&[0x57C0], |c| c.regs.sr.z = true);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0xFF, "Scc true → 0xFF");
+}

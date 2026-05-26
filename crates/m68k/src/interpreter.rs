@@ -290,14 +290,19 @@ impl Cpu {
         let start = self.cycles;
         let op = self.fetch16(bus);
         match op >> 12 {
+            0x0 => self.op_immediate(op, bus),
             0x1..=0x3 => self.op_move(op, bus),
             0x4 => self.op_4(op, bus),
-            0x5 => self.op_addq_subq(op, bus),
+            0x5 => self.op_5(op, bus),
             0x6 => self.op_branch(op, bus),
             0x7 => self.op_moveq(op),
+            0x8 => self.op_logic(op, |a, b| a | b, bus),
             0x9 => self.op_addsub(op, false, bus),
+            0xB => self.op_cmp_eor(op, bus),
+            0xC => self.op_and_group(op, bus),
             0xD => self.op_addsub(op, true, bus),
-            _ => { /* unimplemented in increment 1 — treated as a NOP */ }
+            0xE => self.op_shift(op, bus),
+            _ => { /* still unimplemented (multiply/BCD/bit ops) — NOP for now */ }
         }
         (self.cycles - start) as u32
     }
@@ -342,6 +347,53 @@ impl Cpu {
 
         let mode = (op >> 3) & 7;
         let reg = op & 7;
+
+        // SWAP Dn (0x4840|reg): exchange the register halves.
+        if op & 0xFFF8 == 0x4840 {
+            let r = (op & 7) as usize;
+            let v = self.regs.d[r].rotate_left(16);
+            self.regs.d[r] = v;
+            self.set_logic_flags(v, Size::Long);
+            return;
+        }
+        // EXT.W (0x4880|reg): sign-extend byte→word.
+        if op & 0xFFF8 == 0x4880 {
+            let r = (op & 7) as usize;
+            let v = (self.regs.d[r] as u8 as i8 as i16 as u16) as u32;
+            self.regs.d[r] = (self.regs.d[r] & 0xFFFF_0000) | v;
+            self.set_logic_flags(v, Size::Word);
+            return;
+        }
+        // EXT.L (0x48C0|reg): sign-extend word→long.
+        if op & 0xFFF8 == 0x48C0 {
+            let r = (op & 7) as usize;
+            let v = self.regs.d[r] as u16 as i16 as i32 as u32;
+            self.regs.d[r] = v;
+            self.set_logic_flags(v, Size::Long);
+            return;
+        }
+        // MOVE from SR (0x40C0|ea): store the 16-bit SR to the EA.
+        if op & 0xFFC0 == 0x40C0 {
+            let ea = self.resolve_ea(mode, reg, Size::Word, bus);
+            let v = self.regs.sr.to_u16() as u32;
+            self.write_ea(ea, Size::Word, v, bus);
+            return;
+        }
+        // MOVE to CCR (0x44C0|ea): low byte of the word source → CCR.
+        if op & 0xFFC0 == 0x44C0 {
+            let ea = self.resolve_ea(mode, reg, Size::Word, bus);
+            let v = self.read_ea(ea, Size::Word, bus);
+            self.regs.sr.set_ccr((v & 0x1F) as u8);
+            return;
+        }
+        // MOVE to SR (0x46C0|ea): word source → SR (privileged; the
+        // privilege trap arrives with the exception model).
+        if op & 0xFFC0 == 0x46C0 {
+            let ea = self.resolve_ea(mode, reg, Size::Word, bus);
+            let v = self.read_ea(ea, Size::Word, bus);
+            self.write_sr(v as u16);
+            return;
+        }
 
         // LEA An,<ea>: 0100 AAA 111 mmmrrr
         if op & 0x01C0 == 0x01C0 && (op & 0xF000) == 0x4000 && (op >> 6) & 7 == 7 {
@@ -388,6 +440,20 @@ impl Cpu {
                             let v = self.read_ea(ea, size, bus);
                             self.set_logic_flags(v, size);
                         }
+                        0x4 => {
+                            // NEG: 0 - dst
+                            let ea = self.resolve_ea(mode, reg, size, bus);
+                            let d = self.read_ea(ea, size, bus);
+                            let r = self.sub_flags(d, 0, size, true);
+                            self.write_ea(ea, size, r, bus);
+                        }
+                        0x6 => {
+                            // NOT: ones-complement
+                            let ea = self.resolve_ea(mode, reg, size, bus);
+                            let r = (!self.read_ea(ea, size, bus)) & size.mask();
+                            self.write_ea(ea, size, r, bus);
+                            self.set_logic_flags(r, size);
+                        }
                         _ => {}
                     }
                 }
@@ -395,11 +461,44 @@ impl Cpu {
         }
     }
 
-    /// ADDQ/SUBQ #data,<ea> (0101 ddd b ss mmmrrr; b=1 → SUBQ).
-    fn op_addq_subq(&mut self, op: u16, bus: &mut impl Bus) {
-        let Some(size) = Size::from_op_bits(op >> 6) else {
-            return; // ss == 3 → Scc/DBcc, not yet implemented
-        };
+    /// Write the full 16-bit SR, banking A7 on an S-bit change and keeping
+    /// all status fields consistent. Used by MOVE/ANDI/ORI/EORI to SR.
+    fn write_sr(&mut self, nv: u16) {
+        self.regs.set_supervisor(nv & 0x2000 != 0);
+        self.regs.sr.set_ccr((nv & 0x1F) as u8);
+        self.regs.sr.imask = ((nv >> 8) & 7) as u8;
+        self.regs.sr.trace = nv & 0x8000 != 0;
+    }
+
+    /// The 0x5 group: ADDQ/SUBQ when the size field is byte/word/long, or
+    /// Scc/DBcc when it is 0b11.
+    fn op_5(&mut self, op: u16, bus: &mut impl Bus) {
+        if (op >> 6) & 3 == 3 {
+            // DBcc Dn,disp16 = 0101 cccc 11001 rrr ; otherwise Scc <ea>.
+            let cond = Cond::from_bits((op >> 8) & 0xF);
+            if op & 0x00F8 == 0x00C8 {
+                let reg = (op & 7) as usize;
+                let base = self.regs.pc;
+                let disp = self.fetch16(bus) as i16 as i32;
+                if self.cond(cond) {
+                    return; // condition true → loop terminates, no decrement
+                }
+                let counter = (self.regs.d[reg] as u16).wrapping_sub(1);
+                self.regs.d[reg] = (self.regs.d[reg] & 0xFFFF_0000) | counter as u32;
+                if counter != 0xFFFF {
+                    self.regs.pc = base.wrapping_add(disp as u32);
+                }
+            } else {
+                // Scc <ea> — byte set to 0xFF if true, else 0x00.
+                let mode = (op >> 3) & 7;
+                let reg = op & 7;
+                let ea = self.resolve_ea(mode, reg, Size::Byte, bus);
+                let v = if self.cond(cond) { 0xFF } else { 0x00 };
+                self.write_ea(ea, Size::Byte, v, bus);
+            }
+            return;
+        }
+        let size = Size::from_op_bits(op >> 6).expect("size checked above");
         let mut data = ((op >> 9) & 7) as u32;
         if data == 0 {
             data = 8;
@@ -518,6 +617,280 @@ impl Cpu {
                 self.sub_flags(src, dst, size, true)
             };
             self.regs.d[reg] = (dst & !size.mask()) | (res & size.mask());
+        }
+    }
+
+    /// The immediate group (0x0): ORI/ANDI/SUBI/ADDI/EORI/CMPI, plus the
+    /// ORI/ANDI/EORI-to-CCR/SR special forms. Bit-manipulation and MOVEP
+    /// (bit 8 set) are a later increment.
+    fn op_immediate(&mut self, op: u16, bus: &mut impl Bus) {
+        if op & 0x0100 != 0 {
+            return; // BTST/BCHG/BCLR/BSET/MOVEP — not yet
+        }
+        let ttt = (op >> 9) & 7;
+        let Some(size) = Size::from_op_bits(op >> 6) else {
+            return;
+        };
+        let imm = match size {
+            Size::Byte => (self.fetch16(bus) & 0xFF) as u32,
+            Size::Word => self.fetch16(bus) as u32,
+            Size::Long => self.fetch32(bus),
+        };
+        let mode = (op >> 3) & 7;
+        let ea_reg = op & 7;
+
+        // ORI/ANDI/EORI #imm,CCR (byte) or #imm,SR (word): EA slot is the
+        // immediate-mode encoding (mode 7, reg 4).
+        if mode == 7 && ea_reg == 4 {
+            match size {
+                Size::Byte => {
+                    let cur = self.regs.sr.ccr();
+                    let nv = match ttt {
+                        0 => cur | imm as u8,
+                        1 => cur & imm as u8,
+                        5 => cur ^ imm as u8,
+                        _ => return,
+                    };
+                    self.regs.sr.set_ccr(nv);
+                }
+                Size::Word => {
+                    let cur = self.regs.sr.to_u16();
+                    let nv = match ttt {
+                        0 => cur | imm as u16,
+                        1 => cur & imm as u16,
+                        5 => cur ^ imm as u16,
+                        _ => return,
+                    };
+                    self.write_sr(nv);
+                }
+                Size::Long => {}
+            }
+            return;
+        }
+
+        let ea = self.resolve_ea(mode, ea_reg, size, bus);
+        match ttt {
+            0 => {
+                let r = (self.read_ea(ea, size, bus) | imm) & size.mask();
+                self.write_ea(ea, size, r, bus);
+                self.set_logic_flags(r, size);
+            }
+            1 => {
+                let r = (self.read_ea(ea, size, bus) & imm) & size.mask();
+                self.write_ea(ea, size, r, bus);
+                self.set_logic_flags(r, size);
+            }
+            2 => {
+                let d = self.read_ea(ea, size, bus);
+                let r = self.sub_flags(imm, d, size, true);
+                self.write_ea(ea, size, r, bus);
+            }
+            3 => {
+                let d = self.read_ea(ea, size, bus);
+                let r = self.add_flags(imm, d, size);
+                self.write_ea(ea, size, r, bus);
+            }
+            5 => {
+                let r = (self.read_ea(ea, size, bus) ^ imm) & size.mask();
+                self.write_ea(ea, size, r, bus);
+                self.set_logic_flags(r, size);
+            }
+            6 => {
+                let d = self.read_ea(ea, size, bus);
+                self.sub_flags(imm, d, size, false); // CMPI — no write
+            }
+            _ => {}
+        }
+    }
+
+    /// OR/AND register↔EA (`f` is the bitwise op). The opmode's high bit
+    /// selects the direction; opmode 3/7 (MUL/DIV) is not yet implemented.
+    fn op_logic(&mut self, op: u16, f: fn(u32, u32) -> u32, bus: &mut impl Bus) {
+        let reg = ((op >> 9) & 7) as usize;
+        let opmode = (op >> 6) & 7;
+        let mode = (op >> 3) & 7;
+        let ea_reg = op & 7;
+        let Some(size) = Size::from_op_bits(opmode) else {
+            return; // 011/111 → MULU/MULS or DIVU/DIVS
+        };
+        let to_ea = opmode & 0b100 != 0;
+        let ea = self.resolve_ea(mode, ea_reg, size, bus);
+        if to_ea {
+            let dst = self.read_ea(ea, size, bus);
+            let r = f(self.regs.d[reg], dst) & size.mask();
+            self.write_ea(ea, size, r, bus);
+            self.set_logic_flags(r, size);
+        } else {
+            let src = self.read_ea(ea, size, bus);
+            let r = f(src, self.regs.d[reg]) & size.mask();
+            self.regs.d[reg] = (self.regs.d[reg] & !size.mask()) | r;
+            self.set_logic_flags(r, size);
+        }
+    }
+
+    /// The 0xC group: AND, or EXG when the encoding matches. (MULU/MULS and
+    /// ABCD are later increments.)
+    fn op_and_group(&mut self, op: u16, bus: &mut impl Bus) {
+        match op & 0xF1F8 {
+            0xC140 => {
+                let (x, y) = (((op >> 9) & 7) as usize, (op & 7) as usize);
+                self.regs.d.swap(x, y);
+                return;
+            }
+            0xC148 => {
+                let (x, y) = (((op >> 9) & 7) as usize, (op & 7) as usize);
+                self.regs.a.swap(x, y);
+                return;
+            }
+            0xC188 => {
+                let (x, y) = (((op >> 9) & 7) as usize, (op & 7) as usize);
+                core::mem::swap(&mut self.regs.d[x], &mut self.regs.a[y]);
+                return;
+            }
+            _ => {}
+        }
+        self.op_logic(op, |a, b| a & b, bus);
+    }
+
+    /// The 0xB group: CMP <ea>,Dn ; CMPA <ea>,An ; EOR Dn,<ea> ; CMPM.
+    fn op_cmp_eor(&mut self, op: u16, bus: &mut impl Bus) {
+        let reg = ((op >> 9) & 7) as usize;
+        let opmode = (op >> 6) & 7;
+        let mode = (op >> 3) & 7;
+        let ea_reg = op & 7;
+
+        if opmode == 0b011 || opmode == 0b111 {
+            // CMPA — compares the full 32 bits, word source sign-extended.
+            let size = if opmode == 0b011 {
+                Size::Word
+            } else {
+                Size::Long
+            };
+            let ea = self.resolve_ea(mode, ea_reg, size, bus);
+            let src = size.sign_extend(self.read_ea(ea, size, bus)) as u32;
+            self.sub_flags(src, self.regs.a[reg], Size::Long, false);
+            return;
+        }
+
+        let Some(size) = Size::from_op_bits(opmode) else {
+            return;
+        };
+        if opmode & 0b100 != 0 {
+            if mode == 1 {
+                // CMPM (Ay)+,(Ax)+ → compares (Ax)+ - (Ay)+.
+                let s = {
+                    let ea = self.resolve_ea(3, ea_reg, size, bus);
+                    self.read_ea(ea, size, bus)
+                };
+                let d = {
+                    let ea = self.resolve_ea(3, reg as u16, size, bus);
+                    self.read_ea(ea, size, bus)
+                };
+                self.sub_flags(s, d, size, false);
+            } else {
+                // EOR Dn,<ea>
+                let ea = self.resolve_ea(mode, ea_reg, size, bus);
+                let r = (self.read_ea(ea, size, bus) ^ self.regs.d[reg]) & size.mask();
+                self.write_ea(ea, size, r, bus);
+                self.set_logic_flags(r, size);
+            }
+        } else {
+            // CMP <ea>,Dn
+            let ea = self.resolve_ea(mode, ea_reg, size, bus);
+            let src = self.read_ea(ea, size, bus);
+            self.sub_flags(src, self.regs.d[reg], size, false);
+        }
+    }
+
+    /// Shift/rotate group (0xE): the register-target forms. Memory shift-by-1
+    /// is a later increment.
+    fn op_shift(&mut self, op: u16, bus: &mut impl Bus) {
+        let Some(size) = Size::from_op_bits(op >> 6) else {
+            return; // ss == 3 → memory shift, not yet
+        };
+        let reg = (op & 7) as usize;
+        let left = op & 0x0100 != 0;
+        let kind = (op >> 3) & 3; // 0=ASx 1=LSx 2=ROXx 3=ROx
+        let count = if op & 0x0020 != 0 {
+            // register count, mod 64
+            self.regs.d[((op >> 9) & 7) as usize] & 0x3F
+        } else {
+            // immediate count: 0 means 8
+            let c = (op >> 9) & 7;
+            if c == 0 { 8 } else { c as u32 }
+        };
+        let _ = bus;
+
+        let mask = size.mask();
+        let msb = size.msb();
+        let mut val = self.regs.d[reg] & mask;
+        let mut carry = false;
+        let mut overflow = false;
+
+        for _ in 0..count {
+            match (kind, left) {
+                (0, true) | (1, true) => {
+                    // ASL / LSL
+                    carry = val & msb != 0;
+                    let next = (val << 1) & mask;
+                    if kind == 0 && (next & msb != 0) != (val & msb != 0) {
+                        overflow = true;
+                    }
+                    val = next;
+                }
+                (0, false) => {
+                    // ASR — keep the sign bit
+                    carry = val & 1 != 0;
+                    let sign = val & msb;
+                    val = (val >> 1) | sign;
+                }
+                (1, false) => {
+                    // LSR
+                    carry = val & 1 != 0;
+                    val >>= 1;
+                }
+                (3, true) => {
+                    // ROL
+                    carry = val & msb != 0;
+                    val = ((val << 1) | carry as u32) & mask;
+                }
+                (3, false) => {
+                    // ROR
+                    carry = val & 1 != 0;
+                    val = (val >> 1) | (if carry { msb } else { 0 });
+                }
+                (2, true) => {
+                    // ROXL through X
+                    let xin = self.regs.sr.x as u32;
+                    carry = val & msb != 0;
+                    val = ((val << 1) | xin) & mask;
+                    self.regs.sr.x = carry;
+                }
+                (2, false) => {
+                    // ROXR through X
+                    let xin = self.regs.sr.x as u32;
+                    carry = val & 1 != 0;
+                    val = (val >> 1) | (if xin != 0 { msb } else { 0 });
+                    self.regs.sr.x = carry;
+                }
+                _ => {}
+            }
+        }
+
+        self.regs.d[reg] = (self.regs.d[reg] & !mask) | (val & mask);
+        self.regs.sr.n = val & msb != 0;
+        self.regs.sr.z = val & mask == 0;
+        self.regs.sr.v = if kind == 0 { overflow } else { false };
+        // C is the last bit shifted out; a zero-count shift clears C (and for
+        // ASx/LSx/ROx leaves X untouched — ROXx already updated X above).
+        if count == 0 {
+            self.regs.sr.c = false;
+        } else {
+            self.regs.sr.c = carry;
+            if kind != 2 && kind != 3 {
+                // ASx / LSx also load X with the last bit out.
+                self.regs.sr.x = carry;
+            }
         }
     }
 }
