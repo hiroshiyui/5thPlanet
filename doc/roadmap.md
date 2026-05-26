@@ -373,8 +373,31 @@ phases (`OREG0/1 = 0xF0` no-controller, `SR = 0xC0|pmode` then `0x80|pmode`),
 replacing the inline single-shot response. No boot regression (the BIOS path
 is insensitive — divergence still the VBlank phase at 10.58M), but the
 protocol is now correct for controller reads. The CD-block and SMPC
-host-interface fidelity is now aligned to MAME across the board; the only
-open frontier is cycle-exact interrupt timing.
+host-interface fidelity is now aligned to MAME across the board.
+
+**Cycle-timing frontier — investigated; our SH-2 model is spec-correct, so
+we do NOT chase exact MAME-match.** Instruction-rate analysis (gap between
+VBlank-handler entries) shows MAME runs ~436K master instr/frame vs our
+~297K, which initially looked like a systematic over-count. It isn't:
+- Our `BF`/`BT` taken = 3 cycles / not-taken = 1 — exactly the SH7604
+  manual value; MAME uses the same 3/1.
+- The deterministic hot loops match MAME **exactly**: the `DT;BF` delay loop
+  at `0x1D3C` = 3,600,000 iterations in both; the `0x2B0` routine = 523,584
+  in both. Identical counts ⟹ our per-instruction cycle accounting agrees
+  with MAME wherever the path is timing-independent. (MAME's own
+  `BUSY_LOOP_HACKS` is disabled, so it isn't fast-forwarding either.)
+- The only count divergence is in **variable poll loops** (e.g. the `0x42E8`
+  routine, 98,517× ours vs 360,010× MAME) that spin until a polled
+  peripheral/flag state flips. Their count depends on *when* that state
+  changes — accumulated timing **phase**, not a per-instruction cost we got
+  wrong.
+
+Reference emulators are guides, not ground truth: matching MAME's exact
+poll-iteration count would over-fit to MAME's timing approximations and make
+us *less* faithful to the SH-2 spec, not more. The deterministic cycle model
+is correct and stays as-is. Closing the splash from here is a question of
+finding any genuine *spec* deviation (peripheral behavior / interrupt
+delivery vs the hardware manuals), not of bending cycle costs to mirror MAME.
 
 ### Verification gates
 
