@@ -88,18 +88,21 @@ confirming the SH-2 core, cache, SMPC, SCU, and bus reproduce known-good
 behavior bit-for-bit and pinpointing boot-sequence bugs down to the exact
 instruction:
 
-- [Yabause](https://github.com/Yabause/yabause) — the primary reference
-  during early development; a patched, headless build emits the master
-  PC stream for diffing.
-- [MAME](https://github.com/mamedev/mame) — a second, accuracy-focused
-  reference (its Saturn driver models the chips closely, down to a
-  low-level CD-block SH-1). Used both to cross-check the PC trace and to
-  read its Saturn-subsystem logic when a divergence needs a second
-  opinion — e.g. it was MAME that showed a stuck boot was a wrong-path
-  symptom rather than the register mismatch first suspected.
+- [MAME](https://github.com/mamedev/mame) — the **primary** reference.
+  Its Saturn driver is the accuracy-focused one (the chips are modeled
+  closely, down to a low-level CD-block SH-1), so where the two
+  references disagree MAME wins. Used both to diff the master PC trace
+  and to read its Saturn-subsystem logic when a divergence needs a
+  second opinion — e.g. MAME showed a stuck boot was a wrong-path
+  symptom, then that a periodic report was clobbering the CD-block
+  signature the BIOS checks (Yabause's behavior had masked it).
+- [Yabause](https://github.com/Yabause/yabause) — the **secondary**
+  reference; the primary during early development (M1–M3) and still a
+  useful second opinion. A patched, headless build emits the master PC
+  stream for diffing.
 
 Each is set up as a local, **never-committed** build (gitignored
-`yabref/` and `mameref/`). **No emulator code is included in or derived
+`mameref/` and `yabref/`). **No emulator code is included in or derived
 by this project** — they serve purely as behavioral references for
 cross-checking.
 
