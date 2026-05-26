@@ -308,19 +308,37 @@ That advanced the first divergence to BIOS **`0x00003398`**, with matched
 instructions jumping **8.78M → 15.84M** (nearly 2×, through all of CD
 init). The new divergence is a different class: ours takes a **VBlank-IN
 interrupt** (→ handler `0x06000840`) one instruction before MAME does — a
-timing *phase* difference (our `update_video_timing` raises VBlank on
-256-cycle batch boundaries; MAME is cycle-exact), not a control-flow bug.
-PC-trace diffing can't align across an async interrupt landing on a
-different instruction, so this is the practical limit of the trace-diff
-method; closing it needs cycle-exact VBlank timing (raise on the exact
-raster cycle, not the batch edge).
+timing *phase* difference, not a control-flow bug.
 
-**Caveat — drain granularity.** The single-step trace path (drain=256) now
-tracks MAME to ~15.84M instructions, but `run_frame` still parks at
-`0x060108BA`. The two paths differ because the trace drains/raises
-interrupts at different granularity than the scheduler; reconciling them
-(so the park reproduces identically under both) is part of the cycle-exact
-timing work above.
+**Raster timing corrected + cycle-exact VBlank** (see `fix(saturn): correct
+NTSC frame length + cycle-exact VBlank-IN`). Two causes of the VBlank phase
+drift:
+
+- `CYCLES_PER_FRAME` was `476_932`; MAME's screen `set_raw` + clock ratios
+  (SH-2 `MASTER_CLOCK_352/2`, dot clock `MASTER_CLOCK_320/8` → `64/15`
+  cycles/dot) give `427 × 263 × 64/15 = 479_151`. The ~2200-cycle/frame
+  shortfall drifted our VBlank earlier each frame. Corrected; VBlank-IN edge
+  now computed from the frame length (no per-line rounding).
+- `run_for` clamps each batch to the next VBlank-IN edge, raising the
+  interrupt within one instruction of the exact raster cycle.
+
+The first divergence advanced **10.2M → 15.63M** instructions (drain=1), and
+drain=1/drain=256 now agree (~frame 21). **The residual is the
+cycle-accuracy frontier:** still a VBlank landing one instruction off, but
+now from instruction-level **cycle-count differences vs MAME** accumulating
+over ~21 frames — not raster drift. Closing it would mean matching MAME's
+per-instruction SH-2 cycle costs exactly (memory wait states, pipeline
+interlocks), which is deep and of uncertain value (MAME's cycle model is
+not itself ground truth). Diminishing returns from MAME PC-diffing here.
+
+**Caveat — drain granularity / `run_frame` park.** The single-step trace
+(master-only) now tracks MAME to ~15.63M instructions, but `run_frame`
+(full scheduler: master + slave + CD) still parks (now `~0x060108C2`). The
+two paths differ because `run_frame` interleaves the **slave**, perturbing
+the master's interrupt phase. `run_frame` is the real splash path, so the
+next productive target is its park specifically — likely needs a
+full-system (not master-only) trace to diff against MAME, and/or auditing
+slave/scheduler interleave timing — rather than more master-only PC-diffing.
 
 ### Verification gates
 
