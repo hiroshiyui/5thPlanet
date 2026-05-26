@@ -708,7 +708,11 @@ fn dump_cd_state() {
         rd(&mut sat, 0x0589_0020),
         rd(&mut sat, 0x0589_0024),
     );
-    println!("  (Yabause reference: HIRQ=0xFFF7 CR1=0x2100 CR2=0x4101 CR3=0x0100 CR4=0x0096)");
+    // MAME (no CD image): if no command was issued, the "CDBLOCK" signature
+    // is held (CR1=0x0043 CR2=0x4442 CR3=0x4C4F CR4=0x434B, HIRQ=0); after a
+    // command + periodic it's PERI|PAUSE status with zero geometry
+    // (CR1=0x2100 CR2=CR3=CR4=0).
+    println!("  (MAME, no disc: signature held until a command, then 0x2100/0/0/0)");
 }
 
 #[test]

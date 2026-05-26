@@ -48,9 +48,12 @@ const HIRQ_ESEL: u16 = 0x0040; // soft-reset / selector settings done
 const HIRQ_EHST: u16 = 0x0080; // host I/O done
 const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
 
-// CD status codes (cs2.c).
+// CD status codes — high byte of CR1 (cs2.c / MAME `CD_STAT_*`).
 const STAT_PAUSE: u8 = 0x01; // drive ready, disc present, not playing
 const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
+
+// 16-bit CR1 status bits that live above the status byte (MAME `CD_STAT_*`).
+const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
 /// SH-2 master cycles between periodic status reports. The CD-block
 /// firmware emits one report per periodic interval; with no disc playing
@@ -136,20 +139,20 @@ impl CdBlock {
             cr2: ((b'D' as u16) << 8) | b'B' as u16,
             cr3: ((b'L' as u16) << 8) | b'O' as u16,
             cr4: ((b'C' as u16) << 8) | b'K' as u16,
-            // Model a disc present and ready in the tray — what every
-            // emulator's "no CD image" dummy drive reports so BIOS init
-            // proceeds to the splash (Yabause's dummy core returns
-            // "disc present, spinning" → status PAUSE). Real no-disc and
-            // CD-image handling land with the full CD-block in a later
-            // milestone. Report fields match cs2.c's `Cs2Reset` for a
-            // present disc: FAD 150, ctrl/addr 0x41, track 1, index 1.
+            // No CD image present. Status is `PAUSE` (MAME resets `cd_stat`
+            // to PAUSE even with no image), but the disc *geometry* is all
+            // zero: MAME's `cr_standard_return` returns CR2=CR3=CR4=0 when
+            // `!cdrom_image->exists()`. (Yabause's `DummyCD` instead reports
+            // a present disc with FAD 150 / ctrl-addr 0x41 / track 1 — the
+            // earlier model here; MAME is now the primary reference.) Real
+            // disc-image geometry lands with the full CD-block in M6.
             status: STAT_PAUSE,
             options: 0x00,
             repcnt: 0x00,
-            ctrladdr: 0x41,
-            track: 0x01,
-            index: 0x01,
-            fad: 150,
+            ctrladdr: 0x00,
+            track: 0x00,
+            index: 0x00,
+            fad: 0,
             disk_changed: true,
             command_pending: false,
             cr_written: 0,
@@ -299,11 +302,9 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK;
             }
             0x01 => {
-                // Get hardware info: status, CD/MPEG version, drive rev.
-                // Acknowledges the disc-change (cs2.c clears isdiskchanged
-                // here when a disc is present), so DCHG stops being
-                // re-asserted on subsequent HIRQ reads.
-                self.disk_changed = false;
+                // Get hardware info: status, CD/MPEG version, drive rev
+                // (MAME `cmd_get_hw_info`). MAME does *not* touch the
+                // disc-changed state here, so we don't either.
                 self.cr1 = (self.status as u16) << 8;
                 self.cr2 = 0x0201; // MPEG card present / CD version
                 self.cr3 = 0x0000; // MPEG not authenticated
@@ -311,20 +312,25 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK;
             }
             0x02 => {
-                // Get TOC: no disc → empty, but answer so the host moves on.
-                self.cr1 = (self.status as u16) << 8;
+                // Get TOC (MAME `cmd_get_toc`): status becomes TRANS|PAUSE
+                // (we don't track the TRANS status bit separately, so set it
+                // directly in CR1); CR2 = TOC length in words = 102*2 = 0xCC.
+                self.cr1 = STAT_TRANS | ((self.status as u16) << 8);
                 self.cr2 = 0x00CC;
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
                 self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
             }
             0x03 => {
-                // Get session info.
+                // Get session info (MAME `cmd_get_session_info`, no-disc /
+                // total-session case): CR3 = sessions(1) in high byte, CR4 = 0.
+                // (Was 0xFFFF/0xFFFF, Yabause-style — MAME warns CR4 must be
+                // > 1 and < 100 or the BIOS rejects it.)
                 self.status = STAT_PAUSE;
                 self.cr1 = (self.status as u16) << 8;
                 self.cr2 = 0x0000;
-                self.cr3 = 0xFFFF;
-                self.cr4 = 0xFFFF;
+                self.cr3 = 0x0100;
+                self.cr4 = 0x0000;
                 self.hirq |= HIRQ_CMOK;
             }
             0x04 => {
@@ -444,21 +450,21 @@ mod tests {
     }
 
     #[test]
-    fn get_status_command_returns_disc_present_report_and_cmok() {
+    fn get_status_command_returns_no_disc_report_and_cmok() {
         let mut c = CdBlock::new();
         c.hirq = 0;
-        // Command 0x00 (Get Status): write CR1 high byte = 0x00, then CR4.
+        // Command 0x00 (Get Status): write CR1 high byte = 0x00, then CR2-4.
         c.write16(0x0018, 0x0000);
         c.write16(0x001C, 0x0000);
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000); // triggers execute
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
-        // Disc-present PAUSE report (FAD 150, ctrl/addr 0x41, track 1,
-        // index 1): CR1=0x0100, CR2=0x4101, CR3=0x0100, CR4=0x0096.
+        // No-disc PAUSE report (MAME `cr_standard_return`, no image): status
+        // PAUSE in CR1, zero geometry in CR2..CR4.
         assert_eq!(c.read16(0x0018), 0x0100);
-        assert_eq!(c.read16(0x001C), 0x4101);
-        assert_eq!(c.read16(0x0020), 0x0100);
-        assert_eq!(c.read16(0x0024), 0x0096);
+        assert_eq!(c.read16(0x001C), 0x0000);
+        assert_eq!(c.read16(0x0020), 0x0000);
+        assert_eq!(c.read16(0x0024), 0x0000);
     }
 
     #[test]

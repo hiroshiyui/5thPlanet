@@ -19,11 +19,26 @@ use crate::smpc::Command as SmpcCommand;
 /// poking SMPC every tick isn't paid 28 million times per second.
 const SMPC_POLL_QUANTUM: u64 = 256;
 
-/// INTBACK status-command execution time. Hardware (and Yabause) keep
-/// SF busy ~250 µs before the response is ready; at the 28.6 MHz SH-2
-/// master clock that's ≈7150 cycles. The BIOS polls SF in a wait loop
-/// and only proceeds correctly once it clears at the right time.
-const INTBACK_EXEC_CYCLES: u64 = 7150;
+/// SH-2 master cycles per microsecond (28.6364 MHz). Used to convert
+/// MAME's µs-based SMPC command timings into our cycle clock.
+const CYCLES_PER_US: u64 = 28;
+
+/// INTBACK SF-busy time in microseconds, computed from the request like
+/// MAME (`smpc.cpp`): a base 8 µs, +8 if status data is requested
+/// (`IREG0 != 0`), +700 if peripheral data is requested (`IREG1 & 8`). The
+/// BIOS polls SF after issuing INTBACK and only proceeds once it clears, so
+/// the duration must track the request. (Was a fixed ~250 µs, Yabause-style;
+/// MAME computes 16 µs for status-only, ~716 µs with peripheral data.)
+fn intback_busy_us(ireg0: u8, ireg1: u8) -> u64 {
+    let mut us = 8;
+    if ireg0 != 0 {
+        us += 8;
+    }
+    if ireg1 & 0x08 != 0 {
+        us += 700;
+    }
+    us
+}
 
 /// NTSC raster timing in SH-2 master-clock cycles, derived to match the
 /// reference (MAME): the SH-2 runs at `MASTER_CLOCK_352/2` and the 320-mode
@@ -345,15 +360,16 @@ impl Saturn {
                 }
                 SmpcCommand::IntBack => {
                     // Fill OREG and raise the SMPC interrupt now, so the
-                    // response is ready the moment SF drops. But INTBACK
-                    // takes ~250 µs to execute on hardware, so keep SF busy
-                    // until then — `settle_intback` clears it on the exact
-                    // instruction that reads SMPC past the completion cycle.
-                    // Clearing SF immediately makes the BIOS's tight SF-poll
-                    // (0x1D5A..0x1D64) exit too early and derail (Yabause
-                    // reference-diff).
+                    // response is ready the moment SF drops. Keep SF busy for
+                    // the request-dependent execution time (see
+                    // `intback_busy_us`); `settle_intback` clears it on the
+                    // exact instruction that reads SMPC past the completion
+                    // cycle. Clearing SF immediately makes the BIOS's tight
+                    // SF-poll (0x1D5A..0x1D64) exit too early and derail.
                     self.respond_to_intback();
-                    let done_at = self.now().saturating_add(INTBACK_EXEC_CYCLES);
+                    let busy = intback_busy_us(self.bus.smpc.ireg[0], self.bus.smpc.ireg[1])
+                        * CYCLES_PER_US;
+                    let done_at = self.now().saturating_add(busy);
                     self.bus.smpc.intback_complete_at = Some(done_at);
                     continue; // do NOT mark_command_done (SF stays busy)
                 }
@@ -404,11 +420,21 @@ impl Saturn {
         // OREG9 — area code. 0x04 = North America (NTSC), matching the
         // USA BIOS image. Japan = 0x01, Europe PAL = 0x0C.
         s.oreg[9] = 0x04;
-        // OREG10..11 — system status 1 / 2. Nominal: no special state.
-        s.oreg[10] = 0x00;
+        // OREG10 — system status 1 (MAME `resolve_intback`): bit5 MSHNMI,
+        // bit4 SYSRES, bit2 SOUNDRES, bit6 = current VDP2 dot-select (0). That
+        // is 0x34. (Was 0x00.) OREG11 — system status 2 (CDRES), nominal 0.
+        s.oreg[10] = 0x34;
         s.oreg[11] = 0x00;
         // OREG12.. — peripheral data. Report no peripheral in either
         // port via the 0xF0 "port empty" header tag.
+        //
+        // NOTE — divergence from MAME still pending: MAME's INTBACK *status*
+        // response puts the 4 SMEM (backup-memory) bytes in OREG12..15 and
+        // delivers peripheral data in a separate continuation phase
+        // (`intback_continue_request`), with OREG31 = 0x10 (the command echo).
+        // We return peripheral data inline in this single response, which is
+        // enough for the BIOS to see "no controller" and proceed; aligning to
+        // MAME's staged protocol is a larger follow-up.
         s.oreg[12] = 0xF0; // port 1 header: no peripheral
         s.oreg[13] = 0xF0; // port 2 header: no peripheral
         for i in 14..31 {
