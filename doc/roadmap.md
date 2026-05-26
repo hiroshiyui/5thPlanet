@@ -466,6 +466,45 @@ the old frame length, and the rounded `CYCLES_PER_US`. Spec-grounded values
 - CD-ROM image loading + real SH-1 / CD-block firmware — M6
 - Save states — M5+ once the peripheral set stabilises
 
+## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
+
+With the BIOS-boot frontier characterised as an interrupt-phase/cycle
+question rather than a missing-chip question, the next leverage is
+*coverage*: turn the remaining presence-stubs into real chips, in the
+order the user set — **VDP1, then MC68EC000, then VDP2**. Each is a
+self-contained, independently testable unit, same one-chip-at-a-time
+discipline as M1–M3. MAME (`/mameref`) is an encoding/behaviour
+reference only; the hardware manuals stay authoritative.
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | **VDP1 plotter** — command-list walker (END/jump/skip/call/return), local/clip coordinate commands, quad rasteriser (polygon/distorted/scaled/normal sprite + line/polyline), all six colour modes, SPD/mesh/end-code, colour-calc modes, render into the VDP1 framebuffer | ✅ done |
+| 2 | VDP1 finish — gouraud shading, framebuffer erase (EWDR/EWLR/EWRR) + double-buffer swap (FBCR), draw-end timing + SCU sprite-draw-end interrupt, VDP2 sprite-layer compositing hook | pending |
+| 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU): register file, ~80 instruction families, BCD, exception model, cycle timing; structured like `sh2` | pending |
+| 4 | **VDP2 build-out** — NBG1–3, RBG0/1 rotation, per-layer priority compositing, windows, line-scroll, colour calculation, beyond the current NBG0-only renderer | pending |
+
+### Task #1 — what landed (`cargo test -p saturn --test vdp1` → 15 tests)
+
+`crates/saturn/src/vdp1/{command,plotter}.rs` turn the address-space
+stub into a real plotter. `Command` decodes a 32-byte command-table
+entry; `Plotter` walks the list (END / jump / skip / call+return) and
+rasterises every primitive into the 512×256 RGB555 frame buffer:
+
+- **Geometry** — one textured-quad rasteriser (forward-differenced edge
+  walk, 16.16 fixed point) backs polygons, distorted/scaled sprites,
+  lines and polylines; normal sprites use a direct blit loop. Local
+  coordinates (0xA) and system/user clipping (0x9/0x8) are honoured.
+- **Pixel pipeline** — all six CMDPMOD colour modes (4bpp bank/LUT,
+  8bpp 64/128/256-colour banks, 16bpp RGB), the no-transparency poly
+  writer, SPD, MESH, end-code, and the replace / shadow / half-luminance
+  / half-transparent colour-calc modes.
+- **Trigger** — a `PTMR` write runs the list synchronously and latches
+  `EDSR.CEF` + `COPR`, replacing the old register-only handshake.
+
+Deferred to task #2: gouraud shading, frame-buffer erase + double-buffer
+swap, draw-end *timing* + the SCU sprite-end interrupt, and the VDP2
+sprite-layer compositing hook.
+
 ## Later milestones (queued)
 
 - **M5** — VDP1 sprite/polygon engine, SCSP + M68k + SDL2 audio, SDL2 keyboard mapping via SMPC peripheral data, save states.
