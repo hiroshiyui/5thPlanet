@@ -135,24 +135,27 @@ buffer:
   aggregate). **Remaining (task #2):** gouraud, double-buffer swap, draw-end timing,
   VDP2 sprite-layer compositing.
 
-### Task #3 — MC68EC000 (`cargo test -p m68k` → 38 tests)
+### Task #3 — MC68EC000 (`cargo test -p m68k` → 64 tests)
 
 A new `m68k` crate, structured like `sh2` (`no_std` + alloc, big-endian,
-host-owned bus returning `(value, stall)`):
+host-owned bus returning `(value, stall)`). The CPU is now essentially
+complete for user-mode code plus the interrupt model SCSP needs:
 
 - **Registers** — D0-D7 / A0-A7 with USP↔SSP banking on the S bit, PC, named SR.
-- **Effective addresses** — all twelve modes (incl. brief-format index + PC-relative),
-  resolved while executing.
-- **Instructions** — reset; MOVE/MOVEA/MOVEQ; ADD/SUB/ADDA/SUBA/ADDQ/SUBQ;
-  AND/OR/EOR/EXG; CMP/CMPA/CMPM; the immediate group (ADDI/SUBI/ANDI/ORI/EORI/CMPI
-  + the -to-CCR/SR forms); CLR/TST/NEG/NOT/EXT/SWAP; MOVE to/from CCR/SR;
-  shift/rotate (ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR, register target); BRA/BSR/Bcc,
-  DBcc/Scc, RTS, JMP/JSR — all with correct NZVCX flags.
+- **Effective addresses** — all twelve modes (incl. brief-format index + PC-relative).
+- **Instructions** — MOVE/MOVEA/MOVEQ; the ADD/SUB/AND/OR/EOR/CMP families with
+  immediate/quick/address/extend (ADDX/SUBX) forms; MULU/MULS, DIVU/DIVS;
+  ABCD/SBCD/NBCD; NEG/NEGX/NOT/CLR/TST/TAS; bit ops (BTST/BCHG/BCLR/BSET, static
+  + dynamic); EXT/SWAP/EXG; shifts/rotates; MOVEM, LINK/UNLK; BRA/BSR/Bcc/DBcc/Scc,
+  RTS, JMP/JSR; MOVE to/from CCR/SR — all with correct NZVCX flags.
+- **Exceptions** — TRAP/TRAPV/CHK, zero-divide, illegal + line-A/F, privilege
+  violation, STOP/RESET/RTE/RTR, and external-interrupt dispatch (autovector,
+  `SR.imask`-gated, level-7 NMI). `raise_interrupt()` is the host's entry point.
 
 Cycle model counts the 68000's 4-clock bus cycle per word; per-instruction timing
-tables are a later refinement. **Remaining:** MULU/MULS, DIVU/DIVS, ABCD/SBCD/NBCD,
-bit ops (BTST/BCHG/BCLR/BSET), MOVEM/MOVEP, LINK/UNLK, memory shifts, the exception
-model (TRAP, privilege, address error, interrupts), and SCSP host wiring.
+tables are a later refinement. **Remaining:** MOVEP, memory shift-by-1,
+address/bus-error frames, and the **SCSP host wiring** (the SCSP crate that maps
+the 68k into sound RAM + control registers and drives it from the scheduler).
 
 ### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 31 tests)
 
