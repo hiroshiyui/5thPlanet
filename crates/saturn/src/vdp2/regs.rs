@@ -358,6 +358,16 @@ impl Vdp2Regs {
         let addr = (((self.read16(hi) & 0x7) as u32) << 16) | self.read16(lo) as u32;
         addr << 1
     }
+    /// Vertical-cell-scroll enable for NBG`n` (SCRCTL N0VCSC/N1VCSC).
+    pub fn nbg_vcell_scroll(&self, n: usize) -> bool {
+        self.scrctl_bits(n) & 0x01 != 0
+    }
+    /// Byte address in VDP2 VRAM of the (shared) vertical-cell-scroll table
+    /// (VCSTAU/VCSTAL at 0x09C/0x09E), word-addressed.
+    pub fn vcell_scroll_table(&self) -> u32 {
+        let addr = (((self.read16(0x09C) & 0x7) as u32) << 16) | self.read16(0x09E) as u32;
+        addr << 1
+    }
 
     // ---- Sprite-layer (VDP1 framebuffer) control ----
     //

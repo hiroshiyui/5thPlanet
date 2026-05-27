@@ -19,9 +19,9 @@
 //!   RGB555 (modes 0/1) or true RGB888 (modes 2/3).
 //! - **Backdrop** = CRAM index 0 (the real BKTAU/BKTAL backdrop register is
 //!   a later refinement; palette entry 0 is what splash software programs).
-//! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll for
-//!   NBG0/NBG1 (SCRCTL/LSTAn — integer H/V, LSS interval); fractional scroll
-//!   and line zoom are ignored.
+//! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll and
+//!   per-column vertical cell scroll for NBG0/NBG1 (SCRCTL/LSTAn/VCSTA —
+//!   integer H/V, LSS interval); fractional scroll and line zoom are ignored.
 //! - **NTSC low-res** (320×224).
 //!
 //! The **VDP1 sprite layer** is composited too: VDP2 reads the VDP1 frame
@@ -52,7 +52,7 @@
 //!
 //! Deferred to later increments: the line-coefficient table (per-line scaling)
 //! and dual-parameter window selection, the sprite window plane, and
-//! vertical-cell-scroll / line-zoom.
+//! line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -308,14 +308,40 @@ fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32) {
     (dx, dy)
 }
 
+/// Per-column vertical cell-scroll offset (signed) for NBG0/NBG1 at screen
+/// column `x/8`, read from the shared VCSTA table. When both NBG0 and NBG1 use
+/// it the table interleaves their longwords (NBG0 even, NBG1 odd); the value
+/// is an 11-bit signed scroll in bits 26..16.
+fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
+    let both = vdp2.regs.nbg_vcell_scroll(0) && vdp2.regs.nbg_vcell_scroll(1);
+    let (mult, off) = if both {
+        (2, if n == 1 { 1 } else { 0 })
+    } else {
+        (1, 0)
+    };
+    let col = x / 8;
+    let addr = vdp2.regs.vcell_scroll_table() + (col * mult + off) * 4;
+    let raw = (vdp2.vram.read32(addr) >> 16) & 0x07FF;
+    // Sign-extend the 11-bit value.
+    if raw & 0x0400 != 0 {
+        (raw | 0xFFFF_F800) as i32
+    } else {
+        raw as i32
+    }
+}
+
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
 fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
     let (mut scroll_x, mut scroll_y) = vdp2.regs.nbg_scroll(n);
-    // NBG0/NBG1 support per-line scroll on top of the whole-layer scroll.
+    // NBG0/NBG1 support per-line scroll and per-column vertical cell scroll on
+    // top of the whole-layer scroll.
     if n < 2 {
         let (dx, dy) = line_scroll(vdp2, n, y);
         scroll_x += dx;
         scroll_y += dy;
+        if vdp2.regs.nbg_vcell_scroll(n) {
+            scroll_y = scroll_y.wrapping_add(vcell_scroll(vdp2, n, x) as u32);
+        }
     }
     let depth = vdp2.regs.nbg_color_mode(n);
     let sx = x + scroll_x;
@@ -1277,6 +1303,29 @@ mod tests {
         assert_eq!(pixel(&buf, 0, 2), [0xFF, 0, 0, 0xFF], "line 2 scrolled");
         // Line 0 has no scroll, so screen (0,0) samples the empty (0,0).
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "line 0 unscrolled");
+    }
+
+    #[test]
+    fn nbg0_vertical_cell_scroll_shifts_a_column() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x09A, 0x0001); // SCRCTL.N0VCSC
+        v.regs.write16(0x09E, 0x0200); // VCSTAL → table at byte 0x400
+        // Column 0 (x 0..7): vertical scroll +3 (bits 26..16).
+        v.vram.write32(0x400, 3 << 16);
+        v.cram.write16(2, 0x001F); // index 1 = red
+        v.vram.write8(3 * 512, 1); // bitmap dot at (0, 3)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Column 0 scrolls +3, so screen (0,0) samples bitmap (0,3) → red.
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "column 0 scrolled +3"
+        );
+        // Same column, row 1 → bitmap (0,4), which is empty → backdrop.
+        assert_eq!(pixel(&buf, 0, 1), [0, 0, 0, 0xFF], "row 1 maps elsewhere");
     }
 
     #[test]
