@@ -36,7 +36,7 @@ fn build() -> Saturn {
 fn reset_leaves_slave_halted_and_master_running() {
     let sat = build();
     assert!(sat.slave_is_halted(), "slave starts halted on reset");
-    assert!(!sat.master().pipeline.cycles == 0 || true, "master is runnable");
+    assert!(!sat.master_is_halted(), "master runs from reset");
 }
 
 #[test]
@@ -57,11 +57,15 @@ fn sshon_command_released_by_run_for_releases_slave() {
     let mut sat = build();
     assert!(sat.slave_is_halted());
     // Software writes SSHON (0x02) to COMREG.
-    sat.bus.write8(COMREG, SmpcCommand::SshOn as u8 as u8, AccessKind::Data);
+    sat.bus
+        .write8(COMREG, SmpcCommand::SshOn as u8, AccessKind::Data);
     // After SMPC's poll quantum elapses inside run_for, the slave
     // should be released and SF should drop.
     sat.run_for(512);
-    assert!(!sat.slave_is_halted(), "SSHON should have released the slave");
+    assert!(
+        !sat.slave_is_halted(),
+        "SSHON should have released the slave"
+    );
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF dropped after command processed");
     assert!(sat.slave().pipeline.cycles > 0, "slave actually stepped");
@@ -98,14 +102,51 @@ fn unknown_comreg_command_does_not_set_sf() {
 }
 
 #[test]
-fn settime_recognised_as_no_op_but_sf_drops_correctly() {
+fn settime_sets_the_clock_reported_by_intback() {
     let mut sat = build();
+    // SETTIME IREG: 2001-09-11, 13:46:00. IREG layout matches the INTBACK RTC
+    // bytes (year-hi, year-lo, weekday|month, day, hour, minute, second).
+    for (off, val) in [
+        (0x01u32, 0x20), // year hi
+        (0x03, 0x01),    // year lo → 2001
+        (0x05, 0x09),    // month 9 (weekday nibble is recomputed)
+        (0x07, 0x11),    // day 11
+        (0x09, 0x13),    // hour 13
+        (0x0B, 0x46),    // minute 46
+        (0x0D, 0x00),    // second 0
+    ] {
+        sat.bus.write8(0x0010_0000 + off, val, AccessKind::Data);
+    }
     sat.bus.write8(COMREG, 0x16, AccessKind::Data); // SETTIME
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 1, "SF goes busy on queue");
     sat.run_for(512);
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
-    assert_eq!(sf, 0, "SF drops after processing even for no-op commands");
+    assert_eq!(sf, 0, "SF drops after SETTIME");
+
+    // Read it back via an INTBACK status request.
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x00, AccessKind::Data); // IREG1: status only
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(16_000);
+    let o = &sat.bus.smpc.oreg;
+    assert_eq!(o[1], 0x20, "RTC year hi");
+    assert_eq!(o[2], 0x01, "RTC year lo");
+    assert_eq!(o[3] & 0x0F, 0x09, "RTC month");
+    assert_eq!(o[3] >> 4, 2, "weekday recomputed: 2001-09-11 = Tuesday");
+    assert_eq!(o[4], 0x11, "RTC day");
+    assert_eq!(o[5], 0x13, "RTC hour");
+    assert_eq!(o[6], 0x46, "RTC minute");
+}
+
+#[test]
+fn region_code_is_configurable_and_reported_by_intback() {
+    let mut sat = build();
+    sat.set_region(saturn::smpc::region::EUROPE_PAL);
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(16_000);
+    assert_eq!(sat.bus.smpc.oreg[9], saturn::smpc::region::EUROPE_PAL);
 }
 
 #[test]
@@ -135,7 +176,8 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
     // cascade. Point VBR at low WRAM and put a self-loop at vector 11.
     sat.master_mut().regs.vbr = 0x0020_4000;
     let handler = 0x0020_5000;
-    sat.bus.write32(0x0020_4000 + 11 * 4, handler, AccessKind::Data);
+    sat.bus
+        .write32(0x0020_4000 + 11 * 4, handler, AccessKind::Data);
     sat.bus.write16(handler, 0xAFFE, AccessKind::Data);
     sat.bus.write16(handler + 2, 0x0009, AccessKind::Data);
 
@@ -205,7 +247,10 @@ fn intback_peripheral_continuation_reports_the_digital_pad() {
     // active-low data with Start (bit 4) and Left (bit 1) of byte 1 held.
     assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: 1 device, direct");
     assert_eq!(sat.bus.smpc.oreg[1], 0x02, "standard digital pad");
-    assert_eq!(sat.bus.smpc.oreg[2], !0x12, "Start + Left held (active low)");
+    assert_eq!(
+        sat.bus.smpc.oreg[2], !0x12,
+        "Start + Left held (active low)"
+    );
     assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "no second-byte buttons held");
     assert_eq!(sat.bus.smpc.oreg[4], 0xF0, "port 2: no peripheral");
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);

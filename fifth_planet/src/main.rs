@@ -15,6 +15,16 @@
 use std::env;
 use std::fs;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
+/// somehow before the epoch). Used to seed the Saturn RTC.
+fn host_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 fn main() -> ExitCode {
     let bios_path = match env::args().nth(1) {
@@ -60,6 +70,9 @@ fn run(bios: Vec<u8>) -> ExitCode {
 
     let mut saturn = Saturn::new(bios);
     saturn.reset();
+    // Seed the RTC from the host clock so the Saturn shows real wall-clock
+    // time, like a console with a charged backup battery.
+    saturn.set_rtc_unix(host_unix_secs());
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
@@ -182,6 +195,9 @@ fn run(bios: Vec<u8>) -> ExitCode {
 
     let mut saturn = Saturn::new(bios);
     saturn.reset();
+    // Seed the RTC from the host clock so the Saturn shows real wall-clock
+    // time, like a console with a charged backup battery.
+    saturn.set_rtc_unix(host_unix_secs());
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
     for _ in 0..HEADLESS_FRAMES {
         saturn.run_frame(&mut framebuffer);

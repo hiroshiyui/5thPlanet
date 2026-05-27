@@ -64,6 +64,9 @@ fn intback_busy_us(ireg0: u8, ireg1: u8) -> u64 {
 /// from the nominal NTSC 59.94 Hz. The crystal-derived 64/15 cycles/dot is
 /// solid; the htotal/vtotal are the part to verify against VDP2 docs.
 const CYCLES_PER_FRAME: u64 = 479_151;
+/// Master-clock cycles per second, for advancing the SMPC RTC (1 Hz). NTSC
+/// runs ≈59.76 frames/s; the small rounding here is far below RTC resolution.
+const CYCLES_PER_SECOND: u64 = (CYCLES_PER_FRAME * 5976) / 100;
 const LINES_PER_FRAME: u64 = 263;
 const ACTIVE_LINES: u64 = 224;
 /// Cycles per scanline ≈ 1822. Used only for sub-frame granularity (CD
@@ -160,6 +163,10 @@ impl Saturn {
 
     pub fn slave_is_halted(&self) -> bool {
         self.scheduler.entity(self.slave_id).sh2().is_halted()
+    }
+
+    pub fn master_is_halted(&self) -> bool {
+        self.scheduler.entity(self.master_id).sh2().is_halted()
     }
 
     pub fn master(&self) -> &Cpu {
@@ -426,10 +433,22 @@ impl Saturn {
                     self.bus.scu.raise(crate::scu::Source::Smpc);
                     continue; // do NOT mark_command_done (SF stays busy)
                 }
-                // Other commands are recognised but have no
-                // emulator-side effect yet (SETTIME / SETSMEM / etc.)
-                // — they get real implementations as the corresponding
-                // peripherals land in later milestones.
+                SmpcCommand::SetTime => {
+                    // SETTIME loads the RTC from the seven IREG bytes (same
+                    // layout as the INTBACK RTC: year-hi/lo, weekday|month,
+                    // day, hour, minute, second).
+                    let now = self.now();
+                    let ireg = self.bus.smpc.ireg;
+                    self.bus.smpc.set_rtc_bcd(ireg, now);
+                }
+                SmpcCommand::SetSMem => {
+                    // SETSMEM writes the four SMPC-backup-memory bytes from
+                    // IREG0..3; they're echoed in INTBACK OREG12..15.
+                    let ireg = self.bus.smpc.ireg;
+                    self.bus.smpc.smem.copy_from_slice(&ireg[0..4]);
+                }
+                // Remaining commands (clock-change, reset-enable/disable, …)
+                // are recognised but have no emulator-side effect yet.
                 _ => {}
             }
             self.bus.smpc.mark_command_done();
@@ -473,34 +492,24 @@ impl Saturn {
     ///   OREG31     0x10 — echo of the issued command (INTBACK)
     /// ```
     fn respond_to_intback_status(&mut self) {
+        let now = self.now();
         let s = &mut self.bus.smpc;
         s.oreg[0] = 0x80;
-        // REVIEW(magic): OREG1..7 are a fixed, arbitrary (but BCD-valid) RTC
-        // stamp — we model no real-time clock source. The BIOS accepts any
-        // BCD-valid date; the exact value is not meaningful. (A real RTC /
-        // SETTIME persistence would replace this.)
-        s.oreg[1] = 0x20; // year hi
-        s.oreg[2] = 0x26; // year lo
-        s.oreg[3] = 0x05; // weekday 0, month 5
-        s.oreg[4] = 0x18; // day
-        s.oreg[5] = 0x12; // hour
-        s.oreg[6] = 0x00; // minute
-        s.oreg[7] = 0x00; // second
+        // OREG1..7 — live RTC, advanced from the (host- or SETTIME-set) base
+        // by the emulated seconds elapsed.
+        let rtc = s.rtc_oreg(now, CYCLES_PER_SECOND);
+        s.oreg[1..8].copy_from_slice(&rtc);
         s.oreg[8] = 0x00; // cartridge
-        // OREG9 area code 0x04 = North America: this IS meaningful — the BIOS
-        // halts on a region mismatch (verified). Spec-grounded (region table).
-        s.oreg[9] = 0x04;
+        // OREG9 area code — meaningful: the BIOS halts on a region mismatch.
+        s.oreg[9] = s.region;
         // REVIEW(magic): OREG10 = 0x34 (MSHNMI|SYSRES|SOUNDRES, dot-select 0)
         // is taken literally from MAME `resolve_intback`. The bit meanings are
         // spec-defined (SMPC manual), but this exact post-reset value is
         // unverified vs hardware and had no observed boot effect.
         s.oreg[10] = 0x34; // system status 1
         s.oreg[11] = 0x00; // system status 2
-        // OREG12..15 — SMEM backup memory (none stored → 0). MAME copies its
-        // 4 SMEM bytes here; we don't model SMPC backup memory yet.
-        for o in s.oreg.iter_mut().take(16).skip(12) {
-            *o = 0x00;
-        }
+        // OREG12..15 — SMPC backup memory (SMEM), as written by SETSMEM.
+        s.oreg[12..16].copy_from_slice(&s.smem);
         // OREG16..30 — undefined; MAME writes 0xFF.
         for o in s.oreg.iter_mut().take(31).skip(16) {
             *o = 0xFF;
@@ -529,6 +538,22 @@ impl Saturn {
     /// The frontend calls this each frame from the host keyboard.
     pub fn set_pad1(&mut self, pressed: u16) {
         self.bus.smpc.pad1 = pressed;
+    }
+
+    /// Set the SMPC area (region) code reported to the BIOS via INTBACK
+    /// (see [`crate::smpc::region`]). Must match the BIOS build region or the
+    /// BIOS halts.
+    pub fn set_region(&mut self, region: u8) {
+        self.bus.smpc.region = region;
+    }
+
+    /// Seed the RTC from the host clock (seconds since the Unix epoch). The
+    /// frontend calls this at startup so the Saturn shows real wall-clock time
+    /// like a console with a charged battery; the core otherwise runs from a
+    /// deterministic default date.
+    pub fn set_rtc_unix(&mut self, unix_secs: u64) {
+        let now = self.now();
+        self.bus.smpc.set_rtc_unix(unix_secs, now);
     }
 
     /// Run any DMA transfers that the SCU queued during the last

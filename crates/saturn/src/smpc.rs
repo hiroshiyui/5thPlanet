@@ -59,9 +59,9 @@ pub enum Command {
     /// INTBACK — peripheral data fetch. M4 returns "no controller"
     /// (see [`crate::system::Saturn`] INTBACK handling).
     IntBack = 0x10,
-    /// SETTIME — initialise the clock. M3 stores the request and clears SF.
+    /// SETTIME — set the RTC from IREG0..6 (see `system` command handling).
     SetTime = 0x16,
-    /// SETSMEM — set saved memory. M3 no-op.
+    /// SETSMEM — write the four SMPC-backup-memory (SMEM) bytes from IREG0..3.
     SetSMem = 0x17,
     /// NMIREQ — assert NMI to master SH-2. Routed via INTC.
     NmiReq = 0x18,
@@ -140,6 +140,20 @@ pub struct Smpc {
     /// [`pad`] bit positions. The INTBACK peripheral phase reports the
     /// active-low inverse; default 0 = nothing pressed. The frontend sets it.
     pub pad1: u16,
+    /// Real-time clock value, in seconds since the Unix epoch, as of
+    /// `rtc_set_cycle`. The live time is this plus the emulated seconds
+    /// elapsed since (see [`Smpc::rtc_oreg`]). Set by the `SETTIME` command or
+    /// [`Smpc::set_rtc_unix`]; defaults to a fixed date so the core is
+    /// deterministic (the frontend can inject the host clock).
+    rtc_secs: u64,
+    /// Global cycle at which `rtc_secs` was last synced.
+    rtc_set_cycle: u64,
+    /// Area (region) code reported in INTBACK OREG9. 0x04 = North America
+    /// (NTSC); the BIOS halts on a mismatch with its build region.
+    pub region: u8,
+    /// SMPC backup memory (`SMEM`) — 4 bytes echoed in INTBACK OREG12..15 and
+    /// written by the `SETSMEM` command.
+    pub smem: [u8; 4],
 }
 
 /// Standard digital-pad button bits for [`Smpc::pad1`] (1 = pressed). The high
@@ -161,9 +175,108 @@ pub mod pad {
     pub const R: u16 = 1 << 3;
 }
 
+/// Region code for INTBACK OREG9 (SMPC manual area-code table).
+pub mod region {
+    pub const JAPAN: u8 = 0x01;
+    pub const ASIA_NTSC: u8 = 0x02;
+    pub const NORTH_AMERICA: u8 = 0x04;
+    pub const EUROPE_PAL: u8 = 0x0C;
+}
+
+/// Days from the proleptic-Gregorian civil date to 1970-01-01 (Howard
+/// Hinnant's `days_from_civil`). Valid across the RTC's whole range.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Civil `(year, month, day)` for `z` days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[inline]
+fn to_bcd(v: u32) -> u8 {
+    (((v / 10) << 4) | (v % 10)) as u8
+}
+#[inline]
+fn from_bcd(v: u8) -> u32 {
+    ((v >> 4) as u32) * 10 + (v & 0x0F) as u32
+}
+
+/// Encode `unix_secs` as the seven INTBACK RTC bytes (OREG1..7): year-hi/lo
+/// BCD, `(weekday<<4)|month` (weekday 0=Sun, month 1..12 in the low nibble),
+/// then day/hour/minute/second BCD.
+fn rtc_bytes(unix_secs: u64) -> [u8; 7] {
+    let days = (unix_secs / 86_400) as i64;
+    let tod = unix_secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    // 1970-01-01 was a Thursday (4, with Sunday = 0).
+    let weekday = (days + 4).rem_euclid(7) as u8;
+    [
+        to_bcd((y / 100) as u32),
+        to_bcd((y % 100) as u32),
+        (weekday << 4) | (m as u8 & 0x0F),
+        to_bcd(d as u32),
+        to_bcd((tod / 3600) as u32),
+        to_bcd((tod % 3600 / 60) as u32),
+        to_bcd((tod % 60) as u32),
+    ]
+}
+
 impl Smpc {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            region: region::NORTH_AMERICA,
+            // Deterministic default clock: 1996-01-01 00:00:00. The frontend
+            // overrides it with the host time via `set_rtc_unix`.
+            rtc_secs: days_from_civil(1996, 1, 1) as u64 * 86_400,
+            ..Default::default()
+        }
+    }
+
+    /// Set the RTC to `unix_secs` (seconds since 1970-01-01), syncing the
+    /// advance origin to the current global cycle `now`.
+    pub fn set_rtc_unix(&mut self, unix_secs: u64, now: u64) {
+        self.rtc_secs = unix_secs;
+        self.rtc_set_cycle = now;
+    }
+
+    /// Set the RTC from the seven `SETTIME` IREG bytes (same layout as the
+    /// INTBACK RTC bytes), syncing the advance origin to `now`.
+    pub fn set_rtc_bcd(&mut self, t: [u8; 7], now: u64) {
+        let year = from_bcd(t[0]) as i64 * 100 + from_bcd(t[1]) as i64;
+        let month = (t[2] & 0x0F) as i64;
+        let day = from_bcd(t[3]) as i64;
+        // A nonsense date (e.g. an all-zero IREG → year 0) yields negative
+        // days; clamp so garbage input can't overflow rather than panic.
+        let days = days_from_civil(year, month.max(1), day.max(1)).max(0) as u64;
+        let secs = days * 86_400
+            + from_bcd(t[4]) as u64 * 3600
+            + from_bcd(t[5]) as u64 * 60
+            + from_bcd(t[6]) as u64;
+        self.set_rtc_unix(secs, now);
+    }
+
+    /// The current RTC as the seven INTBACK OREG bytes, advancing the stored
+    /// value by the emulated seconds elapsed since it was set
+    /// (`cycles_per_second` is the master-clock rate).
+    pub fn rtc_oreg(&self, now: u64, cycles_per_second: u64) -> [u8; 7] {
+        let elapsed = now.saturating_sub(self.rtc_set_cycle) / cycles_per_second.max(1);
+        rtc_bytes(self.rtc_secs + elapsed)
     }
 
     pub fn read8(&self, offset: u32) -> u8 {
@@ -176,9 +289,7 @@ impl Smpc {
             0x0B => self.ireg[5],
             0x0D => self.ireg[6],
             0x1F => self.comreg,
-            o if (0x21..=0x5F).contains(&o) && (o & 1) == 1 => {
-                self.oreg[((o - 0x21) / 2) as usize]
-            }
+            o if (0x21..=0x5F).contains(&o) && (o & 1) == 1 => self.oreg[((o - 0x21) / 2) as usize],
             0x61 => self.sr,
             0x63 => self.sf,
             0x75 => self.pdr1,
@@ -309,6 +420,53 @@ impl Smpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn civil_day_conversion_round_trips() {
+        for &(y, m, d) in &[(1970, 1, 1), (1996, 1, 1), (2001, 9, 11), (2099, 12, 31)] {
+            let z = days_from_civil(y, m, d);
+            assert_eq!(civil_from_days(z), (y, m, d), "{y}-{m}-{d}");
+        }
+        // 1970-01-01 is day 0 and a Thursday (weekday 4, Sunday = 0).
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn rtc_bytes_encode_a_known_timestamp() {
+        // 2001-09-11 13:46:00.
+        let secs = days_from_civil(2001, 9, 11) as u64 * 86_400 + 13 * 3600 + 46 * 60;
+        let b = rtc_bytes(secs);
+        assert_eq!(b[0], 0x20, "year hi");
+        assert_eq!(b[1], 0x01, "year lo");
+        assert_eq!(b[2] & 0x0F, 0x09, "month");
+        assert_eq!(b[2] >> 4, 2, "Tuesday");
+        assert_eq!(b[3], 0x11, "day");
+        assert_eq!(b[4], 0x13, "hour");
+        assert_eq!(b[5], 0x46, "minute");
+        assert_eq!(b[6], 0x00, "second");
+    }
+
+    #[test]
+    fn rtc_advances_with_emulated_time() {
+        let mut s = Smpc::new();
+        s.set_rtc_unix(0, 0); // 1970-01-01 00:00:00 at cycle 0
+        let cps = 1000; // 1000 cycles per second for the test
+        assert_eq!(s.rtc_oreg(0, cps)[6], 0x00, "0 s");
+        assert_eq!(s.rtc_oreg(5 * 1000, cps)[6], 0x05, "5 s later → :05");
+        assert_eq!(s.rtc_oreg(90 * 1000, cps)[5], 0x01, "90 s later → minute 1");
+    }
+
+    #[test]
+    fn settime_bcd_round_trips_through_the_rtc() {
+        let mut s = Smpc::new();
+        // year 2010, month 12, day 25, 06:30:15.
+        s.set_rtc_bcd([0x20, 0x10, 0x0C, 0x25, 0x06, 0x30, 0x15], 0);
+        let b = s.rtc_oreg(0, 1000);
+        assert_eq!([b[0], b[1]], [0x20, 0x10], "year");
+        assert_eq!(b[2] & 0x0F, 0x0C, "month 12");
+        assert_eq!(b[3], 0x25, "day 25");
+        assert_eq!([b[4], b[5], b[6]], [0x06, 0x30, 0x15], "time");
+    }
 
     #[test]
     fn ireg_round_trip() {
