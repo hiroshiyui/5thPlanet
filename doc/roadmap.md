@@ -20,7 +20,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
 | VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll; CRAM modes 0/1/2 (RGB555 + RGB888); **remaining:** rotation 4×4-page planes, line-coefficient table, vertical-cell-scroll / line-zoom, sprite window plane |
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
-| MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
+| MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
 | CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
 | SH-1 (CD-block CPU) | ⬜ | M7 |
@@ -176,7 +176,7 @@ buffer:
   fires only after the duration — settled by the bus on VDP1 access and by the
   run loop between batches. This closes task #2.
 
-### Task #3 — MC68EC000 (`cargo test -p m68k` → 64 tests)
+### Task #3 — MC68EC000 (`cargo test -p m68k` → 68 tests)
 
 A new `m68k` crate, structured like `sh2` (`no_std` + alloc, big-endian,
 host-owned bus returning `(value, stall)`). The CPU is now essentially
@@ -204,8 +204,9 @@ at 0x05A0_0000 / 0x05B0_0000 (shared RAM). `Scsp::run` paces the 68k at the
 re-hold it. End-to-end: SH-2 stages a program into sound RAM → SNDON → the
 scheduler runs the 68k from it (9 tests).
 
-**Remaining for the chip:** MOVEP, memory shift-by-1, address/bus-error frames
-(rare), and — as the **M6 audio milestone** — the SCSP slot/FM engine, the SCSP
+**Remaining for the chip:** address/bus-error stack frames (rare) and precise
+long-operation timing tables. (MOVEP and the memory shift/rotate forms landed
+in the post-M6 fidelity pass.) As the **M6 audio milestone**: the SCSP slot/FM engine, the SCSP
 DSP, the mixer/DAC, and the timer/sound interrupt sources feeding
 `Scsp::raise_interrupt`.
 
