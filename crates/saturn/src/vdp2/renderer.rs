@@ -43,14 +43,16 @@
 //!
 //! **Windows** (W0/W1): each layer's WCTL byte enables W0/W1 with an
 //! inside/outside area bit and AND/OR logic; a windowed-out dot is suppressed.
-//! Rectangles come from WPSX/WPSY/WPEX/WPEY (X at half-dot resolution).
+//! Rectangles come from WPSX/WPSY/WPEX/WPEY (X at half-dot resolution), or — if
+//! a line window is enabled (LWTAn) — the horizontal start/end are read per
+//! scanline from a VRAM table while WPSY/WPEY bound it vertically.
 //!
 //! **Sprite shadow**: an MSB-only sprite word (bit 15 set, no colour) on a
 //! shadow-capable sprite type halves the colour of the layer beneath.
 //!
 //! Deferred to later increments: the line-coefficient table (per-line scaling)
-//! and dual-parameter window selection, line windows, the sprite window plane,
-//! and vertical-cell-scroll / line-zoom.
+//! and dual-parameter window selection, the sprite window plane, and
+//! vertical-cell-scroll / line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -211,12 +213,22 @@ fn window_allows(vdp2: &Vdp2, ctl: u8, x: u32, y: u32) -> bool {
 }
 
 /// One window's pass/fail at `(x, y)`: disabled → always pass; `area` set →
-/// pass inside the rectangle, clear → pass outside.
+/// pass inside the window, clear → pass outside. With a line window enabled,
+/// the horizontal start/end come from the per-line table (the vertical bounds
+/// stay from WPSY/WPEY).
 fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) -> bool {
     if !enable {
         return true;
     }
-    let (sx, ex, sy, ey) = vdp2.regs.window_rect(w);
+    let (mut sx, mut ex, sy, ey) = vdp2.regs.window_rect(w);
+    if vdp2.regs.window_line_enabled(w) {
+        // One 32-bit entry per line: start X in bits 25..16, end X in bits 9..0
+        // (10-bit dots; halved to the renderer's low-res scale, matching the
+        // rectangle path's `& 0x3FE >> 1`).
+        let word = vdp2.vram.read32(vdp2.regs.window_line_table(w) + y * 4);
+        sx = ((word >> 16) & 0x3FF) >> 1;
+        ex = (word & 0x3FF) >> 1;
+    }
     let inside = x >= sx && x <= ex && y >= sy && y <= ey;
     if area { inside } else { !inside }
 }
@@ -1265,5 +1277,40 @@ mod tests {
         assert_eq!(pixel(&buf, 0, 2), [0xFF, 0, 0, 0xFF], "line 2 scrolled");
         // Line 0 has no scroll, so screen (0,0) samples the empty (0,0).
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "line 0 unscrolled");
+    }
+
+    #[test]
+    fn nbg0_line_window_clips_per_scanline() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.cram.write16(0, 0x1F << 5); // backdrop green
+        v.cram.write16(2, 0x001F); // index 1 red
+        v.vram.write8(2 * 512 + 2, 1); // NBG0 dot at (2,2)
+        v.vram.write8(2, 1); // NBG0 dot at (2,0)
+        // NBG0 window: W0 enable + area=inside, AND logic (W1 off).
+        v.regs.write16(0x0D0, 0x0003);
+        v.regs.write16(0x0C2, 0); // WPSY0 → sy 0
+        v.regs.write16(0x0C6, 10); // WPEY0 → ey 10
+        // W0 line window: enable (bit15) + table at byte 0x800 (reg = 0x400).
+        v.regs.write16(0x0D8, 0x8000);
+        v.regs.write16(0x0DA, 0x0400);
+        // Per-line X (10-bit dots, halved): line 0 → [0,0]; line 2 → [0,3].
+        v.vram.write32(0x800, 0); // line 0: start 0, end 0
+        v.vram.write32(0x800 + 2 * 4, 7); // line 2: start 0, end 3 (7>>1)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Line 2 window spans x∈[0,3] → (2,2) inside → red.
+        assert_eq!(
+            pixel(&buf, 2, 2),
+            [0xFF, 0, 0, 0xFF],
+            "inside line-2 window"
+        );
+        // Line 0 window is just x=0 → (2,0) outside → backdrop green.
+        assert_eq!(
+            pixel(&buf, 2, 0),
+            [0, 0xFF, 0, 0xFF],
+            "outside the narrow line-0 window"
+        );
     }
 }

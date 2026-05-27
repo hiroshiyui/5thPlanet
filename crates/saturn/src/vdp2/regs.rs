@@ -456,8 +456,9 @@ impl Vdp2Regs {
 
     /// Window `w` (0/1) rectangle `(start_x, end_x, start_y, end_y)` in
     /// low-res screen dots. Horizontal coordinates are stored at half-dot
-    /// resolution (`>>1`) in normal mode; vertical is per-line. Line windows
-    /// and hi-res scaling are later refinements.
+    /// resolution (`>>1`) in normal mode; vertical is per-line. With a line
+    /// window enabled the horizontal pair is overridden per scanline from the
+    /// line-window table; hi-res scaling is a later refinement.
     pub fn window_rect(&self, w: usize) -> (u32, u32, u32, u32) {
         let base = if w == 0 { 0x0C0 } else { 0x0C8 };
         let sx = ((self.read16(base) & 0x3FE) >> 1) as u32;
@@ -465,6 +466,22 @@ impl Vdp2Regs {
         let ex = ((self.read16(base + 4) & 0x3FE) >> 1) as u32;
         let ey = (self.read16(base + 6) & 0x3FF) as u32;
         (sx, ex, sy, ey)
+    }
+    /// Whether window `w` uses a per-line window table (LWTAnU bit 15).
+    pub fn window_line_enabled(&self, w: usize) -> bool {
+        let reg = if w == 0 { 0x0D8 } else { 0x0DC };
+        self.read16(reg) & 0x8000 != 0
+    }
+    /// Byte address in VDP2 VRAM of window `w`'s line-window table (LWTAn).
+    /// The register pair holds the address divided by 2 (word units).
+    pub fn window_line_table(&self, w: usize) -> u32 {
+        let (hi, lo) = if w == 0 {
+            (0x0D8, 0x0DA)
+        } else {
+            (0x0DC, 0x0DE)
+        };
+        let addr = (((self.read16(hi) & 0x7) as u32) << 16) | (self.read16(lo) & 0xFFFE) as u32;
+        addr << 1
     }
     /// Per-layer window-control byte (W0/W1 enable+area+logic bits). N0/N1 in
     /// WCTLA (0x0D0), N2/N3 in WCTLB (0x0D2), RBG0/sprite in WCTLC (0x0D4).
