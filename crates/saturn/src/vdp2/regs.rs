@@ -558,9 +558,48 @@ impl Vdp2Regs {
         (((self.read16(0x0BC) & 0x7) as u32) << 16 | self.read16(0x0BE) as u32) << 1
     }
     /// Rotation plane-A map number (low 6 bits): RA from MPABRA (0x050), RB
-    /// from MPABRB (0x060). Only plane A is read for now (single-page tile).
+    /// from MPABRB (0x060).
     pub fn rbg_plane_a_map(&self, which: usize) -> u16 {
         self.read16(if which == 0 { 0x050 } else { 0x060 })
+    }
+
+    /// Rotation pattern-name control (PNCR, 0x038) — same field layout as the
+    /// NBG `PNCN` registers.
+    pub fn rbg_pncr(&self) -> u16 {
+        self.read16(0x038)
+    }
+    pub fn rbg_pn_one_word(&self) -> bool {
+        self.rbg_pncr() & 0x8000 != 0
+    }
+    pub fn rbg_pn_cnsm(&self) -> bool {
+        self.rbg_pncr() & 0x4000 != 0
+    }
+    pub fn rbg_pn_spcn(&self) -> u32 {
+        (self.rbg_pncr() & 0x1F) as u32
+    }
+    pub fn rbg_pn_splt(&self) -> u32 {
+        ((self.rbg_pncr() >> 5) & 0x7) as u32
+    }
+    /// Rotation character size (CHCTLB R0CHSZ, bit 8): false = 8×8, true = 16×16.
+    pub fn rbg_char_size_2x2(&self) -> bool {
+        self.chctlb() & 0x0100 != 0
+    }
+    /// Rotation plane size (PLSZ): RA in bits 9..8, RB in bits 13..12.
+    /// 0 = 1×1 page, 1 = 2×1, 3 = 2×2.
+    pub fn rbg_plane_size(&self, which: usize) -> u8 {
+        let shift = if which == 0 { 8 } else { 12 };
+        ((self.read16(0x03A) >> shift) & 0x3) as u8
+    }
+    /// The 9-bit map number for rotation `which`, plane index `plane` (0..15 =
+    /// A..P, row-major over the 4×4 plane grid). RA map registers are
+    /// MPABRA..MPOPRA (0x050..0x05E), RB MPABRB..MPOPRB (0x060..0x06E), two
+    /// 6-bit numbers per 16-bit register.
+    pub fn rbg_plane_number(&self, which: usize, plane: usize) -> u32 {
+        let base = if which == 0 { 0x050 } else { 0x060 };
+        let reg = base + (plane as u32 / 2) * 2;
+        let shift = (plane & 1) * 8;
+        let mp = ((self.read16(reg) >> shift) & 0x3F) as u32;
+        (self.rbg_map_offset(which) << 6) | mp
     }
 
     // ---- NBG0 wrappers (kept for existing callers/tests) ----

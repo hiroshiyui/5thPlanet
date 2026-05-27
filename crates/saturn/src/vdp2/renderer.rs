@@ -31,8 +31,9 @@
 //!
 //! The **rotation backgrounds RBG0/RBG1** are composited via [`super::rotation`]:
 //! each screen dot is mapped through the rotation parameter table's affine
-//! transform, then the rotation plane (bitmap or single-page tile) is sampled.
-//! RBG0 uses parameter set A (priority PRIR); RBG1 uses set B (priority N0PRIN).
+//! transform, then the rotation plane is sampled — a bitmap, or a tile field
+//! composed as the full 4×4 grid of planes (A..P) with the shared pattern-name
+//! decode. RBG0 uses parameter set A (priority PRIR); RBG1 uses set B (N0PRIN).
 //! Full layer order: sprite > RBG0 > NBG0 > RBG1 > NBG1 > NBG2 > NBG3.
 //!
 //! **Colour calculation** (CCCTL): the top two opaque dots by priority are
@@ -50,9 +51,9 @@
 //! **Sprite shadow**: an MSB-only sprite word (bit 15 set, no colour) on a
 //! shadow-capable sprite type halves the colour of the layer beneath.
 //!
-//! Deferred to later increments: the line-coefficient table (per-line scaling)
-//! and dual-parameter window selection, the sprite window plane, and
-//! line-zoom.
+//! Deferred to later increments: the rotation line-coefficient table (per-line
+//! scaling) and dual-parameter window selection, the rotation screen-over
+//! modes (RAOVR/RBOVR), the sprite window plane, and line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -66,10 +67,6 @@ pub const FRAME_HEIGHT: usize = 224;
 pub const FRAMEBUFFER_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
 
 const BACKDROP_PALETTE_INDEX: usize = 0;
-
-/// One tile plane is 64×64 cells of 8×8 px = 512×512 px; scroll wraps here.
-/// (Larger plane sizes from PLSZ are a later refinement.)
-const TILE_PLANE_WIDTH_PX: u32 = 64 * 8;
 
 /// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
 /// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
@@ -399,6 +396,94 @@ struct Pattern {
     vflip: bool,
 }
 
+/// Pattern-name format bits (PNCN for NBG, PNCR for rotation) — they share the
+/// same layout, so NBG and RBG tile sampling reuse one decoder.
+#[derive(Clone, Copy)]
+struct PnFormat {
+    one_word: bool,
+    cnsm: bool,
+    spcn: u32,
+    splt: u32,
+}
+
+/// Decode the pattern-name entry at `pn_addr` per `fmt`, the character size,
+/// and the colour `depth`.
+fn decode_pattern(vdp2: &Vdp2, pn_addr: u32, fmt: PnFormat, two_cells: bool, depth: u8) -> Pattern {
+    if fmt.one_word {
+        let data = vdp2.vram.read16(pn_addr) as u32;
+        let spcn = fmt.spcn;
+        let (cell, hflip, vflip) = if fmt.cnsm {
+            // 12-bit char number, no flip.
+            let c = if !two_cells {
+                (data & 0xFFF) + ((spcn & 0x1C) << 10)
+            } else {
+                ((data & 0xFFF) << 2) + (spcn & 3) + ((spcn & 0x10) << 10)
+            };
+            (c, false, false)
+        } else {
+            // 10-bit char number + 2 flip bits (11 = V, 10 = H).
+            let c = if !two_cells {
+                (data & 0x3FF) + (spcn << 10)
+            } else {
+                ((data & 0x3FF) << 2) + (spcn & 3) + ((spcn & 0x1C) << 10)
+            };
+            (c, data & 0x400 != 0, data & 0x800 != 0)
+        };
+        let palette = if depth != 0 {
+            (data >> 12) & 0x7 // 8bpp colour bank
+        } else {
+            ((data >> 12) & 0xF) + (fmt.splt << 4)
+        };
+        Pattern {
+            cell,
+            palette,
+            hflip,
+            vflip,
+        }
+    } else {
+        let data = vdp2.vram.read32(pn_addr);
+        Pattern {
+            cell: data & 0x7FFF,
+            palette: (data >> 16) & 0x7F,
+            hflip: data & 0x4000_0000 != 0,
+            vflip: data & 0x8000_0000 != 0,
+        }
+    }
+}
+
+/// Sample the dot at in-character `(in_x, in_y)` of a decoded pattern, applying
+/// flip and (for 16×16 characters) selecting the right 8×8 cell. `None` for a
+/// transparent dot.
+fn sample_pattern_cell(
+    vdp2: &Vdp2,
+    pat: &Pattern,
+    two_cells: bool,
+    depth: u8,
+    mut in_x: u32,
+    mut in_y: u32,
+) -> Option<(u8, u8, u8)> {
+    let cell_px = if two_cells { 16 } else { 8 };
+    if pat.hflip {
+        in_x = (cell_px - 1) - in_x;
+    }
+    if pat.vflip {
+        in_y = (cell_px - 1) - in_y;
+    }
+    // For 16×16 characters the four 8×8 cells are consecutive (TL,TR,BL,BR).
+    let cell = pat.cell + (in_y / 8) * 2 + (in_x / 8);
+    let (px, py) = (in_x % 8, in_y % 8);
+    if depth == 1 {
+        // 8bpp cell: 64 bytes, one byte/pixel; palette is the colour bank.
+        let byte = vdp2.vram.read8(cell * 64 + py * 8 + px) as usize;
+        (byte != 0).then(|| cram(vdp2, (pat.palette as usize) << 8 | byte))
+    } else {
+        // 4bpp cell: 32 bytes, two pixels/byte (high nibble = even column).
+        let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
+        let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
+        (nibble != 0).then(|| cram(vdp2, (pat.palette as usize) << 4 | nibble))
+    }
+}
+
 fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8, u8, u8)> {
     let r = &vdp2.regs;
     let two_cells = r.nbg_char_size_2x2(n); // 16×16 vs 8×8 character
@@ -417,8 +502,8 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
     let mx = sx % (2 * pages_x * page_px);
     let my = sy % (2 * pages_y * page_px);
     let (tx, ty) = (mx / cell_px, my / cell_px); // PN-entry coordinates
-    let mut in_x = mx % cell_px;
-    let mut in_y = my % cell_px;
+    let in_x = mx % cell_px;
+    let in_y = my % cell_px;
 
     // Select plane (A/B/C/D), the page within it, and the entry within the page.
     let psh = if two_cells { 5 } else { 6 }; // log2(pg_tiles)
@@ -447,68 +532,14 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
     let base = (((plane_num & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF;
     let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * entry_bytes;
 
-    // Decode the pattern name.
-    let pat = if one_word {
-        let data = vdp2.vram.read16(pn_addr) as u32;
-        let spcn = r.nbg_pn_spcn(n);
-        let (cell, hflip, vflip) = if r.nbg_pn_cnsm(n) {
-            // 12-bit char number, no flip.
-            let c = if !two_cells {
-                (data & 0xFFF) + ((spcn & 0x1C) << 10)
-            } else {
-                ((data & 0xFFF) << 2) + (spcn & 3) + ((spcn & 0x10) << 10)
-            };
-            (c, false, false)
-        } else {
-            // 10-bit char number + 2 flip bits (11 = V, 10 = H).
-            let c = if !two_cells {
-                (data & 0x3FF) + (spcn << 10)
-            } else {
-                ((data & 0x3FF) << 2) + (spcn & 3) + ((spcn & 0x1C) << 10)
-            };
-            (c, data & 0x400 != 0, data & 0x800 != 0)
-        };
-        let palette = if depth != 0 {
-            (data >> 12) & 0x7 // 8bpp colour bank
-        } else {
-            ((data >> 12) & 0xF) + (r.nbg_pn_splt(n) << 4)
-        };
-        Pattern {
-            cell,
-            palette,
-            hflip,
-            vflip,
-        }
-    } else {
-        let data = vdp2.vram.read32(pn_addr);
-        Pattern {
-            cell: data & 0x7FFF,
-            palette: (data >> 16) & 0x7F,
-            hflip: data & 0x4000_0000 != 0,
-            vflip: data & 0x8000_0000 != 0,
-        }
+    let fmt = PnFormat {
+        one_word,
+        cnsm: r.nbg_pn_cnsm(n),
+        spcn: r.nbg_pn_spcn(n),
+        splt: r.nbg_pn_splt(n),
     };
-
-    if pat.hflip {
-        in_x = (cell_px - 1) - in_x;
-    }
-    if pat.vflip {
-        in_y = (cell_px - 1) - in_y;
-    }
-    // For 16×16 characters the four 8×8 cells are consecutive (TL,TR,BL,BR).
-    let cell = pat.cell + (in_y / 8) * 2 + (in_x / 8);
-    let (px, py) = (in_x % 8, in_y % 8);
-
-    if depth == 1 {
-        // 8bpp cell: 64 bytes, one byte/pixel; palette is the colour bank.
-        let byte = vdp2.vram.read8(cell * 64 + py * 8 + px) as usize;
-        (byte != 0).then(|| cram(vdp2, (pat.palette as usize) << 8 | byte))
-    } else {
-        // 4bpp cell: 32 bytes, two pixels/byte (high nibble = even column).
-        let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
-        let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
-        (nibble != 0).then(|| cram(vdp2, (pat.palette as usize) << 4 | nibble))
-    }
+    let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y)
 }
 
 // Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
@@ -648,6 +679,12 @@ fn sample_rot_bitmap(
     }
 }
 
+/// Sample a rotation tile plane at transformed coordinate `(plane_x,
+/// plane_y)`. The rotation field is a **4×4 grid of planes** (A..P), each
+/// `RAPLSZ`/`RBPLSZ` pages of 512 px; the coordinate wraps into the field
+/// (screen-over "repeat" mode). The matching plane's map number selects its
+/// page-aligned base, then the full pattern-name decode + cell sample run
+/// (shared with the NBG tile path).
 fn sample_rot_tile(
     vdp2: &Vdp2,
     which: usize,
@@ -655,25 +692,50 @@ fn sample_rot_tile(
     plane_x: i32,
     plane_y: i32,
 ) -> Option<(u8, u8, u8)> {
-    // Single 512×512 page (full 4×4-page composition is a later refinement).
-    // Plane-A map number: RA from MPABRA (0x050), RB from MPABRB (0x060).
-    let mpab = vdp2.regs.rbg_plane_a_map(which);
-    let pn_base = ((vdp2.regs.rbg_map_offset(which) << 6) | (mpab & 0x3F) as u32) * 0x2000;
-    let sx = plane_x.rem_euclid(TILE_PLANE_WIDTH_PX as i32) as u32;
-    let sy = plane_y.rem_euclid(TILE_PLANE_WIDTH_PX as i32) as u32;
-    let (tile_x, in_x) = (sx / 8, sx % 8);
-    let (tile_y, in_y) = (sy / 8, sy % 8);
-    let pn = vdp2.vram.read16(pn_base + (tile_y * 64 + tile_x) * 2);
-    let char_num = (pn & 0x03FF) as u32;
-    let palette_bank = ((pn >> 12) & 0xF) as usize;
-    if depth == 1 {
-        let byte = vdp2.vram.read8(char_num * 64 + in_y * 8 + in_x) as usize;
-        (byte != 0).then(|| cram(vdp2, byte))
-    } else {
-        let byte = vdp2.vram.read8(char_num * 32 + in_y * 4 + in_x / 2);
-        let nibble = if in_x & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-        (nibble != 0).then(|| cram(vdp2, (palette_bank << 4) | nibble))
-    }
+    let r = &vdp2.regs;
+    let two_cells = r.rbg_char_size_2x2();
+    let one_word = r.rbg_pn_one_word();
+    let plane_size = (r.rbg_plane_size(which) & 3) as u32;
+    let cell_px = if two_cells { 16 } else { 8 };
+    let pg_tiles = if two_cells { 32 } else { 64 };
+    let entry_bytes = if one_word { 2 } else { 4 };
+    let pg_bytes = pg_tiles * pg_tiles * entry_bytes;
+    let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
+    let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
+
+    // Wrap into the 4×4-plane field (each page is 512 px).
+    let page_px = pg_tiles * cell_px;
+    let plane_w = pages_x * page_px;
+    let plane_h = pages_y * page_px;
+    let mx = plane_x.rem_euclid((4 * plane_w) as i32) as u32;
+    let my = plane_y.rem_euclid((4 * plane_h) as i32) as u32;
+
+    // Which plane (0..15, row-major A..P), then the page within it.
+    let plane_idx = (my / plane_h) as usize * 4 + (mx / plane_w) as usize;
+    let (wx, wy) = (mx % plane_w, my % plane_h);
+    let (tx, ty) = (wx / cell_px, wy / cell_px);
+    let in_x = wx % cell_px;
+    let in_y = wy % cell_px;
+    let page = (tx / pg_tiles) + (ty / pg_tiles) * pages_x;
+    let (xoff, yoff) = (tx % pg_tiles, ty % pg_tiles);
+
+    // Plane base: align the plane number to the plane size, then scale.
+    let plane_num = r.rbg_plane_number(which, plane_idx);
+    let shift = [0u32, 1, 2, 2][plane_size as usize];
+    let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
+    let upper_mask = 0x1FF >> upper_shift;
+    let plsize_bytes = pg_bytes * pages_x * pages_y;
+    let base = (((plane_num & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF;
+    let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * entry_bytes;
+
+    let fmt = PnFormat {
+        one_word,
+        cnsm: r.rbg_pn_cnsm(),
+        spcn: r.rbg_pn_spcn(),
+        splt: r.rbg_pn_splt(),
+    };
+    let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y)
 }
 
 #[cfg(test)]
@@ -1174,6 +1236,43 @@ mod tests {
             pixel(&buf, 15, 20),
             [0, 0xFF, 0, 0xFF],
             "RBG1 via parameter B"
+        );
+    }
+
+    #[test]
+    fn rbg0_tile_samples_the_correct_4x4_plane() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // BGON.R0ON
+        v.regs.write16(0x02A, 0x0000); // CHCTLB: RBG0 tile, 4bpp, 8×8
+        v.regs.write16(0x038, 0x8000); // PNCR: 1-word pattern names
+        v.regs.write16(0x03A, 0x0000); // PLSZ: RA plane size 1×1
+        v.regs.write16(0x0FC, 0x0001); // PRIR: RBG0 priority 1
+        // MPABRA: plane A map 0, plane B map 1 → plane B's PN table at 0x2000.
+        v.regs.write16(0x050, 0x0100);
+        // Identity rotation, but start X at plane coordinate 512 → screen
+        // (0,0) lands in plane B (the second plane of the 4×4 grid).
+        for (k, val) in [
+            (0u32, 0x0200_0000), // Xst = 512.0
+            (4, 1 << 16),        // dyst
+            (5, 1 << 16),        // dx
+            (7, 1 << 16),        // A
+            (11, 1 << 16),       // E
+            (19, 1 << 16),       // kx
+            (20, 1 << 16),       // ky
+        ] {
+            v.vram.write32(k * 4, val);
+        }
+        // Plane B PN[0] → char 2; char 2 pixel (0,0) = nibble 5 → CRAM[5].
+        v.vram.write16(0x2000, 0x0002);
+        v.vram.write8(2 * 32, 0x50);
+        v.cram.write16(5 * 2, 0x001F); // red
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "screen (0,0) → plane B tile via the 4×4 grid"
         );
     }
 
