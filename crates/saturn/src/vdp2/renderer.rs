@@ -19,7 +19,9 @@
 //!   RGB555 (modes 0/1) or true RGB888 (modes 2/3).
 //! - **Backdrop** = CRAM index 0 (the real BKTAU/BKTAL backdrop register is
 //!   a later refinement; palette entry 0 is what splash software programs).
-//! - **Scrolling**: integer NBG scroll; fractional scroll and zoom ignored.
+//! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll for
+//!   NBG0/NBG1 (SCRCTL/LSTAn — integer H/V, LSS interval); fractional scroll
+//!   and line zoom are ignored.
 //! - **NTSC low-res** (320×224).
 //!
 //! The **VDP1 sprite layer** is composited too: VDP2 reads the VDP1 frame
@@ -48,7 +50,7 @@
 //!
 //! Deferred to later increments: the line-coefficient table (per-line scaling)
 //! and dual-parameter window selection, line windows, the sprite window plane,
-//! and line-scroll.
+//! and vertical-cell-scroll / line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -265,9 +267,44 @@ fn put_pixel(out: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
     out[dst + 3] = 0xFF;
 }
 
+/// Per-line scroll offset `(dx, dy)` for NBG0/NBG1 at screen line `y`, read
+/// from the line-scroll table (SCRCTL/LSTAn). Only the integer part of each
+/// enabled component (bits 26..16) is applied; line zoom occupies its table
+/// slot but isn't yet applied.
+fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32) {
+    let r = &vdp2.regs;
+    let (lscx, lscy, lzmx) = (
+        r.nbg_line_scroll_x(n),
+        r.nbg_line_scroll_y(n),
+        r.nbg_line_zoom_x(n),
+    );
+    if !lscx && !lscy {
+        return (0, 0);
+    }
+    let stride = (lscx as u32 + lscy as u32 + lzmx as u32) * 4;
+    let entry = r.nbg_line_scroll_table(n) + (y / r.nbg_line_scroll_interval(n)) * stride;
+    let mut off = entry;
+    let int = |w: u32| (w >> 16) & 0x07FF;
+    let dx = if lscx {
+        let v = int(vdp2.vram.read32(off));
+        off += 4;
+        v
+    } else {
+        0
+    };
+    let dy = if lscy { int(vdp2.vram.read32(off)) } else { 0 };
+    (dx, dy)
+}
+
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
 fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
-    let (scroll_x, scroll_y) = vdp2.regs.nbg_scroll(n);
+    let (mut scroll_x, mut scroll_y) = vdp2.regs.nbg_scroll(n);
+    // NBG0/NBG1 support per-line scroll on top of the whole-layer scroll.
+    if n < 2 {
+        let (dx, dy) = line_scroll(vdp2, n, y);
+        scroll_x += dx;
+        scroll_y += dy;
+    }
     let depth = vdp2.regs.nbg_color_mode(n);
     let sx = x + scroll_x;
     let sy = y + scroll_y;
@@ -1209,5 +1246,24 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0x12, 0x34, 0x56, 0xFF]);
+    }
+
+    #[test]
+    fn nbg0_line_scroll_x_shifts_a_single_line() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x09A, 0x0002); // SCRCTL.N0LSCX, LSS=0 (every line)
+        v.regs.write16(0x0A2, 0x0200); // LSTA0L → table at byte 0x400
+        // Line 0 entry = 0 (no scroll); line 2 entry = integer 4 (bits 26..16).
+        v.vram.write32(0x400 + 2 * 4, 4 << 16);
+        v.cram.write16(2, 0x001F); // index 1 = red
+        v.vram.write8(2 * 512 + 4, 1); // bitmap dot at (4, 2)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Line 2 scrolls +4, so screen (0,2) samples bitmap (4,2) → red.
+        assert_eq!(pixel(&buf, 0, 2), [0xFF, 0, 0, 0xFF], "line 2 scrolled");
+        // Line 0 has no scroll, so screen (0,0) samples the empty (0,0).
+        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "line 0 unscrolled");
     }
 }

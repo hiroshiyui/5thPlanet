@@ -313,6 +313,52 @@ impl Vdp2Regs {
         )
     }
 
+    // ---- Line scroll (NBG0/NBG1 only) ----
+    //
+    // SCRCTL (0x09A) enables per-line horizontal/vertical scroll and selects
+    // the line-scroll interval (LSS): every 1/2/4/8 lines. The table lives in
+    // VRAM at LSTAn (NBG0 0x0A0/0x0A2, NBG1 0x0A4/0x0A6), word-addressed.
+
+    pub fn scrctl(&self) -> u16 {
+        self.read16(0x09A)
+    }
+    /// SCRCTL field block for NBG`n` (n = 0/1): N0 in bits 5..0, N1 in 13..8.
+    fn scrctl_bits(&self, n: usize) -> u16 {
+        if n == 0 {
+            self.scrctl() & 0x3F
+        } else {
+            (self.scrctl() >> 8) & 0x3F
+        }
+    }
+    /// Horizontal line-scroll enable for NBG`n` (LSCX).
+    pub fn nbg_line_scroll_x(&self, n: usize) -> bool {
+        self.scrctl_bits(n) & 0x02 != 0
+    }
+    /// Vertical line-scroll enable for NBG`n` (LSCY).
+    pub fn nbg_line_scroll_y(&self, n: usize) -> bool {
+        self.scrctl_bits(n) & 0x04 != 0
+    }
+    /// Horizontal line-zoom enable for NBG`n` (LZMX) — its longword occupies a
+    /// table slot even though the renderer doesn't apply the zoom yet.
+    pub fn nbg_line_zoom_x(&self, n: usize) -> bool {
+        self.scrctl_bits(n) & 0x08 != 0
+    }
+    /// Line-scroll interval in lines (LSS): 1, 2, 4 or 8.
+    pub fn nbg_line_scroll_interval(&self, n: usize) -> u32 {
+        1 << ((self.scrctl_bits(n) >> 4) & 0x3)
+    }
+    /// Byte address in VDP2 VRAM of NBG`n`'s line-scroll table. The register
+    /// pair holds the address divided by 2 (word units).
+    pub fn nbg_line_scroll_table(&self, n: usize) -> u32 {
+        let (hi, lo) = if n == 0 {
+            (0x0A0, 0x0A2)
+        } else {
+            (0x0A4, 0x0A6)
+        };
+        let addr = (((self.read16(hi) & 0x7) as u32) << 16) | self.read16(lo) as u32;
+        addr << 1
+    }
+
     // ---- Sprite-layer (VDP1 framebuffer) control ----
     //
     // VDP2 reads the VDP1 frame buffer as the sprite layer. SPCTL (0x0E0)
