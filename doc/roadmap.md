@@ -27,8 +27,8 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
 
-**Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ⏸ parked on a cycle-phase
-question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
+**Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ✅ — SEGA splash renders
+· M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
 plus a post-M6 fidelity pass that made the SH-2 on-chip peripherals (FRT/WDT/
 DMAC), SCU DMA (start factors / indirect / strides), and SMPC (live RTC / region)
 behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE + games +
@@ -81,13 +81,15 @@ and the SDL2 frontend shell.
 `cargo test --workspace` → 240 tests. **The "SEGA logo on screen" goal is not yet
 met** — see M4.
 
-## Milestone 4 — BIOS splash on screen ⏸ parked (pivoted to M5)
+## Milestone 4 — BIOS splash on screen ✅ done
 
-Goal: boot a real BIOS to the SEGA logo, confirmed visually via SDL2. M4 closed
-the known peripheral gaps the BIOS hits during init; the splash itself is
-**blocked on an interrupt-phase/cycle-accuracy question** (below) rather than a
-missing chip or spec bug, so work pivoted to M5 chip-coverage. Revisit the
-splash once more chips/behaviours are in.
+Goal: boot a real BIOS to the SEGA logo, confirmed visually. **Achieved
+(2026-05-28):** the BIOS boots to the animated SEGA splash (blue ringed-planet
+on green, "TM & © 1995 SEGA. All rights reserved."), the framebuffer settles to
+a stable image by frame ~285, and the `bios_boot` golden is committed
+(`0xF862E76BE919D7A6` at 300 frames). The blocker turned out to be a **single
+missing interrupt**, found via a re-syncing PC diff against the verified MAME
+reference (see below) — not the "cycle-phase" question we'd parked on.
 
 | # | Task | Status |
 |---|------|--------|
@@ -95,8 +97,8 @@ splash once more chips/behaviours are in.
 | 2 | CD-block presence stub + host-interface command protocol | ✅ done |
 | 3 | VDP1 register + VRAM + framebuffer stub (no rendering — became M5 task #1) | ✅ done |
 | 4 | VDP2 register-decode fidelity — renderer reads real registers, not constants | ✅ done |
-| 5 | Iterate-to-splash — trace BIOS, fix the next blocker | ⏸ parked (cycle-phase frontier) |
-| 6 | Commit splash golden + SDL2 visual confirmation | ⏸ blocked on #5 |
+| 5 | Iterate-to-splash — trace BIOS, fix the next blocker | ✅ done (missing VBlank-OUT interrupt) |
+| 6 | Commit splash golden + visual confirmation | ✅ done (`0xF862E76BE919D7A6`) |
 
 ### BIOS-boot debug — outcome
 
@@ -177,8 +179,23 @@ Revisiting the park with the loop-collapsed PC diff + live-state probes
   the (never-installed) VBlank-IN callback. We arrive at this wait loop *without*
   the BIOS having installed that callback.
 
-**So the genuine bug is a control-flow path we take — somewhere after the
-~9.3 M-instruction MAME-match point — that skips the callback install.**
+**RESOLVED (2026-05-28) — the bug was a missing VBlank-OUT interrupt.** A
+re-syncing PC diff (`mameref/resync_diff.py`) against a longer, verified MAME
+trace matched our control flow for **31.5 M instructions** then diverged exactly
+at the park: MAME exits (`0x060108C4`), we loop. Counting trampoline hits across
+the traces showed why — **SCU vector `0x41` (VBlank-OUT) fired 98× in MAME and
+0× in ours**; its installed callback (`0x060102AA`, runs `0x06013144`) is what
+advances the `0x060408A4` frame counter. `update_video_timing` raised VBlank-IN
+on the active→VBLANK edge but only triggered SCU **DMA** factor 1 (not the
+**interrupt**) on the VBLANK→active edge. One line — `scu.raise(Source::VBlankOut)`
+at that edge (`system.rs`) — ticks the counter, the park exits, the BIOS enables
+VDP2 display (`TVMD.DISP` 0→1) and renders the splash. The earlier "install never
+reached" probe was misleading: it watched vector `0x40`'s slot (legitimately a
+stub); the counter is driven by vector `0x41`.
+
+*Historical (pre-fix) analysis follows; kept for context.* The genuine bug was a
+control-flow path that skips the (`0x41`) callback — because the `0x41` interrupt
+never fired.
 
 **MAME reference verified to boot fully (2026-05-27).** `mameref/saturn` boots the
 *byte-identical* BIOS (USA/EUR/JP `mpr-17933.bin`, SHA1 `faa8ea18…`) past the SEGA
