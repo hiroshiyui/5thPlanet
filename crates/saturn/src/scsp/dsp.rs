@@ -196,7 +196,7 @@ impl Dsp {
                 let mut b = if bsel != 0 {
                     acc
                 } else {
-                    sext(self.temp[((tra + self.dec) & 0x7F) as usize], 24)
+                    sext(self.temp[((tra.wrapping_add(self.dec)) & 0x7F) as usize], 24)
                 };
                 if negb != 0 {
                     b = -b;
@@ -208,7 +208,7 @@ impl Dsp {
             let x = if xsel != 0 {
                 inputs
             } else {
-                sext(self.temp[((tra + self.dec) & 0x7F) as usize], 24)
+                sext(self.temp[((tra.wrapping_add(self.dec)) & 0x7F) as usize], 24)
             };
             let mut y = match ysel {
                 0 => frc_reg,
@@ -234,7 +234,7 @@ impl Dsp {
             acc = (v + b as i64) as i32;
 
             if twt != 0 {
-                self.temp[((twa + self.dec) & 0x7F) as usize] = shifted;
+                self.temp[((twa.wrapping_add(self.dec)) & 0x7F) as usize] = shifted;
             }
             if frcl != 0 {
                 frc_reg = if shift == 3 {
