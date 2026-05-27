@@ -208,6 +208,43 @@ impl Vdp2Regs {
         bit != 0
     }
 
+    /// Pattern-name control word for NBG`n` (PNCN0..3 at 0x030 + n·2).
+    pub fn nbg_pncn(&self, n: usize) -> u16 {
+        self.read16(0x030 + n as u32 * 2)
+    }
+    /// Pattern-name data size: true = 1-word entries, false = 2-word (PNB).
+    pub fn nbg_pn_one_word(&self, n: usize) -> bool {
+        self.nbg_pncn(n) & 0x8000 != 0
+    }
+    /// Character-number supplement mode (CNSM): in 1-word mode, true selects
+    /// a 12-bit char number with no flip, false a 10-bit number + 2 flip bits.
+    pub fn nbg_pn_cnsm(&self, n: usize) -> bool {
+        self.nbg_pncn(n) & 0x4000 != 0
+    }
+    /// Supplementary character bits (SPCN, 1-word mode).
+    pub fn nbg_pn_spcn(&self, n: usize) -> u32 {
+        (self.nbg_pncn(n) & 0x1F) as u32
+    }
+    /// Supplementary palette bits (SPLT, 1-word 16-colour mode).
+    pub fn nbg_pn_splt(&self, n: usize) -> u32 {
+        ((self.nbg_pncn(n) >> 5) & 0x7) as u32
+    }
+
+    /// The 9-bit plane number for NBG`n` plane `plane` (0=A,1=B,2=C,3=D),
+    /// i.e. `(map_offset << 6) | MPxx`. MPABNn (A/B) at 0x040 + n·4, MPCDNn
+    /// (C/D) at 0x042 + n·4.
+    pub fn nbg_plane_page(&self, n: usize, plane: usize) -> u32 {
+        let base = 0x040 + n as u32 * 4;
+        let (reg, shift) = match plane {
+            0 => (base, 0),
+            1 => (base, 8),
+            2 => (base + 2, 0),
+            _ => (base + 2, 8),
+        };
+        let mp = ((self.read16(reg) >> shift) & 0x3F) as u32;
+        (self.nbg_map_offset(n) << 6) | mp
+    }
+
     /// Bitmap-format enable for NBG0/1 (NBG2/3 are cell-only → false).
     pub fn nbg_bitmap_enabled(&self, n: usize) -> bool {
         match n {
