@@ -282,7 +282,13 @@ impl Saturn {
         // pinned to this edge.
         if vblank && (prev & 0x0008) == 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankIn);
+            // VDP1 swaps its draw/display buffers at the frame boundary.
+            self.bus.vdp1.frame_change();
         }
+
+        // Complete any in-flight VDP1 plot whose draw duration has elapsed,
+        // even between CPU accesses, so draw-end lands at the modelled cycle.
+        self.bus.vdp1.settle(now);
     }
 
     /// Within-frame cycle of the active→VBLANK transition (start of line
@@ -667,7 +673,7 @@ impl Saturn {
         const VBLANK_CYCLES: u64 = CYCLES_PER_FRAME - ACTIVE_CYCLES;
 
         self.run_for(ACTIVE_CYCLES);
-        crate::vdp2::render_frame(&self.bus.vdp2, Some(&self.bus.vdp1.fb), out);
+        crate::vdp2::render_frame(&self.bus.vdp2, Some(self.bus.vdp1.display_fb()), out);
         self.run_for(VBLANK_CYCLES);
     }
 

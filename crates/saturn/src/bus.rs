@@ -135,7 +135,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read8(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read8(addr - SOUND_BASE),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read8(addr - CD_BLOCK_BASE),
-            a if Vdp1::owns(a) => self.vdp1.read8(a),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.read8(a)
+            }
             a if Vdp2::owns(a) => self.vdp2.read8(a),
             SCU_BASE..=SCU_END => self.scu.read8(addr - SCU_BASE),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read8(addr - SCSP_RAM_BASE),
@@ -158,7 +161,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read16(addr - CD_BLOCK_BASE),
-            a if Vdp1::owns(a) => self.vdp1.read16(a),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.read16(a)
+            }
             a if Vdp2::owns(a) => self.vdp2.read16(a),
             SCU_BASE..=SCU_END => self.scu.read16(addr - SCU_BASE),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read16(addr - SCSP_RAM_BASE),
@@ -181,7 +187,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read32(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read32(addr - SOUND_BASE),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read32(addr - CD_BLOCK_BASE),
-            a if Vdp1::owns(a) => self.vdp1.read32(a),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.read32(a)
+            }
             a if Vdp2::owns(a) => self.vdp2.read32(a),
             SCU_BASE..=SCU_END => self.scu.read32(addr - SCU_BASE),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read32(addr - SCSP_RAM_BASE),
@@ -201,7 +210,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write8(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write8(addr - SOUND_BASE, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write8(addr - CD_BLOCK_BASE, val),
-            a if Vdp1::owns(a) => self.vdp1.write8(a, val),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.write8(a, val)
+            }
             a if Vdp2::owns(a) => self.vdp2.write8(a, val),
             SCU_BASE..=SCU_END => self.scu.write8(addr - SCU_BASE, val),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write8(addr - SCSP_RAM_BASE, val),
@@ -221,7 +233,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write16(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write16(addr - SOUND_BASE, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write16(addr - CD_BLOCK_BASE, val),
-            a if Vdp1::owns(a) => self.vdp1.write16(a, val),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.write16(a, val)
+            }
             a if Vdp2::owns(a) => self.vdp2.write16(a, val),
             SCU_BASE..=SCU_END => self.scu.write16(addr - SCU_BASE, val),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write16(addr - SCSP_RAM_BASE, val),
@@ -241,7 +256,10 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write32(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write32(addr - SOUND_BASE, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write32(addr - CD_BLOCK_BASE, val),
-            a if Vdp1::owns(a) => self.vdp1.write32(a, val),
+            a if Vdp1::owns(a) => {
+                self.vdp1.tick(self.cycle);
+                self.vdp1.write32(a, val)
+            }
             a if Vdp2::owns(a) => self.vdp2.write32(a, val),
             SCU_BASE..=SCU_END => self.scu.write32(addr - SCU_BASE, val),
             SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write32(addr - SCSP_RAM_BASE, val),

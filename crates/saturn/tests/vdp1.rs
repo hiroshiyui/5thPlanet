@@ -30,11 +30,14 @@ fn plot_trigger_acks_draw_end_via_the_bus() {
     // EDSR (0x10) starts with no end flag.
     let (edsr, _) = sat.bus.read16(REGS_BASE + 0x10, AccessKind::Data);
     assert_eq!(edsr & 0x0002, 0);
-    // Write PTMR (0x04) to kick a plot; EDSR.CEF must latch so BIOS
-    // polling on the draw-end flag completes.
+    // Write PTMR (0x04) to kick a plot. The draw is timed, so EDSR.CEF stays
+    // clear while it is in progress and latches once the duration elapses.
     sat.bus.write16(REGS_BASE + 0x04, 0x0001, AccessKind::Data);
     let (edsr, _) = sat.bus.read16(REGS_BASE + 0x10, AccessKind::Data);
-    assert_eq!(edsr & 0x0002, 0x0002, "PTMR must set EDSR.CEF");
+    assert_eq!(edsr & 0x0002, 0, "draw still in progress");
+    sat.bus.vdp1.settle(u64::MAX); // advance past the modelled draw duration
+    let (edsr, _) = sat.bus.read16(REGS_BASE + 0x10, AccessKind::Data);
+    assert_eq!(edsr & 0x0002, 0x0002, "EDSR.CEF latches at draw-end");
 }
 
 #[test]
@@ -356,11 +359,16 @@ fn ptmr_write_through_registers_triggers_the_plot() {
     // immediate-draw mode bit set.
     v.write16(REGS_BASE + 0x04, 0x0002);
 
+    // The pixels are rendered immediately, but draw-end is timed: CEF stays
+    // clear until the modelled draw duration elapses.
     assert_eq!(v.fb.pixel(35, 35), 0x001F, "PTMR write drove the plotter");
+    assert!(v.is_drawing(), "draw is in progress, not instantaneous");
+    assert_eq!(v.regs.read16(0x10) & 0x0002, 0, "CEF not yet latched");
+    v.settle(u64::MAX);
     assert_eq!(
         v.regs.read16(0x10) & 0x0002,
         0x0002,
-        "draw-end flag latched"
+        "draw-end flag latched after the draw duration"
     );
 }
 
@@ -527,12 +535,38 @@ fn plot_raises_the_scu_sprite_draw_end_interrupt() {
     // Stage an (empty) command list and kick the plot through the bus.
     sat.bus.write32(VRAM_BASE, 0x8000_0000, AccessKind::Data); // END
     sat.bus.write16(REGS_BASE + 0x04, 0x0002, AccessKind::Data); // PTMR
-    // The aggregate drains the VDP1 draw-end into the SCU here.
+    // The draw is timed; advance past its duration so it completes, then let
+    // the aggregate drain the VDP1 draw-end into the SCU.
+    sat.bus.vdp1.settle(u64::MAX);
     sat.debug_drain();
     // SCU IST bit 13 = SpriteDrawEnd (sticky until software clears it).
     assert_ne!(
         sat.bus.scu.ist & (1 << 13),
         0,
         "VDP1 draw-end must raise the SCU sprite-draw-end source"
+    );
+}
+
+#[test]
+fn timed_draw_end_fires_after_the_draw_duration_via_run_for() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.bus.write32(VRAM_BASE, 0x8000_0000, AccessKind::Data); // END
+    sat.bus.write16(REGS_BASE + 0x04, 0x0002, AccessKind::Data); // PTMR
+
+    // The draw is in progress and has not yet raised the SCU source.
+    assert!(
+        sat.bus.vdp1.is_drawing(),
+        "plot is timed, still in progress"
+    );
+    assert_eq!(sat.bus.scu.ist & (1 << 13), 0, "no draw-end yet");
+
+    // Advancing global time completes the draw and raises the interrupt.
+    sat.run_for(4096);
+    assert!(!sat.bus.vdp1.is_drawing(), "plot completed");
+    assert_ne!(
+        sat.bus.scu.ist & (1 << 13),
+        0,
+        "draw-end latched after the modelled draw duration"
     );
 }

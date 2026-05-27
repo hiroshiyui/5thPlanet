@@ -16,8 +16,12 @@
 //!   0x05D0_0000..0x05D0_0017   Registers    (11 × 16-bit)
 //! ```
 //!
-//! Still to come (M5 task #2): gouraud shading, double-buffer swap, and
-//! cycle-accurate draw-end timing.
+//! Double buffering: the plotter draws into the *draw* buffer ([`Vdp1::fb`])
+//! while VDP2 composites the *display* buffer ([`Vdp1::display_fb`]); `FBCR`
+//! swaps them at the frame boundary (automatic 1-cycle mode or a manual
+//! change). A plot kicked through `PTMR` takes a modelled number of cycles
+//! proportional to its commands + dots, so `EDSR.CEF` reads busy and the SCU
+//! sprite-draw-end interrupt fires only once that duration elapses.
 
 pub mod command;
 pub mod framebuffer;
@@ -38,14 +42,30 @@ pub const FB_END: u32 = 0x05CB_FFFF;
 pub const REGS_BASE: u32 = 0x05D0_0000;
 pub const REGS_END: u32 = 0x05D0_0017;
 
+/// Per-command setup and per-dot cost of a plot, in SH-2 master cycles.
+/// REVIEW(magic): the VDP1 draws roughly one dot per video-clock cycle plus
+/// per-command overhead; these are modelled coefficients (not from a manual
+/// table) chosen so a full-screen plot takes most of a frame while a tiny
+/// list completes quickly. They give draw-end a realistic, non-zero latency.
+const DRAW_CMD_CYCLES: u64 = 16;
+const DRAW_PIXEL_CYCLES: u64 = 1;
+
 #[derive(Clone, Debug)]
 pub struct Vdp1 {
     pub vram: Vram,
+    /// Draw buffer — the plotter renders here.
     pub fb: Framebuffer,
+    /// Display buffer — VDP2 composites this as the sprite layer.
+    display: Framebuffer,
     pub regs: Vdp1Regs,
     /// Set when a plot finishes; the Saturn aggregate drains this and
     /// raises the SCU sprite-draw-end interrupt (drain-at-aggregate).
     draw_end_pending: bool,
+    /// Current global cycle, refreshed by the bus on each VDP1 access so a
+    /// `PTMR`-kicked plot can schedule its completion.
+    now: u64,
+    /// When a timed plot is in flight, the global cycle it completes at.
+    busy_until: Option<u64>,
 }
 
 impl Default for Vdp1 {
@@ -59,8 +79,54 @@ impl Vdp1 {
         Self {
             vram: Vram::new(),
             fb: Framebuffer::new(),
+            display: Framebuffer::new(),
             regs: Vdp1Regs::new(),
             draw_end_pending: false,
+            now: 0,
+            busy_until: None,
+        }
+    }
+
+    /// The buffer VDP2 reads as the sprite layer (the front/display buffer).
+    pub fn display_fb(&self) -> &Framebuffer {
+        &self.display
+    }
+
+    /// Refresh the cycle hint and complete any in-flight plot that is now due.
+    /// The bus calls this on every VDP1 access (mirroring SMPC's INTBACK
+    /// settle), so CPU polling of `EDSR` advances the draw clock.
+    pub fn tick(&mut self, now: u64) {
+        self.now = now;
+        self.settle(now);
+    }
+
+    /// Complete a timed plot once `now` reaches its scheduled end: latch
+    /// `EDSR.CEF` and flag the SCU sprite-draw-end interrupt.
+    pub fn settle(&mut self, now: u64) {
+        if let Some(end) = self.busy_until
+            && now >= end
+        {
+            self.busy_until = None;
+            self.regs.cef_set();
+            self.draw_end_pending = true;
+        }
+    }
+
+    /// Whether a plot is still in progress (draw-end not yet latched).
+    pub fn is_drawing(&self) -> bool {
+        self.busy_until.is_some()
+    }
+
+    /// `FBCR`-driven frame-buffer change, called at the VBlank boundary.
+    /// Automatic 1-cycle mode (FCM=0) swaps every frame; manual mode (FCM=1)
+    /// swaps only when the one-shot change trigger FCT is set.
+    pub fn frame_change(&mut self) {
+        let fbcr = self.regs.read16(0x02);
+        let manual = fbcr & 0x02 != 0; // FCM
+        let trigger = fbcr & 0x01 != 0; // FCT
+        if !manual || trigger {
+            core::mem::swap(&mut self.fb, &mut self.display);
+            self.regs.write16(0x02, fbcr & !0x01); // clear the one-shot FCT
         }
     }
 
@@ -142,23 +208,20 @@ impl Vdp1 {
         }
     }
 
-    /// React to a control-register write. `PTMR` (0x04) kicks the
-    /// plotter when its mode bits are set; `ENDR` (0x0C) force-terminates
-    /// the current draw, which (since our plot is synchronous) simply
-    /// raises the draw-end flag for a waiting poll.
+    /// React to a control-register write. `PTMR` (0x04) kicks the plotter
+    /// (a timed draw) when its mode bits are set; `ENDR` (0x0C)
+    /// force-terminates the current draw, completing it immediately.
     fn after_reg_write(&mut self, off: u32) {
         match off {
-            0x04 if self.regs.ptmr() & 0x03 != 0 => self.process_list(),
-            0x0C => self.regs.cef_set(),
+            0x04 if self.regs.ptmr() & 0x03 != 0 => self.begin_plot(),
+            0x0C => self.finish_draw(),
             _ => {}
         }
     }
 
-    /// Run the VDP1 command list now: clear the draw-end flag, walk the
-    /// table in VRAM rendering into the frame buffer, then latch COPR and
-    /// raise the draw-end flag. The draw is synchronous (timing-exact
-    /// draw-end + the SCU sprite-end interrupt are the next increment).
-    pub fn process_list(&mut self) {
+    /// Render the command list into the draw buffer and latch the command
+    /// addresses, returning the plot result (used to size the draw duration).
+    fn render_list(&mut self) -> plotter::PlotResult {
         let prev_copr = self.regs.read16(0x14);
         self.erase_framebuffer();
         self.regs.cef_clear();
@@ -166,7 +229,31 @@ impl Vdp1 {
         let mut plotter = Plotter::new(&*vram, fb);
         let result = plotter.process_list();
         regs.set_command_addrs(prev_copr, result.copr);
-        regs.cef_set();
+        result
+    }
+
+    /// Run the command list and complete the draw immediately. Convenience
+    /// path for direct callers/tests that don't model draw timing.
+    pub fn process_list(&mut self) {
+        self.render_list();
+        self.finish_draw();
+    }
+
+    /// Kick a timed plot: render now (the pixels are ready) but defer the
+    /// draw-end — `EDSR.CEF` and the SCU interrupt land after a duration
+    /// proportional to the plot's commands + dots. The bus refreshes `now`
+    /// before this runs (see [`Self::tick`]).
+    pub fn begin_plot(&mut self) {
+        let r = self.render_list();
+        let duration =
+            r.command_count as u64 * DRAW_CMD_CYCLES + r.pixels as u64 * DRAW_PIXEL_CYCLES;
+        self.busy_until = Some(self.now + duration);
+    }
+
+    /// Latch draw-end now (plot finished or force-terminated via ENDR).
+    fn finish_draw(&mut self) {
+        self.busy_until = None;
+        self.regs.cef_set();
         self.draw_end_pending = true;
     }
 
@@ -215,17 +302,47 @@ mod tests {
         let mut v = Vdp1::new();
         v.write32(VRAM_BASE + 0x100, 0xDEAD_BEEF);
         v.write16(FB_BASE + 0x40, 0x7FFF);
-        v.write16(REGS_BASE + 0x00, 0x0003); // TVMR
+        v.write16(REGS_BASE, 0x0003); // TVMR
         assert_eq!(v.read32(VRAM_BASE + 0x100), 0xDEAD_BEEF);
         assert_eq!(v.read16(FB_BASE + 0x40), 0x7FFF);
-        assert_eq!(v.read16(REGS_BASE + 0x00), 0x0003);
+        assert_eq!(v.read16(REGS_BASE), 0x0003);
     }
 
     #[test]
     fn plot_trigger_via_aggregate_sets_draw_end() {
         let mut v = Vdp1::new();
-        v.write16(REGS_BASE + 0x04, 0x0001); // PTMR
-        // EDSR (0x10) CEF bit must be set.
-        assert_eq!(v.read16(REGS_BASE + 0x10) & 0x0002, 0x0002);
+        v.write16(REGS_BASE + 0x04, 0x0001); // PTMR — kicks a timed plot
+        assert!(v.is_drawing(), "plot in progress");
+        assert_eq!(v.read16(REGS_BASE + 0x10) & 0x0002, 0, "CEF not yet set");
+        v.settle(u64::MAX);
+        assert_eq!(v.read16(REGS_BASE + 0x10) & 0x0002, 0x0002, "CEF latched");
+    }
+
+    #[test]
+    fn frame_change_swaps_draw_and_display_buffers() {
+        let mut v = Vdp1::new();
+        // Draw a marker into the draw buffer; the display buffer is still blank.
+        v.fb.set_pixel(3, 3, 0x7FFF);
+        assert_eq!(v.display_fb().pixel(3, 3), 0, "display blank before swap");
+        // FBCR power-on = 0 → automatic 1-cycle mode → swap every frame.
+        v.frame_change();
+        assert_eq!(
+            v.display_fb().pixel(3, 3),
+            0x7FFF,
+            "swap exposes the drawn buffer"
+        );
+    }
+
+    #[test]
+    fn manual_mode_swaps_only_when_the_change_trigger_is_set() {
+        let mut v = Vdp1::new();
+        v.fb.set_pixel(1, 1, 0x1234);
+        v.write16(REGS_BASE + 0x02, 0x0002); // FBCR: FCM=1 (manual), FCT=0
+        v.frame_change();
+        assert_eq!(v.display_fb().pixel(1, 1), 0, "manual mode: no swap");
+        v.write16(REGS_BASE + 0x02, 0x0003); // FCM=1, FCT=1 → change now
+        v.frame_change();
+        assert_eq!(v.display_fb().pixel(1, 1), 0x1234, "FCT triggered the swap");
+        assert_eq!(v.read16(REGS_BASE + 0x02) & 0x0001, 0, "FCT is one-shot");
     }
 }

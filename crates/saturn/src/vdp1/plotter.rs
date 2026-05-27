@@ -105,8 +105,10 @@ enum PixelMode {
 /// Outcome of processing a command list.
 #[derive(Clone, Copy, Debug)]
 pub struct PlotResult {
-    /// Number of commands visited (drives draw-end timing later).
+    /// Number of commands visited (per-command setup cost in draw timing).
     pub command_count: u32,
+    /// Number of frame-buffer dots processed (per-pixel cost in draw timing).
+    pub pixels: u32,
     /// Final command-table position (>>3 form for COPR).
     pub copr: u16,
 }
@@ -123,6 +125,8 @@ pub struct Plotter<'a> {
     /// Per-vertex gouraud colours (R, G, B; 5-bit each) for the four quad
     /// corners A–D when CMDPMOD bit 2 is set, else `None`.
     gouraud: Option<[(i32, i32, i32); 4]>,
+    /// Count of frame-buffer dots processed (drives the draw-duration model).
+    pixels: u32,
 }
 
 impl<'a> Plotter<'a> {
@@ -145,6 +149,7 @@ impl<'a> Plotter<'a> {
             cmd: Command::default(),
             mode: PixelMode::Generic,
             gouraud: None,
+            pixels: 0,
         }
     }
 
@@ -312,6 +317,7 @@ impl<'a> Plotter<'a> {
 
         PlotResult {
             command_count: count,
+            pixels: self.pixels,
             copr: ((position * 0x20) >> 3) as u16,
         }
     }
@@ -348,6 +354,7 @@ impl<'a> Plotter<'a> {
     /// linear texel index `v*xsize + u`; `shade` is the interpolated gouraud
     /// colour (16.16 per channel) when gouraud is active.
     fn draw_pixel(&mut self, x: i32, y: i32, pd: i32, off: i32, shade: Option<(i32, i32, i32)>) {
+        self.pixels += 1; // a processed dot, drawn or clipped, costs draw time
         if self.mode == PixelMode::Poly {
             if (0..FB_STRIDE).contains(&x) && (0..FB_HEIGHT).contains(&y) {
                 self.fb.set_pixel(x, y, self.cmd.colr);
