@@ -661,7 +661,13 @@ pub struct Scsp {
     /// Sub-SH-2-cycle accumulators for the 68k-clock and sample-clock rates.
     frac: u64,
     sample_frac: u64,
+    /// Generated 44.1 kHz output, interleaved L,R. The frontend drains it each
+    /// frame; capped so headless runs (which never drain) don't grow unbounded.
+    out: Vec<i16>,
 }
+
+/// Cap on the buffered audio (interleaved samples ≈ 46 ms) — overrun guard.
+const MAX_AUDIO_SAMPLES: usize = 4096;
 
 impl Default for Scsp {
     fn default() -> Self {
@@ -678,7 +684,14 @@ impl Scsp {
             running: false,
             frac: 0,
             sample_frac: 0,
+            out: Vec::new(),
         }
+    }
+
+    /// Take the generated audio (interleaved L,R, 44.1 kHz). The frontend
+    /// queues this to the audio device each frame.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        core::mem::take(&mut self.out)
     }
 
     /// Release the 68k from reset (SMPC `SNDON`): reload SSP/PC from the
@@ -733,11 +746,22 @@ impl Scsp {
         if !self.running {
             return;
         }
-        // Sample clock → timers.
+        // Sample clock → timers + audio generation.
         self.sample_frac += sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ);
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
         self.ctrl.tick_timers(samples);
+        for _ in 0..samples {
+            if self.out.len() >= MAX_AUDIO_SAMPLES {
+                break; // overrun (frontend not draining) — drop the excess
+            }
+            let (l, r) = {
+                let Scsp { ctrl, ram, .. } = &mut *self;
+                ctrl.mix(ram)
+            };
+            self.out.push(l);
+            self.out.push(r);
+        }
 
         // 68k clock → instruction stepping.
         self.frac += sh2_cycles.saturating_mul(SCSP_CLOCK_HZ);
@@ -1053,7 +1077,7 @@ mod tests {
         s.ctrl.write16(base + 0x08, 0x20); // data[4]: EGHOLD
         s.ctrl.write16(base + 0x16, (disdl << 13) | (dipan << 8)); // DISDL/DIPAN
         s.ctrl.write16(base + 0x10, 0); // OCT/FNS
-        s.ctrl.write16(base + 0x00, 0x1800); // key on (SA high nibble 0)
+        s.ctrl.write16(base, 0x1800); // key on (SA high nibble 0)
     }
 
     #[test]
@@ -1095,6 +1119,20 @@ mod tests {
     fn silence_when_no_slot_is_active() {
         let mut s = Scsp::new();
         assert_eq!(s.next_sample(), (0, 0));
+    }
+
+    #[test]
+    fn run_generates_audio_for_an_active_slot() {
+        let mut s = Scsp::new();
+        s.ram.write32(4, 0x2000); // 68k reset PC
+        s.ram.write16(0x2000, 0x60FE); // BRA self
+        keyon_panned(&mut s, 0, 0x2000, 7, 0x00); // slot 0 audible, centred
+        s.start(); // release the 68k → SCSP runs
+        s.run(2_000_000); // many SH-2 cycles → fill the audio buffer
+        let audio = s.take_audio();
+        assert!(!audio.is_empty(), "audio was generated");
+        assert!(audio.iter().any(|&x| x != 0), "output is non-silent");
+        assert!(s.take_audio().is_empty(), "buffer drained");
     }
 
     #[test]

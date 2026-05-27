@@ -657,4 +657,10 @@ impl Saturn {
         crate::vdp2::render_frame(&self.bus.vdp2, Some(&self.bus.vdp1.fb), out);
         self.run_for(VBLANK_CYCLES);
     }
+
+    /// Take the SCSP's generated audio for this period (interleaved L,R at
+    /// 44.1 kHz). The frontend queues it to the audio device each frame.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.bus.scsp.take_audio()
+    }
 }

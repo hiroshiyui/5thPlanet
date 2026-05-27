@@ -48,6 +48,7 @@ fn main() -> ExitCode {
 
 #[cfg(feature = "sdl2-frontend")]
 fn run(bios: Vec<u8>) -> ExitCode {
+    use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
@@ -60,12 +61,22 @@ fn run(bios: Vec<u8>) -> ExitCode {
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
-    let window = video
-        .window(
-            "5thPlanet",
-            FRAME_WIDTH as u32 * 2,
-            FRAME_HEIGHT as u32 * 2,
+
+    // SCSP audio: a 44.1 kHz stereo S16 queue the SCSP fills each frame.
+    let audio = sdl.audio().expect("SDL2 audio subsystem");
+    let audio_queue = audio
+        .open_queue::<i16, _>(
+            None,
+            &AudioSpecDesired {
+                freq: Some(44_100),
+                channels: Some(2),
+                samples: None,
+            },
         )
+        .expect("open audio queue");
+    audio_queue.resume();
+    let window = video
+        .window("5thPlanet", FRAME_WIDTH as u32 * 2, FRAME_HEIGHT as u32 * 2)
         .position_centered()
         .build()
         .expect("create window");
@@ -116,6 +127,14 @@ fn run(bios: Vec<u8>) -> ExitCode {
         }
 
         saturn.run_frame(&mut framebuffer);
+
+        // Queue this frame's SCSP audio, unless we're already buffered well
+        // ahead (keeps latency bounded if the host runs faster than realtime).
+        let audio_samples = saturn.take_audio();
+        if audio_queue.size() < 44_100 * 2 * 2 / 4 {
+            audio_queue.queue_audio(&audio_samples).ok();
+        }
+
         texture
             .update(None, &framebuffer, FRAME_WIDTH * 4)
             .expect("upload framebuffer");
