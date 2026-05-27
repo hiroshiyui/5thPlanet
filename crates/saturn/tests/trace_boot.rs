@@ -647,6 +647,69 @@ fn dump_callback_table() {
 }
 
 #[test]
+#[ignore = "manual: framebuffer hash + non-black count over time — find a stable splash frame"]
+fn splash_timeline() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let fnv = |b: &[u8]| {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
+    };
+    let mut prev = 0u64;
+    for f in 1..=600u32 {
+        sat.run_frame(&mut fb);
+        if f % 15 == 0 || f <= 5 {
+            let h = fnv(&fb);
+            let nb = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+            let mark = if h == prev { " (stable)" } else { "" };
+            println!("frame {f:>3}: hash=0x{h:016X} nonblack={nb}{mark}");
+            prev = h;
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual: dump the framebuffer at several frames to PPM for visual splash check"]
+fn dump_framebuffer() {
+    use std::io::Write;
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let w = 320usize;
+    let h = 224usize;
+    let mut next = 0u32;
+    for snap in [90u32, 120, 150, 180, 240, 300] {
+        while next < snap {
+            sat.run_frame(&mut fb);
+            next += 1;
+        }
+        // Write a binary PPM (P6, RGB) — drop the RGBA alpha byte.
+        let path = format!("/tmp/fb_{snap:03}.ppm");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        write!(out, "P6\n{w} {h}\n255\n").unwrap();
+        for px in fb.chunks_exact(4) {
+            out.write_all(&px[0..3]).unwrap();
+        }
+        out.flush().unwrap();
+        let nonblack = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+        println!("frame {snap}: wrote {path} ({nonblack} non-black px)");
+    }
+}
+
+#[test]
 #[ignore = "manual: at the park, is VDP2 display on + is the splash in the framebuffer?"]
 fn check_splash_state() {
     let Some((bios, _)) = load_bios() else {
