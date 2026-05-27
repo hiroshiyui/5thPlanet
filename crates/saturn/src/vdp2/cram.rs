@@ -4,12 +4,12 @@
 //! supports three CRAM "modes" selectable by `RAMCTL`:
 //!
 //! - **Mode 0**: 1024 × 16-bit entries (RGB555 + transparency bit)
-//! - **Mode 1**: 2048 × 16-bit entries
-//! - **Mode 2**: 1024 × 32-bit entries (true 8-bit-per-channel)
+//! - **Mode 1**: 2048 × 16-bit entries (same RGB555 encoding, more entries)
+//! - **Mode 2**: 1024 × 32-bit entries (true 8-bit-per-channel RGB888)
 //!
-//! M3 renders in Mode 0 only — that's what the BIOS splash uses
-//! (and most 2D-era games besides). Mode 1 / 2 helpers can land
-//! when a target game demands them.
+//! [`Cram::color_rgb888`] decodes any of them given the current RAMCTL.CRMD;
+//! the renderer passes the live mode. ([`Cram::color_rgb888_mode0`] remains
+//! the fast RGB555 path the mode-aware lookup delegates to for modes 0/1.)
 
 const CRAM_BYTES: usize = 4 * 1024;
 
@@ -85,6 +85,27 @@ impl Cram {
         let b5 = (entry >> 10) & 0x1F;
         (expand5to8(r5), expand5to8(g5), expand5to8(b5))
     }
+
+    /// Look up a palette entry honouring the current CRAM mode (RAMCTL.CRMD):
+    ///
+    /// - **0 / 1** — 16-bit RGB555 entries (`index × 2`); modes differ only in
+    ///   entry count (1024 vs 2048), which is the caller's index range.
+    /// - **2 / 3** — 32-bit RGB888 entries (`index × 4`, stored `0x00BBGGRR`),
+    ///   giving true 8-bit-per-channel colour.
+    pub fn color_rgb888(&self, index: usize, cram_mode: u8) -> (u8, u8, u8) {
+        match cram_mode {
+            2 | 3 => {
+                let off = (index * 4) % self.bytes.len();
+                let w = self.read32(off as u32);
+                (
+                    (w & 0xFF) as u8,
+                    ((w >> 8) & 0xFF) as u8,
+                    ((w >> 16) & 0xFF) as u8,
+                )
+            }
+            _ => self.color_rgb888_mode0(index),
+        }
+    }
 }
 
 /// Expand a 15-bit RGB555 value (the low 15 bits of an entry / a direct
@@ -149,5 +170,17 @@ mod tests {
         // Set T bit + R=31; the T bit shouldn't bleed into the colour.
         c.write16(0, 0x801F);
         assert_eq!(c.color_rgb888_mode0(0), (0xFF, 0x00, 0x00));
+    }
+
+    #[test]
+    fn mode2_lookup_reads_32bit_rgb888_entries() {
+        let mut c = Cram::new();
+        // Entry 1 (index 1 → byte 4): 0x00BBGGRR with R=0x12, G=0x34, B=0x56.
+        c.write32(4, 0x0056_3412);
+        assert_eq!(c.color_rgb888(1, 2), (0x12, 0x34, 0x56));
+        // Modes 0/1 still take the 16-bit RGB555 path.
+        c.write16(0, 0x001F);
+        assert_eq!(c.color_rgb888(0, 0), (0xFF, 0x00, 0x00));
+        assert_eq!(c.color_rgb888(0, 1), (0xFF, 0x00, 0x00));
     }
 }

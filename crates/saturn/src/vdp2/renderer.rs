@@ -12,10 +12,11 @@
 //!   char vs 10-bit char + H/V flip, with SPCN/SPLT supplement) and 2-word
 //!   (15-bit char + 7-bit palette + flip) entries, 8×8 and 16×16 characters,
 //!   and plane sizes 1×1 / 2×1 / 2×2 pages composed across planes A–D.
-//! - **Colour formats**: 4bpp / 8bpp paletted (CRAM mode 0, RGB555) for both
-//!   tile and bitmap, plus 16bpp RGB direct-colour for bitmap. Palette index
-//!   0 (paletted) / value 0 (RGB) is transparent. 8bpp tiles select a CRAM
-//!   colour bank from the pattern-name palette field.
+//! - **Colour formats**: 4bpp / 8bpp paletted for both tile and bitmap, plus
+//!   16bpp RGB direct-colour for bitmap. Palette index 0 (paletted) / value 0
+//!   (RGB) is transparent. 8bpp tiles select a CRAM colour bank from the
+//!   pattern-name palette field. Palette lookups honour the live CRAM mode —
+//!   RGB555 (modes 0/1) or true RGB888 (modes 2/3).
 //! - **Backdrop** = CRAM index 0 (the real BKTAU/BKTAL backdrop register is
 //!   a later refinement; palette entry 0 is what splash software programs).
 //! - **Scrolling**: integer NBG scroll; fractional scroll and zoom ignored.
@@ -47,7 +48,7 @@
 //!
 //! Deferred to later increments: the line-coefficient table (per-line scaling)
 //! and dual-parameter window selection, line windows, the sprite window plane,
-//! line-scroll, and CRAM modes 1/2.
+//! and line-scroll.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -84,7 +85,7 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
         return;
     }
 
-    let backdrop = vdp2.cram.color_rgb888_mode0(BACKDROP_PALETTE_INDEX);
+    let backdrop = cram(vdp2, BACKDROP_PALETTE_INDEX);
 
     for y in 0..FRAME_HEIGHT {
         for x in 0..FRAME_WIDTH {
@@ -139,6 +140,13 @@ struct Dot {
     pri: u8,
     rgb: (u8, u8, u8),
     cc: Option<(u8, bool)>,
+}
+
+/// Look up CRAM palette `index` honouring the live CRAM mode (RGB555 for
+/// modes 0/1, RGB888 for modes 2/3).
+#[inline]
+fn cram(vdp2: &Vdp2, index: usize) -> (u8, u8, u8) {
+    vdp2.cram.color_rgb888(index, vdp2.regs.cram_mode())
 }
 
 /// The sprite layer's contribution: a normal colour dot, or an MSB shadow that
@@ -294,14 +302,14 @@ fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(
         // 8bpp paletted (256 colour).
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0).then(|| vdp2.cram.color_rgb888_mode0(idx))
+            (idx != 0).then(|| cram(vdp2, idx))
         }
         // 4bpp paletted (16 colour). The BMPNA palette bank is a later
         // refinement; the nibble indexes the low palette directly.
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0).then(|| vdp2.cram.color_rgb888_mode0(nibble))
+            (nibble != 0).then(|| cram(vdp2, nibble))
         }
     }
 }
@@ -419,18 +427,12 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
     if depth == 1 {
         // 8bpp cell: 64 bytes, one byte/pixel; palette is the colour bank.
         let byte = vdp2.vram.read8(cell * 64 + py * 8 + px) as usize;
-        (byte != 0).then(|| {
-            vdp2.cram
-                .color_rgb888_mode0((pat.palette as usize) << 8 | byte)
-        })
+        (byte != 0).then(|| cram(vdp2, (pat.palette as usize) << 8 | byte))
     } else {
         // 4bpp cell: 32 bytes, two pixels/byte (high nibble = even column).
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
         let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
-        (nibble != 0).then(|| {
-            vdp2.cram
-                .color_rgb888_mode0((pat.palette as usize) << 4 | nibble)
-        })
+        (nibble != 0).then(|| cram(vdp2, (pat.palette as usize) << 4 | nibble))
     }
 }
 
@@ -519,7 +521,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
     let ccidx = ((pix >> SPRITE_CCR_SHIFT[stype]) & SPRITE_CCR_MASK[stype]) as usize;
     Some(SpriteDot::Colour(Dot {
         pri,
-        rgb: vdp2.cram.color_rgb888_mode0(code),
+        rgb: cram(vdp2, code),
         cc: sprite_cc(vdp2, pri, ccidx),
     }))
 }
@@ -561,12 +563,12 @@ fn sample_rot_bitmap(
         }
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0).then(|| vdp2.cram.color_rgb888_mode0(idx))
+            (idx != 0).then(|| cram(vdp2, idx))
         }
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0).then(|| vdp2.cram.color_rgb888_mode0(nibble))
+            (nibble != 0).then(|| cram(vdp2, nibble))
         }
     }
 }
@@ -591,11 +593,11 @@ fn sample_rot_tile(
     let palette_bank = ((pn >> 12) & 0xF) as usize;
     if depth == 1 {
         let byte = vdp2.vram.read8(char_num * 64 + in_y * 8 + in_x) as usize;
-        (byte != 0).then(|| vdp2.cram.color_rgb888_mode0(byte))
+        (byte != 0).then(|| cram(vdp2, byte))
     } else {
         let byte = vdp2.vram.read8(char_num * 32 + in_y * 4 + in_x / 2);
         let nibble = if in_x & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-        (nibble != 0).then(|| vdp2.cram.color_rgb888_mode0((palette_bank << 4) | nibble))
+        (nibble != 0).then(|| cram(vdp2, (palette_bank << 4) | nibble))
     }
 }
 
@@ -1193,5 +1195,19 @@ mod tests {
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0x7F, 0x7F, 0x7F, 0xFF], "shadowed");
         assert_eq!(pixel(&buf, 0, 1), [0xFF, 0xFF, 0xFF, 0xFF], "unshadowed");
+    }
+
+    #[test]
+    fn cram_mode2_yields_true_rgb888() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x00E, 0x2000); // RAMCTL.CRMD = 2 (RGB888)
+        // Mode-2 entry for index 1 is the 32-bit word at byte 4: 0x00BBGGRR.
+        v.cram.write32(4, 0x0056_3412);
+        v.vram.write8(0, 1); // bitmap dot → palette index 1
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0x12, 0x34, 0x56, 0xFF]);
     }
 }
