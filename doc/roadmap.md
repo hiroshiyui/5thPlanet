@@ -21,16 +21,17 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | VDP2 | 🟡 | NBG0–3 + RBG0/1 rotation + VDP1 sprite layer, priority composited; **remaining:** windows, line-scroll, colour calculation, 2-word PNC, larger planes, CRAM modes 1/2 |
 | VDP1 | 🟡 | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed; **remaining:** gouraud, double-buffer swap, draw-end timing |
 | MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
-| SCSP | 🟡 | Sound RAM + registers, hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR envelope + TL; **remaining (M6):** mixer/DAC, audio output, SCSP DSP, MIDI |
+| SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
 | CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
 | SH-1 (CD-block CPU) | ⬜ | M7 |
 | Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
-| SDL2 frontend | 🟡 | Window + framebuffer upload; **remaining:** audio output, keyboard input |
+| SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ⏸ parked on a cycle-phase
-question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) mostly done · **M6
-(audio) 🚧 active** — SCSP timers + interrupts landed; synthesis next.
+question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) mostly done · M6 (SCSP
+audio) ✅ · **next: M7** (CD-block SH-1 + games + cartridge slot), plus the
+deferred VDP1/VDP2 refinements.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -224,20 +225,23 @@ windows, line-scroll, colour calculation (sprite alpha + shadow), 2-word
 pattern names, 2×2-cell chars, larger/4×4-page plane sizes, the 8bpp-tile
 colour bank, and CRAM modes 1/2.
 
-## Milestone 6 — SCSP audio 🚧 active
+## Milestone 6 — SCSP audio ✅ complete
 
-The MC68EC000 is complete and hosted (M5 task #3); M6 turns the SCSP into a
-sound source.
+The MC68EC000 is complete and hosted (M5 task #3); M6 turned the SCSP into a
+sound source. The full chain runs end to end: a sound program on the 68k keys
+slots → PCM + ADSR envelope + TL → mixer (DISDL/DIPAN) → optional effect DSP →
+44.1 kHz stereo → SDL2; SMPC reports a keyboard-mapped digital pad. (Remaining
+refinements: precise effect-return panning, MIDI, master-volume scaling.)
 
 | # | Task | Status |
 |---|------|--------|
 | 1 | SCSP timers (A/B/C) + interrupt model (68k IRQ via SCIEB/SCIPD/SCILV, main-CPU sound IRQ via MCIPD/MCIEB → SCU) | ✅ done |
 | 2 | Slot engine — 32 PCM slots: phase/pitch (OCT/FNS), loop control, 8/16-bit, interpolation, key-on/off | ✅ done |
 | 3 | Envelope generator (ADSR) + total level (TL) attenuation per slot | ✅ done |
-| 4 | Mixer / DAC — sum slots to L/R at the master volume; produce a 44.1 kHz sample stream | pending |
-| 5 | SDL2 audio output — feed the sample stream to the frontend | pending |
-| 6 | SCSP DSP — 128-step effect microprogram (reverb etc.) | pending |
-| 7 | SMPC peripheral data → SDL2 keyboard input (the deferred controller path) | pending |
+| 4 | Mixer / DAC — sum slots to L/R via DISDL/DIPAN; produce a 44.1 kHz stream | ✅ done |
+| 5 | SDL2 audio output — feed the sample stream to the frontend | ✅ done |
+| 6 | SCSP DSP — 128-step effect microprogram (reverb etc.) | ✅ done |
+| 7 | SMPC peripheral data → SDL2 keyboard input (digital pad) | ✅ done |
 
 ### Task #1 — timers + interrupts (`cargo test -p saturn --lib scsp` → 8 tests)
 
@@ -267,6 +271,19 @@ one sample and returns the linear EG × TL multiplier (attack ramps directly,
 later phases via a log→linear table; TL is the SCSP per-bit dB attenuation
 ladder). Key-off enters the release phase. The mixer (task #4) multiplies
 `slot_sample` by `eg_advance` and pans the result to L/R.
+
+### Tasks #4–7 — mixer, output, DSP, input
+
+- **#4 Mixer/DAC:** per sample, each slot's enveloped voice is panned by
+  DIPAN and scaled by the direct-sound level DISDL (precomputed gain tables),
+  summed across 32 slots, and clamped to a 16-bit stereo pair (`next_sample`).
+- **#5 Audio output:** `Scsp::run` buffers the 44.1 kHz stream;
+  `Saturn::take_audio` hands it to the SDL2 frontend, which queues it each frame.
+- **#6 Effect DSP** (`scsp/dsp.rs`): the 128-step microprogram engine
+  (24×13-bit MAC, TEMP/MEMS/COEF, sound-RAM delay line with float PACK/UNPACK).
+  Slot effect-sends (ISEL/IMXL) feed its input mix; EFREG folds back into L/R.
+- **#7 Input:** the INTBACK peripheral phase reports a standard digital pad
+  (`smpc::pad`), driven by the frontend's keyboard mapping.
 
 ## Later milestones (queued)
 
