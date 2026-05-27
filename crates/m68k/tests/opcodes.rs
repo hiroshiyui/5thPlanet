@@ -435,3 +435,214 @@ fn scc_sets_byte_on_condition() {
     cpu.step(&mut bus);
     assert_eq!(cpu.regs.d[0] & 0xFF, 0xFF, "Scc true → 0xFF");
 }
+
+// ---- increment 3: MUL / DIV / bit ops / MOVEM / LINK / X-ops / BCD / TAS ----
+
+#[test]
+fn mulu_w_unsigned_16x16_to_32() {
+    // MULU.W D1, D0 → 0xC0C1
+    let (mut cpu, mut bus) = boot(&[0xC0C1], |c| {
+        c.regs.d[0] = 0x0000_0003;
+        c.regs.d[1] = 0x0000_0004;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 12);
+    assert!(!cpu.regs.sr.z && !cpu.regs.sr.n);
+}
+
+#[test]
+fn muls_w_signed() {
+    // MULS.W D1, D0 → 0xC1C1
+    let (mut cpu, mut bus) = boot(&[0xC1C1], |c| {
+        c.regs.d[0] = 0x0000_FFFF; // -1 (word)
+        c.regs.d[1] = 0x0000_0002;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xFFFF_FFFE, "-1 × 2 = -2");
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn divu_w_quotient_and_remainder() {
+    // DIVU.W D1, D0 → 0x80C1
+    let (mut cpu, mut bus) = boot(&[0x80C1], |c| {
+        c.regs.d[0] = 17;
+        c.regs.d[1] = 5;
+    });
+    cpu.step(&mut bus);
+    // remainder (2) in high word, quotient (3) in low word.
+    assert_eq!(cpu.regs.d[0], (2 << 16) | 3);
+}
+
+#[test]
+fn divs_w_signed_quotient_and_remainder() {
+    // DIVS.W D1, D0 → 0x81C1
+    let (mut cpu, mut bus) = boot(&[0x81C1], |c| {
+        c.regs.d[0] = (-17i32) as u32;
+        c.regs.d[1] = 5;
+    });
+    cpu.step(&mut bus);
+    // -17 / 5 = -3 rem -2 → (0xFFFE << 16) | 0xFFFD.
+    assert_eq!(cpu.regs.d[0], 0xFFFE_FFFD);
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn divu_overflow_sets_v() {
+    // 0x10000 / 1 overflows a 16-bit quotient.
+    let (mut cpu, mut bus) = boot(&[0x80C1], |c| {
+        c.regs.d[0] = 0x0001_0000;
+        c.regs.d[1] = 1;
+    });
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.v, "quotient > 16 bits → V");
+}
+
+#[test]
+fn btst_dynamic_sets_z_from_bit() {
+    // BTST D1, D0 → 0x0300 (bit number in D1)
+    let (mut cpu, mut bus) = boot(&[0x0300], |c| {
+        c.regs.d[0] = 0x0000_0002; // bit 1 set
+        c.regs.d[1] = 1;
+    });
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.z, "bit 1 is set → Z clear");
+    assert_eq!(cpu.regs.d[0], 0x0000_0002, "BTST does not modify");
+}
+
+#[test]
+fn bset_static_sets_bit_and_reports_old() {
+    // BSET #3, D0 → 0x08C0 + bit number word
+    let (mut cpu, mut bus) = boot(&[0x08C0, 0x0003], |c| c.regs.d[0] = 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0008, "bit 3 set");
+    assert!(cpu.regs.sr.z, "old bit was 0 → Z set");
+}
+
+#[test]
+fn bclr_static_clears_bit() {
+    // BCLR #2, D0 → 0x0880 + word
+    let (mut cpu, mut bus) = boot(&[0x0880, 0x0002], |c| c.regs.d[0] = 0x0F);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0B, "bit 2 cleared");
+    assert!(!cpu.regs.sr.z, "old bit was 1");
+}
+
+#[test]
+fn btst_on_memory_uses_byte_modulo_8() {
+    // BTST #9, (A0) → 0x0810 + word (bit 9 & 7 = bit 1 of the byte)
+    let (mut cpu, mut bus) = boot(&[0x0810, 0x0009], |c| c.regs.a[0] = 0x3000);
+    bus.write8(0x3000, 0x02, m68k::AccessKind::Data);
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.z, "byte bit 1 set");
+}
+
+#[test]
+fn movem_store_predecrement_then_load_postincrement_round_trips() {
+    // MOVEM.L D0/D1, -(A7) → 0x48E7 mask 0xC000 ; then MOVEM.L (A7)+, D0/D1.
+    let (mut cpu, mut bus) = boot(&[0x48E7, 0xC000, 0x4CDF, 0x0003], |c| {
+        c.regs.d[0] = 0x1111_1111;
+        c.regs.d[1] = 0x2222_2222;
+    });
+    cpu.step(&mut bus); // store
+    assert_eq!(cpu.regs.a[7], 0x2000 - 8, "two longs pushed");
+    assert_eq!(
+        bus.read32(0x1FF8, m68k::AccessKind::Data).0,
+        0x1111_1111,
+        "D0 lowest"
+    );
+    assert_eq!(
+        bus.read32(0x1FFC, m68k::AccessKind::Data).0,
+        0x2222_2222,
+        "D1 next"
+    );
+    // Clobber, then restore via load.
+    cpu.regs.d[0] = 0;
+    cpu.regs.d[1] = 0;
+    cpu.step(&mut bus); // load
+    assert_eq!(cpu.regs.d[0], 0x1111_1111);
+    assert_eq!(cpu.regs.d[1], 0x2222_2222);
+    assert_eq!(cpu.regs.a[7], 0x2000, "stack restored");
+}
+
+#[test]
+fn link_and_unlk_build_and_collapse_a_frame() {
+    // LINK A6, #-8 → 0x4E56 + 0xFFF8 ; UNLK A6 → 0x4E5E.
+    let (mut cpu, mut bus) = boot(&[0x4E56, 0xFFF8, 0x4E5E], |c| {
+        c.regs.a[6] = 0xDEAD_BEEF;
+    });
+    cpu.step(&mut bus); // LINK
+    assert_eq!(cpu.regs.a[7], 0x2000 - 4 - 8, "old A6 pushed + frame grown");
+    assert_eq!(cpu.regs.a[6], 0x2000 - 4, "A6 = frame pointer");
+    cpu.step(&mut bus); // UNLK
+    assert_eq!(cpu.regs.a[7], 0x2000, "stack restored");
+    assert_eq!(cpu.regs.a[6], 0xDEAD_BEEF, "A6 restored");
+}
+
+#[test]
+fn addx_l_adds_with_extend() {
+    // ADDX.L D1, D0 → 0xD181
+    let (mut cpu, mut bus) = boot(&[0xD181], |c| {
+        c.regs.d[0] = 0x10;
+        c.regs.d[1] = 0x20;
+        c.regs.sr.x = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x31);
+}
+
+#[test]
+fn subx_l_subtracts_with_extend() {
+    // SUBX.L D1, D0 → 0x9181
+    let (mut cpu, mut bus) = boot(&[0x9181], |c| {
+        c.regs.d[0] = 0x30;
+        c.regs.d[1] = 0x10;
+        c.regs.sr.x = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x1F);
+}
+
+#[test]
+fn negx_l_negates_with_borrow() {
+    // NEGX.L D0 → 0x4080
+    let (mut cpu, mut bus) = boot(&[0x4080], |c| {
+        c.regs.d[0] = 1;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xFFFF_FFFF);
+}
+
+#[test]
+fn abcd_adds_packed_bcd() {
+    // ABCD D1, D0 → 0xC101
+    let (mut cpu, mut bus) = boot(&[0xC101], |c| {
+        c.regs.d[0] = 0x25;
+        c.regs.d[1] = 0x18;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x43, "25 + 18 = 43 (BCD)");
+}
+
+#[test]
+fn sbcd_subtracts_packed_bcd() {
+    // SBCD D1, D0 → 0x8101
+    let (mut cpu, mut bus) = boot(&[0x8101], |c| {
+        c.regs.d[0] = 0x42;
+        c.regs.d[1] = 0x18;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x24, "42 - 18 = 24 (BCD)");
+}
+
+#[test]
+fn tas_sets_flags_then_msb() {
+    // TAS D0 → 0x4AC0
+    let (mut cpu, mut bus) = boot(&[0x4AC0], |c| c.regs.d[0] = 0);
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.z, "byte was zero");
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x80, "bit 7 set after test");
+}

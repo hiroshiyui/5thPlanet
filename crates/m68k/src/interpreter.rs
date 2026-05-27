@@ -7,11 +7,15 @@
 //! operands (reading any extension words via [`Cpu::fetch16`]/[`fetch32`]),
 //! executes, and returns the cycles consumed.
 //!
-//! **Scope (increment 1):** the data-movement and control-flow core —
-//! MOVE/MOVEA/MOVEQ, ADD/SUB/ADDA/SUBA/ADDQ/SUBQ, CLR/TST, LEA, NOP, the
-//! branch group (BRA/BSR/Bcc), RTS, and JMP/JSR. The logical/immediate/
-//! shift/multiply/BCD groups, DBcc/Scc, and the full exception model are
-//! later increments.
+//! **Scope:** nearly the full user-mode ISA — MOVE/MOVEA/MOVEQ; the
+//! ADD/SUB/AND/OR/EOR/CMP families incl. immediate, quick, address, and
+//! extend (ADDX/SUBX) forms; MULU/MULS and DIVU/DIVS; ABCD/SBCD/NBCD;
+//! NEG/NEGX/NOT/CLR/TST/TAS; the bit ops (BTST/BCHG/BCLR/BSET, static and
+//! dynamic); EXT/SWAP/EXG; shifts/rotates; MOVEM and LINK/UNLK; the branch
+//! group (BRA/BSR/Bcc/DBcc/Scc), RTS, JMP/JSR; and MOVE to/from CCR/SR.
+//! Still to come: the **exception model** (TRAP/TRAPV, privilege, illegal,
+//! address error, zero-divide, interrupt dispatch + RTE), MOVEP, memory
+//! shift-by-1, and SCSP host wiring.
 //!
 //! **Cycle model:** each memory word access costs the 68000's 4-clock bus
 //! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along
@@ -272,6 +276,118 @@ impl Cpu {
         c.test(sr.c, sr.v, sr.z, sr.n)
     }
 
+    /// `dst + src + X` with the multi-precision rules: NZVCX, but Z is sticky
+    /// (only ever cleared, so a multi-word zero stays Z).
+    fn addx(&mut self, src: u32, dst: u32, size: Size) -> u32 {
+        let (mask, msb) = (size.mask(), size.msb());
+        let (s, d, x) = (src & mask, dst & mask, self.regs.sr.x as u64);
+        let full = s as u64 + d as u64 + x;
+        let res = (full as u32) & mask;
+        let (sm, dm, rm) = (s & msb != 0, d & msb != 0, res & msb != 0);
+        self.regs.sr.c = full > mask as u64;
+        self.regs.sr.x = self.regs.sr.c;
+        self.regs.sr.v = (sm && dm && !rm) || (!sm && !dm && rm);
+        self.regs.sr.n = rm;
+        if res != 0 {
+            self.regs.sr.z = false;
+        }
+        res
+    }
+
+    /// `dst - src - X`, NZVCX with the same sticky-Z rule as [`addx`].
+    fn subx(&mut self, src: u32, dst: u32, size: Size) -> u32 {
+        let (mask, msb) = (size.mask(), size.msb());
+        let (s, d, x) = (src & mask, dst & mask, self.regs.sr.x as i64);
+        let diff = d as i64 - s as i64 - x;
+        let res = (diff as u32) & mask;
+        let (sm, dm, rm) = (s & msb != 0, d & msb != 0, res & msb != 0);
+        self.regs.sr.c = diff < 0;
+        self.regs.sr.x = diff < 0;
+        self.regs.sr.v = (!sm && dm && !rm) || (sm && !dm && rm);
+        self.regs.sr.n = rm;
+        if res != 0 {
+            self.regs.sr.z = false;
+        }
+        res
+    }
+
+    /// Packed-BCD `dst + src + X` (byte), setting C/X and sticky Z.
+    fn bcd_add(&mut self, src: u32, dst: u32) -> u32 {
+        let x = self.regs.sr.x as u32;
+        let mut lo = (src & 0xF) + (dst & 0xF) + x;
+        let mut hi = ((src >> 4) & 0xF) + ((dst >> 4) & 0xF);
+        if lo > 9 {
+            lo -= 10;
+            hi += 1;
+        }
+        let carry = hi > 9;
+        if carry {
+            hi -= 10;
+        }
+        let res = ((hi << 4) | lo) & 0xFF;
+        self.regs.sr.c = carry;
+        self.regs.sr.x = carry;
+        if res != 0 {
+            self.regs.sr.z = false;
+        }
+        self.regs.sr.n = res & 0x80 != 0;
+        res
+    }
+
+    /// Packed-BCD `dst - src - X` (byte), setting C/X (borrow) and sticky Z.
+    fn bcd_sub(&mut self, src: u32, dst: u32) -> u32 {
+        let x = self.regs.sr.x as i32;
+        let mut lo = (dst & 0xF) as i32 - (src & 0xF) as i32 - x;
+        let mut hi = ((dst >> 4) & 0xF) as i32 - ((src >> 4) & 0xF) as i32;
+        if lo < 0 {
+            lo += 10;
+            hi -= 1;
+        }
+        let borrow = hi < 0;
+        if borrow {
+            hi += 10;
+        }
+        let res = (((hi << 4) | lo) as u32) & 0xFF;
+        self.regs.sr.c = borrow;
+        self.regs.sr.x = borrow;
+        if res != 0 {
+            self.regs.sr.z = false;
+        }
+        self.regs.sr.n = res & 0x80 != 0;
+        res
+    }
+
+    /// BTST/BCHG/BCLR/BSET (`kind` 0..3) of bit `bitnum`. Dn targets are
+    /// 32-bit (bit mod 32); memory targets are byte (bit mod 8). Z reflects
+    /// the *pre-modification* bit; BTST never writes back.
+    fn op_bit(&mut self, op: u16, kind: u16, bitnum: u32, bus: &mut impl Bus) {
+        let mode = (op >> 3) & 7;
+        let reg = op & 7;
+        if mode == 0 {
+            let r = reg as usize;
+            let mask = 1u32 << (bitnum & 31);
+            self.regs.sr.z = self.regs.d[r] & mask == 0;
+            match kind {
+                1 => self.regs.d[r] ^= mask,
+                2 => self.regs.d[r] &= !mask,
+                3 => self.regs.d[r] |= mask,
+                _ => {}
+            }
+        } else {
+            let mask = 1u32 << (bitnum & 7);
+            let ea = self.resolve_ea(mode, reg, Size::Byte, bus);
+            let v = self.read_ea(ea, Size::Byte, bus);
+            self.regs.sr.z = v & mask == 0;
+            let nv = match kind {
+                1 => v ^ mask,
+                2 => v & !mask,
+                3 => v | mask,
+                _ => return,
+            };
+            self.write_ea(ea, Size::Byte, nv, bus);
+        }
+    }
+
     fn push32(&mut self, val: u32, bus: &mut impl Bus) {
         self.regs.a[7] = self.regs.a[7].wrapping_sub(4);
         self.write_mem(self.regs.a[7], Size::Long, val, bus);
@@ -296,13 +412,13 @@ impl Cpu {
             0x5 => self.op_5(op, bus),
             0x6 => self.op_branch(op, bus),
             0x7 => self.op_moveq(op),
-            0x8 => self.op_logic(op, |a, b| a | b, bus),
+            0x8 => self.op_or_group(op, bus),
             0x9 => self.op_addsub(op, false, bus),
             0xB => self.op_cmp_eor(op, bus),
             0xC => self.op_and_group(op, bus),
             0xD => self.op_addsub(op, true, bus),
             0xE => self.op_shift(op, bus),
-            _ => { /* still unimplemented (multiply/BCD/bit ops) — NOP for now */ }
+            _ => { /* line A/F — emulator traps, handled with the exception model */ }
         }
         (self.cycles - start) as u32
     }
@@ -370,6 +486,43 @@ impl Cpu {
             let v = self.regs.d[r] as u16 as i16 as i32 as u32;
             self.regs.d[r] = v;
             self.set_logic_flags(v, Size::Long);
+            return;
+        }
+        // LINK An,#disp (0x4E50|An): push An, frame-point it, grow the stack.
+        if op & 0xFFF8 == 0x4E50 {
+            let an = (op & 7) as usize;
+            let disp = self.fetch16(bus) as i16 as i32;
+            self.push32(self.regs.a[an], bus);
+            self.regs.a[an] = self.regs.a[7];
+            self.regs.a[7] = self.regs.a[7].wrapping_add(disp as u32);
+            return;
+        }
+        // UNLK An (0x4E58|An): collapse the frame.
+        if op & 0xFFF8 == 0x4E58 {
+            let an = (op & 7) as usize;
+            self.regs.a[7] = self.regs.a[an];
+            self.regs.a[an] = self.pop32(bus);
+            return;
+        }
+        // MOVEM (0100 1d00 1s mmmrrr): register-list load/store.
+        if op & 0xFB80 == 0x4880 {
+            self.op_movem(op, bus);
+            return;
+        }
+        // NBCD <ea> (0x4800|ea): 0 - <ea> - X, packed BCD.
+        if op & 0xFFC0 == 0x4800 {
+            let ea = self.resolve_ea(mode, reg, Size::Byte, bus);
+            let d = self.read_ea(ea, Size::Byte, bus);
+            let r = self.bcd_sub(d, 0);
+            self.write_ea(ea, Size::Byte, r, bus);
+            return;
+        }
+        // TAS <ea> (0x4AC0|ea): test byte, set N/Z, then set bit 7.
+        if op & 0xFFC0 == 0x4AC0 {
+            let ea = self.resolve_ea(mode, reg, Size::Byte, bus);
+            let v = self.read_ea(ea, Size::Byte, bus);
+            self.set_logic_flags(v, Size::Byte);
+            self.write_ea(ea, Size::Byte, v | 0x80, bus);
             return;
         }
         // MOVE from SR (0x40C0|ea): store the 16-bit SR to the EA.
@@ -453,6 +606,13 @@ impl Cpu {
                             let r = (!self.read_ea(ea, size, bus)) & size.mask();
                             self.write_ea(ea, size, r, bus);
                             self.set_logic_flags(r, size);
+                        }
+                        0x0 => {
+                            // NEGX: 0 - dst - X
+                            let ea = self.resolve_ea(mode, reg, size, bus);
+                            let d = self.read_ea(ea, size, bus);
+                            let r = self.subx(d, 0, size);
+                            self.write_ea(ea, size, r, bus);
                         }
                         _ => {}
                     }
@@ -573,6 +733,12 @@ impl Cpu {
         let ea_reg = op & 7;
         let opmode = (op >> 6) & 7;
 
+        // ADDX/SUBX: bit 8 set with the addressing field (bits 5..4) zero.
+        if op & 0x0130 == 0x0100 {
+            self.op_addx_subx(op, is_add, bus);
+            return;
+        }
+
         // ADDA/SUBA: opmode 011 (word) or 111 (long) — target is An.
         if opmode == 0b011 || opmode == 0b111 {
             let size = if opmode == 0b011 {
@@ -620,12 +786,147 @@ impl Cpu {
         }
     }
 
-    /// The immediate group (0x0): ORI/ANDI/SUBI/ADDI/EORI/CMPI, plus the
-    /// ORI/ANDI/EORI-to-CCR/SR special forms. Bit-manipulation and MOVEP
-    /// (bit 8 set) are a later increment.
+    /// ADDX/SUBX: `Dx op Dy` (register) or `-(Ax) op -(Ay)` (memory), with
+    /// extend and multi-precision sticky Z.
+    fn op_addx_subx(&mut self, op: u16, is_add: bool, bus: &mut impl Bus) {
+        let size = Size::from_op_bits(op >> 6).unwrap_or(Size::Byte);
+        let rx = ((op >> 9) & 7) as usize;
+        let ry = (op & 7) as usize;
+        let xfn = |cpu: &mut Self, s, d| {
+            if is_add {
+                cpu.addx(s, d, size)
+            } else {
+                cpu.subx(s, d, size)
+            }
+        };
+        if op & 0x0008 != 0 {
+            // -(Ay), -(Ax): predecrement the source then the destination.
+            let s = {
+                let ea = self.resolve_ea(4, ry as u16, size, bus);
+                self.read_ea(ea, size, bus)
+            };
+            let ea = self.resolve_ea(4, rx as u16, size, bus);
+            let d = self.read_ea(ea, size, bus);
+            let r = xfn(self, s, d);
+            self.write_ea(ea, size, r, bus);
+        } else {
+            let r = xfn(self, self.regs.d[ry], self.regs.d[rx]);
+            self.regs.d[rx] = (self.regs.d[rx] & !size.mask()) | (r & size.mask());
+        }
+    }
+
+    /// MOVEM — move a register list to/from memory. Word transfers sign-extend
+    /// into the 32-bit registers on load. The `-(An)` store walks the list in
+    /// reverse (A7..D0); every other mode walks D0..A7 with ascending address.
+    fn op_movem(&mut self, op: u16, bus: &mut impl Bus) {
+        let to_mem = op & 0x0400 == 0; // bit 10: 0 = registers→memory
+        let size = if op & 0x40 != 0 {
+            Size::Long
+        } else {
+            Size::Word
+        };
+        let mode = (op >> 3) & 7;
+        let reg = op & 7;
+        let mask = self.fetch16(bus);
+        let bytes = size.bytes();
+
+        if to_mem && mode == 4 {
+            // Predecrement store: bit i selects A7..D0 as i goes 0..15.
+            let mut addr = self.regs.a[reg as usize];
+            for i in 0..16 {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                let val = if i < 8 {
+                    self.regs.a[7 - i]
+                } else {
+                    self.regs.d[15 - i]
+                };
+                addr = addr.wrapping_sub(bytes);
+                self.write_mem(addr, size, val, bus);
+            }
+            self.regs.a[reg as usize] = addr;
+            return;
+        }
+
+        if !to_mem && mode == 3 {
+            // Postincrement load.
+            let mut addr = self.regs.a[reg as usize];
+            for i in 0..16 {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                let v = self.movem_load(addr, size, bus);
+                self.set_movem_reg(i, v);
+                addr = addr.wrapping_add(bytes);
+            }
+            self.regs.a[reg as usize] = addr;
+            return;
+        }
+
+        // Control-addressing modes: ascending address, list order D0..A7.
+        let Ea::Mem(mut addr) = self.resolve_ea(mode, reg, size, bus) else {
+            return;
+        };
+        for i in 0..16 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            if to_mem {
+                let val = self.movem_reg(i);
+                self.write_mem(addr, size, val, bus);
+            } else {
+                let v = self.movem_load(addr, size, bus);
+                self.set_movem_reg(i, v);
+            }
+            addr = addr.wrapping_add(bytes);
+        }
+    }
+
+    /// List-order register read for MOVEM (bit i: 0..7 = D0..D7, 8..15 = A0..A7).
+    fn movem_reg(&self, i: usize) -> u32 {
+        if i < 8 {
+            self.regs.d[i]
+        } else {
+            self.regs.a[i - 8]
+        }
+    }
+    /// List-order register write, sign-extending word loads to 32 bits.
+    fn set_movem_reg(&mut self, i: usize, v: u32) {
+        if i < 8 {
+            self.regs.d[i] = v;
+        } else {
+            self.regs.a[i - 8] = v;
+        }
+    }
+    fn movem_load(&mut self, addr: u32, size: Size, bus: &mut impl Bus) -> u32 {
+        let v = self.read_mem(addr, size, bus);
+        if size == Size::Word {
+            v as u16 as i16 as i32 as u32
+        } else {
+            v
+        }
+    }
+
+    /// The immediate group (0x0): ORI/ANDI/SUBI/ADDI/EORI/CMPI, the bit ops
+    /// (static + dynamic), and the ORI/ANDI/EORI-to-CCR/SR special forms.
     fn op_immediate(&mut self, op: u16, bus: &mut impl Bus) {
+        // Static bit ops (0000 1000 kk mmmrrr): bit number in the next word.
+        if op & 0x0F00 == 0x0800 {
+            let kind = (op >> 6) & 3;
+            let bitnum = self.fetch16(bus) as u32;
+            self.op_bit(op, kind, bitnum, bus);
+            return;
+        }
+        // Dynamic bit ops (bit 8 set): bit number in Dn (bits 11..9).
         if op & 0x0100 != 0 {
-            return; // BTST/BCHG/BCLR/BSET/MOVEP — not yet
+            if (op >> 3) & 7 == 1 {
+                return; // MOVEP — not yet implemented
+            }
+            let kind = (op >> 6) & 3;
+            let bitnum = self.regs.d[((op >> 9) & 7) as usize];
+            self.op_bit(op, kind, bitnum, bus);
+            return;
         }
         let ttt = (op >> 9) & 7;
         let Some(size) = Size::from_op_bits(op >> 6) else {
@@ -728,9 +1029,19 @@ impl Cpu {
         }
     }
 
-    /// The 0xC group: AND, or EXG when the encoding matches. (MULU/MULS and
-    /// ABCD are later increments.)
+    /// The 0xC group: MULU/MULS, ABCD, EXG, or AND.
     fn op_and_group(&mut self, op: u16, bus: &mut impl Bus) {
+        let opmode = (op >> 6) & 7;
+        // MULU.W (011) / MULS.W (111): Dn.W × <ea>.W → Dn.L.
+        if opmode == 0b011 || opmode == 0b111 {
+            self.op_mul(op, opmode == 0b111, bus);
+            return;
+        }
+        // ABCD: opmode 100 (bit8 set) with the addressing field zero.
+        if op & 0x01F0 == 0x0100 {
+            self.op_bcd(op, true, bus);
+            return;
+        }
         match op & 0xF1F8 {
             0xC140 => {
                 let (x, y) = (((op >> 9) & 7) as usize, (op & 7) as usize);
@@ -750,6 +1061,104 @@ impl Cpu {
             _ => {}
         }
         self.op_logic(op, |a, b| a & b, bus);
+    }
+
+    /// The 0x8 group: DIVU/DIVS, SBCD, or OR.
+    fn op_or_group(&mut self, op: u16, bus: &mut impl Bus) {
+        let opmode = (op >> 6) & 7;
+        if opmode == 0b011 || opmode == 0b111 {
+            self.op_div(op, opmode == 0b111, bus);
+            return;
+        }
+        if op & 0x01F0 == 0x0100 {
+            self.op_bcd(op, false, bus);
+            return;
+        }
+        self.op_logic(op, |a, b| a | b, bus);
+    }
+
+    /// MULU.W / MULS.W: `Dn.W × <ea>.W → Dn.L`. N from bit 31, Z, V=C=0.
+    fn op_mul(&mut self, op: u16, signed: bool, bus: &mut impl Bus) {
+        let reg = ((op >> 9) & 7) as usize;
+        let ea = self.resolve_ea((op >> 3) & 7, op & 7, Size::Word, bus);
+        let src = self.read_ea(ea, Size::Word, bus) & 0xFFFF;
+        let dn = self.regs.d[reg] & 0xFFFF;
+        let result = if signed {
+            ((src as u16 as i16 as i32) * (dn as u16 as i16 as i32)) as u32
+        } else {
+            src * dn
+        };
+        self.regs.d[reg] = result;
+        self.regs.sr.n = result & 0x8000_0000 != 0;
+        self.regs.sr.z = result == 0;
+        self.regs.sr.v = false;
+        self.regs.sr.c = false;
+    }
+
+    /// DIVU.W / DIVS.W: `Dn.L / <ea>.W` → quotient in the low word, remainder
+    /// in the high word. Overflow sets V and leaves Dn; divide-by-zero is a
+    /// no-op here (the zero-divide trap arrives with the exception model).
+    fn op_div(&mut self, op: u16, signed: bool, bus: &mut impl Bus) {
+        let reg = ((op >> 9) & 7) as usize;
+        let ea = self.resolve_ea((op >> 3) & 7, op & 7, Size::Word, bus);
+        let divisor = self.read_ea(ea, Size::Word, bus) & 0xFFFF;
+        if divisor == 0 {
+            return; // TODO(exceptions): zero-divide trap (vector 5)
+        }
+        let dividend = self.regs.d[reg];
+        self.regs.sr.c = false;
+        if signed {
+            let dvs = divisor as u16 as i16 as i32;
+            let q = (dividend as i32) / dvs;
+            let r = (dividend as i32) % dvs;
+            if !(-32768..=32767).contains(&q) {
+                self.regs.sr.v = true;
+                return;
+            }
+            self.regs.d[reg] = ((r as u32) << 16) | (q as u16 as u32);
+            self.regs.sr.n = (q as i16) < 0;
+            self.regs.sr.z = q == 0;
+        } else {
+            let q = dividend / divisor;
+            let r = dividend % divisor;
+            if q > 0xFFFF {
+                self.regs.sr.v = true;
+                return;
+            }
+            self.regs.d[reg] = (r << 16) | (q & 0xFFFF);
+            self.regs.sr.n = q & 0x8000 != 0;
+            self.regs.sr.z = q == 0;
+        }
+        self.regs.sr.v = false;
+    }
+
+    /// ABCD / SBCD: packed-BCD add/subtract with extend, on a Dn pair or a
+    /// `-(Ay),-(Ax)` byte pair.
+    fn op_bcd(&mut self, op: u16, is_add: bool, bus: &mut impl Bus) {
+        let rx = ((op >> 9) & 7) as usize;
+        let ry = (op & 7) as usize;
+        if op & 0x0008 != 0 {
+            let s = {
+                let ea = self.resolve_ea(4, ry as u16, Size::Byte, bus);
+                self.read_ea(ea, Size::Byte, bus)
+            };
+            let ea = self.resolve_ea(4, rx as u16, Size::Byte, bus);
+            let d = self.read_ea(ea, Size::Byte, bus);
+            let r = if is_add {
+                self.bcd_add(s, d)
+            } else {
+                self.bcd_sub(s, d)
+            };
+            self.write_ea(ea, Size::Byte, r, bus);
+        } else {
+            let (s, d) = (self.regs.d[ry] & 0xFF, self.regs.d[rx] & 0xFF);
+            let r = if is_add {
+                self.bcd_add(s, d)
+            } else {
+                self.bcd_sub(s, d)
+            };
+            self.regs.d[rx] = (self.regs.d[rx] & !0xFF) | (r & 0xFF);
+        }
     }
 
     /// The 0xB group: CMP <ea>,Dn ; CMPA <ea>,An ; EOR Dn,<ea> ; CMPM.
