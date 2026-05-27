@@ -319,6 +319,7 @@ impl Saturn {
                 .min(SMPC_POLL_QUANTUM)
                 .min(Self::cycles_to_next_vblank_in(now).max(1));
             self.scheduler.run_for(batch, &mut self.bus);
+            self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
             self.drain_scu_dma();
@@ -352,6 +353,7 @@ impl Saturn {
                         }
                     }
                 });
+            self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
             self.drain_scu_dma();
@@ -371,6 +373,11 @@ impl Saturn {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
                 SmpcCommand::SshOff => self.halt_slave(),
+                // SNDON releases the sound 68k from reset (reloading its
+                // vectors from the program the main CPU staged into sound
+                // RAM); SNDOFF re-holds it.
+                SmpcCommand::SndOn => self.bus.scsp.start(),
+                SmpcCommand::SndOff => self.bus.scsp.stop(),
                 SmpcCommand::NmiReq => {
                     // SMPC NMIREQ asserts NMI on the master SH-2.
                     // NMI bypasses SR.imask so it fires at the next

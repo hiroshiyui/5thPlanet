@@ -43,6 +43,7 @@ version = "0.1.0"
 name = "saturn"
 version = "0.1.0"
 dependencies = [
+ "m68k",
  "scu_dsp",
  "sh2",
 ]

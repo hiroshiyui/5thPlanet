@@ -26,6 +26,7 @@ use sh2::bus::{AccessKind, Bus};
 
 use crate::cd_block::{CD_BLOCK_BASE, CD_BLOCK_END, CdBlock};
 use crate::memory::{BiosRom, Ram, StubRegisterBank};
+use crate::scsp::Scsp;
 use crate::scu::{SCU_BASE, SCU_END, Scu};
 use crate::smpc::Smpc;
 use crate::vdp1::Vdp1;
@@ -41,13 +42,13 @@ pub const LOW_WRAM_BASE: u32 = 0x0020_0000;
 pub const LOW_WRAM_END: u32 = 0x002F_FFFF;
 pub const SOUND_BASE: u32 = 0x0040_0000;
 pub const SOUND_END: u32 = 0x004F_FFFF;
-/// SCSP sound RAM: 512 KiB at 0x05A0_0000, mirrored through the 1 MiB
-/// window. The MC68EC000 + SCSP proper are M5; for now this is a plain
-/// backing-RAM presence stub so the BIOS's sound-RAM write-verify init
-/// (master polls `[0x25A0_0000]` until a written value reads back)
-/// completes instead of spinning on open bus.
+/// SCSP sound RAM: 512 KiB at 0x05A0_0000, mirrored through the 1 MiB window,
+/// shared between the SH-2 and the hosted sound 68k (which sees it at 0).
 pub const SCSP_RAM_BASE: u32 = 0x05A0_0000;
 pub const SCSP_RAM_END: u32 = 0x05AF_FFFF;
+/// SCSP control + slot + DSP registers at 0x05B0_0000 (mirrored).
+pub const SCSP_REGS_BASE: u32 = 0x05B0_0000;
+pub const SCSP_REGS_END: u32 = 0x05BF_FFFF;
 pub const ABUS_BBUS_BASE: u32 = 0x0500_0000;
 pub const ABUS_BBUS_END: u32 = 0x05FF_FFFF;
 pub const HIGH_WRAM_BASE: u32 = 0x0600_0000;
@@ -72,7 +73,7 @@ pub struct SaturnBus {
     pub vdp1: Vdp1,
     pub vdp2: Vdp2,
     pub cd_block: CdBlock,
-    pub scsp_ram: Ram,
+    pub scsp: Scsp,
     pub abus_bbus: StubRegisterBank,
     pub high_wram: Ram,
     /// Current global cycle, refreshed by the scheduler before each CPU
@@ -97,7 +98,7 @@ impl SaturnBus {
             vdp1: Vdp1::new(),
             vdp2: Vdp2::new(),
             cd_block: CdBlock::new(),
-            scsp_ram: Ram::new(512 * 1024),
+            scsp: Scsp::new(),
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
             cycle: 0,
@@ -137,7 +138,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.read8(a),
             a if Vdp2::owns(a) => self.vdp2.read8(a),
             SCU_BASE..=SCU_END => self.scu.read8(addr - SCU_BASE),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.read8(addr - SCSP_RAM_BASE),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read8(addr - SCSP_RAM_BASE),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.read8(addr - SCSP_REGS_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read8(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read8(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -159,7 +161,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.read16(a),
             a if Vdp2::owns(a) => self.vdp2.read16(a),
             SCU_BASE..=SCU_END => self.scu.read16(addr - SCU_BASE),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.read16(addr - SCSP_RAM_BASE),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read16(addr - SCSP_RAM_BASE),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.read16(addr - SCSP_REGS_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read16(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read16(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -181,7 +184,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.read32(a),
             a if Vdp2::owns(a) => self.vdp2.read32(a),
             SCU_BASE..=SCU_END => self.scu.read32(addr - SCU_BASE),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.read32(addr - SCSP_RAM_BASE),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.read32(addr - SCSP_RAM_BASE),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.read32(addr - SCSP_REGS_BASE),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.read32(addr - ABUS_BBUS_BASE),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read32(addr - HIGH_WRAM_BASE),
             _ => 0,
@@ -200,7 +204,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.write8(a, val),
             a if Vdp2::owns(a) => self.vdp2.write8(a, val),
             SCU_BASE..=SCU_END => self.scu.write8(addr - SCU_BASE, val),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.write8(addr - SCSP_RAM_BASE, val),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write8(addr - SCSP_RAM_BASE, val),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.write8(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write8(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
             _ => {}
@@ -219,7 +224,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.write16(a, val),
             a if Vdp2::owns(a) => self.vdp2.write16(a, val),
             SCU_BASE..=SCU_END => self.scu.write16(addr - SCU_BASE, val),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.write16(addr - SCSP_RAM_BASE, val),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write16(addr - SCSP_RAM_BASE, val),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.write16(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write16(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write16(addr - HIGH_WRAM_BASE, val),
             _ => {}
@@ -238,7 +244,8 @@ impl Bus for SaturnBus {
             a if Vdp1::owns(a) => self.vdp1.write32(a, val),
             a if Vdp2::owns(a) => self.vdp2.write32(a, val),
             SCU_BASE..=SCU_END => self.scu.write32(addr - SCU_BASE, val),
-            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp_ram.write32(addr - SCSP_RAM_BASE, val),
+            SCSP_RAM_BASE..=SCSP_RAM_END => self.scsp.ram.write32(addr - SCSP_RAM_BASE, val),
+            SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.regs.write32(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write32(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
             _ => {}

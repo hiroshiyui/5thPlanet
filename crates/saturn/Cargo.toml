@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 sh2 = { path = "../sh2" }
 scu_dsp = { path = "../scu_dsp" }
+m68k = { path = "../m68k" }
 
 [lints]
 workspace = true
