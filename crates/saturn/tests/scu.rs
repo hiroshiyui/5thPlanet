@@ -12,8 +12,23 @@ use sh2::bus::{AccessKind, Bus};
 const D0R: u32 = SCU_BASE; // 0x05FE_0000
 const D0W: u32 = SCU_BASE + 0x04;
 const D0C: u32 = SCU_BASE + 0x08;
+const D0AD: u32 = SCU_BASE + 0x0C;
 const D0EN: u32 = SCU_BASE + 0x10;
+const D0MD: u32 = SCU_BASE + 0x14;
 const DGO: u32 = 1 << 8;
+/// D*AD for a contiguous copy: read +4 per source word (bit 8), write +2
+/// (16-bit B-bus step, code 1).
+const AD_CONTIGUOUS: u32 = 0x100 | 0x01;
+/// Low work-RAM scratch base used as a legal DMA source (the SCU can't DMA
+/// from the BIOS A-bus).
+const WRAM: u32 = 0x0020_0000;
+
+/// Plant `n` bytes `0x10, 0x11, …` at work-RAM `base` through the bus.
+fn plant(sat: &mut Saturn, base: u32, n: u32) {
+    for i in 0..n {
+        sat.bus.write8(base + i, (0x10 + i) as u8, AccessKind::Data);
+    }
+}
 
 fn build() -> Saturn {
     let mut bios = vec![0u8; 512 * 1024];
@@ -36,58 +51,80 @@ fn version_register_is_read_through_the_bus() {
 }
 
 #[test]
-fn dma_channel0_copies_bios_bytes_into_low_wram() {
+fn dma_channel0_copies_a_block_between_work_ram() {
     let mut sat = build();
-    // Set up channel 0: copy 64 bytes from BIOS+0x10 to low WRAM 0x1000.
-    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data); // source: BIOS+0x10
-    sat.bus.write32(D0W, 0x0020_1000, AccessKind::Data); // dest: low WRAM
-    sat.bus.write32(D0C, 0x40, AccessKind::Data); // count: 64 bytes
+    plant(&mut sat, WRAM, 0x40);
+    // Copy 64 bytes WRAM→WRAM, contiguous, with the address-update bits set.
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_1000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x40, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    // D*MD: manual factor (7) + RUP (bit16) + WUP (bit8) so D*R/D*W advance.
+    sat.bus
+        .write32(D0MD, (1 << 16) | (1 << 8) | 7, AccessKind::Data);
     sat.bus.write32(D0EN, DGO, AccessKind::Data); // trigger
 
-    // Drain runs inside the next run_for batch.
     sat.run_for(512);
 
-    // Verify 64 bytes landed at the destination and match the source.
     for i in 0..0x40u32 {
         let (b, _) = sat.bus.read8(0x0020_1000 + i, AccessKind::Data);
         assert_eq!(b, (0x10 + i) as u8, "byte {i:#x} mismatch");
     }
-    // SCU should report the channel done (count zeroed, addresses past the block).
     let (cnt, _) = sat.bus.read32(D0C, AccessKind::Data);
     assert_eq!(cnt, 0, "transfer_count zeroed after DMA");
     let (read_after, _) = sat.bus.read32(D0R, AccessKind::Data);
     let (write_after, _) = sat.bus.read32(D0W, AccessKind::Data);
-    assert_eq!(read_after, 0x0010 + 0x40);
-    assert_eq!(write_after, 0x0020_1000 + 0x40);
+    assert_eq!(read_after, WRAM + 0x40, "RUP advanced D*R");
+    assert_eq!(write_after, 0x0020_1000 + 0x40, "WUP advanced D*W");
 }
 
 #[test]
-fn dma_with_non_multiple_of_four_bytes_handles_tail_correctly() {
+fn dma_address_registers_hold_when_update_bits_clear() {
     let mut sat = build();
-    // 7 bytes — exercises the tail-loop after the 4-byte fast path.
-    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
-    sat.bus.write32(D0W, 0x0020_2000, AccessKind::Data);
-    sat.bus.write32(D0C, 7, AccessKind::Data);
+    plant(&mut sat, WRAM, 0x10);
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_1000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x10, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, 7, AccessKind::Data); // manual, RUP/WUP clear
     sat.bus.write32(D0EN, DGO, AccessKind::Data);
     sat.run_for(512);
-    for i in 0..7u32 {
+    // Data still copied, but the address registers keep their programmed values.
+    let (b, _) = sat.bus.read8(0x0020_1000, AccessKind::Data);
+    assert_eq!(b, 0x10);
+    let (read_after, _) = sat.bus.read32(D0R, AccessKind::Data);
+    assert_eq!(read_after, WRAM, "RUP clear → D*R unchanged");
+}
+
+#[test]
+fn dma_with_a_partial_longword_count() {
+    let mut sat = build();
+    plant(&mut sat, WRAM, 0x10);
+    // 6 bytes — three 16-bit transfers, not a whole number of longwords.
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_2000, AccessKind::Data);
+    sat.bus.write32(D0C, 6, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, 7, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+    for i in 0..6u32 {
         let (b, _) = sat.bus.read8(0x0020_2000 + i, AccessKind::Data);
         assert_eq!(b, (0x10 + i) as u8);
     }
-    // Untouched byte beyond the count remains 0.
-    let (b8, _) = sat.bus.read8(0x0020_2000 + 7, AccessKind::Data);
-    assert_eq!(b8, 0);
+    let (b6, _) = sat.bus.read8(0x0020_2000 + 6, AccessKind::Data);
+    assert_eq!(b6, 0, "byte past the count untouched");
 }
 
 #[test]
 fn dma_with_zero_count_does_not_trigger() {
     let mut sat = build();
-    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data);
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
     sat.bus.write32(D0W, 0x0020_3000, AccessKind::Data);
     sat.bus.write32(D0C, 0, AccessKind::Data);
+    sat.bus.write32(D0MD, 7, AccessKind::Data);
     sat.bus.write32(D0EN, DGO, AccessKind::Data);
     sat.run_for(512);
-    // Destination still zero.
     let (b, _) = sat.bus.read8(0x0020_3000, AccessKind::Data);
     assert_eq!(b, 0);
 }
@@ -95,29 +132,105 @@ fn dma_with_zero_count_does_not_trigger() {
 #[test]
 fn channels_1_and_2_have_independent_state() {
     let mut sat = build();
+    plant(&mut sat, WRAM + 0x100, 0x10); // ch1 source
+    plant(&mut sat, WRAM + 0x200, 0x10); // ch2 source
     // Channel 1 — base 0x20.
     sat.bus
-        .write32(SCU_BASE + 0x20, 0x0000_0020, AccessKind::Data);
+        .write32(SCU_BASE + 0x20, WRAM + 0x100, AccessKind::Data);
     sat.bus
         .write32(SCU_BASE + 0x24, 0x0020_4000, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x28, 0x10, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x2C, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x34, 7, AccessKind::Data); // manual factor
     sat.bus.write32(SCU_BASE + 0x30, DGO, AccessKind::Data);
     // Channel 2 — base 0x40.
     sat.bus
-        .write32(SCU_BASE + 0x40, 0x0000_0030, AccessKind::Data);
+        .write32(SCU_BASE + 0x40, WRAM + 0x200, AccessKind::Data);
     sat.bus
         .write32(SCU_BASE + 0x44, 0x0020_5000, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x48, 0x10, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x4C, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x54, 7, AccessKind::Data);
     sat.bus.write32(SCU_BASE + 0x50, DGO, AccessKind::Data);
 
     sat.run_for(512);
 
     for i in 0..0x10u32 {
         let (b1, _) = sat.bus.read8(0x0020_4000 + i, AccessKind::Data);
-        assert_eq!(b1, (0x20 + i) as u8, "ch1 byte {i:#x}");
+        assert_eq!(b1, (0x10 + i) as u8, "ch1 byte {i:#x}");
         let (b2, _) = sat.bus.read8(0x0020_5000 + i, AccessKind::Data);
-        assert_eq!(b2, (0x30 + i) as u8, "ch2 byte {i:#x}");
+        assert_eq!(b2, (0x10 + i) as u8, "ch2 byte {i:#x}");
     }
+}
+
+#[test]
+fn dma_from_bios_area_is_refused() {
+    // The SCU shares the A-bus with the BIOS ROM and cannot DMA from it.
+    let mut sat = build();
+    sat.bus.write32(D0R, 0x0000_0010, AccessKind::Data); // BIOS source
+    sat.bus.write32(D0W, 0x0020_6800, AccessKind::Data);
+    sat.bus.write32(D0C, 0x10, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, 7, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+    let (b, _) = sat.bus.read8(0x0020_6800, AccessKind::Data);
+    assert_eq!(b, 0, "BIOS-sourced DMA transfers nothing");
+}
+
+#[test]
+fn dma_indirect_mode_walks_a_table_of_transfers() {
+    let mut sat = build();
+    // Two source words.
+    sat.bus.write32(WRAM, 0xAABB_CCDD, AccessKind::Data);
+    sat.bus.write32(WRAM + 0x10, 0x1122_3344, AccessKind::Data);
+    // Indirect table at 0x0020_3000: {size, dst, src} triplets; the last
+    // entry flags bit 31 of its source word.
+    let tbl = 0x0020_3000;
+    sat.bus.write32(tbl, 4, AccessKind::Data);
+    sat.bus.write32(tbl + 4, 0x0020_4000, AccessKind::Data);
+    sat.bus.write32(tbl + 8, WRAM, AccessKind::Data);
+    sat.bus.write32(tbl + 0xC, 4, AccessKind::Data);
+    sat.bus.write32(tbl + 0x10, 0x0020_4010, AccessKind::Data);
+    sat.bus
+        .write32(tbl + 0x14, (WRAM + 0x10) | 0x8000_0000, AccessKind::Data); // last
+    sat.bus.write32(D0W, tbl, AccessKind::Data); // table address
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, (1 << 24) | 7, AccessKind::Data); // indirect + manual
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+
+    let (a, _) = sat.bus.read32(0x0020_4000, AccessKind::Data);
+    let (b, _) = sat.bus.read32(0x0020_4010, AccessKind::Data);
+    assert_eq!(a, 0xAABB_CCDD, "indirect entry 0");
+    assert_eq!(b, 0x1122_3344, "indirect entry 1");
+}
+
+#[test]
+fn dma_with_a_hardware_start_factor_waits_for_the_event() {
+    let mut sat = build();
+    plant(&mut sat, WRAM, 0x10);
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_7000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x10, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, 0, AccessKind::Data); // start factor 0 = VBlank-IN
+    sat.bus.write32(D0EN, DGO, AccessKind::Data); // arm — must NOT fire yet
+
+    // Run a fraction of a frame (before VBlank-IN): the DMA stays armed.
+    sat.run_for(4096);
+    let (b, _) = sat.bus.read8(0x0020_7000, AccessKind::Data);
+    assert_eq!(
+        b, 0,
+        "factor-0 DMA must not fire on enable, only on VBlank-IN"
+    );
+
+    // Run a full frame so VBlank-IN occurs and triggers the transfer.
+    sat.run_for(480_000);
+    let (b, _) = sat.bus.read8(0x0020_7000, AccessKind::Data);
+    assert_eq!(b, 0x10, "VBlank-IN triggered the DMA");
 }
 
 #[test]

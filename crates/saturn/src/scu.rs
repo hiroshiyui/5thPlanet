@@ -128,9 +128,47 @@ pub struct DmaChannel {
     pub add_value: u32,
     pub enable: u32,
     pub mode: u32,
-    /// Set when a `D*EN` write triggered a block move. Picked up by
-    /// [`Scu::take_pending_dma`] and cleared.
+    /// Set when the channel has been triggered (manual go or a start-factor
+    /// event). Picked up by [`Scu::take_pending_dma`] and cleared.
     triggered: bool,
+}
+
+impl DmaChannel {
+    /// `D*EN` bit 8 — the channel is armed (enabled). A start factor / the go
+    /// bit only triggers a transfer while this is set.
+    fn armed(&self) -> bool {
+        self.enable & 0x100 != 0
+    }
+    /// Start factor (`D*MD` bits 2..0): 0 VBlank-IN, 1 VBlank-OUT, 2 HBlank-IN,
+    /// 3 Timer0, 4 Timer1, 5 Sound-Req, 6 Sprite-draw-end, 7 manual (the go
+    /// bit in `D*EN`).
+    fn start_factor(&self) -> u8 {
+        (self.mode & 0x7) as u8
+    }
+    /// `D*MD` bit 24 — indirect (table-driven) vs direct transfer.
+    fn indirect(&self) -> bool {
+        self.mode & (1 << 24) != 0
+    }
+    /// `D*MD` bit 16 (read-address update) — whether `D*R` advances past the
+    /// transferred region (else it keeps its programmed value).
+    fn read_update(&self) -> bool {
+        self.mode & (1 << 16) != 0
+    }
+    /// `D*MD` bit 8 (write-address update).
+    fn write_update(&self) -> bool {
+        self.mode & (1 << 8) != 0
+    }
+    /// Read-address increment per source word: `D*AD` bit 8 → 4 bytes, else 0
+    /// (fixed source, e.g. a FIFO register).
+    fn src_add(&self) -> u32 {
+        if self.add_value & 0x100 != 0 { 4 } else { 0 }
+    }
+    /// Write-address increment: `2^(D*AD & 7)` bytes, with the `0` code
+    /// meaning a fixed destination.
+    fn dst_add(&self) -> u32 {
+        let a = 1u32 << (self.add_value & 0x7);
+        if a == 1 { 0 } else { a }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -166,18 +204,38 @@ pub struct Scu {
     fresh_assertions: u32,
 }
 
-/// Snapshot of a queued DMA request handed to the bus drainer.
+/// Snapshot of a queued DMA request handed to the bus drainer. The drainer
+/// (`system::drain_scu_dma`) performs the byte movement through the bus,
+/// since the SCU itself can't reach it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmaRequest {
     pub channel: usize,
     pub src: u32,
     pub dst: u32,
     pub bytes: u32,
+    /// Source-address increment per word (0 = fixed).
+    pub src_add: u32,
+    /// Destination-address increment per word (0 = fixed).
+    pub dst_add: u32,
+    /// Indirect mode: `dst` points at a table of `{size, dst, src}` longword
+    /// triplets, the last flagged by bit 31 of its source word.
+    pub indirect: bool,
+    /// Whether to write the advanced source / destination back to `D*R` / `D*W`.
+    pub read_update: bool,
+    pub write_update: bool,
 }
 
 impl Scu {
     pub fn new() -> Self {
-        Self::default()
+        let mut s = Self::default();
+        // Reset start factor is manual (7) for every channel, so a D*EN go
+        // before any D*MD write performs a manual transfer (matches the
+        // SCU's reset state; software sets D*MD explicitly for event-driven
+        // DMA).
+        for c in &mut s.channels {
+            c.mode = 0x07;
+        }
+        s
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
@@ -277,7 +335,16 @@ impl Scu {
             0x0C => c.add_value = val,
             0x10 => {
                 c.enable = val;
-                if val & DGO_BIT != 0 && c.transfer_count > 0 {
+                // Only a channel set to the *manual* start factor (7) fires on
+                // the D*EN go bit. Channels configured for a hardware start
+                // factor (0..6) are merely armed here and wait for that event
+                // (see `trigger_factor`) — enabling them must NOT start a
+                // transfer immediately. Indirect transfers take their size
+                // from the table, so the count guard only applies to direct.
+                if val & DGO_BIT != 0
+                    && c.start_factor() == 7
+                    && (c.indirect() || c.transfer_count > 0)
+                {
                     c.triggered = true;
                 }
             }
@@ -422,20 +489,44 @@ impl Scu {
                     src: ch.read_addr,
                     dst: ch.write_addr,
                     bytes: ch.transfer_count,
+                    src_add: ch.src_add(),
+                    dst_add: ch.dst_add(),
+                    indirect: ch.indirect(),
+                    read_update: ch.read_update(),
+                    write_update: ch.write_update(),
                 });
             }
         }
         None
     }
 
-    /// Mark a DMA channel as having completed: zero its remaining count,
+    /// Trigger every armed channel whose start factor matches `factor` (0..6;
+    /// the SCU manual's hardware DMA-start events — see [`DmaChannel::
+    /// start_factor`]). The Saturn aggregate calls this from the matching
+    /// event (VBlank-IN, sprite-draw-end, …); the queued transfers drain the
+    /// same way a manual DMA does. Channels stay armed, so they re-fire on the
+    /// next event.
+    pub fn trigger_dma_factor(&mut self, factor: u8) {
+        for c in &mut self.channels {
+            if c.armed() && c.start_factor() == factor {
+                c.triggered = true;
+            }
+        }
+    }
+
+    /// Mark a DMA channel as having completed: zero its remaining count, and
+    /// — only when the corresponding update flag (`D*MD` RUP/WUP) is set —
     /// store the post-transfer source / destination so software reading
-    /// `D*R` / `D*W` sees the addresses past the moved block, and raise
-    /// the channel's "DMA end" interrupt source.
+    /// `D*R` / `D*W` sees the addresses past the moved block. Then raise the
+    /// channel's "DMA end" interrupt source.
     pub fn finish_dma(&mut self, channel: usize, final_src: u32, final_dst: u32) {
         let c = &mut self.channels[channel];
-        c.read_addr = final_src;
-        c.write_addr = final_dst;
+        if c.read_update() {
+            c.read_addr = final_src;
+        }
+        if c.write_update() {
+            c.write_addr = final_dst;
+        }
         c.transfer_count = 0;
         let source = match channel {
             0 => Source::Level0DmaEnd,
@@ -593,8 +684,11 @@ mod tests {
     }
 
     #[test]
-    fn finish_dma_writes_back_final_addresses_and_zero_count() {
+    fn finish_dma_writes_back_final_addresses_only_when_update_enabled() {
         let mut s = Scu::new();
+        // D*MD with RUP (bit16) + WUP (bit8) + manual factor (7): addresses
+        // update to the post-transfer values.
+        s.channels[0].mode = (1 << 16) | (1 << 8) | 7;
         s.channels[0].read_addr = 0x0600_0000;
         s.channels[0].write_addr = 0x0020_0000;
         s.channels[0].transfer_count = 0x100;
@@ -602,6 +696,22 @@ mod tests {
         assert_eq!(s.channels[0].read_addr, 0x0600_0100);
         assert_eq!(s.channels[0].write_addr, 0x0020_0100);
         assert_eq!(s.channels[0].transfer_count, 0);
+
+        // With RUP/WUP clear, the addresses keep their programmed values.
+        let mut s = Scu::new(); // mode defaults to factor 7, RUP/WUP clear
+        s.channels[1].read_addr = 0x0600_0000;
+        s.channels[1].write_addr = 0x0020_0000;
+        s.channels[1].transfer_count = 0x100;
+        s.finish_dma(1, 0x0600_0100, 0x0020_0100);
+        assert_eq!(
+            s.channels[1].read_addr, 0x0600_0000,
+            "RUP clear → unchanged"
+        );
+        assert_eq!(
+            s.channels[1].write_addr, 0x0020_0000,
+            "WUP clear → unchanged"
+        );
+        assert_eq!(s.channels[1].transfer_count, 0);
     }
 
     #[test]
