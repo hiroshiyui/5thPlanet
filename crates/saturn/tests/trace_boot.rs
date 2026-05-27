@@ -486,6 +486,319 @@ fn watch_display() {
 }
 
 #[test]
+#[ignore = "manual: analyze the 0x060108BE WRAM park — what it polls + VBlank delivery"]
+fn analyze_park() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..150u32 {
+        sat.run_frame(&mut fb);
+    }
+    let pc = sat.master().regs.pc & 0x07FF_FFFF;
+    println!("after 150 frames: pc=0x{pc:07X} imask={}", sat.master().regs.sr.imask());
+    disasm_range(&mut sat, "park loop (live WRAM)", 0x0601_08A0, 0x40, pc | 0x0600_0000);
+
+    // Count VBlank-IN interrupt deliveries over the next 5 frames by watching
+    // the master enter the VBlank handler vector, and watch the polled counter.
+    let (ctr_before, _) = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data);
+    let mut handler_hits = 0u64;
+    let mut steps = 0u64;
+    let budget = 5 * (CYCLES_PER_FRAME_HINT);
+    let mut prev_pc = sat.master().regs.pc;
+    while steps < budget {
+        sat.debug_step_master();
+        sat.debug_drain();
+        let p = sat.master().regs.pc & 0x07FF_FFFF;
+        // VBlank-IN handler entry observed earlier at 0x06000840.
+        if p == 0x0600_0840 && (prev_pc & 0x07FF_FFFF) != 0x0600_0840 {
+            handler_hits += 1;
+        }
+        prev_pc = sat.master().regs.pc;
+        steps += 1;
+    }
+    let (ctr_after, _) = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data);
+    println!(
+        "over ~5 frames of single-step: VBlank handler(0x06000840) entered {handler_hits}x; \
+         counter[60408A4] {ctr_before:08X} -> {ctr_after:08X}"
+    );
+
+    // Dump the VBlank-IN callback-table slot the handler dispatches through.
+    // (Earlier probe: handler JSRs through R6 loaded from a table.)
+    for a in [0x0600_0840u32, 0x0600_0924, 0x0600_083C] {
+        let (w, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
+        println!("  [{a:08X}] = {w:08X}");
+    }
+}
+
+const CYCLES_PER_FRAME_HINT: u64 = 479_151;
+
+#[test]
+#[ignore = "manual: disassemble the VBlank-IN handler to see how 0x060408A4 should update"]
+fn disasm_vblank_handler() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..150u32 {
+        sat.run_frame(&mut fb);
+    }
+    disasm_range(&mut sat, "VBlank-IN handler (live WRAM)", 0x0600_0800, 0x140, 0x0600_0840);
+    // The interrupt vector table: which handler does the master's INTC vector
+    // to for VBlank-IN? VBR + vector*4. Read VBR + a few likely SCU vectors.
+    let vbr = sat.master().regs.vbr;
+    println!("\nVBR=0x{vbr:08X}");
+    for vec in 0x40u32..0x48 {
+        let (h, _) = sat.bus.read32(vbr.wrapping_add(vec * 4), sh2::bus::AccessKind::Data);
+        println!("  vector 0x{vec:02X} -> 0x{h:08X}");
+    }
+}
+
+#[test]
+#[ignore = "manual: read the BIOS interrupt callback table — what's installed per vector"]
+fn dump_callback_table() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..150u32 {
+        sat.run_frame(&mut fb);
+    }
+    let rd = |sat: &mut Saturn, a: u32| sat.bus.read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data).0;
+    let srmask_base = rd(&mut sat, 0x0600_0960);
+    let cb_base = rd(&mut sat, 0x0600_0998);
+    println!("SR-mask table base = 0x{srmask_base:08X}; callback table base = 0x{cb_base:08X}");
+    // Vectors 0x40..0x48 — the SCU interrupt block (VBlank-IN..). Dump the
+    // installed callback + whether it's the do-nothing stub 0x0600083C.
+    for vec in 0x40u32..0x50 {
+        let cb = rd(&mut sat, cb_base.wrapping_add(vec * 4));
+        let stub = if (cb & 0x07FF_FFFF) == 0x0600_083C { " (do-nothing stub)" } else { "" };
+        println!("  vec 0x{vec:02X}: callback=0x{cb:08X}{stub}");
+    }
+}
+
+#[test]
+#[ignore = "manual: at the park, is VDP2 display on + is the splash in the framebuffer?"]
+fn check_splash_state() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..150u32 {
+        sat.run_frame(&mut fb);
+    }
+    // VDP2 TVMD (0x05F8_0000): bit15 DISP = display enable; bits[2:0] HRESO.
+    let (tvmd, _) = sat.bus.read16(0x05F8_0000, sh2::bus::AccessKind::Data);
+    let (bgon, _) = sat.bus.read16(0x05F8_0020, sh2::bus::AccessKind::Data); // BGON
+    println!("TVMD=0x{tvmd:04X} (DISP={}), BGON=0x{bgon:04X}", (tvmd >> 15) & 1);
+    // Framebuffer non-black pixel count.
+    let nonblack = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+    println!("framebuffer: {nonblack}/{} pixels non-black", fb.len() / 4);
+    // Histogram of the top distinct RGBA colors.
+    use std::collections::HashMap;
+    let mut hist: HashMap<[u8; 4], u32> = HashMap::new();
+    for p in fb.chunks_exact(4) {
+        *hist.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
+    }
+    let mut v: Vec<_> = hist.into_iter().collect();
+    v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    for (c, n) in v.into_iter().take(6) {
+        println!("  color {c:02X?} x{n}");
+    }
+    // The watched address the park polls: R3 = *(0x06010970) (PC-rel @0x060108BC).
+    for a in [0x0601_0970u32, 0x0601_0974, 0x0601_0978] {
+        let (ptr, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
+        let (val, _) = sat.bus.read32(ptr & 0x07FF_FFFF, sh2::bus::AccessKind::Data);
+        println!("  [{a:08X}]=0x{ptr:08X}  *that=0x{val:08X}");
+    }
+}
+
+#[test]
+#[ignore = "manual: is the boot stuck or just slow? sample PC over many frames"]
+fn boot_progress() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let frames: u32 = std::env::var("PROGRESS_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let chunk = 20u32;
+    for c in 0..(frames / chunk) {
+        for _ in 0..chunk {
+            sat.run_frame(&mut fb);
+        }
+        let m = sat.master();
+        let pc = m.regs.pc & 0x07FF_FFFF;
+        // Show the master PC + a couple of WRAM cells the BIOS boot watches.
+        let (vbl, _) = sat.bus.read32(0x0604_08A4, sh2::bus::AccessKind::Data);
+        println!(
+            "frame {:>4}: pc=0x{pc:07X} imask={} vblank_ctr[60408A4]=0x{vbl:08X}",
+            (c + 1) * chunk,
+            sat.master().regs.sr.imask(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual: disassemble the two BIOS steady-state loops (our hang vs MAME)"]
+fn disasm_bios_park_loops() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    // BIOS is ROM — no boot needed to read the code.
+    disasm_range(&mut sat, "OUR hang (0x00001D3C tight spin)", 0x0000_1D10, 0x60, 0x0000_1D3C);
+    disasm_range(&mut sat, "MAME loop (0x00003200 region)", 0x0000_31E0, 0x80, 0x0000_3200);
+}
+
+#[test]
+#[ignore = "manual: dump the 0x06001168 boot divergence (loop condition + polled memory)"]
+fn catch_divergence_1168() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    // The divergence is at ~9.3M instructions ≈ frame 37; run up to it.
+    for _ in 0..37u32 {
+        sat.run_frame(&mut fb);
+    }
+    // Single-step to the divergent branch and dump state.
+    const TARGET: u32 = 0x0600_1168;
+    let mut steps = 0u64;
+    while sat.master().regs.pc != TARGET && steps < 6_000_000 {
+        sat.debug_step_master();
+        steps += 1;
+    }
+    if sat.master().regs.pc != TARGET {
+        println!("never reached 0x{TARGET:08X} (pc=0x{:08X})", sat.master().regs.pc);
+        return;
+    }
+    let m = sat.master();
+    println!("at 0x{TARGET:08X} (after {steps} steps): sr.t={} imask={}", m.regs.sr.t(), m.regs.sr.imask());
+    for row in 0..4 {
+        let b = row * 4;
+        println!(
+            "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+            b, m.regs.r[b], b + 1, m.regs.r[b + 1], b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+        );
+    }
+    disasm_range(&mut sat, "divergent loop", 0x0600_1140, 0x50, TARGET);
+    // The loop likely polls a memory location; dump the candidates the
+    // registers point at (low WRAM around the values in R0..R7).
+    println!("\n  memory at register-pointed WRAM:");
+    for r in 0..8 {
+        let a = sat.master().regs.r[r];
+        if (0x0600_0000..0x0608_0000).contains(&a) {
+            let (v, _) = sat.bus.read32(a & !3, sh2::bus::AccessKind::Data);
+            println!("    R{r}=0x{a:08X}  [{:08X}]=0x{v:08X}", a & !3);
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual: trace one VBlank-IN handler invocation + its user callback"]
+fn trace_vblank_handler() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    // Run past the relocation + into the park loop (~frame 40+).
+    for _ in 0..60u32 {
+        sat.run_frame(&mut fb);
+    }
+    const HANDLER: u32 = 0x0600_0840;
+    const RTE: u32 = 0x0600_094A;
+    const JSR: u32 = 0x0600_0924; // JSR @R6 — calls the user callback
+    let ctr_addr = 0x0604_08A4u32;
+    let read32 = |s: &mut Saturn, a: u32| s.bus.read32(a, sh2::bus::AccessKind::Data).0;
+
+    // Single-step until the next VBlank-IN handler entry, then trace it.
+    let mut steps = 0u64;
+    while sat.master().regs.pc != HANDLER && steps < 4_000_000 {
+        sat.debug_step_master();
+        steps += 1;
+    }
+    if sat.master().regs.pc != HANDLER {
+        println!("VBlank handler never entered in {steps} steps");
+        return;
+    }
+    println!("VBlank-IN handler entered after {steps} steps");
+    let ctr_before = read32(&mut sat, ctr_addr);
+    let mut callback = 0u32;
+    let mut trace_steps = 0u64;
+    let mut in_callback = false;
+    let mut callback_pcs: Vec<u32> = Vec::new();
+    loop {
+        let pc = sat.master().regs.pc;
+        if pc == JSR {
+            callback = sat.master().regs.r[6];
+            println!("  JSR @R6: callback = 0x{callback:08X}");
+        }
+        // After the JSR, record where the callback actually executes.
+        if callback != 0 && pc == callback {
+            in_callback = true;
+        }
+        if in_callback && callback_pcs.len() < 40 {
+            callback_pcs.push(pc);
+        }
+        if pc == RTE {
+            break;
+        }
+        sat.debug_step_master();
+        trace_steps += 1;
+        if trace_steps > 2000 {
+            println!("  handler didn't reach RTE in 2000 steps (pc=0x{pc:08X})");
+            break;
+        }
+    }
+    let ctr_after = read32(&mut sat, ctr_addr);
+    println!(
+        "  counter [0x{ctr_addr:08X}]: before=0x{ctr_before:08X} after=0x{ctr_after:08X}"
+    );
+    if !callback_pcs.is_empty() {
+        println!("  callback PC path (first {}):", callback_pcs.len());
+        for pc in &callback_pcs {
+            print!(" {:06X}", pc & 0xFFFFFF);
+        }
+        println!();
+        disasm_range(&mut sat, "callback", callback, 0x40, u32::MAX);
+    } else if callback != 0 {
+        println!("  callback 0x{callback:08X} was never entered (JSR didn't reach it)");
+        disasm_range(&mut sat, "callback target", callback, 0x20, u32::MAX);
+    }
+    // Dump the dispatcher's callback-table region around the VBlank-IN slot.
+    println!("\n  callback table (R3+vec*4) candidates:");
+    for base in [0x0600_0980u32, 0x0600_0A80] {
+        let cb = read32(&mut sat, base + 0x40 * 4);
+        println!("    [0x{base:08X} + 0x40*4] = 0x{cb:08X}");
+    }
+}
+
+#[test]
 #[ignore = "manual: full-system master PC trace (scheduler order, with slave) for ref diff"]
 fn gen_fullsystem_pc_trace() {
     use std::io::Write;

@@ -358,6 +358,10 @@ impl Saturn {
     /// to diff the `run_frame` boot park against a reference.
     pub fn run_for_traced(&mut self, cycles: u64, pcs: &mut Vec<u32>) {
         let master_id = self.master_id;
+        // Reference traces differ on whether they log branch delay slots:
+        // Yabause omits them; MAME logs them. Set PCTRACE_DELAYSLOTS to match
+        // a MAME reference trace (which includes the slot PC).
+        let log_delay_slots = std::env::var("PCTRACE_DELAYSLOTS").is_ok();
         let target = self.now().saturating_add(cycles);
         while self.now() < target {
             let now = self.now();
@@ -369,7 +373,7 @@ impl Saturn {
                 .run_for_traced(batch, &mut self.bus, |entity, id| {
                     if id == master_id {
                         let cpu = &entity.sh2().cpu;
-                        if !cpu.next_is_delay_slot() {
+                        if log_delay_slots || !cpu.next_is_delay_slot() {
                             pcs.push(cpu.regs.pc);
                         }
                     }
