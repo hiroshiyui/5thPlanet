@@ -647,6 +647,40 @@ fn dump_callback_table() {
 }
 
 #[test]
+#[ignore = "manual: analyze the post-splash park (0x06028F9E) — what it polls"]
+fn analyze_park2() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..780u32 {
+        sat.run_frame(&mut fb);
+    }
+    let pc = sat.master().regs.pc & 0x07FF_FFFF;
+    let m = sat.master();
+    println!("after 780 frames: pc=0x{pc:07X} imask={}", m.regs.sr.imask());
+    for row in 0..4 {
+        let b = row * 4;
+        println!(
+            "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+            b, m.regs.r[b], b + 1, m.regs.r[b + 1], b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+        );
+    }
+    disasm_range(&mut sat, "post-splash park (live WRAM)", 0x0602_8F60, 0x60, pc | 0x0600_0000);
+    println!("\n  WRAM at register-pointed addresses:");
+    for r in 0..16 {
+        let a = sat.master().regs.r[r];
+        if (0x0600_0000..0x0608_0000).contains(&(a & 0x07FF_FFFF)) {
+            let (v, _) = sat.bus.read32(a & !3, sh2::bus::AccessKind::Data);
+            println!("    R{r}=0x{a:08X}  [{:08X}]=0x{v:08X}", a & !3);
+        }
+    }
+}
+
+#[test]
 #[ignore = "manual: framebuffer hash + non-black count over time — find a stable splash frame"]
 fn splash_timeline() {
     let Some((bios, _)) = load_bios() else {
@@ -665,9 +699,9 @@ fn splash_timeline() {
         h
     };
     let mut prev = 0u64;
-    for f in 1..=600u32 {
+    for f in 1..=1000u32 {
         sat.run_frame(&mut fb);
-        if f % 15 == 0 || f <= 5 {
+        if f % 20 == 0 || f <= 5 {
             let h = fnv(&fb);
             let nb = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
             let mark = if h == prev { " (stable)" } else { "" };
@@ -1189,4 +1223,75 @@ fn disasm_range(sat: &mut Saturn, label: &str, start: u32, len: u32, mark: u32) 
             sh2::debug::disasm(op)
         );
     }
+}
+
+#[test]
+#[ignore = "manual: dump SCSP timer/interrupt regs + SCU sound-request state at the park"]
+fn scsp_state_at_park() {
+    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..780u32 { sat.run_frame(&mut fb); }
+    let rd16 = |sat: &mut Saturn, o: u32| sat.bus.read16(0x05B0_0000 + o, sh2::bus::AccessKind::Data).0;
+    for (name, o) in [("TIMA", 0x418u32), ("TIMB", 0x41A), ("TIMC", 0x41C),
+                      ("SCIEB", 0x41E), ("SCIPD", 0x420), ("MCIEB", 0x42A), ("MCIPD", 0x42C)] {
+        println!("  {name}(0x{o:03X}) = 0x{:04X}", rd16(&mut sat, o));
+    }
+}
+
+#[test]
+#[ignore = "manual: SCU IMS/IST + SMPC state at the post-splash park (is vec 0x47 masked?)"]
+fn scu_state_at_park2() {
+    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..780u32 { sat.run_frame(&mut fb); }
+    let base = 0x25FE_0000u32;
+    let rd = |sat: &mut Saturn, o: u32| sat.bus.read32(base + o, sh2::bus::AccessKind::Data).0;
+    let ims = rd(&mut sat, 0xB0);
+    let ist = rd(&mut sat, 0xB4);
+    println!("at park: IMS=0x{ims:08X} IST=0x{ist:08X}", );
+    println!("  Smpc(bit7) masked={} pending={}", (ims>>7)&1, (ist>>7)&1);
+    println!("  imask(master)={}", sat.master().regs.sr.imask());
+    // Step ~3 frames; count Smpc raises (IST bit7 transitions) + INTBACK COMREG writes.
+    let mut smpc_seen = 0u64;
+    let mut prev_ist7 = (ist >> 7) & 1;
+    let mut steps = 0u64;
+    while steps < 3 * 479_151 {
+        sat.debug_step_master();
+        sat.debug_drain();
+        let i = (sat.bus.read32(base + 0xB4, sh2::bus::AccessKind::Data).0 >> 7) & 1;
+        if i == 1 && prev_ist7 == 0 { smpc_seen += 1; }
+        prev_ist7 = i;
+        steps += 1;
+    }
+    println!("over ~3 frames: SCU Smpc(IST bit7) rising edges = {smpc_seen}");
+}
+
+#[test]
+#[ignore = "manual: is the BIOS issuing SMPC commands (INTBACK) post-splash?"]
+fn smpc_activity_at_park() {
+    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..780u32 { sat.run_frame(&mut fb); }
+    // SMPC SF at 0x0010_0063 (bit0 busy); COMREG at 0x0010_001F.
+    let sf = |sat: &mut Saturn| sat.bus.read8(0x0010_0063, sh2::bus::AccessKind::Data).0;
+    let comreg = |sat: &mut Saturn| sat.bus.read8(0x0010_001F, sh2::bus::AccessKind::Data).0;
+    println!("at park: SF=0x{:02X} COMREG=0x{:02X}", sf(&mut sat), comreg(&mut sat));
+    let mut sf_busy_edges = 0u64;
+    let mut prev = sf(&mut sat) & 1;
+    let mut steps = 0u64;
+    while steps < 5 * 479_151 {
+        sat.debug_step_master();
+        sat.debug_drain();
+        let b = sf(&mut sat) & 1;
+        if b == 1 && prev == 0 { sf_busy_edges += 1; }
+        prev = b;
+        steps += 1;
+    }
+    println!("over ~5 frames: SMPC SF busy rising edges = {sf_busy_edges} (each = a command issued)");
 }
