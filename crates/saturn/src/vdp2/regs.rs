@@ -590,6 +590,13 @@ impl Vdp2Regs {
         let shift = if which == 0 { 8 } else { 12 };
         ((self.read16(0x03A) >> shift) & 0x3) as u8
     }
+    /// Rotation screen-over mode (PLSZ RAOVR bits 11..10 / RBOVR 15..14):
+    /// 0 = repeat the field, 1 = screen-over pattern, 2 = transparent outside
+    /// the field, 3 = transparent outside a 512×512 area.
+    pub fn rbg_screen_over(&self, which: usize) -> u8 {
+        let shift = if which == 0 { 10 } else { 14 };
+        ((self.read16(0x03A) >> shift) & 0x3) as u8
+    }
     /// The 9-bit map number for rotation `which`, plane index `plane` (0..15 =
     /// A..P, row-major over the 4×4 plane grid). RA map registers are
     /// MPABRA..MPOPRA (0x050..0x05E), RB MPABRB..MPOPRB (0x060..0x06E), two

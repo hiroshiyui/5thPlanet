@@ -55,10 +55,12 @@
 //! it overrides kx/ky (perspective) in modes 0/1/2, or flags a line
 //! transparent via the coefficient MSB.
 //!
+//! Rotation **screen-over** (RAOVR/RBOVR) is honoured: outside the plane field
+//! the layer either repeats (wrap) or is transparent (modes 2/3).
+//!
 //! Deferred to later increments: dual-parameter window selection, the
 //! coefficient mode-3 (Xp) override and CRAM-resident coefficient tables, the
-//! rotation screen-over modes (RAOVR/RBOVR), the sprite window plane, and
-//! line-zoom.
+//! screen-over pattern (mode 1), the sprite window plane, and line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -721,8 +723,17 @@ fn sample_rot_bitmap(
     } else {
         512
     };
-    let px = plane_x.rem_euclid(w) as u32;
-    let py = plane_y.rem_euclid(h) as u32;
+    // Screen-over modes 2/3 leave the area outside the bitmap transparent;
+    // mode 0/1 repeat it.
+    let over = vdp2.regs.rbg_screen_over(which);
+    let (px, py) = if over == 2 || over == 3 {
+        if plane_x < 0 || plane_y < 0 || plane_x >= w || plane_y >= h {
+            return None;
+        }
+        (plane_x as u32, plane_y as u32)
+    } else {
+        (plane_x.rem_euclid(w) as u32, plane_y.rem_euclid(h) as u32)
+    };
     let w = w as u32;
     match depth {
         3 => {
@@ -765,12 +776,29 @@ fn sample_rot_tile(
     let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
     let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
 
-    // Wrap into the 4×4-plane field (each page is 512 px).
+    // The 4×4-plane field (each page is 512 px). The screen-over mode decides
+    // what happens outside it: repeat (wrap), or transparent.
     let page_px = pg_tiles * cell_px;
     let plane_w = pages_x * page_px;
     let plane_h = pages_y * page_px;
-    let mx = plane_x.rem_euclid((4 * plane_w) as i32) as u32;
-    let my = plane_y.rem_euclid((4 * plane_h) as i32) as u32;
+    let over = vdp2.regs.rbg_screen_over(which);
+    let (field_w, field_h) = if over == 3 {
+        (page_px, page_px) // transparent outside a single 512×512 area
+    } else {
+        (4 * plane_w, 4 * plane_h)
+    };
+    let (mx, my) = if over == 2 || over == 3 {
+        // Outside the field is transparent.
+        if plane_x < 0 || plane_y < 0 || plane_x as u32 >= field_w || plane_y as u32 >= field_h {
+            return None;
+        }
+        (plane_x as u32, plane_y as u32)
+    } else {
+        (
+            plane_x.rem_euclid(field_w as i32) as u32,
+            plane_y.rem_euclid(field_h as i32) as u32,
+        )
+    };
 
     // Which plane (0..15, row-major A..P), then the page within it.
     let plane_idx = (my / plane_h) as usize * 4 + (mx / plane_w) as usize;
@@ -1367,6 +1395,40 @@ mod tests {
         );
         // Line 1 coefficient MSB → the whole line is transparent → backdrop.
         assert_eq!(pixel(&buf, 1, 1), [0, 0, 0, 0xFF], "MSB → transparent line");
+    }
+
+    #[test]
+    fn rbg_screen_over_makes_outside_the_field_transparent() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x1200); // RBG0 8bpp bitmap
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x03E, 0x0001); // bitmap base 0x20000
+        setup_rot_identity(&mut v, 0);
+        v.vram.write32(0, 0x0200_0000); // Xst = 512 → screen (0,0) → plane (512,0)
+        v.cram.write16(2, 0x001F); // red
+        v.vram.write8(0x20000, 1); // bitmap dot at (0,0)
+
+        // Over mode 0 (repeat): plane x 512 wraps to 0 → samples the dot.
+        v.regs.write16(0x03A, 0x0000);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "repeat wraps to the dot"
+        );
+
+        // Over mode 3 (transparent outside 512×512): plane x 512 is outside.
+        v.regs.write16(0x03A, 0x0C00); // RAOVR = 3
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0, 0, 0xFF],
+            "outside the field → backdrop"
+        );
     }
 
     #[test]
