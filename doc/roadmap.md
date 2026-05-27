@@ -114,9 +114,9 @@ hardware manuals stay authoritative.
 | # | Task | Status |
 |---|------|--------|
 | 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
-| 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅; remaining: gouraud, double-buffer swap (FBCR), draw-end timing, VDP2 sprite-layer compositing | 🚧 partial |
+| 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅; remaining: gouraud, double-buffer swap (FBCR), draw-end timing | 🚧 partial |
 | 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU), structured like `sh2` | 🚧 in progress |
-| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅; remaining: RBG0/1 rotation, VDP1 sprite layer, windows, line-scroll, colour calc | 🚧 partial |
+| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅; remaining: RBG0/1 rotation, windows, line-scroll, colour calc | 🚧 partial |
 
 ### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 18 tests)
 
@@ -165,9 +165,16 @@ layer; else the CRAM[0] backdrop). Colour formats: 4bpp/8bpp paletted (tile +
 bitmap) and 16bpp RGB555 direct (bitmap); bitmap now uses the hardware width and
 characters address as `char_number × cell_bytes`.
 
-**Remaining:** RBG0/1 rotation, the VDP1 sprite layer (ties into VDP1 task #2),
-windows, line-scroll, colour calculation, 2-word pattern names, 2×2-cell chars,
-larger plane sizes, the 8bpp-tile colour bank, and CRAM modes 1/2.
+The **VDP1 sprite layer** is now composited too: `render_frame` reads the VDP1
+frame buffer and `sample_sprite` decodes each word per the SPCTL sprite-type
+tables (colour mask + priority shift/mask) into a colour (CRAM palette code, or
+RGB555 direct when the MSB is set and SPCLMD is on) and a priority from
+PRISA..PRISD; the sprite layer wins priority ties against the NBGs. A real VDP1
+plot shows through at its sprite priority.
+
+**Remaining:** RBG0/1 rotation, windows, line-scroll, colour calculation
+(sprite alpha + shadow), 2-word pattern names, 2×2-cell chars, larger plane
+sizes, the 8bpp-tile colour bank, and CRAM modes 1/2.
 
 ## Later milestones (queued)
 
