@@ -12,11 +12,11 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, on-chip peripherals, exceptions |
+| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, exceptions; on-chip INTC/DIVU + live FRT (counts + interrupts), working DMAC (transfers + interrupt), behavioral WDT (SCI/UBC remain storage stubs; BSC wait-state timing a refinement) |
 | Saturn bus + memory map | ✅ | Typed regions, wait states, open-bus default |
 | Event-driven scheduler | ✅ | Deterministic; SH-2 ×2 + CD-block entities |
 | SMPC | ✅ | Slave hold/release, staged INTBACK, NMIREQ, SNDON/SNDOFF, RTC/region |
-| SCU (+ DMA + INTC) | ✅ | 3 DMA channels, interrupt aggregation → master INTC |
+| SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct + indirect, D*AD strides, hardware start factors: VBlank/sprite-end/sound), interrupt aggregation → master INTC; cycle-stealing bus timing a refinement |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
 | VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll; CRAM modes 0/1/2 (RGB555 + RGB888); **remaining:** rotation 4×4-page planes, line-coefficient table, vertical-cell-scroll / line-zoom, sprite window plane |
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
@@ -41,7 +41,9 @@ Standalone `sh2` library crate validated by unit tests and ROM regressions.
 
 - Full SH-2 ISA (~142 ops): decoder, interpreter, delay slots, exceptions.
 - 5-stage pipeline cycle model (load-use stalls, multiply latency, branch costs).
-- 4 KiB 4-way cache + on-chip peripherals (INTC, DMAC, DIVU, FRT; BSC/WDT/SCI/UBC stubs).
+- 4 KiB 4-way cache + on-chip peripherals (INTC, DMAC, DIVU, FRT, WDT behavioral;
+  BSC/SCI/UBC register-storage stubs). FRT/WDT activation + working DMAC transfers
+  landed in the post-M6 fidelity pass.
 - Exception/interrupt dispatch (reset, illegal, slot-illegal, address error, NMI, TRAPA, external).
 - ROM regression harness with committed golden state hashes.
 
