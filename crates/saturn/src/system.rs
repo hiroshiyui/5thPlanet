@@ -294,8 +294,14 @@ impl Saturn {
             // VDP1 swaps its draw/display buffers at the frame boundary.
             self.bus.vdp1.frame_change();
         }
-        // VBlank-OUT edge (VBLANK → active): SCU DMA start factor 1.
+        // VBlank-OUT edge (VBLANK → active, i.e. the start of the next frame's
+        // active display): raise the SCU VBlank-OUT interrupt and fire SCU DMA
+        // start factor 1. The BIOS installs a VBlank-OUT callback (SCU vector
+        // 0x41) that advances its frame counter at `[0x060408A4]`; without this
+        // interrupt that counter never ticks and the BIOS boot parks forever
+        // polling it (the splash never appears). Mirrors the VBlank-IN edge.
         if !vblank && (prev & 0x0008) != 0 {
+            self.bus.scu.raise(crate::scu::Source::VBlankOut);
             self.bus.scu.trigger_dma_factor(1);
         }
 
