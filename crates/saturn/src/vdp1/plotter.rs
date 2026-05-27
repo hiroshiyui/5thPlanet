@@ -17,9 +17,10 @@
 //!   (transparent-pixel disable), MESH and end-code controls, plus the
 //!   replace / shadow / half-luminance / half-transparent colour-calc
 //!   modes.
-//!
-//! **Gouraud shading is deferred** (next increment) — CMDPMOD bit 2 is
-//! parsed but the per-scanline colour correction is not yet applied.
+//! * **Gouraud shading** (CMDPMOD bit 2) — the four per-vertex colours from
+//!   the CMDGRDA table are interpolated across each primitive (per-edge in the
+//!   quad rasteriser, bilinear over the 1:1 normal-sprite rect) and each
+//!   RGB555 channel is offset by `correction - 16`, clamped 0..31.
 //!
 //! The algorithm mirrors MAME's `saturn_v.cpp` plotter (used as a
 //! behaviour reference); the field semantics follow the VDP1 User's
@@ -41,21 +42,53 @@ struct Rect {
     max_y: i32,
 }
 
-/// One quad corner with its texture coordinate (16.16 once scaled).
+/// One quad corner with its texture coordinate and per-vertex gouraud colour
+/// channels (all 16.16 once scaled).
 #[derive(Clone, Copy, Debug, Default)]
 struct SPoint {
     x: i32,
     y: i32,
     u: i32,
     v: i32,
+    r: i32,
+    g: i32,
+    b: i32,
 }
 
-/// A walked edge: framebuffer x plus texture (u, v), all 16.16.
+/// A walked edge: framebuffer x, texture (u, v), and gouraud (r, g, b), all
+/// 16.16.
 #[derive(Clone, Copy, Debug, Default)]
 struct Edge {
     x: i32,
     u: i32,
     v: i32,
+    r: i32,
+    g: i32,
+    b: i32,
+}
+
+impl Edge {
+    /// The edge anchored at a quad corner (drops the corner's y).
+    fn at(p: &SPoint) -> Self {
+        Edge {
+            x: p.x,
+            u: p.u,
+            v: p.v,
+            r: p.r,
+            g: p.g,
+            b: p.b,
+        }
+    }
+
+    /// Advance every channel by `n` steps of slope `s` (forward differencing).
+    fn advance(&mut self, s: &Edge, n: i32) {
+        self.x += n * s.x;
+        self.u += n * s.u;
+        self.v += n * s.v;
+        self.r += n * s.r;
+        self.g += n * s.g;
+        self.b += n * s.b;
+    }
 }
 
 /// Which pixel writer the current command selects.
@@ -87,6 +120,9 @@ pub struct Plotter<'a> {
     user_clip: Rect,
     cmd: Command,
     mode: PixelMode,
+    /// Per-vertex gouraud colours (R, G, B; 5-bit each) for the four quad
+    /// corners A–D when CMDPMOD bit 2 is set, else `None`.
+    gouraud: Option<[(i32, i32, i32); 4]>,
 }
 
 impl<'a> Plotter<'a> {
@@ -108,7 +144,27 @@ impl<'a> Plotter<'a> {
             user_clip: full,
             cmd: Command::default(),
             mode: PixelMode::Generic,
+            gouraud: None,
         }
+    }
+
+    /// Read the four per-vertex gouraud colours from VRAM when CMDPMOD bit 2
+    /// (gouraud enable) is set; otherwise clear them. The table is four
+    /// consecutive big-endian RGB555 words at `CMDGRDA << 3` (VDP1 manual
+    /// §"Gouraud Shading"), one per vertex A, B, C, D.
+    fn load_gouraud(&mut self) {
+        self.gouraud = (self.cmd.pmod & 0x0004 != 0).then(|| {
+            let base = (self.cmd.grda as u32) * 8;
+            let rgb = |o: u32| {
+                let w = self.vram.read16((base + o) & 0x7_FFFF);
+                (
+                    (w & 0x1F) as i32,
+                    ((w >> 5) & 0x1F) as i32,
+                    ((w >> 10) & 0x1F) as i32,
+                )
+            };
+            [rgb(0), rgb(2), rgb(4), rgb(6)]
+        });
     }
 
     /// Walk the command table from offset 0 and draw every command.
@@ -191,31 +247,37 @@ impl<'a> Plotter<'a> {
                 0x0 => {
                     self.cmd.ispoly = false;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_normal_sprite(&clip);
                 }
                 0x1 => {
                     self.cmd.ispoly = false;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_scaled_sprite(&clip);
                 }
                 0x2 | 0x3 => {
                     self.cmd.ispoly = false;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_distorted_sprite(&clip);
                 }
                 0x4 => {
                     self.cmd.ispoly = true;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_distorted_sprite(&clip);
                 }
                 0x5 | 0x7 => {
                     self.cmd.ispoly = true;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_poly_line(&clip);
                 }
                 0x6 => {
                     self.cmd.ispoly = true;
                     self.set_pixel_mode();
+                    self.load_gouraud();
                     self.draw_line(&clip);
                 }
                 0x8 => {
@@ -283,22 +345,30 @@ impl<'a> Plotter<'a> {
     // ---- pixel pipeline -----------------------------------------------
 
     /// Write one pixel. `pd` is the character byte address; `off` is the
-    /// linear texel index `v*xsize + u`.
-    fn draw_pixel(&mut self, x: i32, y: i32, pd: i32, off: i32) {
+    /// linear texel index `v*xsize + u`; `shade` is the interpolated gouraud
+    /// colour (16.16 per channel) when gouraud is active.
+    fn draw_pixel(&mut self, x: i32, y: i32, pd: i32, off: i32, shade: Option<(i32, i32, i32)>) {
         if self.mode == PixelMode::Poly {
             if (0..FB_STRIDE).contains(&x) && (0..FB_HEIGHT).contains(&y) {
                 self.fb.set_pixel(x, y, self.cmd.colr);
             }
             return;
         }
-        self.draw_pixel_generic(x, y, pd, off);
+        self.draw_pixel_generic(x, y, pd, off, shade);
     }
 
     fn texel(&self, byte_addr: i32) -> u8 {
         self.vram.read8((byte_addr as u32) & 0x7_FFFF)
     }
 
-    fn draw_pixel_generic(&mut self, x: i32, y: i32, pd: i32, off: i32) {
+    fn draw_pixel_generic(
+        &mut self,
+        x: i32,
+        y: i32,
+        pd: i32,
+        off: i32,
+        shade: Option<(i32, i32, i32)>,
+    ) {
         let pmod = self.cmd.pmod;
         let mesh = pmod & 0x100 != 0;
         if mesh && (x ^ y) & 1 == 0 {
@@ -403,6 +473,12 @@ impl<'a> Plotter<'a> {
             return;
         }
 
+        // Gouraud shading (CMDPMOD bit 2): offset each RGB555 channel by the
+        // interpolated correction (centred at 16 → no change), clamped 0..31.
+        if let Some((gr, gg, gb)) = shade {
+            pix = apply_gouraud(pix, gr, gg, gb);
+        }
+
         // Colour-calc mode: CMDPMOD bits 1-0.
         match pmod & 0x3 {
             0 => self.fb.set_pixel(x, y, pix), // replace
@@ -468,12 +544,19 @@ impl<'a> Plotter<'a> {
         }
         let max_y = (y + ysize - 1).min(clip.max_y);
         let max_x = (x + xsize - 1).min(clip.max_x);
+        // For a normal (1:1) sprite the gouraud colours are bilinearly
+        // interpolated across the drawn rectangle (A=TL, B=TR, C=BR, D=BL); the
+        // quad rasteriser handles the scaled/distorted/polygon cases.
+        let (gw, gh) = (max_x - x, max_y - y);
         let mut dy = y;
         while dy <= max_y {
             let mut uu = u;
             let mut dx = x;
             while dx <= max_x {
-                self.draw_pixel(dx, dy, pd, uu);
+                let shade = self
+                    .gouraud
+                    .map(|g| gouraud_bilerp(&g, dx - x, dy - y, gw, gh));
+                self.draw_pixel(dx, dy, pd, uu, shade);
                 uu += dux;
                 dx += 1;
             }
@@ -664,24 +747,42 @@ impl<'a> Plotter<'a> {
             return;
         }
         let (mut u, mut v) = (e1.u, e1.v);
+        let (mut r, mut g, mut b) = (e1.r, e1.g, e1.b);
         let (mut slux, mut slvx) = (0, 0);
+        let (mut slr, mut slg, mut slb) = (0, 0, 0);
         if xx1 != xx2 {
             let d = xx2 - xx1;
             slux = (e2.u - e1.u) / d;
             slvx = (e2.v - e1.v) / d;
+            slr = (e2.r - e1.r) / d;
+            slg = (e2.g - e1.g) / d;
+            slb = (e2.b - e1.b) / d;
         }
         if xx1 < clip.min_x {
             let d = clip.min_x - xx1;
             u += slux * d;
             v += slvx * d;
+            r += slr * d;
+            g += slg * d;
+            b += slb * d;
             xx1 = clip.min_x;
         }
         let xend = xx2.min(clip.max_x);
         while xx1 <= xend {
-            self.draw_pixel(xx1, y, pd, (v >> FRAC_SHIFT) * xsize + (u >> FRAC_SHIFT));
+            let shade = self.gouraud.map(|_| (r, g, b));
+            self.draw_pixel(
+                xx1,
+                y,
+                pd,
+                (v >> FRAC_SHIFT) * xsize + (u >> FRAC_SHIFT),
+                shade,
+            );
             xx1 += 1;
             u += slux;
             v += slvx;
+            r += slr;
+            g += slg;
+            b += slb;
         }
     }
 
@@ -706,12 +807,8 @@ impl<'a> Plotter<'a> {
         }
         if y2 <= clip.min_y {
             let delta = y2 - y1;
-            e1.x += delta * s1.x;
-            e1.u += delta * s1.u;
-            e1.v += delta * s1.v;
-            e2.x += delta * s2.x;
-            e2.u += delta * s2.u;
-            e2.v += delta * s2.v;
+            e1.advance(&s1, delta);
+            e2.advance(&s2, delta);
             return;
         }
 
@@ -727,12 +824,8 @@ impl<'a> Plotter<'a> {
         let mut m2 = s2;
         if yy1 < clip.min_y {
             let delta = clip.min_y - yy1;
-            a1.x += delta * m1.x;
-            a1.u += delta * m1.u;
-            a1.v += delta * m1.v;
-            a2.x += delta * m2.x;
-            a2.u += delta * m2.u;
-            a2.v += delta * m2.v;
+            a1.advance(&m1, delta);
+            a2.advance(&m2, delta);
             yy1 = clip.min_y;
         }
 
@@ -749,39 +842,48 @@ impl<'a> Plotter<'a> {
                 let mut xx1 = a1.x >> FRAC_SHIFT;
                 let xx2 = a2.x >> FRAC_SHIFT;
                 let (mut u, mut v) = (a1.u, a1.v);
+                let (mut r, mut g, mut b) = (a1.r, a1.g, a1.b);
                 let (mut slux, mut slvx) = (0, 0);
+                let (mut slr, mut slg, mut slb) = (0, 0, 0);
                 if xx1 != xx2 {
                     let d = xx2 - xx1;
                     slux = (a2.u - a1.u) / d;
                     slvx = (a2.v - a1.v) / d;
+                    slr = (a2.r - a1.r) / d;
+                    slg = (a2.g - a1.g) / d;
+                    slb = (a2.b - a1.b) / d;
                 }
                 if xx1 <= clip.max_x || xx2 >= clip.min_x {
                     if xx1 < clip.min_x {
                         let d = clip.min_x - xx1;
                         u += slux * d;
                         v += slvx * d;
+                        r += slr * d;
+                        g += slg * d;
+                        b += slb * d;
                         xx1 = clip.min_x;
                     }
                     let xend = xx2.min(clip.max_x);
                     while xx1 <= xend {
+                        let shade = self.gouraud.map(|_| (r, g, b));
                         self.draw_pixel(
                             xx1,
                             yy1,
                             pd,
                             (v >> FRAC_SHIFT) * xsize + (u >> FRAC_SHIFT),
+                            shade,
                         );
                         xx1 += 1;
                         u += slux;
                         v += slvx;
+                        r += slr;
+                        g += slg;
+                        b += slb;
                     }
                 }
             }
-            a1.x += m1.x;
-            a1.u += m1.u;
-            a1.v += m1.v;
-            a2.x += m2.x;
-            a2.u += m2.u;
-            a2.v += m2.v;
+            a1.advance(&m1, 1);
+            a2.advance(&m2, 1);
             yy1 += 1;
         }
 
@@ -795,14 +897,22 @@ impl<'a> Plotter<'a> {
     }
 
     fn fill_quad(&mut self, clip: &Rect, pd: i32, xsize: i32, q: &[SPoint; 4]) {
-        // Duplicate the four corners so edge walks can wrap around.
+        // Duplicate the four corners so edge walks can wrap around. The
+        // gouraud colour at each corner (5-bit per channel) is carried in 16.16
+        // and interpolated alongside (u, v); without a table it stays zero and
+        // is never applied.
+        let gr = self.gouraud;
         let mut p = [SPoint::default(); 8];
         for i in 0..4 {
+            let (cr, cg, cb) = gr.map_or((0, 0, 0), |t| t[i]);
             let sp = SPoint {
                 x: q[i].x << FRAC_SHIFT,
                 y: q[i].y,
                 u: q[i].u << FRAC_SHIFT,
                 v: q[i].v << FRAC_SHIFT,
+                r: cr << FRAC_SHIFT,
+                g: cg << FRAC_SHIFT,
+                b: cb << FRAC_SHIFT,
             };
             p[i] = sp;
             p[i + 4] = sp;
@@ -824,26 +934,14 @@ impl<'a> Plotter<'a> {
 
         // Degenerate: a single horizontal span.
         if cury == limy {
-            let mut e1 = Edge {
-                x: p[0].x,
-                u: p[0].u,
-                v: p[0].v,
-            };
+            let mut e1 = Edge::at(&p[0]);
             let mut e2 = e1;
             for pt in p.iter().take(4).skip(1) {
                 if pt.x < e1.x {
-                    e1 = Edge {
-                        x: pt.x,
-                        u: pt.u,
-                        v: pt.v,
-                    };
+                    e1 = Edge::at(pt);
                 }
                 if pt.x > e2.x {
-                    e2 = Edge {
-                        x: pt.x,
-                        u: pt.u,
-                        v: pt.v,
-                    };
+                    e2 = Edge::at(pt);
                 }
             }
             self.fill_line(clip, pd, xsize, cury, e1, e2);
@@ -868,16 +966,8 @@ impl<'a> Plotter<'a> {
         while p[ps2 + 1].y == cury {
             ps2 += 1;
         }
-        let mut e1 = Edge {
-            x: p[ps1].x,
-            u: p[ps1].u,
-            v: p[ps1].v,
-        };
-        let mut e2 = Edge {
-            x: p[ps2].x,
-            u: p[ps2].u,
-            v: p[ps2].v,
-        };
+        let mut e1 = Edge::at(&p[ps1]);
+        let mut e2 = Edge::at(&p[ps2]);
         let mut s1 = slope(&p[ps1], &p[ps1 - 1], cury);
         let mut s2 = slope(&p[ps2], &p[ps2 + 1], cury);
 
@@ -898,16 +988,8 @@ impl<'a> Plotter<'a> {
                 while p[ps2 + 1].y == cury {
                     ps2 += 1;
                 }
-                e1 = Edge {
-                    x: p[ps1].x,
-                    u: p[ps1].u,
-                    v: p[ps1].v,
-                };
-                e2 = Edge {
-                    x: p[ps2].x,
-                    u: p[ps2].u,
-                    v: p[ps2].v,
-                };
+                e1 = Edge::at(&p[ps1]);
+                e2 = Edge::at(&p[ps2]);
                 s1 = slope(&p[ps1], &p[ps1 - 1], cury);
                 s2 = slope(&p[ps2], &p[ps2 + 1], cury);
             } else if ya < yb {
@@ -920,11 +1002,7 @@ impl<'a> Plotter<'a> {
                 while p[ps1 - 1].y == cury {
                     ps1 -= 1;
                 }
-                e1 = Edge {
-                    x: p[ps1].x,
-                    u: p[ps1].u,
-                    v: p[ps1].v,
-                };
+                e1 = Edge::at(&p[ps1]);
                 s1 = slope(&p[ps1], &p[ps1 - 1], cury);
             } else {
                 self.fill_slope(clip, pd, xsize, &mut e1, &mut e2, s1, s2, cury, yb);
@@ -936,11 +1014,7 @@ impl<'a> Plotter<'a> {
                 while p[ps2 + 1].y == cury {
                     ps2 += 1;
                 }
-                e2 = Edge {
-                    x: p[ps2].x,
-                    u: p[ps2].u,
-                    v: p[ps2].v,
-                };
+                e2 = Edge::at(&p[ps2]);
                 s2 = slope(&p[ps2], &p[ps2 + 1], cury);
             }
         }
@@ -956,13 +1030,52 @@ impl<'a> Plotter<'a> {
 fn slope(from: &SPoint, other: &SPoint, cury: i32) -> Edge {
     let delta = cury - other.y;
     if delta == 0 {
-        return Edge { x: 0, u: 0, v: 0 };
+        return Edge::default();
     }
     Edge {
         x: (from.x - other.x) / delta,
         u: (from.u - other.u) / delta,
         v: (from.v - other.v) / delta,
+        r: (from.r - other.r) / delta,
+        g: (from.g - other.g) / delta,
+        b: (from.b - other.b) / delta,
     }
+}
+
+/// Bilinearly interpolate the four corner gouraud colours (A=TL, B=TR, C=BR,
+/// D=BL; 5-bit channels) at fractional position `(fx/w, fy/h)`, returning each
+/// channel in 16.16. Used by the 1:1 normal-sprite path; the quad rasteriser
+/// interpolates per-edge instead.
+fn gouraud_bilerp(g: &[(i32, i32, i32); 4], fx: i32, fy: i32, w: i32, h: i32) -> (i32, i32, i32) {
+    let lerp = |a: i32, b: i32, n: i32, d: i32| if d == 0 { a } else { a + (b - a) * n / d };
+    let chan = |a: i32, b: i32, c: i32, d: i32| {
+        let top = lerp(a, b, fx, w); // A → B along the top edge
+        let bot = lerp(d, c, fx, w); // D → C along the bottom edge
+        lerp(top, bot, fy, h) << FRAC_SHIFT
+    };
+    (
+        chan(g[0].0, g[1].0, g[2].0, g[3].0),
+        chan(g[0].1, g[1].1, g[2].1, g[3].1),
+        chan(g[0].2, g[1].2, g[2].2, g[3].2),
+    )
+}
+
+/// Apply a gouraud correction to one RGB555 channel: the 16.16 `correction`
+/// is reduced to its 5-bit value and added as `corr - 16`, then clamped to
+/// 0..31 (VDP1 manual; mirrors MAME's `_shading`).
+#[inline]
+fn shade_channel(color: i32, correction: i32) -> i32 {
+    let corr = (correction >> FRAC_SHIFT) & 0x1F;
+    (color + corr - 16).clamp(0, 0x1F)
+}
+
+/// Apply gouraud to a whole RGB555 pixel, preserving the MSB.
+fn apply_gouraud(pix: u16, gr: i32, gg: i32, gb: i32) -> u16 {
+    let msb = pix & 0x8000;
+    let r = shade_channel((pix & 0x1F) as i32, gr) as u16;
+    let g = shade_channel(((pix >> 5) & 0x1F) as i32, gg) as u16;
+    let b = shade_channel(((pix >> 10) & 0x1F) as i32, gb) as u16;
+    msb | (b << 10) | (g << 5) | r
 }
 
 /// Average two RGB555 colours (the half-transparent calc mode at the

@@ -415,6 +415,101 @@ fn erase_clears_the_ewrr_region_to_the_erase_colour() {
     assert_eq!(v.fb.pixel(16, 8), 0, "just outside the region untouched");
 }
 
+/// Write the four per-vertex gouraud RGB555 colours at VRAM byte `base`
+/// (so CMDGRDA = base >> 3) for vertices A, B, C, D.
+fn put_gouraud(v: &mut Vdp1, base: u32, abcd: [u16; 4]) {
+    for (i, c) in abcd.iter().enumerate() {
+        v.vram.write16(base + i as u32 * 2, *c);
+    }
+}
+
+#[test]
+fn gouraud_uniform_offsets_every_channel() {
+    let mut v = Vdp1::new();
+    put_gouraud(&mut v, 0x100, [0x7FFF; 4]); // all vertices max → +15/channel
+    // Type 4 polygon, CMDPMOD = gouraud (0x4) + SPD (0x40); base colour black.
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0004, 0x0000),
+            w(0x0044, 0x0000), // gouraud + SPD, CMDCOLR = 0
+            0,
+            w(10, 10),
+            w(20, 10),
+            w(20, 20),
+            w(10, 20),
+            w(0x0020, 0x0000), // CMDGRDA = 0x100 >> 3 = 0x20
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    // black (0,0,0) + (31-16) on each channel = (15,15,15) → 0x3DEF.
+    assert_eq!(v.fb.pixel(15, 15), 0x3DEF, "uniform gouraud brightens");
+}
+
+#[test]
+fn gouraud_interpolates_across_a_polygon() {
+    let mut v = Vdp1::new();
+    // Left vertices dark (correction 0 → −16), right vertices bright (+15).
+    put_gouraud(&mut v, 0x100, [0x0000, 0x7FFF, 0x7FFF, 0x0000]);
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0004, 0x0000),
+            w(0x0044, 0x0010), // gouraud + SPD, CMDCOLR red = 16
+            0,
+            w(10, 10), // A (left)
+            w(40, 10), // B (right)
+            w(40, 20), // C (right)
+            w(10, 20), // D (left)
+            w(0x0020, 0x0000),
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    // Base R = 16: left correction ≈ 0 → R ≈ 0, right ≈ 31. R must increase
+    // left-to-right across the span.
+    let left_r = v.fb.pixel(13, 15) & 0x1F;
+    let right_r = v.fb.pixel(37, 15) & 0x1F;
+    assert!(
+        left_r < right_r,
+        "gouraud R gradient: left {left_r} should be < right {right_r}"
+    );
+}
+
+#[test]
+fn gouraud_applies_to_a_normal_sprite() {
+    let mut v = Vdp1::new();
+    // 8×8 character of black (0x0000) at VRAM byte 0x2000.
+    for i in 0..64u32 {
+        v.vram.write16(0x2000 + i * 2, 0x0000);
+    }
+    put_gouraud(&mut v, 0x100, [0x7FFF; 4]);
+    let srca = (0x2000u32 / 8) as u16;
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0000, 0x0000), // normal sprite
+            w(0x006C, 0x0000), // 16bpp (0x28) + gouraud (0x4) + SPD (0x40)
+            w(srca, 0x0108),   // 8×8
+            w(5, 5),
+            0,
+            0,
+            0,
+            w(0x0020, 0x0000), // CMDGRDA = 0x20
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    assert_eq!(v.fb.pixel(8, 8), 0x3DEF, "normal-sprite gouraud brightens");
+}
+
 #[test]
 fn draw_end_flag_pops_once_per_plot() {
     let mut v = Vdp1::new();
