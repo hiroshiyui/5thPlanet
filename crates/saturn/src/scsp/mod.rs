@@ -16,8 +16,14 @@
 //! interrupt (`MCIPD`/`MCIEB`), which the aggregate forwards to the SCU. This
 //! is what makes the hosted 68k an interrupt-driven sound engine.
 //!
-//! Still to come (M6): the slot/FM synthesis engine, the SCSP DSP, the
-//! mixer/DAC, MIDI, and SDL2 audio output.
+//! **Slots + envelope (M6, increments 2–3):** 32 PCM slots play waveforms
+//! from sound RAM (OCT/FNS pitch, 8/16-bit, interpolation, the four loop
+//! modes); each has an ADSR envelope generator (rate-scaled attack/decay/
+//! release + decay level) whose log output, scaled by TL, multiplies the
+//! slot. `slot_sample` yields the raw PCM and `eg_advance` the EG×TL
+//! multiplier — the mixer (next) pairs them and pans to L/R.
+//!
+//! Still to come (M6): the mixer/DAC, SDL2 audio output, the SCSP DSP, MIDI.
 
 use crate::memory::Ram;
 use m68k::bus::{AccessKind, Bus};
@@ -59,6 +65,33 @@ const SLOT_STRIDE: u32 = 0x20;
 const PHASE_SHIFT: u32 = 12;
 const SOUND_RAM_MASK: u32 = (SOUND_RAM_BYTES as u32) - 1;
 
+/// Envelope-volume fixed-point shift (the EG counter is `0..0x3FF << EG_SHIFT`).
+const EG_SHIFT: u32 = 16;
+
+/// The four ADSR phases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EgState {
+    Attack,
+    Decay1,
+    Decay2,
+    #[default]
+    Release,
+}
+
+/// Per-slot envelope-generator state. Rates are cached at key-on (they depend
+/// on OCT/KRS); `volume` is the log loudness index (`0` silent … `0x3FF` full).
+#[derive(Clone, Copy, Debug, Default)]
+struct Eg {
+    state: EgState,
+    volume: i32,
+    ar: i32,
+    d1r: i32,
+    d2r: i32,
+    rr: i32,
+    dl: i32,
+    eghold: bool,
+}
+
 /// One PCM slot's runtime state (the configuration lives in the register bank;
 /// this is the per-sample playback state set up at key-on).
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,7 +103,69 @@ struct Slot {
     nxt: u32,
     /// Phase increment per output sample (from OCT/FNS).
     step: u32,
+    eg: Eg,
 }
+
+/// Attack / decay envelope time constants (ms) for each of the 64 rates
+/// (SCSP/YMF292 tables, via MAME's `scsp.cpp`).
+#[rustfmt::skip]
+const AR_TIMES: [f64; 64] = [
+    100000.0, 100000.0, 8100.0, 6900.0, 6000.0, 4800.0, 4000.0, 3400.0, 3000.0, 2400.0, 2000.0,
+    1700.0, 1500.0, 1200.0, 1000.0, 860.0, 760.0, 600.0, 500.0, 430.0, 380.0, 300.0, 250.0, 220.0,
+    190.0, 150.0, 130.0, 110.0, 95.0, 76.0, 63.0, 55.0, 47.0, 38.0, 31.0, 27.0, 24.0, 19.0, 15.0,
+    13.0, 12.0, 9.4, 7.9, 6.8, 6.0, 4.7, 3.8, 3.4, 3.0, 2.4, 2.0, 1.8, 1.6, 1.3, 1.1, 0.93, 0.85,
+    0.65, 0.53, 0.44, 0.40, 0.35, 0.0, 0.0,
+];
+#[rustfmt::skip]
+const DR_TIMES: [f64; 64] = [
+    100000.0, 100000.0, 118200.0, 101300.0, 88600.0, 70900.0, 59100.0, 50700.0, 44300.0, 35500.0,
+    29600.0, 25300.0, 22200.0, 17700.0, 14800.0, 12700.0, 11100.0, 8900.0, 7400.0, 6300.0, 5500.0,
+    4400.0, 3700.0, 3200.0, 2800.0, 2200.0, 1800.0, 1600.0, 1400.0, 1100.0, 920.0, 790.0, 690.0,
+    550.0, 460.0, 390.0, 340.0, 270.0, 230.0, 200.0, 170.0, 140.0, 110.0, 98.0, 85.0, 68.0, 57.0,
+    49.0, 43.0, 34.0, 28.0, 25.0, 22.0, 18.0, 14.0, 12.0, 11.0, 8.5, 7.1, 6.1, 5.4, 4.3, 3.6, 3.1,
+];
+
+/// Precomputed envelope tables (built once, shared): per-sample volume steps
+/// for attack/decay rates, the log→linear envelope curve, and the TL
+/// (total-level) attenuation curve. All linear values are `0..1 << PHASE_SHIFT`.
+struct EgTables {
+    ar: [i32; 64],
+    dr: [i32; 64],
+    eg: [i32; 1024],
+    tl: [i32; 256],
+}
+
+static EG_TABLES: std::sync::LazyLock<EgTables> = std::sync::LazyLock::new(|| {
+    let scale = (1u32 << EG_SHIFT) as f64;
+    let mut ar = [0i32; 64];
+    let mut dr = [0i32; 64];
+    for i in 2..64 {
+        ar[i] = if AR_TIMES[i] != 0.0 {
+            ((1023.0 * 1000.0) / (44100.0 * AR_TIMES[i]) * scale) as i32
+        } else {
+            1024 << EG_SHIFT
+        };
+        dr[i] = ((1023.0 * 1000.0) / (44100.0 * DR_TIMES[i]) * scale) as i32;
+    }
+    let lin = (1u32 << PHASE_SHIFT) as f64;
+    let mut eg = [0i32; 1024];
+    for (i, e) in eg.iter_mut().enumerate() {
+        let db = (3.0 * (i as f64 - 1023.0)) / 32.0;
+        *e = (10f64.powf(db / 20.0) * lin) as i32;
+    }
+    let mut tl = [0i32; 256];
+    for (i, t) in tl.iter_mut().enumerate() {
+        let steps = [0.4, 0.8, 1.5, 3.0, 6.0, 12.0, 24.0, 48.0];
+        let db: f64 = steps
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| i & (1 << b) != 0)
+            .map(|(_, d)| -d)
+            .sum();
+        *t = (10f64.powf(db / 20.0) * lin) as i32;
+    }
+    EgTables { ar, dr, eg, tl }
+});
 
 /// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
 #[derive(Clone, Debug, Default)]
@@ -285,8 +380,10 @@ impl ScspCtrl {
             let data0 = self.slot_reg(i, 0);
             if data0 & 0x0800 != 0 {
                 self.start_slot(i);
-            } else {
-                self.slots[i].active = false;
+            } else if self.slots[i].active {
+                // Key-off enters the release phase (the slot keeps playing
+                // until the release envelope decays to silence).
+                self.slots[i].eg.state = EgState::Release;
             }
             // Clear KYONEX (bit 12) so the strobe is one-shot.
             if data0 & 0x1000 != 0 {
@@ -297,13 +394,110 @@ impl ScspCtrl {
 
     fn start_slot(&mut self, i: usize) {
         let step = self.slot_step(i);
+        let eg = self.compute_eg(i);
         self.slots[i] = Slot {
             active: true,
             backwards: false,
             cur: 0,
             nxt: 1 << PHASE_SHIFT,
             step,
+            eg,
         };
+    }
+
+    /// Build the envelope state at key-on: cache the AR/D1R/D2R/RR step sizes
+    /// (rate-scaled by OCT/KRS/FNS), the decay level, and EGHOLD.
+    fn compute_eg(&self, i: usize) -> Eg {
+        let t = &*EG_TABLES;
+        let reg4 = self.slot_reg(i, 4); // D2R(15-11) D1R(10-6) EGHOLD(5) AR(4-0)
+        let reg5 = self.slot_reg(i, 5); // KRS(13-10) DL(9-5) RR(4-0)
+        let reg8 = self.slot_reg(i, 8); // OCT(14-11) FNS(9-0)
+        let krs = (reg5 >> 10) & 0xF;
+        let oct = (reg8 >> 11) & 0xF;
+        let fns = reg8 & 0x3FF;
+        let octave = (oct ^ 8) as i32 - 8;
+        let rate = if krs != 0xF {
+            octave + 2 * krs as i32 + ((fns >> 9) & 1) as i32
+        } else {
+            0
+        };
+        let ar =
+            |field: u16, tbl: &[i32; 64]| tbl[(rate + ((field as i32) << 1)).clamp(0, 63) as usize];
+        Eg {
+            state: EgState::Attack,
+            volume: 0x17F << EG_SHIFT,
+            ar: ar(reg4 & 0x1F, &t.ar),
+            d1r: ar((reg4 >> 6) & 0x1F, &t.dr),
+            d2r: ar((reg4 >> 11) & 0x1F, &t.dr),
+            rr: ar(reg5 & 0x1F, &t.dr),
+            dl: 0x1F - ((reg5 >> 5) & 0x1F) as i32,
+            eghold: reg4 & 0x20 != 0,
+        }
+    }
+
+    /// Advance slot `i`'s envelope one output sample and return the linear
+    /// output multiplier (EG × TL, `0..1 << PHASE_SHIFT`). Returns 0 for an
+    /// inactive slot; a release that decays to zero deactivates the slot.
+    pub fn eg_advance(&mut self, i: usize) -> i32 {
+        if !self.slots[i].active {
+            return 0;
+        }
+        let tl = (self.slot_reg(i, 6) & 0xFF) as usize;
+        let was_attack = self.slots[i].eg.state == EgState::Attack;
+        let mut deactivate = false;
+        // EG_Update: advance volume / state, yield the raw EG value.
+        let raw = {
+            let eg = &mut self.slots[i].eg;
+            match eg.state {
+                EgState::Attack => {
+                    eg.volume += eg.ar;
+                    if eg.volume >= (0x3FF << EG_SHIFT) {
+                        eg.volume = 0x3FF << EG_SHIFT;
+                        eg.state = if eg.d1r >= (1024 << EG_SHIFT) {
+                            EgState::Decay2
+                        } else {
+                            EgState::Decay1
+                        };
+                    }
+                    if eg.eghold {
+                        0x3FF << (PHASE_SHIFT - 10)
+                    } else {
+                        (eg.volume >> EG_SHIFT) << (PHASE_SHIFT - 10)
+                    }
+                }
+                EgState::Decay1 => {
+                    eg.volume = (eg.volume - eg.d1r).max(0);
+                    if (eg.volume >> (EG_SHIFT + 5)) <= eg.dl {
+                        eg.state = EgState::Decay2;
+                    }
+                    (eg.volume >> EG_SHIFT) << (PHASE_SHIFT - 10)
+                }
+                EgState::Decay2 => {
+                    eg.volume = (eg.volume - eg.d2r).max(0);
+                    (eg.volume >> EG_SHIFT) << (PHASE_SHIFT - 10)
+                }
+                EgState::Release => {
+                    eg.volume -= eg.rr;
+                    if eg.volume <= 0 {
+                        eg.volume = 0;
+                        deactivate = true;
+                    }
+                    (eg.volume >> EG_SHIFT) << (PHASE_SHIFT - 10)
+                }
+            }
+        };
+        if deactivate {
+            self.slots[i].active = false;
+        }
+        let t = &*EG_TABLES;
+        // Attack uses the raw value as a linear ramp; the other phases index
+        // the log→linear envelope curve.
+        let eg_mul = if was_attack {
+            raw
+        } else {
+            t.eg[((raw >> (PHASE_SHIFT - 10)) as usize) & 0x3FF]
+        };
+        (eg_mul * t.tl[tl]) >> PHASE_SHIFT
     }
 
     pub fn slot_active(&self, i: usize) -> bool {
@@ -453,6 +647,12 @@ impl Scsp {
     pub fn slot_sample(&mut self, i: usize) -> i16 {
         let Scsp { ctrl, ram, .. } = self;
         ctrl.slot_sample(i, ram)
+    }
+
+    /// Advance slot `i`'s envelope one sample and return the EG × TL output
+    /// multiplier (`0..1 << 12`). The mixer pairs this with `slot_sample`.
+    pub fn eg_advance(&mut self, i: usize) -> i32 {
+        self.ctrl.eg_advance(i)
     }
 
     /// Pop the main-CPU sound interrupt (the aggregate forwards it to the SCU
@@ -723,14 +923,52 @@ mod tests {
     }
 
     #[test]
-    fn key_off_silences_the_slot() {
+    fn envelope_ramps_up_during_attack() {
         let mut s = Scsp::new();
+        s.ctrl.write16(0x08, 20); // data[4]: AR = 20 (a gradual attack), EGHOLD off
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
+        let early = s.eg_advance(0);
+        let mut later = early;
+        for _ in 0..100 {
+            later = s.eg_advance(0);
+        }
+        assert!(later > early, "attack envelope rises ({early} → {later})");
+    }
+
+    #[test]
+    fn total_level_attenuates_the_output() {
+        // EGHOLD holds the attack at full scale, isolating the TL attenuation.
+        let mut loud = Scsp::new();
+        loud.ctrl.write16(0x08, 0x20); // data[4]: EGHOLD
+        loud.ctrl.write16(0x0C, 0x0000); // data[6]: TL = 0 (no attenuation)
+        keyon_slot0(&mut loud, 0, 0x100, 0, 0x100, 0);
+        let full = loud.eg_advance(0);
+
+        let mut quiet = Scsp::new();
+        quiet.ctrl.write16(0x08, 0x20); // EGHOLD
+        quiet.ctrl.write16(0x0C, 0x0080); // TL = 0x80 (−48 dB)
+        keyon_slot0(&mut quiet, 0, 0x100, 0, 0x100, 0);
+        let attenuated = quiet.eg_advance(0);
+
+        assert!(full > 0xF00, "TL 0 → near full scale");
+        assert!(attenuated < full / 4, "TL 0x80 sharply attenuates");
+    }
+
+    #[test]
+    fn key_off_enters_release_then_silences() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(0x0A, 0x001F); // data[5]: RR = 31 (fast release)
         keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
         assert!(s.slot_active(0));
-        // Clear KYONB, strobe KYONEX → key off.
-        s.ctrl.write16(0x00, 0x1000);
-        assert!(!s.slot_active(0));
-        assert_eq!(s.slot_sample(0), 0, "silent once keyed off");
+        s.ctrl.write16(0x00, 0x1000); // clear KYONB, strobe KYONEX → key off
+        assert!(s.slot_active(0), "key-off enters release, still playing");
+        for _ in 0..100_000 {
+            if !s.slot_active(0) {
+                break;
+            }
+            s.eg_advance(0);
+        }
+        assert!(!s.slot_active(0), "release decays to silence → slot off");
     }
 
     #[test]
