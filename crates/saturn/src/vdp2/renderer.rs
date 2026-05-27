@@ -32,9 +32,22 @@
 //! RBG0 uses parameter set A (priority PRIR); RBG1 uses set B (priority N0PRIN).
 //! Full layer order: sprite > RBG0 > NBG0 > RBG1 > NBG1 > NBG2 > NBG3.
 //!
+//! **Colour calculation** (CCCTL): the top two opaque dots by priority are
+//! kept, and when the front layer enables colour calc it blends with the dot
+//! below — ratio mode (alpha = `(31-CCRT)/31`) or additive (CCMD). NBG0–3 use
+//! CCRNA/CCRNB, RBG0 uses CCRR, and sprites use CCRSA..D selected per type,
+//! gated by SPCCEN + the SPCCCS/SPCCN priority condition.
+//!
+//! **Windows** (W0/W1): each layer's WCTL byte enables W0/W1 with an
+//! inside/outside area bit and AND/OR logic; a windowed-out dot is suppressed.
+//! Rectangles come from WPSX/WPSY/WPEX/WPEY (X at half-dot resolution).
+//!
+//! **Sprite shadow**: an MSB-only sprite word (bit 15 set, no colour) on a
+//! shadow-capable sprite type halves the colour of the layer beneath.
+//!
 //! Deferred to later increments: the line-coefficient table (per-line scaling)
-//! and dual-parameter window selection, windows, line-scroll, colour
-//! calculation / sprite alpha + shadow, and CRAM modes 1/2.
+//! and dual-parameter window selection, line windows, the sprite window plane,
+//! line-scroll, and CRAM modes 1/2.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -76,53 +89,163 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
     for y in 0..FRAME_HEIGHT {
         for x in 0..FRAME_WIDTH {
             let (sx, sy) = (x as u32, y as u32);
-            // Evaluate layers in VDP2's default front-to-back order; the
-            // first dot at a given priority wins (consider only replaces on a
-            // strictly higher priority): sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
-            let mut winner: Option<(u8, (u8, u8, u8))> = None;
-            consider(
-                &mut winner,
-                sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)),
-            );
-            consider(&mut winner, rbg_layer(vdp2, 0, sx, sy));
-            consider(&mut winner, nbg_layer(vdp2, 0, sx, sy));
-            consider(&mut winner, rbg_layer(vdp2, 1, sx, sy));
-            consider(&mut winner, nbg_layer(vdp2, 1, sx, sy));
-            consider(&mut winner, nbg_layer(vdp2, 2, sx, sy));
-            consider(&mut winner, nbg_layer(vdp2, 3, sx, sy));
-            let (r, g, b) = winner.map(|(_, rgb)| rgb).unwrap_or(backdrop);
-            put_pixel(out, x, y, r, g, b);
+            // Evaluate layers in VDP2's default front-to-back order, keeping
+            // the top two by priority (front order wins ties) so colour
+            // calculation can blend the front layer with the one below it:
+            // sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
+            let mut top: Option<Dot> = None;
+            let mut second: Option<Dot> = None;
+            let mut shadow = false;
+
+            // The sprite layer may produce a colour dot or an MSB shadow.
+            if window_allows(vdp2, vdp2.regs.sprite_window_control(), sx, sy) {
+                match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
+                    Some(SpriteDot::Colour(d)) => insert_dot(&mut top, &mut second, Some(d)),
+                    Some(SpriteDot::Shadow) => shadow = true,
+                    None => {}
+                }
+            }
+            insert_dot(&mut top, &mut second, rbg_layer(vdp2, 0, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 0, sx, sy));
+            insert_dot(&mut top, &mut second, rbg_layer(vdp2, 1, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 1, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 2, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 3, sx, sy));
+
+            let mut rgb = match top {
+                Some(t) => match t.cc {
+                    Some((ratio, add)) => {
+                        let below = second.map(|s| s.rgb).unwrap_or(backdrop);
+                        blend(t.rgb, below, ratio, add)
+                    }
+                    None => t.rgb,
+                },
+                None => backdrop,
+            };
+            // MSB-shadow sprites darken whatever shows beneath them by half.
+            if shadow {
+                rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+            }
+            put_pixel(out, x, y, rgb.0, rgb.1, rgb.2);
         }
     }
 }
 
-/// Replace `winner` with `cand` only if `cand` has a strictly higher (nonzero)
-/// priority — so layers evaluated earlier win ties.
-fn consider(winner: &mut Option<(u8, (u8, u8, u8))>, cand: Option<(u8, (u8, u8, u8))>) {
-    if let Some((p, c)) = cand
-        && p != 0
-        && winner.is_none_or(|(wp, _)| p > wp)
-    {
-        *winner = Some((p, c));
+/// One layer's contribution at a pixel: priority, colour, and the colour-calc
+/// descriptor `(ratio 0..31, additive?)` when this layer blends with the dot
+/// below it.
+#[derive(Clone, Copy)]
+struct Dot {
+    pri: u8,
+    rgb: (u8, u8, u8),
+    cc: Option<(u8, bool)>,
+}
+
+/// The sprite layer's contribution: a normal colour dot, or an MSB shadow that
+/// darkens the layer beneath instead of drawing.
+enum SpriteDot {
+    Colour(Dot),
+    Shadow,
+}
+
+/// Slot `cand` into the running top-two by priority. Front-order callers win
+/// ties (strict `>` keeps the earlier dot), and a displaced top becomes second.
+fn insert_dot(top: &mut Option<Dot>, second: &mut Option<Dot>, cand: Option<Dot>) {
+    let Some(d) = cand else { return };
+    if d.pri == 0 {
+        return;
+    }
+    match *top {
+        Some(t) if d.pri > t.pri => {
+            *second = *top;
+            *top = Some(d);
+        }
+        Some(_) => {
+            if second.is_none_or(|s| d.pri > s.pri) {
+                *second = Some(d);
+            }
+        }
+        None => *top = Some(d),
     }
 }
 
-/// An enabled NBG layer's (priority, colour) at `(x, y)`, or `None`.
-fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, (u8, u8, u8))> {
+/// Blend front colour `t` over `b`. Ratio mode (CCMD=0) weights the front by
+/// `(31-ratio)/31`; additive mode (CCMD=1) saturating-adds the two.
+fn blend(t: (u8, u8, u8), b: (u8, u8, u8), ratio: u8, add: bool) -> (u8, u8, u8) {
+    if add {
+        (
+            t.0.saturating_add(b.0),
+            t.1.saturating_add(b.1),
+            t.2.saturating_add(b.2),
+        )
+    } else {
+        let alpha = (0x1F - ratio as u32) * 255 / 0x1F;
+        let mix = |t: u8, b: u8| ((t as u32 * alpha + b as u32 * (255 - alpha)) / 255) as u8;
+        (mix(t.0, b.0), mix(t.1, b.1), mix(t.2, b.2))
+    }
+}
+
+/// Whether `ctl` (a per-layer WCTL byte) permits drawing at `(x, y)`. Combines
+/// W0 and W1 per the layer's logic bit; the sprite window is a later
+/// refinement (its enable bit, if set, is treated as "always pass").
+fn window_allows(vdp2: &Vdp2, ctl: u8, x: u32, y: u32) -> bool {
+    let (w0e, w0a) = (ctl & 0x02 != 0, ctl & 0x01 != 0);
+    let (w1e, w1a) = (ctl & 0x08 != 0, ctl & 0x04 != 0);
+    if !w0e && !w1e {
+        return true;
+    }
+    let w0 = win_pixel(vdp2, 0, x, y, w0e, w0a);
+    let w1 = win_pixel(vdp2, 1, x, y, w1e, w1a);
+    // LOG bit (0x80): set = OR the two windows, clear = AND them.
+    if ctl & 0x80 != 0 { w0 || w1 } else { w0 && w1 }
+}
+
+/// One window's pass/fail at `(x, y)`: disabled → always pass; `area` set →
+/// pass inside the rectangle, clear → pass outside.
+fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) -> bool {
+    if !enable {
+        return true;
+    }
+    let (sx, ex, sy, ey) = vdp2.regs.window_rect(w);
+    let inside = x >= sx && x <= ex && y >= sy && y <= ey;
+    if area { inside } else { !inside }
+}
+
+/// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`.
+fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.nbg_enabled(n) {
         return None;
     }
     let pri = vdp2.regs.nbg_priority(n);
-    (pri != 0).then(|| sample_nbg(vdp2, n, x, y).map(|c| (pri, c)))?
+    if pri == 0 || !window_allows(vdp2, vdp2.regs.nbg_window_control(n), x, y) {
+        return None;
+    }
+    let rgb = sample_nbg(vdp2, n, x, y)?;
+    Some(Dot {
+        pri,
+        rgb,
+        cc: vdp2.regs.nbg_color_calc(n),
+    })
 }
 
-/// An enabled rotation layer's (priority, colour) at `(x, y)`, or `None`.
-fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<(u8, (u8, u8, u8))> {
+/// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`.
+fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.rbg_enabled(which) {
         return None;
     }
     let pri = vdp2.regs.rbg_priority(which);
-    (pri != 0).then(|| sample_rbg(vdp2, which, x, y).map(|c| (pri, c)))?
+    // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
+    // ungated for now.
+    let gated = which != 0 || window_allows(vdp2, vdp2.regs.rbg0_window_control(), x, y);
+    if pri == 0 || !gated {
+        return None;
+    }
+    let rgb = sample_rbg(vdp2, which, x, y)?;
+    Some(Dot {
+        pri,
+        rgb,
+        cc: vdp2.regs.rbg_color_calc(which),
+    })
 }
 
 #[inline]
@@ -321,22 +444,65 @@ const SPRITE_COLORMASK: [u16; 16] = [
 ];
 const SPRITE_PRIO_SHIFT: [u16; 16] = [14, 13, 14, 13, 13, 12, 12, 12, 7, 7, 6, 0, 7, 7, 6, 0];
 const SPRITE_PRIO_MASK: [u16; 16] = [3, 7, 1, 3, 3, 7, 7, 7, 1, 1, 3, 0, 1, 1, 3, 0];
+// Which framebuffer bits select the sprite colour-calc ratio register (CCRSx).
+const SPRITE_CCR_SHIFT: [u16; 16] = [11, 11, 11, 11, 10, 11, 10, 9, 0, 6, 0, 6, 0, 6, 0, 6];
+const SPRITE_CCR_MASK: [u16; 16] = [7, 3, 7, 3, 7, 1, 3, 7, 0, 1, 0, 3, 0, 1, 0, 3];
+// Sprite types 2..7 use framebuffer bit 15 as a shadow flag (0x8000); others
+// have no MSB shadow.
+const SPRITE_SHADOW: [u16; 16] = [
+    0, 0, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Whether sprite colour-calculation applies to a dot of priority `pri`, and
+/// with what ratio: SPCCEN gates it, then SPCCCS compares `pri` to SPCCN
+/// (≤ / == / ≥ / always). The ratio comes from CCRSx selected by `ccidx`.
+fn sprite_cc(vdp2: &Vdp2, pri: u8, ccidx: usize) -> Option<(u8, bool)> {
+    if !vdp2.regs.sprite_color_calc_enabled() {
+        return None;
+    }
+    let n = vdp2.regs.sprite_cc_condition();
+    let on = match vdp2.regs.sprite_cc_mode() {
+        0 => pri <= n,
+        1 => pri == n,
+        2 => pri >= n,
+        _ => true,
+    };
+    on.then(|| {
+        (
+            vdp2.regs.sprite_color_calc_ratio(ccidx),
+            vdp2.regs.color_calc_add_mode(),
+        )
+    })
+}
 
 /// Sample the VDP1 sprite layer at screen `(x, y)`: read the frame-buffer
-/// word, decode colour + priority per the SPCTL sprite type, and return
-/// `None` for a transparent dot or a priority-0 (hidden) sprite.
-fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<(u8, (u8, u8, u8))> {
+/// word, decode colour + priority + colour-calc per the SPCTL sprite type.
+/// Returns `None` for a transparent / priority-0 dot, or a [`SpriteDot`]
+/// (colour or MSB shadow).
+fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<SpriteDot> {
     let pix = fb.pixel(x as i32, y as i32);
     if pix == 0 {
         return None; // nothing plotted here
     }
     let stype = vdp2.regs.sprite_type();
 
+    // MSB shadow: for shadow-capable types a word with only bit 15 set is a
+    // pure shadow that darkens the layer below rather than drawing a colour.
+    if SPRITE_SHADOW[stype] != 0 && pix == 0x8000 {
+        return Some(SpriteDot::Shadow);
+    }
+
     // RGB direct colour: MSB set and SPCLMD enabled. Priority comes from
     // sprite register 0.
     if pix & 0x8000 != 0 && vdp2.regs.sprite_rgb_mode() {
         let pri = vdp2.regs.sprite_priority(0);
-        return (pri != 0).then(|| (pri, cram::rgb555_to_888(pix)));
+        return (pri != 0).then(|| {
+            SpriteDot::Colour(Dot {
+                pri,
+                rgb: cram::rgb555_to_888(pix),
+                cc: sprite_cc(vdp2, pri, 0),
+            })
+        });
     }
 
     // Palette code: priority bits index PRISA..PRISD; the masked low bits are
@@ -347,7 +513,15 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<(u8, (
         return None;
     }
     let code = (pix & SPRITE_COLORMASK[stype]) as usize;
-    (code != 0).then(|| (pri, vdp2.cram.color_rgb888_mode0(code)))
+    if code == 0 {
+        return None;
+    }
+    let ccidx = ((pix >> SPRITE_CCR_SHIFT[stype]) & SPRITE_CCR_MASK[stype]) as usize;
+    Some(SpriteDot::Colour(Dot {
+        pri,
+        rgb: vdp2.cram.color_rgb888_mode0(code),
+        cc: sprite_cc(vdp2, pri, ccidx),
+    }))
 }
 
 /// Sample rotation background `which` at screen `(x, y)`: transform through
@@ -932,5 +1106,92 @@ mod tests {
         let v = Vdp2::new();
         let mut tiny = [0u8; 64];
         render_frame(&v, None, &mut tiny);
+    }
+
+    /// Two opaque bitmap layers with colour calc on the front one blend by the
+    /// CCRNA ratio (ratio mode): front=red over below=blue at ratio 15.
+    #[test]
+    fn colour_calc_ratio_blends_front_over_below() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0003); // NBG0 + NBG1
+        v.regs.write16(0x028, 0x1212); // both bitmap, 8bpp
+        v.regs.write16(0x0F8, 0x0205); // N0PRIN=5 (top), N1PRIN=2
+        v.regs.write16(0x03C, 0x0010); // NBG1 bitmap base 0x20000
+        v.regs.write16(0x0EC, 0x0001); // CCCTL.N0CCEN, CCMD=0 (ratio)
+        v.regs.write16(0x108, 0x000F); // CCRNA.N0CCRT = 15
+        v.cram.write16(2, 0x001F); // index 1 red  (NBG0, front)
+        v.cram.write16(4, 0x7C00); // index 2 blue (NBG1, below)
+        v.vram.write8(0, 1);
+        v.vram.write8(0x2_0000, 2);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // alpha = (31-15)*255/31 = 131; red·131 over blue·124.
+        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF]);
+    }
+
+    /// With CCMD=1 the front and below colours add (saturating).
+    #[test]
+    fn colour_calc_additive_sums_front_and_below() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.regs.write16(0x020, 0x0003);
+        v.regs.write16(0x028, 0x1212);
+        v.regs.write16(0x0F8, 0x0205); // NBG0 on top
+        v.regs.write16(0x03C, 0x0010);
+        v.regs.write16(0x0EC, 0x0101); // N0CCEN + CCMD=1 (additive)
+        v.cram.write16(2, 0x001F); // red
+        v.cram.write16(4, 0x7C00); // blue
+        v.vram.write8(0, 1);
+        v.vram.write8(0x2_0000, 2);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0xFF, 0xFF], "red + blue");
+    }
+
+    /// Window 0 with area=inside clips NBG0 to the rectangle; outside it the
+    /// layer is suppressed and the backdrop shows.
+    #[test]
+    fn window_zero_clips_layer_to_rectangle() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // bitmap, 8bpp
+        v.cram.write16(0, 0x1F << 5); // backdrop green
+        v.cram.write16(2, 0x001F); // index 1 red
+        v.vram.write8(0, 1); // (0,0)
+        v.vram.write8(2 * 512 + 3, 1); // (3,2)
+        // NBG0 window control: W0 enable + area=inside, AND logic (W1 off).
+        v.regs.write16(0x0D0, 0x0003);
+        // W0 rect x∈[2,5], y∈[1,3] (X stored at half-dot resolution).
+        v.regs.write16(0x0C0, 4); // WPSX0 → sx 2
+        v.regs.write16(0x0C2, 1); // WPSY0 → sy 1
+        v.regs.write16(0x0C4, 0x0A); // WPEX0 → ex 5
+        v.regs.write16(0x0C6, 3); // WPEY0 → ey 3
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 3, 2), [0xFF, 0, 0, 0xFF], "inside window → red");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0xFF, 0, 0xFF],
+            "outside window → backdrop"
+        );
+    }
+
+    /// An MSB-shadow sprite dot (type 2, word = 0x8000) halves the colour of
+    /// the NBG layer beneath instead of drawing its own colour.
+    #[test]
+    fn sprite_msb_shadow_halves_layer_below() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x0E0, 0x0002); // SPCTL.SPTYPE = 2 (shadow-capable)
+        v.cram.write16(2, 0x7FFF); // index 1 = white (0xFF,0xFF,0xFF)
+        v.vram.write8(0, 1); // NBG0 white at (0,0)
+        v.vram.write8(512, 1); // NBG0 white at (0,1)
+        let fb = sprite_fb_with(0, 0, 0x8000); // pure shadow at (0,0)
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0x7F, 0x7F, 0x7F, 0xFF], "shadowed");
+        assert_eq!(pixel(&buf, 0, 1), [0xFF, 0xFF, 0xFF, 0xFF], "unshadowed");
     }
 }

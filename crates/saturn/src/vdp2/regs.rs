@@ -343,6 +343,100 @@ impl Vdp2Regs {
         let shift = (i & 1) * 8;
         ((self.read16(reg) >> shift) & 0x7) as u8
     }
+    /// Sprite colour-calculation ratio register `i` (0..7) — CCRSA..CCRSD at
+    /// 0x100/0x102/0x104/0x106, two 5-bit fields each.
+    pub fn sprite_color_calc_ratio(&self, i: usize) -> u8 {
+        let reg = 0x100 + (i as u32 / 2) * 2;
+        let shift = (i & 1) * 8;
+        ((self.read16(reg) >> shift) & 0x1F) as u8
+    }
+    /// SPCCN (SPCTL bits 10..8) — the sprite priority compared against for
+    /// colour-calc enable, per SPCCCS mode.
+    pub fn sprite_cc_condition(&self) -> u8 {
+        ((self.spctl() >> 8) & 0x7) as u8
+    }
+    /// SPCCCS (SPCTL bits 13..12) — colour-calc condition mode: 0 = priority
+    /// ≤ SPCCN, 1 = == , 2 = ≥ , 3 = always (MSB-controlled).
+    pub fn sprite_cc_mode(&self) -> u8 {
+        ((self.spctl() >> 12) & 0x3) as u8
+    }
+
+    // ---- Colour calculation (CCCTL 0x0EC + ratio registers) ----
+
+    pub fn ccctl(&self) -> u16 {
+        self.read16(0x0EC)
+    }
+    /// CCMD (CCCTL bit 8): false = ratio (alpha) blend, true = additive blend.
+    pub fn color_calc_add_mode(&self) -> bool {
+        self.ccctl() & 0x100 != 0
+    }
+    /// SPCCEN (CCCTL bit 6) — master enable for sprite colour calculation.
+    pub fn sprite_color_calc_enabled(&self) -> bool {
+        self.ccctl() & 0x40 != 0
+    }
+    /// Colour-calc ratio (0..31) for NBG`n`: CCRNA (0x108) holds N0/N1,
+    /// CCRNB (0x10A) holds N2/N3, low/high 5-bit fields.
+    pub fn nbg_color_calc_ratio(&self, n: usize) -> u8 {
+        let (reg, shift) = match n {
+            0 => (0x108, 0),
+            1 => (0x108, 8),
+            2 => (0x10A, 0),
+            _ => (0x10A, 8),
+        };
+        ((self.read16(reg) >> shift) & 0x1F) as u8
+    }
+    /// Colour-calc descriptor `(ratio, add_mode)` for NBG`n` if CCCTL enables
+    /// it (bits 0..3 = N0..N3), else `None`.
+    pub fn nbg_color_calc(&self, n: usize) -> Option<(u8, bool)> {
+        (self.ccctl() & (1 << n) != 0)
+            .then(|| (self.nbg_color_calc_ratio(n), self.color_calc_add_mode()))
+    }
+    /// Colour-calc descriptor for RBG`which`: RBG0 uses CCCTL bit 4 + CCRR
+    /// (0x10C); RBG1 shares NBG0's bit 0 + ratio.
+    pub fn rbg_color_calc(&self, which: usize) -> Option<(u8, bool)> {
+        if which == 0 {
+            (self.ccctl() & 0x10 != 0).then(|| {
+                (
+                    (self.read16(0x10C) & 0x1F) as u8,
+                    self.color_calc_add_mode(),
+                )
+            })
+        } else {
+            self.nbg_color_calc(0)
+        }
+    }
+
+    // ---- Windows (W0/W1 rectangles + per-layer WCTL control bytes) ----
+
+    /// Window `w` (0/1) rectangle `(start_x, end_x, start_y, end_y)` in
+    /// low-res screen dots. Horizontal coordinates are stored at half-dot
+    /// resolution (`>>1`) in normal mode; vertical is per-line. Line windows
+    /// and hi-res scaling are later refinements.
+    pub fn window_rect(&self, w: usize) -> (u32, u32, u32, u32) {
+        let base = if w == 0 { 0x0C0 } else { 0x0C8 };
+        let sx = ((self.read16(base) & 0x3FE) >> 1) as u32;
+        let sy = (self.read16(base + 2) & 0x3FF) as u32;
+        let ex = ((self.read16(base + 4) & 0x3FE) >> 1) as u32;
+        let ey = (self.read16(base + 6) & 0x3FF) as u32;
+        (sx, ex, sy, ey)
+    }
+    /// Per-layer window-control byte (W0/W1 enable+area+logic bits). N0/N1 in
+    /// WCTLA (0x0D0), N2/N3 in WCTLB (0x0D2), RBG0/sprite in WCTLC (0x0D4).
+    pub fn nbg_window_control(&self, n: usize) -> u8 {
+        let (reg, shift) = match n {
+            0 => (0x0D0, 0),
+            1 => (0x0D0, 8),
+            2 => (0x0D2, 0),
+            _ => (0x0D2, 8),
+        };
+        ((self.read16(reg) >> shift) & 0xFF) as u8
+    }
+    pub fn rbg0_window_control(&self) -> u8 {
+        (self.read16(0x0D4) & 0xFF) as u8
+    }
+    pub fn sprite_window_control(&self) -> u8 {
+        ((self.read16(0x0D4) >> 8) & 0xFF) as u8
+    }
 
     // ---- Rotation backgrounds (RBG0 / RBG1) ----
     //
