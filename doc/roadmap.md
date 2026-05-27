@@ -135,6 +135,38 @@ datasheet are tagged inline; `grep -rn "REVIEW(magic)" crates` enumerates them
 RTC bytes, `OREG10=0x34`, CD Get-HW-Info literals). None gate boot; revisit a tag
 only if a divergence implicates it. Spec-grounded values are deliberately not tagged.
 
+### Splash blocker — refined diagnosis (2026-05-27)
+
+Revisiting the park with the loop-collapsed PC diff + live-state probes
+(`crates/saturn/tests/trace_boot.rs`, all `#[ignore]`) sharpens the picture and
+**revises the "cycle-phase drift" theory above** — the residual is more likely a
+**data-path divergence**, not interrupt phase:
+
+- **Boot reaches a stable WRAM park at `0x060108BE`** (a `MOV.W @R3,R3 / CMP/EQ /
+  BT` loop) waiting for **`[0x060408A4]`** (16-bit) to change. Disassembled live.
+- The watched word **never changes across 600 frames (~10 s emulated)** — far past
+  any splash timing — so this is a **genuine stall, not phase jitter / slowness**.
+- VDP2 **display is still off** (`TVMD.DISP=0`), so it's strictly **pre-splash**.
+- **Interrupts are live and correct**: `imask=0`; the VBlank-IN vector (`0x40`,
+  `VBR=0x06000000` → trampoline `0x06000840` → common dispatcher `0x060008F4`)
+  **fires every frame**, pushes regs, `JSR @R6` through the per-vector callback
+  table, and `RTE`s cleanly. Verified the handler entry is hit ~2×/frame.
+- **But every SCU-vector callback is still the BIOS default do-nothing stub**
+  (`0x0600083C` = `RTS; nop`). Nothing advances `0x060408A4`, so the park spins
+  forever and display is never enabled.
+- **Control flow matches MAME** across the entire traceable window (loop-collapsed
+  skeletons agree for all ~721 K basic blocks we cover; raw PC streams agree
+  bit-exact for ~9.3 M instructions before the first poll-count shift). Since the
+  PC paths agree but the installed callback differs, the divergence is a **value
+  the BIOS writes into the callback table (or the source feeding it) — invisible to
+  PC tracing**, not a control-flow/branch bug.
+
+**Concrete next step** (when the splash is picked back up): set a write-watchpoint
+on the VBlank-IN callback-table slot (and on `0x060408A4`), boot until the BIOS
+*should* install a real callback, and compare the written value / its data source
+against the MAME reference at the same store. The lead is the **callback-install
+data path**, not the interrupt timing.
+
 ## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
 
 Turn the remaining presence-stubs into real chips, in the order set by the user —
