@@ -213,6 +213,46 @@ staged-INTBACK **peripheral** response reports a phantom port-1 pad (`OREG0=0xF1
 OREG1=0x02`) where M4's plan was "no controller" — verify that doesn't send the BIOS
 down a divergent peripheral path.
 
+### Post-splash menu transition — open (diagnosed 2026-05-28)
+
+After the splash fix the boot runs **far** past the logo (through WRAM `0x6011xxx`,
+a long `imask=14` loop at `0x6028DD4`, BIOS `0x0003300`) but the **screen stays on
+the splash** — MAME advances to the "Set Language" menu (~25 s), we don't. New park:
+`0x06028F9E` waits for the byte `[0x060100AB]` to become `1`; in MAME that flag is
+`0x01` by ~6 s, in ours it never sets (park spins 5 M× over 800 frames).
+
+**Behavioral divergence (trampoline-hit counting, ours-800f vs MAME-10s):** the SCU
+**SMPC interrupt (vector `0x47`)** fires **236× in MAME, 0× in ours**. It is *not*
+masked (`IMS=0`, `imask=0`) — it's simply never raised, because **our BIOS issues no
+SMPC commands post-splash** (`SF` idle, 0 command-busy edges over 5 frames) while
+MAME's does. So MAME's post-splash path runs periodic peripheral polling (SMPC
+command → vec `0x47` → handler sets `[0x060100AB]`); **ours takes a different path
+that never starts it.** Root is a *control-flow* divergence, likely a callback-install
+or handler branch we miss.
+
+**Ruled out:** the phantom pad (forcing the INTBACK peripheral response to
+"no controller" gives a byte-identical stuck trajectory); SMPC interrupt masking.
+
+**Methodology notes (carry forward):**
+- The interrupt **trampoline table is not in vector order** — `0x42` (HBlank-IN) is
+  relocated to `0x060008F0`, so entry `0x06000840 + k*6` maps `k=0→0x40, k=1→0x41,
+  k≥2→0x41+k`. An earlier naive `0x40+(entry−base)/6` mislabel pointed at vector
+  `0x46` (sound) — a **red herring**: MAME's SCSP regs (`TIMA/MCIEB/MCIPD`) match ours
+  exactly, and the real missing vector is `0x47` (SMPC).
+- The **re-syncing diff can't cross the post-splash region**: every frame-wait park
+  spins a full frame's worth of iterations at a *timing-dependent* count (ours vs
+  MAME differ), which exceeds any practical resync window. **Trampoline-hit counting
+  is the right tool here**, not the PC diff.
+- Probes for all of this are in `crates/saturn/tests/trace_boot.rs` (`analyze_park2`,
+  `scsp_state_at_park`, `scu_state_at_park2`, `smpc_activity_at_park`,
+  `splash_timeline`), all `#[ignore]`d.
+
+**Next step:** find what *drives* the post-splash periodic SMPC peripheral polling on
+real HW (which sets `[0x060100AB]`) and why our BIOS path never starts it — locate the
+flag-writer (the MAME Lua memory write-tap didn't fire on this RAM; try a debugger
+watchpoint via Lua execution-state polling, or correlate the MAME trace) and trace
+back to the install/branch we diverge on.
+
 ## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
 
 Turn the remaining presence-stubs into real chips, in the order set by the user —
