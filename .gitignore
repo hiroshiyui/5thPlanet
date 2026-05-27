@@ -5,3 +5,7 @@
 # Keep the directory documented via bios/README.md (whitelisted below).
 bios/*
 !bios/README.md
+
+# CD-ROM disc images (CUE/BIN, CCD/IMG/SUB, ISO) live in roms/ and must
+# never be committed — they are copyrighted. Each developer supplies their own.
+roms/
