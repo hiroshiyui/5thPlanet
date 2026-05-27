@@ -19,9 +19,9 @@
 //!   RGB555 (modes 0/1) or true RGB888 (modes 2/3).
 //! - **Backdrop** = CRAM index 0 (the real BKTAU/BKTAL backdrop register is
 //!   a later refinement; palette entry 0 is what splash software programs).
-//! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll and
-//!   per-column vertical cell scroll for NBG0/NBG1 (SCRCTL/LSTAn/VCSTA —
-//!   integer H/V, LSS interval); fractional scroll and line zoom are ignored.
+//! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll,
+//!   per-line horizontal zoom, and per-column vertical cell scroll for
+//!   NBG0/NBG1 (SCRCTL/LSTAn/VCSTA); fractional whole-layer scroll is ignored.
 //! - **NTSC low-res** (320×224).
 //!
 //! The **VDP1 sprite layer** is composited too: VDP2 reads the VDP1 frame
@@ -59,8 +59,10 @@
 //! the layer either repeats (wrap) or is transparent (modes 2/3).
 //!
 //! Deferred to later increments: dual-parameter window selection, the
-//! coefficient mode-3 (Xp) override and CRAM-resident coefficient tables, the
-//! screen-over pattern (mode 1), the sprite window plane, and line-zoom.
+//! coefficient mode-3 (Xp) override and CRAM-resident coefficient tables, and
+//! the screen-over pattern (mode 1). The **sprite window** (WCTL SWE/SWA) is
+//! not modelled — the reference emulator leaves it unimplemented too, and it
+//! would need the VDP1 frame buffer threaded into the per-layer window test.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -283,19 +285,20 @@ fn put_pixel(out: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
     out[dst + 3] = 0xFF;
 }
 
-/// Per-line scroll offset `(dx, dy)` for NBG0/NBG1 at screen line `y`, read
-/// from the line-scroll table (SCRCTL/LSTAn). Only the integer part of each
-/// enabled component (bits 26..16) is applied; line zoom occupies its table
-/// slot but isn't yet applied.
-fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32) {
+/// Per-line scroll for NBG0/NBG1 at screen line `y`, read from the line-scroll
+/// table (SCRCTL/LSTAn): `(dx, dy, zoom_x)`, where `dx`/`dy` are integer scroll
+/// (bits 26..16) and `zoom_x` is the horizontal step in 16.16 (1.0 when line
+/// zoom is off). Components present in the table in order H-scroll, V-scroll,
+/// H-zoom — only the enabled ones.
+fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32, u32) {
     let r = &vdp2.regs;
     let (lscx, lscy, lzmx) = (
         r.nbg_line_scroll_x(n),
         r.nbg_line_scroll_y(n),
         r.nbg_line_zoom_x(n),
     );
-    if !lscx && !lscy {
-        return (0, 0);
+    if !lscx && !lscy && !lzmx {
+        return (0, 0, 1 << 16);
     }
     let stride = (lscx as u32 + lscy as u32 + lzmx as u32) * 4;
     let entry = r.nbg_line_scroll_table(n) + (y / r.nbg_line_scroll_interval(n)) * stride;
@@ -308,8 +311,21 @@ fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32) {
     } else {
         0
     };
-    let dy = if lscy { int(vdp2.vram.read32(off)) } else { 0 };
-    (dx, dy)
+    let dy = if lscy {
+        let v = int(vdp2.vram.read32(off));
+        off += 4;
+        v
+    } else {
+        0
+    };
+    // Horizontal line zoom: a 16.16 per-dot step (integer bits 18..16,
+    // fraction bits 15..8). 1.0 means no zoom.
+    let zoom = if lzmx {
+        (vdp2.vram.read32(off) & 0x0007_FF00).max(1)
+    } else {
+        1 << 16
+    };
+    (dx, dy, zoom)
 }
 
 /// Per-column vertical cell-scroll offset (signed) for NBG0/NBG1 at screen
@@ -337,18 +353,21 @@ fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
 fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
     let (mut scroll_x, mut scroll_y) = vdp2.regs.nbg_scroll(n);
-    // NBG0/NBG1 support per-line scroll and per-column vertical cell scroll on
-    // top of the whole-layer scroll.
+    // NBG0/NBG1 support per-line scroll + zoom and per-column vertical cell
+    // scroll on top of the whole-layer scroll.
+    let mut zoom_x: u32 = 1 << 16;
     if n < 2 {
-        let (dx, dy) = line_scroll(vdp2, n, y);
+        let (dx, dy, zoom) = line_scroll(vdp2, n, y);
         scroll_x += dx;
         scroll_y += dy;
+        zoom_x = zoom;
         if vdp2.regs.nbg_vcell_scroll(n) {
             scroll_y = scroll_y.wrapping_add(vcell_scroll(vdp2, n, x) as u32);
         }
     }
     let depth = vdp2.regs.nbg_color_mode(n);
-    let sx = x + scroll_x;
+    // Horizontal line zoom scales the per-dot source step (1.0 = no zoom).
+    let sx = scroll_x.wrapping_add(((x as u64 * zoom_x as u64) >> 16) as u32);
     let sy = y + scroll_y;
     if vdp2.regs.nbg_bitmap_enabled(n) {
         sample_bitmap(vdp2, n, depth, sx, sy)
@@ -1557,6 +1576,24 @@ mod tests {
         assert_eq!(pixel(&buf, 0, 2), [0xFF, 0, 0, 0xFF], "line 2 scrolled");
         // Line 0 has no scroll, so screen (0,0) samples the empty (0,0).
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "line 0 unscrolled");
+    }
+
+    #[test]
+    fn nbg0_line_zoom_scales_the_horizontal_source() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x09A, 0x0008); // SCRCTL.N0LZMX (line zoom only)
+        v.regs.write16(0x0A2, 0x0200); // LSTA0L → table at byte 0x400
+        v.vram.write32(0x400, 0x0002_0000); // line 0 zoom = 2.0
+        v.cram.write16(2, 0x001F); // index 1 = red
+        v.vram.write8(2, 1); // bitmap dot at (2, 0)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Zoom 2× → screen x=1 samples source x=2 → red.
+        assert_eq!(pixel(&buf, 1, 0), [0xFF, 0, 0, 0xFF], "2× zoom maps x=1→2");
+        // Screen x=0 → source 0 (empty) → backdrop.
+        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "x=0 source unscaled");
     }
 
     #[test]
