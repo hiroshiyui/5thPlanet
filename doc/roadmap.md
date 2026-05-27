@@ -161,11 +161,33 @@ Revisiting the park with the loop-collapsed PC diff + live-state probes
   the BIOS writes into the callback table (or the source feeding it) — invisible to
   PC tracing**, not a control-flow/branch bug.
 
-**Concrete next step** (when the splash is picked back up): set a write-watchpoint
-on the VBlank-IN callback-table slot (and on `0x060408A4`), boot until the BIOS
-*should* install a real callback, and compare the written value / its data source
-against the MAME reference at the same store. The lead is the **callback-install
-data path**, not the interrupt timing.
+**Follow-up (2026-05-27, same session):**
+
+- **Install is *not* reached.** The real callback table base is `0x06000900`
+  (captured live from the dispatcher, not PC-rel arithmetic); the VBlank-IN slot
+  `0x06000A00` holds the stub `0x0600083C` and **never changes over 900 frames
+  (~15 s)** — no interrupt callback of any vector is ever installed. So this is
+  not a store-*value* bug; the BIOS is blocked *before* the install code.
+- **Region is not the gate.** The only BIOS present is the **EUR (PAL)** image,
+  but booting it with the matching PAL area code (`0x0C`) instead of the default
+  North-America `0x04` gives a **byte-identical stuck trajectory** — same park,
+  same frame-by-frame PCs. The splash path is region-independent, as expected.
+- **`0x060408A4` is a VBlank frame-counter.** The park is the standard "wait
+  until the counter advances past a saved value" idiom; the counter is bumped by
+  the (never-installed) VBlank-IN callback. We arrive at this wait loop *without*
+  the BIOS having installed that callback.
+
+**So the genuine bug is a control-flow path we take — somewhere after the
+~9.3 M-instruction MAME-match point — that skips the callback install.** Caveat:
+the existing MAME reference trace (44 M PCs) ends in a BIOS loop at `0x0003200`
+and may not itself reach the install/splash, so it can't localise the skip.
+
+**Concrete next step:** regenerate a MAME reference trace long enough to reach the
+callback-install + splash, then run a *re-syncing* (LCS / poll-loop-tolerant) diff
+— not the line-by-line one — to find the first point our control flow leaves
+MAME's. Secondary lead worth checking: our staged-INTBACK **peripheral** response
+reports a phantom port-1 pad (`OREG0=0xF1, OREG1=0x02`) where M4's plan was "no
+controller" — verify that doesn't send the BIOS down a divergent peripheral path.
 
 ## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
 
