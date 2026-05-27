@@ -50,8 +50,10 @@ fn main() -> ExitCode {
 fn run(bios: Vec<u8>) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
-    use sdl2::keyboard::Keycode;
+    use sdl2::keyboard::{Keycode, Scancode};
     use sdl2::pixels::PixelFormatEnum;
+
+    use saturn::smpc::pad;
 
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -125,6 +127,31 @@ fn run(bios: Vec<u8>) -> ExitCode {
                 _ => {}
             }
         }
+
+        // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
+        // Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter = Start.
+        let keys = events.keyboard_state();
+        let mut held = 0u16;
+        for (sc, bit) in [
+            (Scancode::Up, pad::UP),
+            (Scancode::Down, pad::DOWN),
+            (Scancode::Left, pad::LEFT),
+            (Scancode::Right, pad::RIGHT),
+            (Scancode::Z, pad::A),
+            (Scancode::X, pad::B),
+            (Scancode::C, pad::C),
+            (Scancode::A, pad::X),
+            (Scancode::S, pad::Y),
+            (Scancode::D, pad::Z),
+            (Scancode::Q, pad::L),
+            (Scancode::W, pad::R),
+            (Scancode::Return, pad::START),
+        ] {
+            if keys.is_scancode_pressed(sc) {
+                held |= bit;
+            }
+        }
+        saturn.set_pad1(held);
 
         saturn.run_frame(&mut framebuffer);
 

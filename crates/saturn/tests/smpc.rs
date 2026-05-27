@@ -186,8 +186,10 @@ fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
 }
 
 #[test]
-fn intback_peripheral_continuation_reports_no_controller() {
+fn intback_peripheral_continuation_reports_the_digital_pad() {
     let mut sat = build();
+    // Hold Start + Left on port 1.
+    sat.set_pad1(saturn::smpc::pad::START | saturn::smpc::pad::LEFT);
     // Request status + peripheral data (IREG1 bit 3 set).
     sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
     sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
@@ -199,10 +201,13 @@ fn intback_peripheral_continuation_reports_no_controller() {
     // Host requests CONTINUE (IREG0 bit 0x80) → peripheral phase.
     sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data);
     sat.run_for(40_000);
-    // Peripheral phase: both ports report no controller (0xF0); first
-    // continuation is "more data" → SR high bits 0xC0.
-    assert_eq!(sat.bus.smpc.oreg[0], 0xF0, "port 1: no peripheral");
-    assert_eq!(sat.bus.smpc.oreg[1], 0xF0, "port 2: no peripheral");
+    // Port 1: a directly-connected standard digital pad (0xF1, ID 0x02),
+    // active-low data with Start (bit 4) and Left (bit 1) of byte 1 held.
+    assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: 1 device, direct");
+    assert_eq!(sat.bus.smpc.oreg[1], 0x02, "standard digital pad");
+    assert_eq!(sat.bus.smpc.oreg[2], !0x12, "Start + Left held (active low)");
+    assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "no second-byte buttons held");
+    assert_eq!(sat.bus.smpc.oreg[4], 0xF0, "port 2: no peripheral");
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
     assert_eq!(sr & 0xC0, 0xC0, "first peripheral phase: more data");
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);

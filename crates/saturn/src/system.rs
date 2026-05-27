@@ -501,9 +501,22 @@ impl Saturn {
     /// bytes are `0xF0` (peripheral count 0). OREG31 echoes the command.
     fn respond_to_intback_peripheral(&mut self) {
         let s = &mut self.bus.smpc;
-        s.oreg[0] = 0xF0; // port 1 status: no peripheral
-        s.oreg[1] = 0xF0; // port 2 status: no peripheral
+        // Port 1: one directly-connected standard digital pad (ID 0x02 = type
+        // 0, 2 data bytes), reporting the active-low inverse of the pressed
+        // mask. Port 2: no peripheral.
+        let pressed = s.pad1;
+        s.oreg[0] = 0xF1; // direct connection, 1 device
+        s.oreg[1] = 0x02; // standard digital pad
+        s.oreg[2] = !((pressed >> 8) as u8); // first data byte (active low)
+        s.oreg[3] = !(pressed as u8) | 0x07; // second data byte (low 3 bits unused)
+        s.oreg[4] = 0xF0; // port 2: no peripheral
         s.oreg[31] = 0x10;
+    }
+
+    /// Set the port-1 digital-pad state (a `saturn::smpc::pad` pressed mask).
+    /// The frontend calls this each frame from the host keyboard.
+    pub fn set_pad1(&mut self, pressed: u16) {
+        self.bus.smpc.pad1 = pressed;
     }
 
     /// Run any DMA transfers that the SCU queued during the last

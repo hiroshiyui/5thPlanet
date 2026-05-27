@@ -136,6 +136,29 @@ pub struct Smpc {
     /// INTBACK peripheral sequence; the Saturn aggregate drains it to run the
     /// next peripheral phase. Mirrors MAME scheduling `intback_continue_request`.
     intback_continue: bool,
+    /// Port-1 digital-pad state as a *pressed* mask (1 = held), using the
+    /// [`pad`] bit positions. The INTBACK peripheral phase reports the
+    /// active-low inverse; default 0 = nothing pressed. The frontend sets it.
+    pub pad1: u16,
+}
+
+/// Standard digital-pad button bits for [`Smpc::pad1`] (1 = pressed). The high
+/// byte is the SMPC's first data byte, the low byte the second (active-low on
+/// the wire — the report inverts this mask).
+pub mod pad {
+    pub const B: u16 = 1 << 15;
+    pub const C: u16 = 1 << 14;
+    pub const A: u16 = 1 << 13;
+    pub const START: u16 = 1 << 12;
+    pub const UP: u16 = 1 << 11;
+    pub const DOWN: u16 = 1 << 10;
+    pub const LEFT: u16 = 1 << 9;
+    pub const RIGHT: u16 = 1 << 8;
+    pub const L: u16 = 1 << 7;
+    pub const Z: u16 = 1 << 6;
+    pub const Y: u16 = 1 << 5;
+    pub const X: u16 = 1 << 4;
+    pub const R: u16 = 1 << 3;
 }
 
 impl Smpc {
