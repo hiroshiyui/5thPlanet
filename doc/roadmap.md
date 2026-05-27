@@ -24,6 +24,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SCSP | 🟡 | Sound RAM + registers, hosted+scheduled 68k, timers + interrupt model (68k IRQ + main-CPU sound IRQ); **remaining (M6):** slot/FM engine, SCSP DSP, mixer/DAC, MIDI, audio output |
 | CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
 | SH-1 (CD-block CPU) | ⬜ | M7 |
+| Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
 | SDL2 frontend | 🟡 | Window + framebuffer upload; **remaining:** audio output, keyboard input |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
 
@@ -251,6 +252,11 @@ interrupt (`MCIPD`/`MCIEB`), forwarded by `Saturn::drain_scsp` to the SCU
 ## Later milestones (queued)
 
 - **M7 — CD-block + games.** Real CD-block (SH-1) firmware, CD-ROM image loading,
-  first commercial game booting.
+  first commercial game booting, and the **cartridge slot**: Extension RAM carts
+  (1 MB at `0x0240_0000`; 4 MB as two banks at `0x0240_0000` / `0x0260_0000`),
+  the backup-RAM cart, and game ROM carts — selected per game, with the cart-ID
+  the game probes (1 MB / 4 MB detection). The cartridge region is open-bus
+  today; the carts are small RAM/ROM regions + an ID byte (no timing/state),
+  needed by games like Street Fighter Zero 3 / KOF '97 that won't run without them.
 - **Save states** — versioned serde across the crates, once the peripheral set stabilises.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
