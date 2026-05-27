@@ -87,6 +87,17 @@ impl Cram {
     }
 }
 
+/// Expand a 15-bit RGB555 value (the low 15 bits of an entry / a direct
+/// 16bpp dot) to an RGB888 triple. The top bit is ignored.
+#[inline]
+pub fn rgb555_to_888(entry: u16) -> (u8, u8, u8) {
+    (
+        expand5to8(entry & 0x1F),
+        expand5to8((entry >> 5) & 0x1F),
+        expand5to8((entry >> 10) & 0x1F),
+    )
+}
+
 /// Expand a 5-bit colour channel to 8 bits, replicating the high
 /// bits into the low ones so 0x1F maps to 0xFF instead of 0xF8.
 #[inline]

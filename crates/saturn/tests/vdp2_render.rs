@@ -41,12 +41,14 @@ fn bitmap_nbg0_through_run_frame_picks_up_synthetic_scene() {
     // Program VDP2: DISP on, NBG0 on, bitmap mode.
     sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
     sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data);
-    sat.bus.write16(REG_CHCTLA, 0x0002, AccessKind::Data); // N0BMEN (bit 1)
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // N0BMEN + N0CHCN=1 (8bpp)
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA.N0PRIN = 1
     // CRAM: index 0 = black, index 7 = pure red.
     sat.bus.vdp2.cram.write16(0, 0x0000);
     sat.bus.vdp2.cram.write16(7 * 2, 0x001F);
-    // Bitmap: paint pixel (50, 60) with palette index 7.
-    let off = 60u32 * FRAME_WIDTH as u32 + 50;
+    // Bitmap: paint pixel (50, 60) with palette index 7. The hardware
+    // bitmap is 512 px wide (N0BMSZ=0), independent of the 320-px screen.
+    let off = 60u32 * 512 + 50;
     sat.bus.vdp2.vram.write8(off, 7);
 
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];

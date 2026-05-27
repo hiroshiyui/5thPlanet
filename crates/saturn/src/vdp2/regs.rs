@@ -28,9 +28,10 @@
 //!   0x028  CHCTLA   Character Control A     (NBG0/1 mode + bpp)
 //!   0x02A  CHCTLB   Character Control B     (NBG2/3 + RBG0)
 //!   0x02C  BMPNA    Bitmap Palette NBG0/1
-//!   0x03C  PLSZ     Plane Size              (per-background plane size)
-//!   0x03E  MPOFN    Map Offset NBG          (NBG0..3 high addr nibbles)
-//!   0x040..0x05E    Map address registers (per-plane per-bg)
+//!   0x03A  PLSZ     Plane Size              (per-background plane size)
+//!   0x03C  MPOFN    Map Offset NBG          (NBG0..3 high 2 addr bits)
+//!   0x03E  MPOFR    Map Offset RBG (rotation)
+//!   0x040..0x04E    Map address registers (MPABNn/MPCDNn per-bg)
 //!   0x070..0x07E    Scroll register integers for NBG0..3
 //!   0x080..0x09E    Scroll register fractions
 //!   0x0F0..0x0FE    Per-background priority numbers
@@ -159,57 +160,141 @@ impl Vdp2Regs {
         ((self.chctla() >> 2) & 0x3) as u8
     }
 
-    // ---- Map-offset and plane registers (NBG0) ----
+    // ---- Generalized per-NBG accessors (n = 0..3) ----
     //
     // The pattern-name-table address of each plane is
-    // `((map_offset << 6) | plane_number) × plane_size`. The map-offset
-    // register (MPOFN) supplies the upper 3 bits; the per-plane map
-    // registers (MPABN0 / MPCDN0) supply the lower 6. (VDP2 manual,
-    // "Map" register group.)
+    // `((map_offset << 6) | plane_number) × plane_size`. MPOFN supplies the
+    // upper 2 bits per background; the per-plane MPABNn / MPCDNn registers
+    // supply the lower 6. Register offsets and bit fields follow the VDP2
+    // User's Manual (cross-checked against MAME's `saturn_v.cpp`).
 
-    /// MPOFN (0x03E) — Map Offset for NBG0..3. Bits 2..0 = NBG0 (`N0MP`).
+    /// Background-enable bit for NBG`n` (BGON bits 0..3).
+    pub fn nbg_enabled(&self, n: usize) -> bool {
+        self.bgon() & (1 << n) != 0
+    }
+
+    /// Priority number for NBG`n` (PRINA: N0 2..0 / N1 10..8;
+    /// PRINB: N2 2..0 / N3 10..8). Priority 0 means the layer is not shown.
+    pub fn nbg_priority(&self, n: usize) -> u8 {
+        let (reg, shift) = match n {
+            0 => (0x0F8, 0),
+            1 => (0x0F8, 8),
+            2 => (0x0FA, 0),
+            _ => (0x0FA, 8),
+        };
+        ((self.read16(reg) >> shift) & 0x7) as u8
+    }
+
+    /// Character colour number for NBG`n`: 0=16-colour (4bpp),
+    /// 1=256-colour (8bpp), 2=2048-colour, 3=32K-colour RGB, 4=16M RGB.
+    /// NBG2/3 only encode bit 0 (16 vs 256 colour).
+    pub fn nbg_color_mode(&self, n: usize) -> u8 {
+        match n {
+            0 => ((self.chctla() >> 4) & 0x7) as u8,
+            1 => ((self.chctla() >> 12) & 0x3) as u8,
+            2 => ((self.chctlb() >> 1) & 0x1) as u8,
+            _ => ((self.chctlb() >> 5) & 0x1) as u8,
+        }
+    }
+
+    /// Cell size for NBG`n`: 0 = 1×1 cell (8×8 px), 1 = 2×2 cells (16×16 px).
+    pub fn nbg_char_size_2x2(&self, n: usize) -> bool {
+        let bit = match n {
+            0 => self.chctla() & 0x0001,
+            1 => self.chctla() & 0x0100,
+            2 => self.chctlb() & 0x0001,
+            _ => self.chctlb() & 0x0010,
+        };
+        bit != 0
+    }
+
+    /// Bitmap-format enable for NBG0/1 (NBG2/3 are cell-only → false).
+    pub fn nbg_bitmap_enabled(&self, n: usize) -> bool {
+        match n {
+            0 => self.chctla() & 0x0002 != 0,
+            1 => self.chctla() & 0x0200 != 0,
+            _ => false,
+        }
+    }
+
+    /// Bitmap size code for NBG0/1 (CHCTLA `N0BMSZ`/`N1BMSZ`):
+    /// 0 = 512×256, 1 = 512×512, 2 = 1024×256, 3 = 1024×512.
+    pub fn nbg_bitmap_size(&self, n: usize) -> u8 {
+        match n {
+            0 => ((self.chctla() >> 2) & 0x3) as u8,
+            1 => ((self.chctla() >> 10) & 0x3) as u8,
+            _ => 0,
+        }
+    }
+
+    /// Plane size for NBG`n` (PLSZ at 0x03A, 2 bits each): 0 = 1×1 plane,
+    /// 1 = 2×1, 2 = (reserved), 3 = 2×2 planes of pages.
+    pub fn nbg_plane_size(&self, n: usize) -> u8 {
+        ((self.read16(0x03A) >> (n * 2)) & 0x3) as u8
+    }
+
+    /// MPOFN (0x03C) — map offset (high 2 bits of each plane address).
     pub fn mpofn(&self) -> u16 {
-        self.read16(0x03E)
+        self.read16(0x03C)
     }
-    /// `N0MP` — NBG0 map offset (high 3 bits of each NBG0 plane address).
+    /// Map offset for NBG`n` (MPOFN: 2 bits each, N0 1..0 … N3 13..12).
+    pub fn nbg_map_offset(&self, n: usize) -> u32 {
+        ((self.mpofn() >> (n * 4)) & 0x3) as u32
+    }
+
+    /// MPABN`n` plane-A map number (bits 5..0). Register base 0x040, +4/bg.
+    pub fn nbg_plane_a_number(&self, n: usize) -> u32 {
+        let mpab = self.read16(0x040 + (n as u32) * 4);
+        (self.nbg_map_offset(n) << 6) | (mpab & 0x3F) as u32
+    }
+
+    /// Bitmap base for NBG`n`: `map_offset × 0x20000` bytes.
+    pub fn nbg_bitmap_base(&self, n: usize) -> u32 {
+        self.nbg_map_offset(n) * 0x2_0000
+    }
+
+    /// Pattern-name-table base (plane A) for NBG`n`, in bytes. Assumes the
+    /// common 0x2000-byte page (64×64 cells, 1-word entries); larger plane
+    /// sizes are a later refinement.
+    pub fn nbg_pattern_table_base(&self, n: usize) -> u32 {
+        self.nbg_plane_a_number(n) * 0x2000
+    }
+
+    /// Integer scroll (x, y) for NBG`n`. NBG0/1 carry an ignored fractional
+    /// part; NBG2/3 are integer-only. Offsets per the VDP2 scroll register
+    /// block (NBG0 0x70/0x74, NBG1 0x80/0x84, NBG2 0x90/0x92, NBG3 0x94/0x96).
+    pub fn nbg_scroll(&self, n: usize) -> (u32, u32) {
+        let (xo, yo) = match n {
+            0 => (0x070, 0x074),
+            1 => (0x080, 0x084),
+            2 => (0x090, 0x092),
+            _ => (0x094, 0x096),
+        };
+        (
+            (self.read16(xo) & 0x07FF) as u32,
+            (self.read16(yo) & 0x07FF) as u32,
+        )
+    }
+
+    // ---- NBG0 wrappers (kept for existing callers/tests) ----
+
     pub fn nbg0_map_offset(&self) -> u32 {
-        (self.mpofn() & 0x7) as u32
+        self.nbg_map_offset(0)
     }
-    /// MPABN0 (0x040) — NBG0 plane A/B map numbers (bits 5..0 = A,
-    /// 13..8 = B).
-    pub fn mpabn0(&self) -> u16 {
-        self.read16(0x040)
-    }
-    /// MPCDN0 (0x042) — NBG0 plane C/D map numbers (bits 5..0 = C,
-    /// 13..8 = D).
-    pub fn mpcdn0(&self) -> u16 {
-        self.read16(0x042)
-    }
-    /// NBG0 plane-A pattern-name-table number = `(N0MP << 6) | N0MPA`.
     pub fn nbg0_plane_a_number(&self) -> u32 {
-        (self.nbg0_map_offset() << 6) | (self.mpabn0() & 0x3F) as u32
+        self.nbg_plane_a_number(0)
     }
-    /// NBG0 bitmap base address: bitmap data starts at `N0MP × 0x20000`.
     pub fn nbg0_bitmap_base(&self) -> u32 {
-        self.nbg0_map_offset() * 0x2_0000
+        self.nbg_bitmap_base(0)
     }
-    /// NBG0 pattern-name-table base (plane A), in bytes. The minimal
-    /// renderer assumes plane size 0x2000 (64×64 cells, 1-word entries).
     pub fn nbg0_pattern_table_base(&self) -> u32 {
-        self.nbg0_plane_a_number() * 0x2000
+        self.nbg_pattern_table_base(0)
     }
-
-    // ---- Scroll registers (NBG0) ----
-
-    /// SCXIN0 (0x070) — NBG0 horizontal scroll, integer part (11 bits).
-    /// The fractional part (SCXDN0 at 0x072) is ignored by the minimal
-    /// renderer.
     pub fn nbg0_scroll_x(&self) -> u32 {
-        (self.read16(0x070) & 0x07FF) as u32
+        self.nbg_scroll(0).0
     }
-    /// SCYIN0 (0x074) — NBG0 vertical scroll, integer part (11 bits).
     pub fn nbg0_scroll_y(&self) -> u32 {
-        (self.read16(0x074) & 0x07FF) as u32
+        self.nbg_scroll(0).1
     }
 }
 
@@ -284,8 +369,8 @@ mod tests {
     #[test]
     fn map_offset_and_plane_compose_pattern_table_base() {
         let mut r = Vdp2Regs::new();
-        // N0MP = 1 (high 3 bits), N0MPA = 5 (low 6 bits).
-        r.write16(0x03E, 0x0001); // MPOFN.N0MP = 1
+        // N0MP = 1 (high 2 bits), N0MPA = 5 (low 6 bits).
+        r.write16(0x03C, 0x0001); // MPOFN.N0MP = 1
         r.write16(0x040, 0x0005); // MPABN0.N0MPA = 5
         assert_eq!(r.nbg0_map_offset(), 1);
         // plane number = (1 << 6) | 5 = 69.
