@@ -167,6 +167,42 @@ static EG_TABLES: std::sync::LazyLock<EgTables> = std::sync::LazyLock::new(|| {
     EgTables { ar, dr, eg, tl }
 });
 
+/// Per-(DISDL, DIPAN) left/right output gains, `FIX(4 · pan · send-level)`
+/// (no TL — that's already folded into the slot's EG output). Indexed by
+/// `(DISDL << 5) | DIPAN`.
+static PAN_TABLES: std::sync::LazyLock<([i32; 256], [i32; 256])> = std::sync::LazyLock::new(|| {
+    // Direct-sound-level attenuation (dB) for DISDL 0..7 (0 = muted).
+    const SDLT: [f64; 8] = [-1.0e6, -36.0, -30.0, -24.0, -18.0, -12.0, -6.0, 0.0];
+    let lin = (1u32 << PHASE_SHIFT) as f64;
+    let mut lp = [0i32; 256];
+    let mut rp = [0i32; 256];
+    for (disdl, &sdl) in SDLT.iter().enumerate() {
+        let fsdl = if disdl != 0 {
+            10f64.powf(sdl / 20.0)
+        } else {
+            0.0
+        };
+        for dipan in 0..32usize {
+            let pdb = [(0x1, 3.0), (0x2, 6.0), (0x4, 12.0), (0x8, 24.0)]
+                .iter()
+                .filter(|(b, _)| dipan & b != 0)
+                .map(|(_, d)| -d)
+                .sum::<f64>();
+            let pan = if dipan & 0xF == 0xF {
+                0.0
+            } else {
+                10f64.powf(pdb / 20.0)
+            };
+            // DIPAN bit 4 selects which channel is attenuated.
+            let (l, r) = if dipan < 0x10 { (pan, 1.0) } else { (1.0, pan) };
+            let idx = (disdl << 5) | dipan;
+            lp[idx] = (4.0 * l * fsdl * lin) as i32;
+            rp[idx] = (4.0 * r * fsdl * lin) as i32;
+        }
+    }
+    (lp, rp)
+});
+
 /// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
 #[derive(Clone, Debug, Default)]
 struct Timer {
@@ -586,6 +622,30 @@ impl ScspCtrl {
         }
         sample
     }
+
+    /// Mix all active slots into one stereo output sample. Each slot's PCM is
+    /// shaped by its EG × TL, then panned to L/R by DIPAN and scaled by the
+    /// direct-sound level DISDL; the sum is brought back into 16-bit range.
+    fn mix(&mut self, ram: &Ram) -> (i16, i16) {
+        let (lp, rp) = &*PAN_TABLES;
+        let (mut l, mut r) = (0i32, 0i32);
+        for i in 0..NUM_SLOTS {
+            if !self.slots[i].active {
+                continue;
+            }
+            let pcm = self.slot_sample(i, ram) as i32;
+            let voice = (pcm * self.eg_advance(i)) >> PHASE_SHIFT;
+            let reg = self.slot_reg(i, 0xB);
+            let idx = ((((reg >> 13) & 7) << 5) | ((reg >> 8) & 0x1F)) as usize;
+            l += (voice * lp[idx]) >> PHASE_SHIFT;
+            r += (voice * rp[idx]) >> PHASE_SHIFT;
+        }
+        // The pan gains carry ×4 headroom (FIX(4·…)); undo it and clamp.
+        (
+            (l >> 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (r >> 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -653,6 +713,12 @@ impl Scsp {
     /// multiplier (`0..1 << 12`). The mixer pairs this with `slot_sample`.
     pub fn eg_advance(&mut self, i: usize) -> i32 {
         self.ctrl.eg_advance(i)
+    }
+
+    /// Generate one 44.1 kHz stereo output sample, mixing all active slots.
+    pub fn next_sample(&mut self) -> (i16, i16) {
+        let Scsp { ctrl, ram, .. } = self;
+        ctrl.mix(ram)
     }
 
     /// Pop the main-CPU sound interrupt (the aggregate forwards it to the SCU
@@ -969,6 +1035,66 @@ mod tests {
             s.eg_advance(0);
         }
         assert!(!s.slot_active(0), "release decays to silence → slot off");
+    }
+
+    // ---- mixer / DAC ----
+
+    /// Key on slot `idx` with a constant 16-bit sample, EGHOLD (full level),
+    /// and the given DISDL/DIPAN pan word.
+    fn keyon_panned(s: &mut Scsp, idx: usize, value: u16, disdl: u16, dipan: u16) {
+        let base = idx as u32 * 0x20;
+        // Fill a few words of the slot's waveform at SA = 0x1000 + idx*0x40.
+        let sa = 0x1000 + idx as u32 * 0x40;
+        for n in 0..8u32 {
+            s.ram.write16(sa + n * 2, value);
+        }
+        s.ctrl.write16(base + 0x02, sa as u16); // SA low
+        s.ctrl.write16(base + 0x06, 0x100); // LEA
+        s.ctrl.write16(base + 0x08, 0x20); // data[4]: EGHOLD
+        s.ctrl.write16(base + 0x16, (disdl << 13) | (dipan << 8)); // DISDL/DIPAN
+        s.ctrl.write16(base + 0x10, 0); // OCT/FNS
+        s.ctrl.write16(base + 0x00, 0x1800); // key on (SA high nibble 0)
+    }
+
+    #[test]
+    fn mixer_centers_a_single_slot_on_both_channels() {
+        let mut s = Scsp::new();
+        keyon_panned(&mut s, 0, 0x2000, 7, 0x00); // full level, centre pan
+        let (l, r) = s.next_sample();
+        assert!(l > 0 && r > 0, "centre slot audible on both channels");
+        assert_eq!(l, r, "centre pan is symmetric");
+    }
+
+    #[test]
+    fn mixer_pans_hard_left_and_right() {
+        let mut s = Scsp::new();
+        keyon_panned(&mut s, 0, 0x2000, 7, 0x1F); // hard left (right muted)
+        keyon_panned(&mut s, 1, 0x2000, 7, 0x0F); // hard right (left muted)
+        let (l, r) = s.next_sample();
+        // Slot 0 → left only, slot 1 → right only.
+        assert!(l > 0 && r > 0, "both sides driven by one slot each");
+        // With one slot fully on each side, the channels are balanced…
+        assert_eq!(l, r);
+        // …and removing the right-panned slot drops the right channel.
+        let mut s2 = Scsp::new();
+        keyon_panned(&mut s2, 0, 0x2000, 7, 0x1F); // hard left only
+        let (l2, r2) = s2.next_sample();
+        assert!(l2 > 0, "left channel driven");
+        assert_eq!(r2, 0, "nothing panned right");
+    }
+
+    #[test]
+    fn disdl_zero_mutes_the_direct_output() {
+        let mut s = Scsp::new();
+        keyon_panned(&mut s, 0, 0x2000, 0, 0x00); // DISDL = 0 → muted
+        let (l, r) = s.next_sample();
+        assert_eq!((l, r), (0, 0), "DISDL 0 sends nothing to the DAC");
+    }
+
+    #[test]
+    fn silence_when_no_slot_is_active() {
+        let mut s = Scsp::new();
+        assert_eq!(s.next_sample(), (0, 0));
     }
 
     #[test]
