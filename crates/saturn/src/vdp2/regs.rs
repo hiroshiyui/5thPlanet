@@ -276,6 +276,37 @@ impl Vdp2Regs {
         )
     }
 
+    // ---- Sprite-layer (VDP1 framebuffer) control ----
+    //
+    // VDP2 reads the VDP1 frame buffer as the sprite layer. SPCTL (0x0E0)
+    // selects the sprite-data *type* (0..15), which fixes how each 16-bit
+    // frame-buffer word splits into priority bits / colour-calc bits /
+    // colour code; SPCLMD (bit 5) enables RGB direct-colour for words with
+    // the MSB set. The chosen priority bits index the eight sprite-priority
+    // registers PRISA..PRISD (S0PRIN..S7PRIN).
+
+    /// SPCTL (0x0E0) — sprite control.
+    pub fn spctl(&self) -> u16 {
+        self.read16(0x0E0)
+    }
+    /// Sprite data type (SPTYPE, SPCTL bits 3..0).
+    pub fn sprite_type(&self) -> usize {
+        (self.spctl() & 0xF) as usize
+    }
+    /// SPCLMD (SPCTL bit 5): when set, sprite words with the MSB set are
+    /// RGB direct colour rather than a palette code.
+    pub fn sprite_rgb_mode(&self) -> bool {
+        self.spctl() & 0x20 != 0
+    }
+    /// Sprite priority register `i` (0..7) — PRISA/PRISB/PRISC/PRISD at
+    /// 0x0F0/0x0F2/0x0F4/0x0F6, two 3-bit fields each (even = bits 2..0,
+    /// odd = bits 10..8). Priority 0 means the sprite dot is not shown.
+    pub fn sprite_priority(&self, i: usize) -> u8 {
+        let reg = 0x0F0 + (i as u32 / 2) * 2;
+        let shift = (i & 1) * 8;
+        ((self.read16(reg) >> shift) & 0x7) as u8
+    }
+
     // ---- NBG0 wrappers (kept for existing callers/tests) ----
 
     pub fn nbg0_map_offset(&self) -> u32 {

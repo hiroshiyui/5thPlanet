@@ -635,7 +635,7 @@ impl Saturn {
         const VBLANK_CYCLES: u64 = CYCLES_PER_FRAME - ACTIVE_CYCLES;
 
         self.run_for(ACTIVE_CYCLES);
-        crate::vdp2::render_frame(&self.bus.vdp2, out);
+        crate::vdp2::render_frame(&self.bus.vdp2, Some(&self.bus.vdp1.fb), out);
         self.run_for(VBLANK_CYCLES);
     }
 }

@@ -16,14 +16,21 @@
 //! - **Scrolling**: integer NBG scroll; fractional scroll and zoom ignored.
 //! - **NTSC low-res** (320×224).
 //!
-//! Deferred to later increments: RBG0/1 rotation, the VDP1 sprite layer,
-//! windows, line-scroll, colour calculation, 2-word pattern names, 2×2-cell
-//! characters, plane sizes beyond the single 512×512 page, the 8bpp-tile
-//! colour bank, and CRAM modes 1/2.
+//! The **VDP1 sprite layer** is composited too: VDP2 reads the VDP1 frame
+//! buffer per pixel, splits each word per the SPCTL sprite type into a
+//! colour code / RGB value and a priority (from PRISA..PRISD), and the sprite
+//! layer joins the priority race frontmost on ties (sprite > NBG0 > …).
 //!
-//! `render_frame` is `&Vdp2 -> &mut [u8]` — pure, no allocation.
+//! Deferred to later increments: RBG0/1 rotation, windows, line-scroll,
+//! colour calculation / sprite alpha + shadow, 2-word pattern names,
+//! 2×2-cell characters, plane sizes beyond the single 512×512 page, the
+//! 8bpp-tile colour bank, and CRAM modes 1/2.
+//!
+//! `render_frame` is pure (no allocation); the sprite source is the VDP1
+//! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
 
 use super::{Vdp2, cram};
+use crate::vdp1::Framebuffer;
 
 pub const FRAME_WIDTH: usize = 320;
 pub const FRAME_HEIGHT: usize = 224;
@@ -35,9 +42,10 @@ const BACKDROP_PALETTE_INDEX: usize = 0;
 /// (Larger plane sizes from PLSZ are a later refinement.)
 const TILE_PLANE_WIDTH_PX: u32 = 64 * 8;
 
-/// Render one frame of NTSC low-res into `out`. Panics if `out`'s length
-/// isn't exactly [`FRAMEBUFFER_BYTES`].
-pub fn render_frame(vdp2: &Vdp2, out: &mut [u8]) {
+/// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
+/// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
+/// frame buffer to read). Panics if `out`'s length isn't [`FRAMEBUFFER_BYTES`].
+pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) {
     assert_eq!(
         out.len(),
         FRAMEBUFFER_BYTES,
@@ -56,10 +64,15 @@ pub fn render_frame(vdp2: &Vdp2, out: &mut [u8]) {
 
     for y in 0..FRAME_HEIGHT {
         for x in 0..FRAME_WIDTH {
-            // Pick the highest-priority non-transparent NBG dot; ties go to
-            // the lower-numbered layer (it's visited first and only a strictly
-            // higher priority replaces it).
+            // Pick the highest-priority non-transparent dot. The sprite layer
+            // is seeded first so it wins ties (sprite > NBG0 > … > NBG3); each
+            // NBG then replaces it only on a strictly higher priority.
             let mut winner: Option<(u8, (u8, u8, u8))> = None;
+            if let Some(fb) = sprite_fb
+                && let Some((pri, rgb)) = sample_sprite(vdp2, fb, x as u32, y as u32)
+            {
+                winner = Some((pri, rgb));
+            }
             for n in 0..4 {
                 if !vdp2.regs.nbg_enabled(n) {
                     continue;
@@ -165,6 +178,45 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
     }
 }
 
+// Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
+// `saturn_v.cpp`): for each of the 16 SPCTL types, the colour-code mask and
+// the shift/mask that select which frame-buffer bits index the eight sprite
+// priority registers.
+const SPRITE_COLORMASK: [u16; 16] = [
+    0x07FF, 0x07FF, 0x07FF, 0x07FF, 0x03FF, 0x07FF, 0x03FF, 0x01FF, 0x007F, 0x003F, 0x003F, 0x003F,
+    0x00FF, 0x00FF, 0x00FF, 0x00FF,
+];
+const SPRITE_PRIO_SHIFT: [u16; 16] = [14, 13, 14, 13, 13, 12, 12, 12, 7, 7, 6, 0, 7, 7, 6, 0];
+const SPRITE_PRIO_MASK: [u16; 16] = [3, 7, 1, 3, 3, 7, 7, 7, 1, 1, 3, 0, 1, 1, 3, 0];
+
+/// Sample the VDP1 sprite layer at screen `(x, y)`: read the frame-buffer
+/// word, decode colour + priority per the SPCTL sprite type, and return
+/// `None` for a transparent dot or a priority-0 (hidden) sprite.
+fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<(u8, (u8, u8, u8))> {
+    let pix = fb.pixel(x as i32, y as i32);
+    if pix == 0 {
+        return None; // nothing plotted here
+    }
+    let stype = vdp2.regs.sprite_type();
+
+    // RGB direct colour: MSB set and SPCLMD enabled. Priority comes from
+    // sprite register 0.
+    if pix & 0x8000 != 0 && vdp2.regs.sprite_rgb_mode() {
+        let pri = vdp2.regs.sprite_priority(0);
+        return (pri != 0).then(|| (pri, cram::rgb555_to_888(pix)));
+    }
+
+    // Palette code: priority bits index PRISA..PRISD; the masked low bits are
+    // a CRAM colour code (0 = transparent).
+    let pidx = ((pix >> SPRITE_PRIO_SHIFT[stype]) & SPRITE_PRIO_MASK[stype]) as usize;
+    let pri = vdp2.regs.sprite_priority(pidx);
+    if pri == 0 {
+        return None;
+    }
+    let code = (pix & SPRITE_COLORMASK[stype]) as usize;
+    (code != 0).then(|| (pri, vdp2.cram.color_rgb888_mode0(code)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +241,7 @@ mod tests {
     fn display_disabled_emits_opaque_black() {
         let v = Vdp2::new();
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         for chunk in buf.chunks_exact(4) {
             assert_eq!(chunk, &[0, 0, 0, 0xFF]);
         }
@@ -201,7 +253,7 @@ mod tests {
         v.regs.write16(0x000, 0x8000); // DISP
         v.cram.write16(0, 0x001F); // backdrop = red
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         for chunk in buf.chunks_exact(4) {
             assert_eq!(chunk, &[0xFF, 0, 0, 0xFF]);
         }
@@ -218,7 +270,7 @@ mod tests {
         v.cram.write16(2, 0x001F); // index 1 red
         v.vram.write8(0, 1);
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(
             pixel(&buf, 0, 0),
             [0, 0xFF, 0, 0xFF],
@@ -237,7 +289,7 @@ mod tests {
         v.vram.write8(5u32 * 512 + 10, 1); // bitmap pitch 512 (size 0)
         v.vram.write8(100u32 * 512 + 200, 2);
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 10, 5), [0, 0xFF, 0, 0xFF], "green");
         assert_eq!(pixel(&buf, 200, 100), [0, 0, 0xFF, 0xFF], "blue");
     }
@@ -250,7 +302,7 @@ mod tests {
         v.regs.write16(0x028, 0x0032);
         v.vram.write16(5u32 * 512 * 2 + 10 * 2, 0x001F); // (10,5) = red
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 10, 5), [0xFF, 0, 0, 0xFF]);
     }
 
@@ -263,7 +315,7 @@ mod tests {
         v.cram.write16(2, 0x001F); // index 1 red
         v.vram.write8(0x2_0000, 1);
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF]);
     }
 
@@ -277,7 +329,7 @@ mod tests {
         v.cram.write16(2, 0x001F); // red
         v.vram.write8(3 * 512 + 2, 1);
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF]);
     }
 
@@ -292,7 +344,7 @@ mod tests {
         v.vram.write8(5 * 32 + 4 * 4 + 1, 0x07);
         v.cram.write16(0x27 * 2, 0x001F); // index (2<<4)|7 = 0x27 → red
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 3, 4), [0xFF, 0, 0, 0xFF]);
     }
 
@@ -305,7 +357,7 @@ mod tests {
         v.vram.write8(3 * 64, 0x42); // pixel (0,0) = index 0x42
         v.cram.write16(0x42 * 2, 0x001F); // red
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF]);
     }
 
@@ -324,7 +376,7 @@ mod tests {
         v.vram.write8(0, 1); // NBG0 dot at (0,0)
         v.vram.write8(0x2_0000, 2); // NBG1 dot at (0,0)
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 (pri 5) wins");
     }
 
@@ -340,7 +392,7 @@ mod tests {
         v.vram.write8(0, 1); // NBG0 opaque red at (0,0)
         v.vram.write8(0x2_0000, 0); // NBG1 transparent at (0,0)
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(
             pixel(&buf, 0, 0),
             [0xFF, 0, 0, 0xFF],
@@ -357,8 +409,116 @@ mod tests {
         v.vram.write8(0, 1);
         v.cram.write16(2, 0x7C00);
         let mut buf = fresh_buf();
-        render_frame(&v, &mut buf);
+        render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0, 0xFF, 0, 0xFF]);
+    }
+
+    // ---- sprite layer (VDP1 frame buffer) ----
+
+    /// A VDP1 frame buffer with one RGB555 dot plotted at `(x, y)`.
+    fn sprite_fb_with(x: i32, y: i32, dot: u16) -> Framebuffer {
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(x, y, dot);
+        fb
+    }
+
+    #[test]
+    fn sprite_palette_dot_composites_over_backdrop() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x12 * 2, 0x001F); // palette code 0x12 = red
+        // Type 0: colour code = pix & 0x7FF; priority bits 15..14 = 0 → S0.
+        let fb = sprite_fb_with(40, 30, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 40, 30), [0xFF, 0, 0, 0xFF], "sprite dot");
+        assert_eq!(pixel(&buf, 41, 30), [0, 0, 0, 0xFF], "elsewhere = backdrop");
+    }
+
+    #[test]
+    fn sprite_rgb_dot_uses_direct_colour_when_spclmd_set() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x0E0, 0x0020); // SPCTL.SPCLMD (RGB enable), type 0
+        v.regs.write16(0x0F0, 0x0001); // S0PRIN = 1
+        // MSB set → RGB direct: 0x8000 | red(0x1F).
+        let fb = sprite_fb_with(10, 10, 0x801F);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn sprite_beats_nbg_of_equal_priority() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0001); // NBG0 on (bitmap)
+        v.regs.write16(0x028, 0x0012); // N0BMEN + 8bpp
+        v.regs.write16(0x0F8, 0x0003); // NBG0 priority 3
+        v.regs.write16(0x0F0, 0x0003); // sprite S0 priority 3 (tie)
+        v.cram.write16(2, 0x7C00); // NBG0 index 1 = blue
+        v.cram.write16(0x12 * 2, 0x001F); // sprite code 0x12 = red
+        v.vram.write8(0, 1); // NBG0 dot at (0,0)
+        let fb = sprite_fb_with(0, 0, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "sprite wins the tie");
+    }
+
+    #[test]
+    fn higher_priority_nbg_covers_the_sprite() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.regs.write16(0x020, 0x0001);
+        v.regs.write16(0x028, 0x0012);
+        v.regs.write16(0x0F8, 0x0005); // NBG0 priority 5
+        v.regs.write16(0x0F0, 0x0003); // sprite priority 3
+        v.cram.write16(2, 0x7C00); // NBG0 blue
+        v.cram.write16(0x12 * 2, 0x001F); // sprite red
+        v.vram.write8(0, 1);
+        let fb = sprite_fb_with(0, 0, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0, 0xFF, 0xFF],
+            "NBG0 (pri 5) covers sprite"
+        );
+    }
+
+    #[test]
+    fn priority_zero_sprite_is_not_shown() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.cram.write16(0, 0x1F << 5); // backdrop green
+        v.cram.write16(0x12 * 2, 0x001F);
+        // S0PRIN defaults to 0 → sprite hidden.
+        let fb = sprite_fb_with(5, 5, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 5, 5),
+            [0, 0xFF, 0, 0xFF],
+            "priority-0 sprite → backdrop"
+        );
+    }
+
+    #[test]
+    fn empty_sprite_buffer_leaves_nbg_untouched() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // 8bpp bitmap
+        v.cram.write16(2, 0x001F); // red
+        v.vram.write8(0, 1);
+        let fb = Framebuffer::new(); // all transparent
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "NBG0 shows; no sprite"
+        );
     }
 
     #[test]
@@ -366,6 +526,6 @@ mod tests {
     fn wrong_buffer_size_panics_loudly() {
         let v = Vdp2::new();
         let mut tiny = [0u8; 64];
-        render_frame(&v, &mut tiny);
+        render_frame(&v, None, &mut tiny);
     }
 }
