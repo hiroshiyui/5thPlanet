@@ -21,7 +21,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | VDP2 | 🟡 | NBG0–3 + RBG0/1 rotation + VDP1 sprite layer, priority composited; **remaining:** windows, line-scroll, colour calculation, 2-word PNC, larger planes, CRAM modes 1/2 |
 | VDP1 | 🟡 | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed; **remaining:** gouraud, double-buffer swap, draw-end timing |
 | MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
-| SCSP | 🟡 | Sound RAM + registers, hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine (pitch/loop/8-16bit); **remaining (M6):** envelope (ADSR), mixer/DAC, audio output, SCSP DSP, MIDI |
+| SCSP | 🟡 | Sound RAM + registers, hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR envelope + TL; **remaining (M6):** mixer/DAC, audio output, SCSP DSP, MIDI |
 | CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
 | SH-1 (CD-block CPU) | ⬜ | M7 |
 | Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
@@ -233,7 +233,7 @@ sound source.
 |---|------|--------|
 | 1 | SCSP timers (A/B/C) + interrupt model (68k IRQ via SCIEB/SCIPD/SCILV, main-CPU sound IRQ via MCIPD/MCIEB → SCU) | ✅ done |
 | 2 | Slot engine — 32 PCM slots: phase/pitch (OCT/FNS), loop control, 8/16-bit, interpolation, key-on/off | ✅ done |
-| 3 | Envelope generator (ADSR) + total level / pan per slot | pending |
+| 3 | Envelope generator (ADSR) + total level (TL) attenuation per slot | ✅ done |
 | 4 | Mixer / DAC — sum slots to L/R at the master volume; produce a 44.1 kHz sample stream | pending |
 | 5 | SDL2 audio output — feed the sample stream to the frontend | pending |
 | 6 | SCSP DSP — 128-step effect microprogram (reverb etc.) | pending |
@@ -257,6 +257,16 @@ fetches 8-bit (×256) or 16-bit PCM at SA + phase with linear interpolation,
 applies the loop mode (no-loop / normal / reverse / ping-pong), and advances.
 A `KYONEX` write keys slots on/off by their `KYONB` bit. The envelope (ADSR,
 task #3) and the mixer/DAC (task #4) consume these pre-envelope samples.
+
+### Task #3 — envelope generator (ADSR + TL)
+
+Each slot has an ADSR envelope: attack → decay1 → decay2/sustain → release,
+with rates cached at key-on and scaled by OCT/KRS/FNS through the SCSP time
+tables, a decay-level boundary, and EGHOLD. `eg_advance` runs the state machine
+one sample and returns the linear EG × TL multiplier (attack ramps directly,
+later phases via a log→linear table; TL is the SCSP per-bit dB attenuation
+ladder). Key-off enters the release phase. The mixer (task #4) multiplies
+`slot_sample` by `eg_advance` and pans the result to L/R.
 
 ## Later milestones (queued)
 
