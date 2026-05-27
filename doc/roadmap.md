@@ -116,7 +116,7 @@ hardware manuals stay authoritative.
 | 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
 | 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅; remaining: gouraud, double-buffer swap (FBCR), draw-end timing, VDP2 sprite-layer compositing | 🚧 partial |
 | 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU), structured like `sh2` | 🚧 in progress |
-| 4 | **VDP2 build-out** — NBG1–3, RBG0/1 rotation, priority compositing, windows, line-scroll, colour calc | pending |
+| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅; remaining: RBG0/1 rotation, VDP1 sprite layer, windows, line-scroll, colour calc | 🚧 partial |
 
 ### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 18 tests)
 
@@ -153,6 +153,21 @@ Cycle model counts the 68000's 4-clock bus cycle per word; per-instruction timin
 tables are a later refinement. **Remaining:** MULU/MULS, DIVU/DIVS, ABCD/SBCD/NBCD,
 bit ops (BTST/BCHG/BCLR/BSET), MOVEM/MOVEP, LINK/UNLK, memory shifts, the exception
 model (TRAP, privilege, address error, interrupts), and SCSP host wiring.
+
+### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 31 tests)
+
+The NBG0-only renderer became a per-pixel priority compositor over NBG0–3.
+Generalized per-layer register accessors drive it; two register-map bugs found
+against MAME were fixed (MPOFN at 0x03C / 2-bit fields — 0x03E is the rotation
+MPOFR — and PLSZ at 0x03A). Compositing picks the highest PRINA/PRINB priority
+with a non-transparent dot (ties → lower-numbered layer; priority 0 hides a
+layer; else the CRAM[0] backdrop). Colour formats: 4bpp/8bpp paletted (tile +
+bitmap) and 16bpp RGB555 direct (bitmap); bitmap now uses the hardware width and
+characters address as `char_number × cell_bytes`.
+
+**Remaining:** RBG0/1 rotation, the VDP1 sprite layer (ties into VDP1 task #2),
+windows, line-scroll, colour calculation, 2-word pattern names, 2×2-cell chars,
+larger plane sizes, the 8bpp-tile colour bank, and CRAM modes 1/2.
 
 ## Later milestones (queued)
 
