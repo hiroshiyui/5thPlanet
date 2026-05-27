@@ -22,8 +22,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
-| CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
-| SH-1 (CD-block CPU) | ⬜ | M7 |
+| CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; full HLE engine (disc image, buffers/filters, CD-ROM FS) = M7 (active). SH-1 LLE is infeasible (undumped firmware + analog servo) and not pursued — HLE is the model, as in every Saturn emulator |
 | Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
@@ -32,8 +31,8 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
 plus a post-M6 fidelity pass that made the SH-2 on-chip peripherals (FRT/WDT/
 DMAC), SCU DMA (start factors / indirect / strides), and SMPC (live RTC / region)
-behaviorally faithful · M6 (SCSP audio) ✅ · **next: M7** (CD-block
-SH-1 + games + cartridge slot).
+behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE + games +
+cartridge slot) 🚧 active** — see the Milestone 7 section for the scoped phases.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -327,14 +326,43 @@ ladder). Key-off enters the release phase. The mixer (task #4) multiplies
 - **#7 Input:** the INTBACK peripheral phase reports a standard digital pad
   (`smpc::pad`), driven by the frontend's keyboard mapping.
 
+## Milestone 7 — CD-block (HLE) + games 🚧 active
+
+The CD-block is the last subsystem and the blocker for booting commercial
+games. **Approach: HLE** (the established model in every Saturn emulator —
+MAME, Yabause, Mednafen). The SH-1's CD-ROM firmware is undumped (on-die mask
+ROM) and half its job is an analog servo with no digital ground truth, so
+there is nothing to low-level-emulate *against*. We instead model the host
+command interface + the buffer/filter/partition engine + the CD-ROM
+filesystem, reading sectors from a disc image — which is exactly the surface
+the BIOS and games interact with, and fully observable. (This is the one chip
+where "never approximate" is satisfied by HLE rather than LLE; the earlier
+"SH-1 firmware" framing is superseded.) Modelled against MAME's
+`saturn_cd_hle.cpp`.
+
+The current `cd_block.rs` already has the host-register shape (HIRQ/CR1–4,
+`cmd_pending==0xF` dispatch, periodic report, the no-disc command subset).
+M7 grows it into the full engine, in independently-testable phases:
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **Disc image + TOC** | CUE/BIN + raw ISO parser → tracks (Mode 1/2/audio), TOC, FAD↔sector. `Saturn::insert_disc`, frontend `<BIOS> [game]` arg. Real Get TOC / Get Session. |
+| 2 | **Buffer/filter/partition core** | 200 blocks, 24 filters (FAD-range / file-id / channel / submode / coding-info), partitions. Reset Selector / Set Filter\* / Get Buffer\* (`0x40`–`0x54`). Pure-logic tests. |
+| 3 | **Sector pump + data transfer** | 75/150 Hz read pump (extends `CdBlockEntity`) disc→filter→partition; Get/Get-and-Delete Sector Data (`0x60`–`0x63`) streaming the data port + the SCU-DMA path. **Address-map fix:** the data-transfer port is at `0x2581_8000` (the SCU DMA already special-cases `0x0581_8000`) — outside the current `0x0589_xxxx` window, so the bus needs that region. |
+| 4 | **CD-ROM filesystem** | ISO9660 directory parse (PVD at FAD 166, `direntryT` records). Change Dir / Get File Scope / Get File Info / Read File (`0x70`–`0x75`). |
+| 5 | **Authentication + game boot** | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
+
+**Deferred within M7:** CDDA audio playback into the SCSP, the MPEG card
+(`0x90`+), Move/Copy sector ops, and realistic seek timing — none block game
+boot. (The BIOS splash park at `0x060108BA` is a VDP2-only path and may be
+independent of the disc; treated as a possible side-benefit, not the M7 goal.)
+
+Also in M7: the **cartridge slot** — Extension RAM carts (1 MB at `0x0240_0000`;
+4 MB as two banks at `0x0240_0000` / `0x0260_0000`), the backup-RAM cart, and
+game ROM carts, selected per game with the probed cart-ID. Open-bus today;
+small RAM/ROM regions + an ID byte, needed by Street Fighter Zero 3 / KOF '97.
+
 ## Later milestones (queued)
 
-- **M7 — CD-block + games.** Real CD-block (SH-1) firmware, CD-ROM image loading,
-  first commercial game booting, and the **cartridge slot**: Extension RAM carts
-  (1 MB at `0x0240_0000`; 4 MB as two banks at `0x0240_0000` / `0x0260_0000`),
-  the backup-RAM cart, and game ROM carts — selected per game, with the cart-ID
-  the game probes (1 MB / 4 MB detection). The cartridge region is open-bus
-  today; the carts are small RAM/ROM regions + an ID byte (no timing/state),
-  needed by games like Street Fighter Zero 3 / KOF '97 that won't run without them.
 - **Save states** — versioned serde across the crates, once the peripheral set stabilises.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).

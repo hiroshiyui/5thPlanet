@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 5thPlanet is an **accuracy-first** SEGA Saturn emulator in Rust. The Saturn has eight processors with tightly-coupled timing (2× SH-2 SH7604, MC68EC000, VDP1, VDP2, SCU + SCU-DSP, SCSP M68k + SCSP-DSP, SH-1 CD-block); the project is built up one chip at a time so the foundation stays solid. **Performance is explicitly subordinated to fidelity** — never introduce a JIT, dynarec, or "approximate cycle" shortcut.
 
+The one deliberate exception is the **SH-1 CD-block, which is high-level-emulated (HLE), not low-level-emulated** — its CD-ROM firmware is undumped (on-die mask ROM) and half its job is an analog servo with no observable digital ground truth, so there's nothing to be cycle-accurate *against*. Like every Saturn emulator (MAME/Yabause/Mednafen), we model the host command interface + the buffer/filter/partition engine + the CD-ROM filesystem, reading sectors from a disc image. This is M7; see `doc/roadmap.md` and `crates/saturn/src/cd_block.rs`.
+
 **M1 (cycle-accurate SH-2 core), M2 (Saturn bus + dual SH-2 + event-driven scheduler), and M3 (SCU + SMPC + VDP2 minimal + SCU-DSP + SDL2 scaffolding) are complete.** M4 is active: finish M3's stretch goal — get the SEGA splash on screen by closing the remaining BIOS-boot gaps (SMPC INTBACK timing, VDP1/CD-block presence stubs, VDP2 register-decode fidelity, VDP2 raster timing). See `doc/roadmap.md` for task-by-task status and `doc/glossary.md` for the Saturn-specific vocabulary (chip names, address ranges, register acronyms) used throughout this file.
 
 ## Common commands
