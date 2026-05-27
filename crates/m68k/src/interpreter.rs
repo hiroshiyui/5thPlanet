@@ -16,8 +16,8 @@
 //! The **exception model** is in too: TRAP/TRAPV/CHK, zero-divide,
 //! illegal + line-A/F, privilege violation, STOP/RESET/RTE/RTR, and
 //! external-interrupt dispatch (autovector, `SR.imask`-gated, level-7 NMI).
-//! Still to come: MOVEP, memory shift-by-1, address-error/bus-error frames,
-//! and SCSP host wiring.
+//! Still to come: address-error/bus-error stack frames (the 68000's longer
+//! group-0 frame), and precise long-operation (MUL/DIV/shift) timing tables.
 //!
 //! **Cycle model:** each memory word access costs the 68000's 4-clock bus
 //! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along
@@ -1089,7 +1089,8 @@ impl Cpu {
         // Dynamic bit ops (bit 8 set): bit number in Dn (bits 11..9).
         if op & 0x0100 != 0 {
             if (op >> 3) & 7 == 1 {
-                return; // MOVEP — not yet implemented
+                self.op_movep(op, bus);
+                return;
             }
             let kind = (op >> 6) & 3;
             let bitnum = self.regs.d[((op >> 9) & 7) as usize];
@@ -1172,8 +1173,46 @@ impl Cpu {
         }
     }
 
+    /// MOVEP.W/L — move between a data register and *alternating* bytes of
+    /// memory at `(d16, Ay)`, high byte first (a peripheral-access idiom for
+    /// byte-wide devices on a 16-bit bus). Opmode (bits 8..6): 100 = W mem→Dx,
+    /// 101 = L mem→Dx, 110 = W Dx→mem, 111 = L Dx→mem.
+    fn op_movep(&mut self, op: u16, bus: &mut impl Bus) {
+        let dreg = ((op >> 9) & 7) as usize;
+        let areg = (op & 7) as usize;
+        let opmode = (op >> 6) & 7;
+        let disp = self.fetch16(bus) as i16 as i32;
+        let mut addr = self.regs.a[areg].wrapping_add(disp as u32);
+        let long = opmode & 1 != 0; // 101 / 111
+        let to_mem = opmode & 0b010 != 0; // 110 / 111
+        let nbytes = if long { 4 } else { 2 };
+        if to_mem {
+            let val = self.regs.d[dreg];
+            for i in 0..nbytes {
+                let shift = (nbytes - 1 - i) * 8;
+                self.cycles += bus.write8(addr, (val >> shift) as u8, AccessKind::Data) as u64;
+                addr = addr.wrapping_add(2);
+            }
+        } else {
+            let mut val = 0u32;
+            for i in 0..nbytes {
+                let (b, s) = bus.read8(addr, AccessKind::Data);
+                self.cycles += s as u64;
+                val |= (b as u32) << ((nbytes - 1 - i) * 8);
+                addr = addr.wrapping_add(2);
+            }
+            if long {
+                self.regs.d[dreg] = val;
+            } else {
+                self.regs.d[dreg] = (self.regs.d[dreg] & 0xFFFF_0000) | (val & 0xFFFF);
+            }
+        }
+        self.cycles += if long { 24 } else { 16 };
+    }
+
     /// OR/AND register↔EA (`f` is the bitwise op). The opmode's high bit
-    /// selects the direction; opmode 3/7 (MUL/DIV) is not yet implemented.
+    /// selects the direction. (The MUL/DIV opmodes 011/111 are dispatched by
+    /// the 0xC / 0x8 group handlers, not here.)
     fn op_logic(&mut self, op: u16, f: fn(u32, u32) -> u32, bus: &mut impl Bus) {
         let reg = ((op >> 9) & 7) as usize;
         let opmode = (op >> 6) & 7;
@@ -1380,11 +1419,13 @@ impl Cpu {
         }
     }
 
-    /// Shift/rotate group (0xE): the register-target forms. Memory shift-by-1
-    /// is a later increment.
+    /// Shift/rotate group (0xE). The register-target forms (size byte/word/
+    /// long, programmable count) are here; size field 11 selects the
+    /// memory-operand single-bit form, handled by [`Self::op_shift_mem`].
     fn op_shift(&mut self, op: u16, bus: &mut impl Bus) {
         let Some(size) = Size::from_op_bits(op >> 6) else {
-            return; // ss == 3 → memory shift, not yet
+            self.op_shift_mem(op, bus);
+            return;
         };
         let reg = (op & 7) as usize;
         let left = op & 0x0100 != 0;
@@ -1469,6 +1510,72 @@ impl Cpu {
                 // ASx / LSx also load X with the last bit out.
                 self.regs.sr.x = carry;
             }
+        }
+    }
+
+    /// Memory shift/rotate by one bit (size field 11). Operates on a word at
+    /// the EA; the kind is in bits 10..9 (0=ASx 1=LSx 2=ROXx 3=ROx) and bit 8
+    /// selects the direction.
+    fn op_shift_mem(&mut self, op: u16, bus: &mut impl Bus) {
+        let kind = (op >> 9) & 3;
+        let left = op & 0x0100 != 0;
+        let mode = (op >> 3) & 7;
+        let ea_reg = op & 7;
+        let ea = self.resolve_ea(mode, ea_reg, Size::Word, bus);
+        let mut val = self.read_ea(ea, Size::Word, bus) & 0xFFFF;
+        let (mask, msb) = (0xFFFFu32, 0x8000u32);
+        let mut overflow = false;
+        let carry;
+        match (kind, left) {
+            (0, true) | (1, true) => {
+                // ASL / LSL
+                carry = val & msb != 0;
+                let next = (val << 1) & mask;
+                overflow = kind == 0 && (next & msb != 0) != (val & msb != 0);
+                val = next;
+            }
+            (0, false) => {
+                // ASR — preserve sign
+                carry = val & 1 != 0;
+                val = (val >> 1) | (val & msb);
+            }
+            (1, false) => {
+                // LSR
+                carry = val & 1 != 0;
+                val >>= 1;
+            }
+            (3, true) => {
+                // ROL
+                carry = val & msb != 0;
+                val = ((val << 1) | carry as u32) & mask;
+            }
+            (3, false) => {
+                // ROR
+                carry = val & 1 != 0;
+                val = (val >> 1) | (if carry { msb } else { 0 });
+            }
+            (2, true) => {
+                // ROXL through X
+                let xin = self.regs.sr.x as u32;
+                carry = val & msb != 0;
+                val = ((val << 1) | xin) & mask;
+                self.regs.sr.x = carry;
+            }
+            _ => {
+                // ROXR through X
+                let xin = self.regs.sr.x as u32;
+                carry = val & 1 != 0;
+                val = (val >> 1) | (if xin != 0 { msb } else { 0 });
+                self.regs.sr.x = carry;
+            }
+        }
+        self.write_ea(ea, Size::Word, val & mask, bus);
+        self.regs.sr.n = val & msb != 0;
+        self.regs.sr.z = val & mask == 0;
+        self.regs.sr.v = if kind == 0 { overflow } else { false };
+        self.regs.sr.c = carry;
+        if kind != 2 && kind != 3 {
+            self.regs.sr.x = carry;
         }
     }
 }

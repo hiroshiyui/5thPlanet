@@ -5,7 +5,7 @@
 //! built through `m68k::harness::MemBus`.
 
 use m68k::Cpu;
-use m68k::bus::Bus;
+use m68k::bus::{AccessKind, Bus};
 use m68k::harness::MemBus;
 
 /// Build a bus with `words` planted at 0x1000 and a CPU pointed there with a
@@ -762,4 +762,63 @@ fn divide_by_zero_traps() {
     bus.write_long(5 * 4, 0x0000_9000);
     cpu.step(&mut bus);
     assert_eq!(cpu.regs.pc, 0x9000);
+}
+
+#[test]
+fn movep_l_stores_to_alternating_bytes() {
+    // MOVEP.L D1, (0, A2) — opmode 111, mode 001, areg 2 → 0x03CA, disp 0.
+    let (mut cpu, mut bus) = boot(&[0x03CA, 0x0000], |c| {
+        c.regs.d[1] = 0xAABB_CCDD;
+        c.regs.a[2] = 0x3000;
+    });
+    cpu.step(&mut bus);
+    // High byte first, every other byte; odd bytes untouched.
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0xAA);
+    assert_eq!(bus.read8(0x3002, AccessKind::Data).0, 0xBB);
+    assert_eq!(bus.read8(0x3004, AccessKind::Data).0, 0xCC);
+    assert_eq!(bus.read8(0x3006, AccessKind::Data).0, 0xDD);
+    assert_eq!(
+        bus.read8(0x3001, AccessKind::Data).0,
+        0x00,
+        "odd byte skipped"
+    );
+}
+
+#[test]
+fn movep_w_loads_from_alternating_bytes() {
+    // MOVEP.W (0, A1), D3 — opmode 100, mode 001, areg 1 → 0x0709, disp 0.
+    let (mut cpu, mut bus) = boot(&[0x0709, 0x0000], |c| {
+        c.regs.a[1] = 0x3000;
+        c.regs.d[3] = 0xFFFF_0000; // high word must be preserved
+    });
+    bus.write_word(0x3000, 0x1299); // even byte 0x12 read, odd 0x99 skipped
+    bus.write_word(0x3002, 0x3477); // even byte 0x34 read
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[3], 0xFFFF_1234, "low word from even bytes only");
+}
+
+#[test]
+fn memory_asl_shifts_a_word_in_place() {
+    // ASL (A0) — memory single-bit, kind AS, left, EA (A0) → 0xE1D0.
+    let (mut cpu, mut bus) = boot(&[0xE1D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x4001);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x8002);
+    assert!(cpu.regs.sr.n, "result negative");
+    assert!(cpu.regs.sr.v, "MSB changed → overflow");
+    assert!(!cpu.regs.sr.c, "bit shifted out was 0");
+}
+
+#[test]
+fn memory_ror_rotates_a_word_in_place() {
+    // ROR (A0) — kind RO (3), right, EA (A0) → 0xE6D0.
+    let (mut cpu, mut bus) = boot(&[0xE6D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x0001);
+    cpu.step(&mut bus);
+    assert_eq!(
+        bus.read16(0x3000, AccessKind::Data).0,
+        0x8000,
+        "bit 0 → bit 15"
+    );
+    assert!(cpu.regs.sr.c, "rotated-out bit in carry");
 }
