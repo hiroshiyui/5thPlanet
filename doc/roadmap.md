@@ -5,6 +5,32 @@ the foundation is solid before the next chip is added.
 
 The full design rationale lives in `/home/yhh/.claude/plans/temporal-strolling-hollerith.md`.
 
+## Overview — component status
+
+Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
+(usable core, refinements pending) · 🔶 stub · ⬜ not started.
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, on-chip peripherals, exceptions |
+| Saturn bus + memory map | ✅ | Typed regions, wait states, open-bus default |
+| Event-driven scheduler | ✅ | Deterministic; SH-2 ×2 + CD-block entities |
+| SMPC | ✅ | Slave hold/release, staged INTBACK, NMIREQ, SNDON/SNDOFF, RTC/region |
+| SCU (+ DMA + INTC) | ✅ | 3 DMA channels, interrupt aggregation → master INTC |
+| SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
+| VDP2 | 🟡 | NBG0–3 + RBG0/1 rotation + VDP1 sprite layer, priority composited; **remaining:** windows, line-scroll, colour calculation, 2-word PNC, larger planes, CRAM modes 1/2 |
+| VDP1 | 🟡 | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed; **remaining:** gouraud, double-buffer swap, draw-end timing |
+| MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
+| SCSP | 🟡 | Sound RAM + registers, hosted+scheduled 68k, timers + interrupt model (68k IRQ + main-CPU sound IRQ); **remaining (M6):** slot/FM engine, SCSP DSP, mixer/DAC, MIDI, audio output |
+| CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
+| SH-1 (CD-block CPU) | ⬜ | M7 |
+| SDL2 frontend | 🟡 | Window + framebuffer upload; **remaining:** audio output, keyboard input |
+| Save states | ⬜ | Deferred until the peripheral set stabilises |
+
+**Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ⏸ parked on a cycle-phase
+question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) mostly done · **M6
+(audio) 🚧 active** — SCSP timers + interrupts landed; synthesis next.
+
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
 Standalone `sh2` library crate validated by unit tests and ROM regressions.
@@ -197,11 +223,34 @@ windows, line-scroll, colour calculation (sprite alpha + shadow), 2-word
 pattern names, 2×2-cell chars, larger/4×4-page plane sizes, the 8bpp-tile
 colour bank, and CRAM modes 1/2.
 
+## Milestone 6 — SCSP audio 🚧 active
+
+The MC68EC000 is complete and hosted (M5 task #3); M6 turns the SCSP into a
+sound source.
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | SCSP timers (A/B/C) + interrupt model (68k IRQ via SCIEB/SCIPD/SCILV, main-CPU sound IRQ via MCIPD/MCIEB → SCU) | ✅ done |
+| 2 | Slot engine — 32 PCM/FM slots: phase/pitch (OCT/FNS), loop control, 8/16-bit, key-on/off | pending |
+| 3 | Envelope generator (ADSR) + total level / pan per slot | pending |
+| 4 | Mixer / DAC — sum slots to L/R at the master volume; produce a 44.1 kHz sample stream | pending |
+| 5 | SDL2 audio output — feed the sample stream to the frontend | pending |
+| 6 | SCSP DSP — 128-step effect microprogram (reverb etc.) | pending |
+| 7 | SMPC peripheral data → SDL2 keyboard input (the deferred controller path) | pending |
+
+### Task #1 — timers + interrupts (`cargo test -p saturn --lib scsp` → 8 tests)
+
+`ScspCtrl` reacts to control-register writes: three timers tick at the
+44.1 kHz sample clock ÷ 2^prescale and pend `SCIPD` bits on overflow; the
+asserted 68k IRQ level is derived from `SCIPD & SCIEB` encoded through
+`SCILV0..2`, presented level-triggered on `cpu.pending_irq` each instruction
+boundary, and acknowledged via `SCIRE`. Timer A also pends the main-CPU sound
+interrupt (`MCIPD`/`MCIEB`), forwarded by `Saturn::drain_scsp` to the SCU
+`SoundRequest` source. The hosted 68k is now a real interrupt-driven engine.
+
 ## Later milestones (queued)
 
-- **M6 — SCSP + audio.** Finish the MC68EC000 (mul/div/BCD/bit/MOVEM/exceptions),
-  the SCSP DSP + mixer, SDL2 audio output, and SMPC peripheral data → SDL2 keyboard
-  input. Save states once the peripheral set stabilises.
 - **M7 — CD-block + games.** Real CD-block (SH-1) firmware, CD-ROM image loading,
   first commercial game booting.
+- **Save states** — versioned serde across the crates, once the peripheral set stabilises.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
