@@ -561,6 +561,66 @@ fn disasm_vblank_handler() {
 }
 
 #[test]
+#[ignore = "manual: is the VBlank-IN callback ever installed, or is install gated earlier?"]
+fn watch_callback_install() {
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..150u32 {
+        sat.run_frame(&mut fb);
+    }
+    // 1) Capture the REAL callback-table base by single-stepping into the
+    //    dispatcher's table load at 0x0600091E (MOV.L @(R0,R3),R6 — R3=base,
+    //    R0=vector<<2) during a live VBlank-IN.
+    let mut base = 0u32;
+    let mut vec_off = 0u32;
+    let budget = 3 * CYCLES_PER_FRAME_HINT;
+    for _ in 0..budget {
+        sat.debug_step_master();
+        sat.debug_drain();
+        if (sat.master().regs.pc & 0x07FF_FFFF) == 0x0600_091E {
+            base = sat.master().regs.r[3];
+            vec_off = sat.master().regs.r[0];
+            break;
+        }
+    }
+    println!(
+        "callback-table base=0x{base:08X}; this interrupt's slot offset=0x{vec_off:08X} \
+         (vector 0x{:02X})",
+        vec_off >> 2
+    );
+    let slot = base.wrapping_add(0x40 << 2); // VBlank-IN = vector 0x40
+    let rd = |sat: &mut Saturn, a: u32| sat.bus.read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data).0;
+    println!("VBlank-IN slot = 0x{slot:08X}, current = 0x{:08X}", rd(&mut sat, slot));
+
+    // 2) Run frame-by-frame for a long time; report the first frame the slot
+    //    leaves the do-nothing stub (= install reached) or that it never does.
+    let mut changed_at: Option<u32> = None;
+    let start = rd(&mut sat, slot);
+    for f in 0..900u32 {
+        sat.run_frame(&mut fb);
+        let v = rd(&mut sat, slot);
+        if v != start {
+            changed_at = Some(f);
+            println!("  frame +{f}: VBlank slot changed 0x{start:08X} -> 0x{v:08X}");
+            break;
+        }
+    }
+    if changed_at.is_none() {
+        println!(
+            "  VBlank-IN slot NEVER changed over 900 frames (stays 0x{start:08X}) \
+             => the BIOS never reaches callback-install; it is gated earlier."
+        );
+        let pc = sat.master().regs.pc & 0x07FF_FFFF;
+        println!("  final pc=0x{pc:07X}");
+    }
+}
+
+#[test]
 #[ignore = "manual: read the BIOS interrupt callback table — what's installed per vector"]
 fn dump_callback_table() {
     let Some((bios, _)) = load_bios() else {
@@ -634,6 +694,13 @@ fn boot_progress() {
     };
     let mut sat = Saturn::new(bios);
     sat.reset();
+    // Region override: the only BIOS present may be EUR (PAL, area 0x0C); the
+    // default region is North America (0x04). Set SATURN_REGION=0x0C to match.
+    if let Ok(r) = std::env::var("SATURN_REGION") {
+        let r = u8::from_str_radix(r.trim_start_matches("0x"), 16).unwrap_or(0x04);
+        sat.set_region(r);
+        println!("region set to 0x{r:02X}");
+    }
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let frames: u32 = std::env::var("PROGRESS_FRAMES")
         .ok()
