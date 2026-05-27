@@ -178,16 +178,23 @@ Revisiting the park with the loop-collapsed PC diff + live-state probes
   the BIOS having installed that callback.
 
 **So the genuine bug is a control-flow path we take — somewhere after the
-~9.3 M-instruction MAME-match point — that skips the callback install.** Caveat:
-the existing MAME reference trace (44 M PCs) ends in a BIOS loop at `0x0003200`
-and may not itself reach the install/splash, so it can't localise the skip.
+~9.3 M-instruction MAME-match point — that skips the callback install.**
 
-**Concrete next step:** regenerate a MAME reference trace long enough to reach the
-callback-install + splash, then run a *re-syncing* (LCS / poll-loop-tolerant) diff
-— not the line-by-line one — to find the first point our control flow leaves
-MAME's. Secondary lead worth checking: our staged-INTBACK **peripheral** response
-reports a phantom port-1 pad (`OREG0=0xF1, OREG1=0x02`) where M4's plan was "no
-controller" — verify that doesn't send the BIOS down a divergent peripheral path.
+**MAME reference verified to boot fully (2026-05-27).** `mameref/saturn` boots the
+*byte-identical* BIOS (USA/EUR/JP `mpr-17933.bin`, SHA1 `faa8ea18…`) past the SEGA
+splash to the **"Set Language" setup menu** (snapshot via a Lua `video:snapshot()`
+autoboot script + `-seconds_to_run`; screen black at 5 s, menu by 25 s). So the
+splash blocker is squarely on **our** side. The earlier worry that the reference
+might not reach the splash was wrong — the existing `/tmp/mame_pc.log` (ends in a
+BIOS loop at `0x0003200`) was just the **2 s** default of `pctrace.sh`, too short.
+
+**Concrete next step:** regenerate a longer reference trace (`./pctrace.sh 25`, or
+a windowed window-of-interest to keep it from ballooning past ~19 M PCs/s), then run
+a *re-syncing* (LCS / poll-loop-tolerant) diff — not the line-by-line one — to find
+the first point our control flow leaves MAME's. Secondary lead worth checking: our
+staged-INTBACK **peripheral** response reports a phantom port-1 pad (`OREG0=0xF1,
+OREG1=0x02`) where M4's plan was "no controller" — verify that doesn't send the BIOS
+down a divergent peripheral path.
 
 ## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
 
