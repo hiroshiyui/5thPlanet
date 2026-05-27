@@ -25,6 +25,8 @@
 //!
 //! Still to come (M6): the mixer/DAC, SDL2 audio output, the SCSP DSP, MIDI.
 
+mod dsp;
+
 use crate::memory::Ram;
 use m68k::bus::{AccessKind, Bus};
 
@@ -243,6 +245,8 @@ pub struct ScspCtrl {
     raw: [u8; REG_BYTES],
     timers: [Timer; 3],
     slots: [Slot; NUM_SLOTS],
+    /// The effect DSP (reverb/echo); fed by slot effect-sends, mixed back in.
+    dsp: dsp::Dsp,
     /// Current 68k interrupt-line level (0 = none); level-triggered.
     asserted_level: u8,
     /// Main-CPU sound interrupt pending (forwarded to the SCU).
@@ -261,6 +265,7 @@ impl ScspCtrl {
             raw: [0; REG_BYTES],
             timers: Default::default(),
             slots: [Slot::default(); NUM_SLOTS],
+            dsp: dsp::Dsp::new(),
             asserted_level: 0,
             main_pending: false,
         }
@@ -302,6 +307,17 @@ impl ScspCtrl {
     }
     pub fn write16(&mut self, o: u32, v: u16) {
         self.store16(o, v);
+        // DSP program / coefficients / delay-address tables live at
+        // 0x700..0xC00; route them into the DSP and recompute its length.
+        match o & !1 {
+            0x700..=0x77E => self.dsp.coef[((o - 0x700) / 2) as usize] = v as i16,
+            0x780..=0x7BE => self.dsp.madrs[((o - 0x780) / 2) as usize] = v,
+            0x800..=0xBFE => {
+                self.dsp.mpro[((o - 0x800) / 2) as usize] = v;
+                self.dsp.start();
+            }
+            _ => {}
+        }
         // A write touching a slot's first word (data[0]) with KYONEX set
         // executes key-on/off across all slots.
         if o < NUM_SLOTS as u32 * SLOT_STRIDE
@@ -626,19 +642,46 @@ impl ScspCtrl {
     /// Mix all active slots into one stereo output sample. Each slot's PCM is
     /// shaped by its EG × TL, then panned to L/R by DIPAN and scaled by the
     /// direct-sound level DISDL; the sum is brought back into 16-bit range.
-    fn mix(&mut self, ram: &Ram) -> (i16, i16) {
+    fn mix(&mut self, ram: &mut Ram) -> (i16, i16) {
         let (lp, rp) = &*PAN_TABLES;
         let (mut l, mut r) = (0i32, 0i32);
+        let dsp_on = self.dsp.running();
         for i in 0..NUM_SLOTS {
             if !self.slots[i].active {
                 continue;
             }
             let pcm = self.slot_sample(i, ram) as i32;
             let voice = (pcm * self.eg_advance(i)) >> PHASE_SHIFT;
-            let reg = self.slot_reg(i, 0xB);
-            let idx = ((((reg >> 13) & 7) << 5) | ((reg >> 8) & 0x1F)) as usize;
+            // Direct output: pan + direct-sound level.
+            let reg_b = self.slot_reg(i, 0xB);
+            let idx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
             l += (voice * lp[idx]) >> PHASE_SHIFT;
             r += (voice * rp[idx]) >> PHASE_SHIFT;
+            // Effect send: route the voice into the DSP input mix (ISEL) at
+            // the IMXL level (reg 0xA). Only when a DSP program is running.
+            if dsp_on {
+                let reg_a = self.slot_reg(i, 0xA);
+                let imxl = (reg_a & 7) as u32;
+                if imxl != 0 {
+                    let isel = ((reg_a >> 3) & 0xF) as usize;
+                    self.dsp.set_sample(voice << imxl, isel);
+                }
+            }
+        }
+        if dsp_on {
+            // Configure the delay ring from RBL/RBP (reg 0x402), run the
+            // effect program, and fold its outputs back (EFREG even→L, odd→R).
+            let rbc = self.read16(0x402);
+            self.dsp.rbp = (rbc & 0x3F) as u32;
+            self.dsp.rbl = 0x2000u32 << ((rbc >> 7) & 3);
+            self.dsp.step(ram);
+            for (i, &e) in self.dsp.efreg.iter().enumerate() {
+                if i & 1 == 0 {
+                    l += (e as i32) << 4;
+                } else {
+                    r += (e as i32) << 4;
+                }
+            }
         }
         // The pan gains carry ×4 headroom (FIX(4·…)); undo it and clamp.
         (
