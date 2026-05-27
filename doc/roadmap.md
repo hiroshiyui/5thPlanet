@@ -19,7 +19,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SCU (+ DMA + INTC) | ✅ | 3 DMA channels, interrupt aggregation → master INTC |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
 | VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows + sprite shadow; **remaining:** line-scroll, line windows, 4×4-page planes, CRAM modes 1/2 |
-| VDP1 | 🟡 | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading; **remaining:** double-buffer swap, draw-end timing |
+| VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
 | CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; real SH-1 firmware = M7 |
@@ -29,9 +29,10 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ⏸ parked on a cycle-phase
-question · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) mostly done · M6 (SCSP
-audio) ✅ · **next: M7** (CD-block SH-1 + games + cartridge slot), plus the
-deferred VDP1/VDP2 refinements.
+question · M5 (chip-coverage: VDP1 ✅ / MC68EC000 ✅ / VDP2 🟡) — VDP1 complete
+(gouraud + double-buffer + cycle-accurate draw-end), VDP2 has line-scroll /
+line-windows left · M6 (SCSP audio) ✅ · **next: M7** (CD-block SH-1 + games +
+cartridge slot).
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -142,11 +143,11 @@ hardware manuals stay authoritative.
 | # | Task | Status |
 |---|------|--------|
 | 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
-| 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅, gouraud shading ✅; remaining: double-buffer swap (FBCR), draw-end timing | 🚧 partial |
+| 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅, gouraud shading ✅, double-buffer swap (FBCR) ✅, cycle-accurate draw-end ✅ | ✅ done |
 | 3 | **MC68EC000** — `m68k` CPU crate ✅ (ISA + exceptions) + SCSP host wiring ✅ (sound RAM/registers, hosted+scheduled 68k, SNDON/SNDOFF). Audio engine = M6 | ✅ done |
 | 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅, RBG0/1 rotation ✅, background fidelity (full PN formats + 16×16 cells + flip + 2×2-page planes + 8bpp banks) ✅, colour calc + W0/W1 windows + sprite shadow ✅; remaining: line-scroll, line windows | 🚧 partial |
 
-### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 21 tests)
+### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 22 tests)
 
 `crates/saturn/src/vdp1/{command,plotter}.rs` turn the address-space stub into a
 real plotter. `Command` decodes a 32-byte command-table entry; `Plotter` walks the
@@ -163,8 +164,14 @@ buffer:
   aggregate).
 - **Gouraud shading** (CMDPMOD bit 2): the four CMDGRDA vertex colours are
   interpolated per-edge across the quad rasteriser (bilinear over normal sprites)
-  and offset each RGB555 channel by `correction - 16`. **Remaining (task #2):**
-  double-buffer swap (FBCR), cycle-accurate draw-end timing.
+  and offset each RGB555 channel by `correction - 16`.
+- **Double buffering**: the plotter targets a draw buffer; VDP2 composites the
+  display buffer; `FBCR` swaps them at the VBlank edge (automatic 1-cycle mode
+  or a manual one-shot change).
+- **Cycle-accurate draw-end**: a `PTMR` plot models a draw duration (per-command
+  + per-dot), so `EDSR.CEF` reads busy and the SCU sprite-draw-end interrupt
+  fires only after the duration — settled by the bus on VDP1 access and by the
+  run loop between batches. This closes task #2.
 
 ### Task #3 — MC68EC000 (`cargo test -p m68k` → 64 tests)
 
