@@ -101,6 +101,19 @@ impl Intc {
         self.pending &= !(1 << src.ord());
     }
 
+    /// Drive a level-triggered on-chip source's pending bit directly from the
+    /// device's current flag state. Unlike [`Intc::raise`] (edge-style, set
+    /// once), this is called every step so the pending bit tracks the flag —
+    /// e.g. an FRT compare-match interrupt asserts while OCFA is set and the
+    /// match-enable is on, and clears the instant software W1C-clears OCFA.
+    pub fn set_pending(&mut self, src: Source, active: bool) {
+        if active {
+            self.pending |= 1 << src.ord();
+        } else {
+            self.pending &= !(1 << src.ord());
+        }
+    }
+
     /// Return the highest-priority pending source whose level is > `mask`.
     /// `None` means no interrupt should be taken this cycle.
     pub fn next_pending(&self, sr_imask: u8) -> Option<(Source, u8)> {

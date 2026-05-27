@@ -94,7 +94,8 @@ impl OnChip {
                 let shift = 8 * (3 - (addr & 3));
                 let cur = self.divu.read32(off);
                 let mask = !(0xFFu32 << shift);
-                self.divu.write32(off, (cur & mask) | ((val as u32) << shift));
+                self.divu
+                    .write32(off, (cur & mask) | ((val as u32) << shift));
             }
             0x140..=0x17F => self.ubc.write8(addr & 0x1F, val),
             0x180..=0x1BF => dmac_write8(&mut self.dmac, addr & 0x3F, val),
@@ -108,6 +109,13 @@ impl OnChip {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
+        // The WDT registers are written through a guarded 16-bit access (high
+        // byte = magic key); route the whole halfword rather than splitting it
+        // into two bytes, which would lose the key.
+        if (0x080..=0x09F).contains(&(addr & 0x1FF)) {
+            self.wdt.write16(addr & 0x1F, val);
+            return;
+        }
         self.write8(addr, (val >> 8) as u8);
         self.write8(addr + 1, val as u8);
     }
@@ -137,6 +145,41 @@ impl OnChip {
                 self.write8(addr + 2, (val >> 8) as u8);
                 self.write8(addr + 3, val as u8);
             }
+        }
+    }
+
+    /// Advance the time-driven on-chip timers (FRT + WDT) by `cycles` CPU
+    /// clocks. The CPU calls this once per instruction with the cycles that
+    /// instruction consumed, so the free-running counter and watchdog track
+    /// real elapsed time.
+    pub fn advance_timers(&mut self, cycles: u32) {
+        self.frt.tick(cycles);
+        self.wdt.tick(cycles);
+    }
+
+    /// Refresh the level-triggered on-chip interrupt pending bits — FRT
+    /// (input-capture / compare-match A,B / overflow), WDT (interval-mode
+    /// overflow) and DMAC (per-channel transfer-end) — from each peripheral's
+    /// current flag + enable state. Called once per instruction after the
+    /// timers advance and any DMA runs, so the INTC reflects fresh device
+    /// flags at the next instruction boundary. A flag cleared by software
+    /// (FTCSR W1C, CHCR W0C of TE) drops the pending bit on the next refresh.
+    pub fn refresh_interrupts(&mut self) {
+        let (tier, ftcsr) = (self.frt.tier, self.frt.ftcsr);
+        self.intc
+            .set_pending(Source::FrtIci, tier & 0x80 != 0 && ftcsr & 0x80 != 0);
+        self.intc
+            .set_pending(Source::FrtOcia, tier & 0x08 != 0 && ftcsr & 0x08 != 0);
+        self.intc
+            .set_pending(Source::FrtOcib, tier & 0x04 != 0 && ftcsr & 0x04 != 0);
+        self.intc
+            .set_pending(Source::FrtOvi, tier & 0x02 != 0 && ftcsr & 0x02 != 0);
+        self.intc
+            .set_pending(Source::Wdt, self.wdt.interrupt_active());
+        // CHCR transfer-end interrupt: TE (bit 1) AND IE (bit 2) both set.
+        for (ch, src) in [(0usize, Source::DmacCh0), (1, Source::DmacCh1)] {
+            self.intc
+                .set_pending(src, self.dmac.channels[ch].chcr & 0b110 == 0b110);
         }
     }
 }
@@ -299,14 +342,51 @@ mod tests {
 
     #[test]
     fn stub_peripherals_round_trip_byte_writes() {
+        // UBC / BSC / SCI remain register-storage stubs that round-trip byte
+        // writes. (The WDT is now behavioral — keyless byte writes are ignored
+        // per its guarded-write protocol; see `wdt::tests`.)
         let mut o = OnChip::new();
-        o.write8(0xFFFF_FE80, 0xAA); // WDT
         o.write8(0xFFFF_FF40, 0xBB); // UBC
         o.write8(0xFFFF_FFC0, 0xCC); // BSC
         o.write8(0xFFFF_FE00, 0xDD); // SCI
-        assert_eq!(o.read8(0xFFFF_FE80), 0xAA);
         assert_eq!(o.read8(0xFFFF_FF40), 0xBB);
         assert_eq!(o.read8(0xFFFF_FFC0), 0xCC);
         assert_eq!(o.read8(0xFFFF_FE00), 0xDD);
+    }
+
+    #[test]
+    fn frt_compare_match_raises_ocia_and_clears_on_w1c() {
+        let mut o = OnChip::new();
+        o.write16(0xFFFF_FE60, 0x0700); // IPRB FRT priority (bits 11..8) = 7
+        o.write8(0xFFFF_FE10, 0x08); // TIER: OCIAE (output-compare-A int enable)
+        o.write16(0xFFFF_FE14, 0x0005); // OCRA = 5
+        o.advance_timers(5); // FRC reaches 5 → OCFA
+        o.refresh_interrupts();
+        assert_eq!(
+            o.intc.next_pending(0),
+            Some((Source::FrtOcia, 7)),
+            "OCIA asserted while OCFA is set"
+        );
+        // Software clears OCFA via W1C; the pending bit drops next refresh.
+        o.write8(0xFFFF_FE11, 0x08); // FTCSR W1C of OCFA
+        o.refresh_interrupts();
+        assert_eq!(o.intc.next_pending(0), None, "cleared after W1C");
+    }
+
+    #[test]
+    fn wdt_interval_overflow_raises_the_wdt_interrupt() {
+        let mut o = OnChip::new();
+        // IPRA WDT/REF priority (bits 7..4) = 5 so the source can be taken.
+        o.write16(0xFFFF_FEE2, 0x0050);
+        // WTCSR = TME | interval | φ/2 (0x20); WTCNT = 0xFF.
+        o.write16(0xFFFF_FE80, 0xA520);
+        o.write16(0xFFFF_FE80, 0x5AFF);
+        o.advance_timers(2); // one count → overflow
+        o.refresh_interrupts();
+        assert_eq!(
+            o.intc.next_pending(0),
+            Some((Source::Wdt, 5)),
+            "WDT interval overflow pending at IPRA priority"
+        );
     }
 }

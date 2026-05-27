@@ -57,6 +57,11 @@ impl Frt {
             }
             if self.frc == self.ocra {
                 self.ftcsr |= 0x08; // OCFA
+                // CCLRA (FTCSR bit 0): clear the counter on an OCRA match, so
+                // OCRA + the OCIA interrupt give a periodic timer.
+                if self.ftcsr & 0x01 != 0 {
+                    self.frc = 0;
+                }
             }
             if self.frc == self.ocrb {
                 self.ftcsr |= 0x04; // OCFB
@@ -111,7 +116,11 @@ impl Frt {
     }
 
     fn ocr_active(&self) -> u16 {
-        if self.tocr & 0x10 != 0 { self.ocrb } else { self.ocra }
+        if self.tocr & 0x10 != 0 {
+            self.ocrb
+        } else {
+            self.ocra
+        }
     }
     fn write_ocr_high(&mut self, val: u8) {
         let target = if self.tocr & 0x10 != 0 {

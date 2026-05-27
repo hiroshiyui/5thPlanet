@@ -95,9 +95,23 @@ impl Cpu {
         self.pending_branch.is_some()
     }
 
-    /// Fetch + decode + execute one instruction. Returns total cycles
-    /// (instruction issue cost + bus stalls + interlock stalls).
+    /// Fetch + decode + execute one instruction, then advance the on-chip
+    /// time-driven peripherals by the cycles consumed: the FRT and WDT
+    /// counters tick, any enabled DMAC channel runs, and the level-triggered
+    /// on-chip interrupt pending bits are refreshed so they're visible at the
+    /// next instruction boundary. Returns the total cycles.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
+        let cost = self.step_instruction(bus);
+        self.onchip.advance_timers(cost);
+        self.run_dma(bus);
+        self.onchip.refresh_interrupts();
+        cost
+    }
+
+    /// The bare instruction step: interrupt boundary → fetch → decode →
+    /// interlock → execute → cycle-accumulate. [`Cpu::step`] wraps this to
+    /// drive the on-chip peripherals.
+    fn step_instruction(&mut self, bus: &mut impl Bus) -> u32 {
         // ---- Interrupt boundary: check pending INTC sources first ----
         // SH-2 only accepts interrupts at instruction boundaries (never
         // inside a delay slot — that's a hardware invariant).
@@ -157,9 +171,7 @@ impl Cpu {
 
         let exec_cycles = self.execute(op, instr_pc, bus);
 
-        if was_pending
-            && let Some(target) = self.pending_branch.take()
-        {
+        if was_pending && let Some(target) = self.pending_branch.take() {
             self.regs.pc = target;
         }
         self.in_delay_slot = false;
@@ -182,12 +194,7 @@ impl Cpu {
     /// Returns the bus-stall cycles incurred; the caller adds the fixed
     /// 5-cycle exception overhead. If `set_imask` is `Some(lvl)` the SR
     /// interrupt mask is raised to it after the push (interrupt entry).
-    fn take_exception(
-        &mut self,
-        vector: u8,
-        set_imask: Option<u8>,
-        bus: &mut impl Bus,
-    ) -> u32 {
+    fn take_exception(&mut self, vector: u8, set_imask: Option<u8>, bus: &mut impl Bus) -> u32 {
         let mut sp = self.regs.r[15];
         sp = sp.wrapping_sub(4);
         let s1 = self.mem_write32(sp, self.regs.sr.0, AccessKind::Data, bus);
@@ -290,13 +297,15 @@ impl Cpu {
             }
             MovBM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(1);
-                let s = self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
+                let s =
+                    self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
             MovWM { rn, rm } => {
                 let addr = self.regs.r[rn as usize].wrapping_sub(2);
-                let s = self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
+                let s =
+                    self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = addr;
                 1 + s
             }
@@ -367,12 +376,14 @@ impl Cpu {
 
             MovBSX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
-                let s = self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
+                let s =
+                    self.mem_write8(addr, self.regs.r[rm as usize] as u8, AccessKind::Data, bus);
                 1 + s
             }
             MovWSX { rn, rm } => {
                 let addr = self.regs.r[0].wrapping_add(self.regs.r[rn as usize]);
-                let s = self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
+                let s =
+                    self.mem_write16(addr, self.regs.r[rm as usize] as u16, AccessKind::Data, bus);
                 1 + s
             }
             MovLSX { rn, rm } => {
@@ -467,8 +478,7 @@ impl Cpu {
                 1
             }
             AddI { rn, imm } => {
-                self.regs.r[rn as usize] =
-                    self.regs.r[rn as usize].wrapping_add(imm as i32 as u32);
+                self.regs.r[rn as usize] = self.regs.r[rn as usize].wrapping_add(imm as i32 as u32);
                 1
             }
             Addc { rn, rm } => {
@@ -480,8 +490,8 @@ impl Cpu {
                 1
             }
             Addv { rn, rm } => {
-                let (s, ov) =
-                    (self.regs.r[rn as usize] as i32).overflowing_add(self.regs.r[rm as usize] as i32);
+                let (s, ov) = (self.regs.r[rn as usize] as i32)
+                    .overflowing_add(self.regs.r[rm as usize] as i32);
                 self.regs.r[rn as usize] = s as u32;
                 self.regs.sr.set_t(ov);
                 1
@@ -500,8 +510,8 @@ impl Cpu {
                 1
             }
             Subv { rn, rm } => {
-                let (s, ov) =
-                    (self.regs.r[rn as usize] as i32).overflowing_sub(self.regs.r[rm as usize] as i32);
+                let (s, ov) = (self.regs.r[rn as usize] as i32)
+                    .overflowing_sub(self.regs.r[rm as usize] as i32);
                 self.regs.r[rn as usize] = s as u32;
                 self.regs.sr.set_t(ov);
                 1
@@ -622,8 +632,8 @@ impl Cpu {
                 2
             }
             DmuluL { rn, rm } => {
-                let prod = (self.regs.r[rn as usize] as u64)
-                    .wrapping_mul(self.regs.r[rm as usize] as u64);
+                let prod =
+                    (self.regs.r[rn as usize] as u64).wrapping_mul(self.regs.r[rm as usize] as u64);
                 self.regs.macl = prod as u32;
                 self.regs.mach = (prod >> 32) as u32;
                 2
@@ -802,14 +812,20 @@ impl Cpu {
                 2
             }
             Braf { rm } => {
-                self.pending_branch =
-                    Some(instr_pc.wrapping_add(4).wrapping_add(self.regs.r[rm as usize]));
+                self.pending_branch = Some(
+                    instr_pc
+                        .wrapping_add(4)
+                        .wrapping_add(self.regs.r[rm as usize]),
+                );
                 2
             }
             Bsrf { rm } => {
                 self.regs.pr = instr_pc.wrapping_add(4);
-                self.pending_branch =
-                    Some(instr_pc.wrapping_add(4).wrapping_add(self.regs.r[rm as usize]));
+                self.pending_branch = Some(
+                    instr_pc
+                        .wrapping_add(4)
+                        .wrapping_add(self.regs.r[rm as usize]),
+                );
                 2
             }
             Jmp { rm } => {
@@ -1049,7 +1065,12 @@ impl Cpu {
     // memory see the same line storage.
 
     #[inline]
-    pub(crate) fn mem_read8(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u8, u32) {
+    pub(crate) fn mem_read8(
+        &mut self,
+        addr: u32,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> (u8, u32) {
         if addr == CCR_ADDR {
             return (self.cache.ccr(), 0);
         }
@@ -1057,44 +1078,54 @@ impl Cpu {
             return (self.onchip.read8(addr), 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable
-            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
-        {
+        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u8(&line, phys), stall);
         }
         bus.read8(phys, kind)
     }
 
     #[inline]
-    pub(crate) fn mem_read16(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u16, u32) {
+    pub(crate) fn mem_read16(
+        &mut self,
+        addr: u32,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> (u16, u32) {
         if OnChip::owns(addr) {
             return (self.onchip.read16(addr), 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable
-            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
-        {
+        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u16(&line, phys), stall);
         }
         bus.read16(phys, kind)
     }
 
     #[inline]
-    pub(crate) fn mem_read32(&mut self, addr: u32, kind: AccessKind, bus: &mut impl Bus) -> (u32, u32) {
+    pub(crate) fn mem_read32(
+        &mut self,
+        addr: u32,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> (u32, u32) {
         if OnChip::owns(addr) {
             return (self.onchip.read32(addr), 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable
-            && let Some((line, stall)) = self.cache_fill(phys, kind, bus)
-        {
+        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u32(&line, phys), stall);
         }
         bus.read32(phys, kind)
     }
 
     #[inline]
-    pub(crate) fn mem_write8(&mut self, addr: u32, val: u8, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+    pub(crate) fn mem_write8(
+        &mut self,
+        addr: u32,
+        val: u8,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> u32 {
         if addr == CCR_ADDR {
             self.cache.set_ccr(val);
             return 0;
@@ -1113,7 +1144,13 @@ impl Cpu {
     }
 
     #[inline]
-    pub(crate) fn mem_write16(&mut self, addr: u32, val: u16, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+    pub(crate) fn mem_write16(
+        &mut self,
+        addr: u32,
+        val: u16,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write16(addr, val);
             return 0;
@@ -1126,7 +1163,13 @@ impl Cpu {
     }
 
     #[inline]
-    pub(crate) fn mem_write32(&mut self, addr: u32, val: u32, kind: AccessKind, bus: &mut impl Bus) -> u32 {
+    pub(crate) fn mem_write32(
+        &mut self,
+        addr: u32,
+        val: u32,
+        kind: AccessKind,
+        bus: &mut impl Bus,
+    ) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write32(addr, val);
             return 0;
@@ -1136,6 +1179,134 @@ impl Cpu {
             self.cache.write_through_u32(phys, val);
         }
         bus.write32(phys, val, kind)
+    }
+
+    // ---- on-chip DMAC transfer engine ------------------------------------
+    //
+    // DMA accesses go straight to the external bus (bypassing the cache, as
+    // the SH7604 DMAC does), after stripping the SH-2 cache-region bits via
+    // `classify`. `AccessKind::Dma` lets the bus account DMA arbitration.
+
+    fn dma_read(&mut self, addr: u32, size: u32, bus: &mut impl Bus) -> u32 {
+        let (phys, _) = classify(addr);
+        match size {
+            0 => bus.read8(phys, AccessKind::Dma).0 as u32,
+            1 => bus.read16(phys, AccessKind::Dma).0 as u32,
+            _ => bus.read32(phys, AccessKind::Dma).0,
+        }
+    }
+    fn dma_write(&mut self, addr: u32, val: u32, size: u32, bus: &mut impl Bus) {
+        let (phys, _) = classify(addr);
+        match size {
+            0 => {
+                bus.write8(phys, val as u8, AccessKind::Dma);
+            }
+            1 => {
+                bus.write16(phys, val as u16, AccessKind::Dma);
+            }
+            _ => {
+                bus.write32(phys, val, AccessKind::Dma);
+            }
+        }
+    }
+
+    /// Run any enabled on-chip DMAC channel to completion. Mirrors the SH7604
+    /// DMAC: a channel runs when the master enable (DMAOR.DME) and the
+    /// channel's CHCR.DE are set with CHCR.TE clear; it copies TCR units of
+    /// the CHCR.TS size from SAR to DAR honouring the SM/DM address modes
+    /// (fixed / increment / decrement), then writes back the final SAR/DAR,
+    /// zeroes TCR, and latches TE (which raises the channel interrupt when
+    /// CHCR.IE is set — surfaced by [`OnChip::refresh_interrupts`]).
+    ///
+    /// Auto-request, synchronous block transfer. Cycle-stealing/burst bus
+    /// timing and module (DREQ / peripheral) request sources are a later
+    /// refinement — matching the SCU DMA's current synchronous model.
+    fn run_dma(&mut self, bus: &mut impl Bus) {
+        if self.onchip.dmac.dmaor & 1 == 0 {
+            return; // DMAOR.DME master-disable
+        }
+        for ch in 0..2 {
+            self.run_dma_channel(ch, bus);
+        }
+    }
+
+    fn run_dma_channel(&mut self, ch: usize, bus: &mut impl Bus) {
+        let chcr = self.onchip.dmac.channels[ch].chcr;
+        // Need DE (bit 0) set and TE (bit 1) clear.
+        if chcr & 0b11 != 0b01 {
+            return;
+        }
+        let dst_mode = (chcr >> 14) & 3;
+        let src_mode = (chcr >> 12) & 3;
+        let size = (chcr >> 10) & 3;
+        if src_mode == 3 || dst_mode == 3 {
+            return; // illegal address-mode setting; the channel doesn't start
+        }
+        let unit: u32 = match size {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 16,
+        };
+
+        const AM: u32 = 0x07FF_FFFF; // 27-bit external address mask
+        let align = match size {
+            0 => 0,
+            1 => 1,
+            _ => 3,
+        };
+        let mut src = self.onchip.dmac.channels[ch].sar & AM & !align;
+        let mut dst = self.onchip.dmac.channels[ch].dar & AM & !align;
+        let mut count = self.onchip.dmac.channels[ch].tcr & 0x00FF_FFFF;
+        if count == 0 {
+            count = 0x0100_0000; // a TCR of 0 means the maximum count
+        }
+        if size == 3 {
+            count &= !3;
+            if count == 0 {
+                count = 4;
+            }
+        }
+
+        let advance = |mode: u32, u: u32, addr: u32| match mode {
+            1 => addr.wrapping_add(u) & AM,
+            2 => addr.wrapping_sub(u) & AM,
+            _ => addr,
+        };
+
+        while count > 0 {
+            if size == 3 {
+                // 16-byte block: four longwords. The source always advances by
+                // 16; the destination follows DM (fixed / +16 / −16), writing
+                // at the pre-decremented base in decrement mode.
+                let base = if dst_mode == 2 {
+                    dst.wrapping_sub(16) & AM
+                } else {
+                    dst
+                };
+                for k in 0..4 {
+                    let v = self.dma_read(src.wrapping_add(k * 4) & AM, 2, bus);
+                    self.dma_write(base.wrapping_add(k * 4) & AM, v, 2, bus);
+                }
+                src = src.wrapping_add(16) & AM;
+                dst = advance(dst_mode, 16, dst);
+                count -= 4;
+            } else {
+                let v = self.dma_read(src, size, bus);
+                self.dma_write(dst, v, size, bus);
+                src = advance(src_mode, unit, src);
+                dst = advance(dst_mode, unit, dst);
+                count -= 1;
+            }
+        }
+
+        // Completion: SAR/DAR point past the transferred region, TCR = 0,
+        // and TE latches.
+        let c = &mut self.onchip.dmac.channels[ch];
+        c.sar = src;
+        c.dar = dst;
+        c.tcr = 0;
+        c.chcr |= 0b10; // TE
     }
 
     /// Cache miss-fill. Returns `Some((line, stall))` if the cache is
@@ -1180,12 +1351,7 @@ impl Cpu {
     // ----------------------------------------------------------------------
 
     /// AND.B/OR.B/XOR.B #imm,@(R0,GBR). 3 cycles plus bus stalls.
-    fn exec_logical_bg(
-        &mut self,
-        imm: u8,
-        bus: &mut impl Bus,
-        f: fn(u8, u8) -> u8,
-    ) -> u32 {
+    fn exec_logical_bg(&mut self, imm: u8, bus: &mut impl Bus, f: fn(u8, u8) -> u8) -> u32 {
         let addr = self.regs.r[0].wrapping_add(self.regs.gbr);
         let (val, sr) = self.mem_read8(addr, AccessKind::Data, bus);
         let sw = self.mem_write8(addr, f(val, imm), AccessKind::Data, bus);
@@ -1286,7 +1452,11 @@ impl Cpu {
             let (sum, ov) = (self.regs.macl as i32).overflowing_add(prod);
             if ov {
                 // Saturate and set the overflow flag in MACH bit 0.
-                self.regs.macl = if prod < 0 { i32::MIN as u32 } else { i32::MAX as u32 };
+                self.regs.macl = if prod < 0 {
+                    i32::MIN as u32
+                } else {
+                    i32::MAX as u32
+                };
                 self.regs.mach |= 1;
             } else {
                 self.regs.macl = sum as u32;
