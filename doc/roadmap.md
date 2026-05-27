@@ -15,7 +15,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, exceptions; on-chip INTC/DIVU + live FRT (counts + interrupts), working DMAC (transfers + interrupt), behavioral WDT (SCI/UBC remain storage stubs; BSC wait-state timing a refinement) |
 | Saturn bus + memory map | ✅ | Typed regions, wait states, open-bus default |
 | Event-driven scheduler | ✅ | Deterministic; SH-2 ×2 + CD-block entities |
-| SMPC | ✅ | Slave hold/release, staged INTBACK, NMIREQ, SNDON/SNDOFF, RTC/region |
+| SMPC | ✅ | Slave hold/release, staged INTBACK + digital pad, NMIREQ, SNDON/SNDOFF, live RTC (SETTIME + host-seeded), SETSMEM, configurable region; clock-change/SYSRES still no-op |
 | SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct + indirect, D*AD strides, hardware start factors: VBlank/sprite-end/sound), interrupt aggregation → master INTC; cycle-stealing bus timing a refinement |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
 | VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll; CRAM modes 0/1/2 (RGB555 + RGB888); **remaining:** rotation 4×4-page planes, line-coefficient table, vertical-cell-scroll / line-zoom, sprite window plane |
