@@ -53,6 +53,10 @@ pub struct RotationParams {
     pub my: i32,
     pub kx: i32,
     pub ky: i32,
+    /// Coefficient-table start address (16.16; integer part = entry index) and
+    /// its per-line delta, for the line-coefficient table.
+    pub kast: i32,
+    pub dkast: i32,
 }
 
 impl RotationParams {
@@ -114,6 +118,10 @@ impl RotationParams {
             my: field(w(18), 0x3FFF_FFC0, 0x2000_0000, 0xC000_0000),
             kx: field(w(19), 0x00FF_FFFF, 0x0080_0000, 0xFF00_0000),
             ky: field(w(20), 0x00FF_FFFF, 0x0080_0000, 0xFF00_0000),
+            // Coefficient table start (word 21, positive) + per-line delta
+            // (word 22, signed 26-bit).
+            kast: (w(21) & 0xFFFF_FFC0) as i32,
+            dkast: field(w(22), 0x03FF_FFC0, 0x0200_0000, 0xFC00_0000),
         }
     }
 

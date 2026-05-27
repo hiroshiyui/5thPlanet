@@ -51,9 +51,14 @@
 //! **Sprite shadow**: an MSB-only sprite word (bit 15 set, no colour) on a
 //! shadow-capable sprite type halves the colour of the layer beneath.
 //!
-//! Deferred to later increments: the rotation line-coefficient table (per-line
-//! scaling) and dual-parameter window selection, the rotation screen-over
-//! modes (RAOVR/RBOVR), the sprite window plane, and line-zoom.
+//! The rotation **line-coefficient table** (KTCTL) is applied per scanline:
+//! it overrides kx/ky (perspective) in modes 0/1/2, or flags a line
+//! transparent via the coefficient MSB.
+//!
+//! Deferred to later increments: dual-parameter window selection, the
+//! coefficient mode-3 (Xp) override and CRAM-resident coefficient tables, the
+//! rotation screen-over modes (RAOVR/RBOVR), the sprite window plane, and
+//! line-zoom.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -635,13 +640,70 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
 /// Sample rotation background `which` at screen `(x, y)`: transform through
 /// its parameter table, then read the rotation plane (bitmap or tile).
 fn sample_rbg(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
-    let rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), which);
+    let mut rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), which);
+    // Per-line coefficient table: overrides kx/ky (giving perspective) or makes
+    // the whole line transparent.
+    match rot_line_coeff(vdp2, which, &rp, y) {
+        Coeff::Off => {}
+        Coeff::Transparent => return None,
+        Coeff::Set(kx, ky) => {
+            rp.kx = kx;
+            rp.ky = ky;
+        }
+    }
     let (plane_x, plane_y) = rp.transform(x as i32, y as i32);
     let depth = vdp2.regs.rbg_color_mode();
     if vdp2.regs.rbg_bitmap_enabled() {
         sample_rot_bitmap(vdp2, which, depth, plane_x, plane_y)
     } else {
         sample_rot_tile(vdp2, which, depth, plane_x, plane_y)
+    }
+}
+
+/// Outcome of a rotation line-coefficient lookup.
+enum Coeff {
+    /// No coefficient table — use the parameter table's kx/ky.
+    Off,
+    /// The coefficient's MSB flags this line as transparent.
+    Transparent,
+    /// Override (kx, ky) for this line.
+    Set(i32, i32),
+}
+
+/// Read the per-line rotation coefficient for `which` at screen line `y` and
+/// turn it into a kx/ky override (modes 0/1/2) per KTCTL. The table index is
+/// `(kast + dkast·y) >> 16`; longword entries are 24-bit 8.16 fixed, word
+/// entries 15-bit `<<6`. The coefficient table is assumed to live in VRAM
+/// (RAMCTL.CRKTE = 0); mode 3 (Xp override) is a later refinement.
+fn rot_line_coeff(vdp2: &Vdp2, which: usize, rp: &RotationParams, y: u32) -> Coeff {
+    if !vdp2.regs.rbg_coeff_enabled(which) {
+        return Coeff::Off;
+    }
+    let idx = ((rp.kast.wrapping_add(rp.dkast.wrapping_mul(y as i32))) >> 16) as u32;
+    let base = vdp2.regs.rbg_coeff_table_base(which);
+    let (val, transparent) = if vdp2.regs.rbg_coeff_size_word(which) {
+        let w = vdp2.vram.read16(base + idx * 2) as u32;
+        let mut v = (w & 0x7FFF) as i32;
+        if v & 0x4000 != 0 {
+            v |= !0x7FFF; // sign-extend bit 14
+        }
+        (v << 6, w & 0x8000 != 0) // <<6 → 16.16
+    } else {
+        let w = vdp2.vram.read32(base + idx * 4);
+        let mut v = (w & 0x00FF_FFFF) as i32;
+        if v & 0x0080_0000 != 0 {
+            v |= !0x00FF_FFFF; // sign-extend bit 23 (already 8.16)
+        }
+        (v, w & 0x8000_0000 != 0)
+    };
+    if transparent {
+        return Coeff::Transparent;
+    }
+    match vdp2.regs.rbg_coeff_mode(which) {
+        0 => Coeff::Set(val, val),
+        1 => Coeff::Set(val, rp.ky),
+        2 => Coeff::Set(rp.kx, val),
+        _ => Coeff::Off, // mode 3 (Xp) — refinement
     }
 }
 
@@ -1274,6 +1336,37 @@ mod tests {
             [0xFF, 0, 0, 0xFF],
             "screen (0,0) → plane B tile via the 4×4 grid"
         );
+    }
+
+    #[test]
+    fn rbg0_line_coefficient_overrides_kx_and_flags_transparent_lines() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x1200); // RBG0 8bpp bitmap
+        v.regs.write16(0x0FC, 0x0001); // RBG0 priority 1
+        v.regs.write16(0x03E, 0x0001); // MPOFR.RAMP = 1 → bitmap base 0x20000
+        // Coefficient table: enable (RAKTE), mode 0 (kx&ky), longword size.
+        v.regs.write16(0x0B4, 0x0001); // KTCTL
+        v.regs.write16(0x0B6, 0x0001); // KTAOF → table at 0x40000
+        setup_rot_identity(&mut v, 0);
+        // dkast = 1.0 per line → line y reads coefficient entry y.
+        v.vram.write32(22 * 4, 0x0001_0000);
+        // Entry 0: kx = 2.0 (8.16). Entry 1: MSB set → transparent line.
+        v.vram.write32(0x40000, 0x0002_0000);
+        v.vram.write32(0x40004, 0x8000_0000);
+        v.cram.write16(2, 0x001F); // index 1 = red
+        v.vram.write8(0x20000 + 2, 1); // bitmap dot at plane (2, 0)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Line 0 coeff kx=2 → screen (1,0) samples plane (2,0) → red.
+        assert_eq!(
+            pixel(&buf, 1, 0),
+            [0xFF, 0, 0, 0xFF],
+            "kx=2 override applied"
+        );
+        // Line 1 coefficient MSB → the whole line is transparent → backdrop.
+        assert_eq!(pixel(&buf, 1, 1), [0, 0, 0, 0xFF], "MSB → transparent line");
     }
 
     #[test]

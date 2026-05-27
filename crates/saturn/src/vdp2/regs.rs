@@ -602,6 +602,34 @@ impl Vdp2Regs {
         (self.rbg_map_offset(which) << 6) | mp
     }
 
+    // ---- Rotation coefficient table (KTCTL 0x0B4, KTAOF 0x0B6) ----
+
+    /// Coefficient-table enable for rotation `which` (RAKTE / RBKTE).
+    pub fn rbg_coeff_enabled(&self, which: usize) -> bool {
+        self.read16(0x0B4) & (1 << if which == 0 { 0 } else { 8 }) != 0
+    }
+    /// Coefficient data size: false = longword (24-bit), true = word (15-bit).
+    pub fn rbg_coeff_size_word(&self, which: usize) -> bool {
+        self.read16(0x0B4) & (1 << if which == 0 { 1 } else { 9 }) != 0
+    }
+    /// Coefficient use mode (RAKMD/RBKMD): 0 = kx & ky, 1 = kx, 2 = ky,
+    /// 3 = Xp.
+    pub fn rbg_coeff_mode(&self, which: usize) -> u8 {
+        let shift = if which == 0 { 2 } else { 10 };
+        ((self.read16(0x0B4) >> shift) & 0x3) as u8
+    }
+    /// Byte address in VRAM of the coefficient table (KTAOF address offset ×
+    /// the per-size bank). Assumes the table is in VRAM (RAMCTL.CRKTE = 0).
+    pub fn rbg_coeff_table_base(&self, which: usize) -> u32 {
+        let ktaof = self.read16(0x0B6);
+        let aos = (if which == 0 { ktaof } else { ktaof >> 8 } & 0x7) as u32;
+        if self.rbg_coeff_size_word(which) {
+            aos * 0x2_0000
+        } else {
+            (aos & 0x3) * 0x4_0000
+        }
+    }
+
     // ---- NBG0 wrappers (kept for existing callers/tests) ----
 
     pub fn nbg0_map_offset(&self) -> u32 {
