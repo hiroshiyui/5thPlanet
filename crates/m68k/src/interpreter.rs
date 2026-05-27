@@ -13,9 +13,11 @@
 //! NEG/NEGX/NOT/CLR/TST/TAS; the bit ops (BTST/BCHG/BCLR/BSET, static and
 //! dynamic); EXT/SWAP/EXG; shifts/rotates; MOVEM and LINK/UNLK; the branch
 //! group (BRA/BSR/Bcc/DBcc/Scc), RTS, JMP/JSR; and MOVE to/from CCR/SR.
-//! Still to come: the **exception model** (TRAP/TRAPV, privilege, illegal,
-//! address error, zero-divide, interrupt dispatch + RTE), MOVEP, memory
-//! shift-by-1, and SCSP host wiring.
+//! The **exception model** is in too: TRAP/TRAPV/CHK, zero-divide,
+//! illegal + line-A/F, privilege violation, STOP/RESET/RTE/RTR, and
+//! external-interrupt dispatch (autovector, `SR.imask`-gated, level-7 NMI).
+//! Still to come: MOVEP, memory shift-by-1, address-error/bus-error frames,
+//! and SCSP host wiring.
 //!
 //! **Cycle model:** each memory word access costs the 68000's 4-clock bus
 //! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along
@@ -45,6 +47,23 @@ pub struct Cpu {
     /// Set by STOP (and on a halting double fault); the scheduler skips a
     /// stopped core until an interrupt wakes it.
     pub stopped: bool,
+    /// Highest pending external interrupt level (0 = none, 1..7). The host
+    /// (the SCSP, later) raises it; the CPU takes it at an instruction
+    /// boundary when the level beats `SR.imask` (level 7 is non-maskable).
+    pub pending_irq: u8,
+}
+
+/// Fixed 68000 exception vector numbers (vector address = number × 4).
+mod vector {
+    pub const ILLEGAL: u32 = 4;
+    pub const ZERO_DIVIDE: u32 = 5;
+    pub const CHK: u32 = 6;
+    pub const TRAPV: u32 = 7;
+    pub const PRIVILEGE: u32 = 8;
+    pub const LINE_A: u32 = 10;
+    pub const LINE_F: u32 = 11;
+    pub const AUTOVECTOR_BASE: u32 = 24; // + level → 25..31
+    pub const TRAP_BASE: u32 = 32; // + n → 32..47
 }
 
 impl Cpu {
@@ -64,6 +83,42 @@ impl Cpu {
         self.regs.a[7] = ssp;
         self.regs.pc = pc;
         self.stopped = false;
+        self.pending_irq = 0;
+    }
+
+    /// Raise an external interrupt at `level` (1..7); the CPU takes it at the
+    /// next instruction boundary once it outranks `SR.imask`.
+    pub fn raise_interrupt(&mut self, level: u8) {
+        if level > self.pending_irq {
+            self.pending_irq = level;
+        }
+    }
+
+    /// Enter exception processing for `vector`: save SR, switch to supervisor
+    /// (clearing T), push the PC (long) then SR (word) on the supervisor
+    /// stack, and vector through `[vector × 4]`. The 68000 has no VBR — the
+    /// table is fixed at the bottom of memory.
+    fn take_exception(&mut self, vector: u32, bus: &mut impl Bus) {
+        let saved_sr = self.regs.sr.to_u16();
+        self.regs.set_supervisor(true);
+        self.regs.sr.trace = false;
+        self.push32(self.regs.pc, bus);
+        self.push16(saved_sr, bus);
+        self.regs.pc = self.read_mem(vector * 4, Size::Long, bus);
+        self.stopped = false;
+    }
+
+    /// Take a pending interrupt if it outranks the mask (level 7 always).
+    /// Returns true if one was taken.
+    fn service_interrupt(&mut self, bus: &mut impl Bus) -> bool {
+        let level = self.pending_irq;
+        if level == 0 || (level != 7 && level <= self.regs.sr.imask) {
+            return false;
+        }
+        self.pending_irq = 0;
+        self.take_exception(vector::AUTOVECTOR_BASE + level as u32, bus);
+        self.regs.sr.imask = level;
+        true
     }
 
     // ---- fetch helpers ------------------------------------------------
@@ -399,16 +454,39 @@ impl Cpu {
         v
     }
 
+    fn push16(&mut self, val: u16, bus: &mut impl Bus) {
+        self.regs.a[7] = self.regs.a[7].wrapping_sub(2);
+        self.write_mem(self.regs.a[7], Size::Word, val as u32, bus);
+    }
+
+    fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
+        let v = self.read_mem(self.regs.a[7], Size::Word, bus) as u16;
+        self.regs.a[7] = self.regs.a[7].wrapping_add(2);
+        v
+    }
+
     // ---- the main step ------------------------------------------------
 
     /// Execute one instruction; returns the cycles it took.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         let start = self.cycles;
+
+        // Interrupts are sampled at the instruction boundary.
+        if self.service_interrupt(bus) {
+            return (self.cycles - start) as u32;
+        }
+        // STOP parks the CPU until an interrupt arrives.
+        if self.stopped {
+            self.cycles += 4;
+            return (self.cycles - start) as u32;
+        }
+
+        let instr_pc = self.regs.pc;
         let op = self.fetch16(bus);
         match op >> 12 {
             0x0 => self.op_immediate(op, bus),
             0x1..=0x3 => self.op_move(op, bus),
-            0x4 => self.op_4(op, bus),
+            0x4 => self.op_4(op, instr_pc, bus),
             0x5 => self.op_5(op, bus),
             0x6 => self.op_branch(op, bus),
             0x7 => self.op_moveq(op),
@@ -418,9 +496,30 @@ impl Cpu {
             0xC => self.op_and_group(op, bus),
             0xD => self.op_addsub(op, true, bus),
             0xE => self.op_shift(op, bus),
-            _ => { /* line A/F — emulator traps, handled with the exception model */ }
+            // Line-A (0xA) and line-F (0xF) emulator traps push the faulting
+            // instruction's address and vector through 10 / 11.
+            0xA => self.fault(vector::LINE_A, instr_pc, bus),
+            _ => self.fault(vector::LINE_F, instr_pc, bus),
         }
         (self.cycles - start) as u32
+    }
+
+    /// Take a fault whose stacked PC must point at the *faulting* instruction
+    /// (illegal / line-A / line-F), not the following one.
+    fn fault(&mut self, vector: u32, instr_pc: u32, bus: &mut impl Bus) {
+        self.regs.pc = instr_pc;
+        self.take_exception(vector, bus);
+    }
+
+    /// True if in supervisor mode; otherwise take the privilege-violation
+    /// fault (vector 8) and return false.
+    fn require_supervisor(&mut self, instr_pc: u32, bus: &mut impl Bus) -> bool {
+        if self.regs.sr.supervisor {
+            true
+        } else {
+            self.fault(vector::PRIVILEGE, instr_pc, bus);
+            false
+        }
     }
 
     // ---- instruction groups -------------------------------------------
@@ -450,7 +549,7 @@ impl Cpu {
     }
 
     /// The 0x4 group: NOP/RTS/JMP/JSR/LEA/CLR/TST.
-    fn op_4(&mut self, op: u16, bus: &mut impl Bus) {
+    fn op_4(&mut self, op: u16, instr_pc: u32, bus: &mut impl Bus) {
         match op {
             0x4E71 => return, // NOP
             0x4E75 => {
@@ -458,11 +557,78 @@ impl Cpu {
                 self.regs.pc = self.pop32(bus);
                 return;
             }
+            0x4E73 => {
+                // RTE (privileged): restore SR then PC.
+                if !self.require_supervisor(instr_pc, bus) {
+                    return;
+                }
+                let sr = self.pop16(bus);
+                self.regs.pc = self.pop32(bus);
+                self.write_sr(sr);
+                return;
+            }
+            0x4E77 => {
+                // RTR: restore CCR (low byte) then PC; system byte unchanged.
+                let ccr = self.pop16(bus);
+                self.regs.sr.set_ccr((ccr & 0x1F) as u8);
+                self.regs.pc = self.pop32(bus);
+                return;
+            }
+            0x4E72 => {
+                // STOP #imm (privileged): load SR, park until an interrupt.
+                let imm = self.fetch16(bus);
+                if !self.require_supervisor(instr_pc, bus) {
+                    return;
+                }
+                self.write_sr(imm);
+                self.stopped = true;
+                return;
+            }
+            0x4E70 => {
+                // RESET (privileged): asserts the peripheral reset line — a
+                // no-op for the core itself.
+                self.require_supervisor(instr_pc, bus);
+                return;
+            }
+            0x4E76 => {
+                // TRAPV: trap on overflow.
+                if self.regs.sr.v {
+                    self.take_exception(vector::TRAPV, bus);
+                }
+                return;
+            }
+            0x4AFC => {
+                // ILLEGAL (the architecturally-reserved illegal opcode).
+                self.fault(vector::ILLEGAL, instr_pc, bus);
+                return;
+            }
             _ => {}
+        }
+
+        // TRAP #n (0x4E40..0x4E4F): software trap, vectors 32..47.
+        if op & 0xFFF0 == 0x4E40 {
+            self.take_exception(vector::TRAP_BASE + (op & 0xF) as u32, bus);
+            return;
         }
 
         let mode = (op >> 3) & 7;
         let reg = op & 7;
+
+        // CHK <ea>,Dn (opmode 110): trap 6 if Dn.W is < 0 or > the bound.
+        if (op >> 6) & 7 == 0b110 {
+            let dn = ((op >> 9) & 7) as usize;
+            let ea = self.resolve_ea(mode, reg, Size::Word, bus);
+            let bound = self.read_ea(ea, Size::Word, bus) as i16 as i32;
+            let val = self.regs.d[dn] as u16 as i16 as i32;
+            if val < 0 {
+                self.regs.sr.n = true;
+                self.take_exception(vector::CHK, bus);
+            } else if val > bound {
+                self.regs.sr.n = false;
+                self.take_exception(vector::CHK, bus);
+            }
+            return;
+        }
 
         // SWAP Dn (0x4840|reg): exchange the register halves.
         if op & 0xFFF8 == 0x4840 {
@@ -539,9 +705,11 @@ impl Cpu {
             self.regs.sr.set_ccr((v & 0x1F) as u8);
             return;
         }
-        // MOVE to SR (0x46C0|ea): word source → SR (privileged; the
-        // privilege trap arrives with the exception model).
+        // MOVE to SR (0x46C0|ea): word source → SR (privileged).
         if op & 0xFFC0 == 0x46C0 {
+            if !self.require_supervisor(instr_pc, bus) {
+                return;
+            }
             let ea = self.resolve_ea(mode, reg, Size::Word, bus);
             let v = self.read_ea(ea, Size::Word, bus);
             self.write_sr(v as u16);
@@ -1103,7 +1271,8 @@ impl Cpu {
         let ea = self.resolve_ea((op >> 3) & 7, op & 7, Size::Word, bus);
         let divisor = self.read_ea(ea, Size::Word, bus) & 0xFFFF;
         if divisor == 0 {
-            return; // TODO(exceptions): zero-divide trap (vector 5)
+            self.take_exception(vector::ZERO_DIVIDE, bus);
+            return;
         }
         let dividend = self.regs.d[reg];
         self.regs.sr.c = false;

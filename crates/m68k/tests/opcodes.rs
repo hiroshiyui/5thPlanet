@@ -646,3 +646,120 @@ fn tas_sets_flags_then_msb() {
     assert!(cpu.regs.sr.z, "byte was zero");
     assert_eq!(cpu.regs.d[0] & 0xFF, 0x80, "bit 7 set after test");
 }
+
+// ---- increment 4: exception model (traps, interrupts, privilege, RTE) ----
+
+#[test]
+fn trap_vectors_through_the_table() {
+    // TRAP #0 → 0x4E40 ; vector 32 at byte 0x80.
+    let (mut cpu, mut bus) = boot(&[0x4E40], |c| c.regs.sr.supervisor = true);
+    bus.write_long(32 * 4, 0x0000_3000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x3000, "vectored to the TRAP #0 handler");
+    assert!(cpu.regs.sr.supervisor, "exception enters supervisor mode");
+    assert_eq!(cpu.regs.a[7], 0x2000 - 6, "SR + PC frame pushed");
+}
+
+#[test]
+fn external_interrupt_is_taken_when_it_outranks_the_mask() {
+    let (mut cpu, mut bus) = boot(&[0x4E71], |c| c.regs.sr.supervisor = true);
+    bus.write_long((24 + 4) * 4, 0x0000_4000); // autovector level 4
+    cpu.raise_interrupt(4);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x4000, "serviced the IRQ instead of the NOP");
+    assert_eq!(cpu.regs.sr.imask, 4, "mask raised to the serviced level");
+    assert_eq!(cpu.pending_irq, 0, "pending cleared on acknowledge");
+}
+
+#[test]
+fn masked_interrupt_is_ignored() {
+    let (mut cpu, mut bus) = boot(&[0x4E71], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.imask = 5;
+    });
+    cpu.raise_interrupt(3); // 3 <= 5 → masked
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x1002, "NOP ran; IRQ stayed pending");
+    assert_eq!(cpu.pending_irq, 3);
+}
+
+#[test]
+fn level7_interrupt_is_non_maskable() {
+    let (mut cpu, mut bus) = boot(&[0x4E71], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.imask = 7;
+    });
+    bus.write_long((24 + 7) * 4, 0x0000_4444);
+    cpu.raise_interrupt(7);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x4444, "level 7 ignores the mask");
+}
+
+#[test]
+fn rte_restores_sr_and_pc() {
+    // RTE → 0x4E73. Frame: SR at SSP, PC at SSP+2.
+    let (mut cpu, mut bus) = boot(&[0x4E73], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.a[7] = 0x1F00;
+    });
+    bus.write_word(0x1F00, 0x2700); // restored SR: still supervisor, mask 7
+    bus.write_long(0x1F02, 0x0000_5000); // restored PC
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x5000);
+    assert_eq!(cpu.regs.a[7], 0x1F06, "supervisor frame popped");
+    assert!(
+        cpu.regs.sr.supervisor && cpu.regs.sr.imask == 7,
+        "SR restored"
+    );
+}
+
+#[test]
+fn stop_parks_until_an_interrupt_wakes_it() {
+    // STOP #0x2000 → 0x4E72 (SR = supervisor, mask 0).
+    let (mut cpu, mut bus) = boot(&[0x4E72, 0x2000], |c| c.regs.sr.supervisor = true);
+    cpu.step(&mut bus); // STOP
+    assert!(cpu.stopped);
+    let parked_pc = cpu.regs.pc;
+    cpu.step(&mut bus); // idles
+    assert_eq!(cpu.regs.pc, parked_pc, "no progress while stopped");
+    bus.write_long((24 + 4) * 4, 0x0000_6000);
+    cpu.raise_interrupt(4);
+    cpu.step(&mut bus);
+    assert!(!cpu.stopped, "interrupt woke the CPU");
+    assert_eq!(cpu.regs.pc, 0x6000);
+}
+
+#[test]
+fn privileged_instruction_in_user_mode_traps() {
+    // STOP in user mode → privilege violation (vector 8).
+    let (mut cpu, mut bus) = boot(&[0x4E72, 0x0000], |c| {
+        c.regs.sr.supervisor = false;
+        c.regs.ssp = 0x2000;
+    });
+    bus.write_long(8 * 4, 0x0000_7000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x7000, "vectored to the privilege handler");
+    assert!(cpu.regs.sr.supervisor, "now in supervisor mode");
+}
+
+#[test]
+fn illegal_instruction_traps() {
+    // 0x4AFC is the reserved ILLEGAL opcode → vector 4.
+    let (mut cpu, mut bus) = boot(&[0x4AFC], |c| c.regs.sr.supervisor = true);
+    bus.write_long(4 * 4, 0x0000_8000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x8000);
+}
+
+#[test]
+fn divide_by_zero_traps() {
+    // DIVU.W D1, D0 with D1 = 0 → vector 5.
+    let (mut cpu, mut bus) = boot(&[0x80C1], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.d[0] = 10;
+        c.regs.d[1] = 0;
+    });
+    bus.write_long(5 * 4, 0x0000_9000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x9000);
+}
