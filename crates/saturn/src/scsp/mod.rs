@@ -51,6 +51,27 @@ const INT_TIMER_A: u16 = 0x040; // bit 6
 const INT_TIMER_B: u16 = 0x080; // bit 7
 const INT_TIMER_C: u16 = 0x100; // bit 8
 
+pub const NUM_SLOTS: usize = 32;
+/// Slot-register block: 32 slots × 0x20 bytes at the base of the register space.
+const SLOT_STRIDE: u32 = 0x20;
+/// Phase fractional bits (the SCSP's address accumulator is 12.12-ish: the top
+/// bits index the waveform sample, the low `SHIFT` bits interpolate).
+const PHASE_SHIFT: u32 = 12;
+const SOUND_RAM_MASK: u32 = (SOUND_RAM_BYTES as u32) - 1;
+
+/// One PCM slot's runtime state (the configuration lives in the register bank;
+/// this is the per-sample playback state set up at key-on).
+#[derive(Clone, Copy, Debug, Default)]
+struct Slot {
+    active: bool,
+    backwards: bool,
+    /// Phase accumulator: `cur >> PHASE_SHIFT` is the sample index past SA.
+    cur: u32,
+    nxt: u32,
+    /// Phase increment per output sample (from OCT/FNS).
+    step: u32,
+}
+
 /// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
 #[derive(Clone, Debug, Default)]
 struct Timer {
@@ -90,6 +111,7 @@ impl Timer {
 pub struct ScspCtrl {
     raw: [u8; REG_BYTES],
     timers: [Timer; 3],
+    slots: [Slot; NUM_SLOTS],
     /// Current 68k interrupt-line level (0 = none); level-triggered.
     asserted_level: u8,
     /// Main-CPU sound interrupt pending (forwarded to the SCU).
@@ -107,6 +129,7 @@ impl ScspCtrl {
         Self {
             raw: [0; REG_BYTES],
             timers: Default::default(),
+            slots: [Slot::default(); NUM_SLOTS],
             asserted_level: 0,
             main_pending: false,
         }
@@ -148,6 +171,14 @@ impl ScspCtrl {
     }
     pub fn write16(&mut self, o: u32, v: u16) {
         self.store16(o, v);
+        // A write touching a slot's first word (data[0]) with KYONEX set
+        // executes key-on/off across all slots.
+        if o < NUM_SLOTS as u32 * SLOT_STRIDE
+            && (o & (SLOT_STRIDE - 1)) <= 1
+            && self.read16(o & !(SLOT_STRIDE - 1)) & 0x1000 != 0
+        {
+            self.key_on_execute();
+        }
         match o & !1 {
             SCIRE => {
                 // Clear the written pending bits, then re-evaluate.
@@ -223,6 +254,144 @@ impl ScspCtrl {
     fn recompute_main(&mut self) {
         self.main_pending = self.read16(MCIPD) & self.read16(MCIEB) != 0;
     }
+
+    // ---- slot (PCM) engine --------------------------------------------
+
+    /// Slot `i`'s register word `k` (data[k] in the SCSP slot layout).
+    fn slot_reg(&self, i: usize, k: u32) -> u16 {
+        self.read16(i as u32 * SLOT_STRIDE + k * 2)
+    }
+
+    /// Phase increment for slot `i` from OCT (signed octave) and FNS, per the
+    /// SCSP pitch formula: `(FNS + 0x400) << (oct + PHASE_SHIFT - 10)`.
+    fn slot_step(&self, i: usize) -> u32 {
+        let reg = self.slot_reg(i, 0x8);
+        let oct = (reg >> 11) & 0xF;
+        let fns = (reg & 0x3FF) as u32;
+        let octave = ((oct ^ 8) as i32 - 8) + PHASE_SHIFT as i32 - 10;
+        let mut fnv = fns + (1 << 10);
+        if octave >= 0 {
+            fnv <<= octave;
+        } else {
+            fnv >>= -octave;
+        }
+        fnv
+    }
+
+    /// Execute key-on/off for all slots based on each one's KYONB bit, then
+    /// clear the KYONEX strobe wherever it's set.
+    fn key_on_execute(&mut self) {
+        for i in 0..NUM_SLOTS {
+            let data0 = self.slot_reg(i, 0);
+            if data0 & 0x0800 != 0 {
+                self.start_slot(i);
+            } else {
+                self.slots[i].active = false;
+            }
+            // Clear KYONEX (bit 12) so the strobe is one-shot.
+            if data0 & 0x1000 != 0 {
+                self.store16(i as u32 * SLOT_STRIDE, data0 & !0x1000);
+            }
+        }
+    }
+
+    fn start_slot(&mut self, i: usize) {
+        let step = self.slot_step(i);
+        self.slots[i] = Slot {
+            active: true,
+            backwards: false,
+            cur: 0,
+            nxt: 1 << PHASE_SHIFT,
+            step,
+        };
+    }
+
+    pub fn slot_active(&self, i: usize) -> bool {
+        self.slots[i].active
+    }
+
+    /// Produce one output sample (signed 16-bit, pre-envelope) for slot `i`,
+    /// advancing its phase and applying the loop mode. Reads waveform data
+    /// from `ram` (the SCSP sound RAM). Returns 0 for an inactive slot.
+    pub fn slot_sample(&mut self, i: usize, ram: &Ram) -> i16 {
+        if !self.slots[i].active {
+            return 0;
+        }
+        let data0 = self.slot_reg(i, 0);
+        let pcm8 = data0 & 0x0010 != 0;
+        let lpctl = (data0 >> 5) & 3;
+        let sa = ((data0 as u32 & 0xF) << 16) | self.slot_reg(i, 1) as u32;
+        let lsa = self.slot_reg(i, 2) as u32;
+        let lea = self.slot_reg(i, 3) as u32;
+
+        let (cur, nxt) = (self.slots[i].cur, self.slots[i].nxt);
+        let frac = (cur & ((1 << PHASE_SHIFT) - 1)) as i32;
+        let one = 1i32 << PHASE_SHIFT;
+        // Linearly interpolate the current and next waveform samples.
+        let (p1, p2) = if pcm8 {
+            let a1 = cur >> PHASE_SHIFT;
+            let a2 = nxt >> PHASE_SHIFT;
+            (
+                ((ram.read8((sa + a1) & SOUND_RAM_MASK) as i8 as i32) << 8),
+                ((ram.read8((sa + a2) & SOUND_RAM_MASK) as i8 as i32) << 8),
+            )
+        } else {
+            let a1 = (cur >> (PHASE_SHIFT - 1)) & !1;
+            let a2 = (nxt >> (PHASE_SHIFT - 1)) & !1;
+            (
+                ram.read16((sa + a1) & SOUND_RAM_MASK) as i16 as i32,
+                ram.read16((sa + a2) & SOUND_RAM_MASK) as i16 as i32,
+            )
+        };
+        let sample = ((p1 * (one - frac) + p2 * frac) >> PHASE_SHIFT) as i16;
+
+        // Advance the phase and re-derive the next-sample address.
+        let slot = &mut self.slots[i];
+        if slot.backwards {
+            slot.cur = slot.cur.wrapping_sub(slot.step);
+        } else {
+            slot.cur = slot.cur.wrapping_add(slot.step);
+        }
+        slot.nxt = slot.cur.wrapping_add(1 << PHASE_SHIFT);
+
+        // Loop handling on the new current address (sample index).
+        let addr = slot.cur >> PHASE_SHIFT;
+        match lpctl {
+            0 => {
+                if addr >= lsa && addr >= lea {
+                    slot.active = false;
+                }
+            }
+            1 => {
+                if addr >= lea {
+                    slot.cur = (lsa << PHASE_SHIFT) + (slot.cur - (lea << PHASE_SHIFT));
+                    slot.nxt = slot.cur + (1 << PHASE_SHIFT);
+                }
+            }
+            2 => {
+                // Reverse loop.
+                if addr >= lsa && !slot.backwards {
+                    slot.cur = (lea << PHASE_SHIFT) - (slot.cur - (lsa << PHASE_SHIFT));
+                    slot.backwards = true;
+                } else if slot.backwards && (addr < lsa || slot.cur & 0x8000_0000 != 0) {
+                    slot.cur = (lea << PHASE_SHIFT) - ((lsa << PHASE_SHIFT).wrapping_sub(slot.cur));
+                }
+                slot.nxt = slot.cur.wrapping_add(1 << PHASE_SHIFT);
+            }
+            _ => {
+                // Ping-pong (alternating) loop.
+                if addr >= lea && !slot.backwards {
+                    slot.cur = (lea << PHASE_SHIFT) - (slot.cur - (lea << PHASE_SHIFT));
+                    slot.backwards = true;
+                } else if slot.backwards && (addr < lsa || slot.cur & 0x8000_0000 != 0) {
+                    slot.cur = (lsa << PHASE_SHIFT) + ((lsa << PHASE_SHIFT).wrapping_sub(slot.cur));
+                    slot.backwards = false;
+                }
+                slot.nxt = slot.cur.wrapping_add(1 << PHASE_SHIFT);
+            }
+        }
+        sample
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +441,18 @@ impl Scsp {
     /// Re-hold the 68k in reset (SMPC `SNDOFF`).
     pub fn stop(&mut self) {
         self.running = false;
+    }
+
+    /// Whether PCM slot `i` is currently playing.
+    pub fn slot_active(&self, i: usize) -> bool {
+        self.ctrl.slot_active(i)
+    }
+
+    /// One output sample (pre-envelope) for slot `i`, reading the shared sound
+    /// RAM and advancing the slot's phase. The mixer (M6 task #4) sums these.
+    pub fn slot_sample(&mut self, i: usize) -> i16 {
+        let Scsp { ctrl, ram, .. } = self;
+        ctrl.slot_sample(i, ram)
     }
 
     /// Pop the main-CPU sound interrupt (the aggregate forwards it to the SCU
@@ -459,6 +640,97 @@ mod tests {
         assert!(!ctrl.main_pending);
         ctrl.tick_timers(2);
         assert!(ctrl.main_pending, "MCIPD & MCIEB → main interrupt");
+    }
+
+    // ---- slot (PCM) engine ----
+
+    /// Key on slot 0 with the given config words, after planting params.
+    /// `data0_flags` carries PCM8B/LPCTL/SA-hi; KYONB|KYONEX are added here.
+    fn keyon_slot0(s: &mut Scsp, data0_flags: u16, sa: u32, lsa: u16, lea: u16, octfns: u16) {
+        s.ctrl.write16(0x02, sa as u16); // SA low
+        s.ctrl.write16(0x04, lsa); // LSA
+        s.ctrl.write16(0x06, lea); // LEA
+        s.ctrl.write16(0x10, octfns); // OCT/FNS
+        // data[0]: KYONEX|KYONB | flags | SA high nibble.
+        let hi = ((sa >> 16) & 0xF) as u16;
+        s.ctrl.write16(0x00, 0x1800 | data0_flags | hi);
+    }
+
+    #[test]
+    fn key_on_activates_the_slot() {
+        let mut s = Scsp::new();
+        assert!(!s.slot_active(0));
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
+        assert!(s.slot_active(0), "KYONEX with KYONB started the slot");
+    }
+
+    #[test]
+    fn slot_plays_16bit_pcm_at_native_rate() {
+        let mut s = Scsp::new();
+        s.ram.write16(0x100, 0x1111);
+        s.ram.write16(0x102, 0x2222);
+        s.ram.write16(0x104, 0x3333);
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0); // 16-bit, OCT/FNS 0 → 1:1
+        assert_eq!(s.slot_sample(0), 0x1111);
+        assert_eq!(s.slot_sample(0), 0x2222);
+        assert_eq!(s.slot_sample(0), 0x3333);
+    }
+
+    #[test]
+    fn slot_plays_8bit_pcm_scaled_to_16() {
+        let mut s = Scsp::new();
+        s.ram.write8(0x200, 0x40); // +64 → 0x4000
+        s.ram.write8(0x201, 0xC0); // -64 → 0xC000 (sign-extended << 8)
+        keyon_slot0(&mut s, 0x0010, 0x200, 0, 0x100, 0); // PCM8B (bit 4)
+        assert_eq!(s.slot_sample(0), 0x4000);
+        assert_eq!(s.slot_sample(0), (0xC000u16) as i16);
+    }
+
+    #[test]
+    fn pitch_octave_doubles_the_playback_rate() {
+        let mut s = Scsp::new();
+        for n in 0..4u32 {
+            s.ram.write16(0x100 + n * 2, (n as u16) * 0x1000);
+        }
+        // OCT = 1 → step doubles → skips every other sample (0, 2, ...).
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 1 << 11);
+        assert_eq!(s.slot_sample(0), 0x0000);
+        assert_eq!(s.slot_sample(0), 0x2000);
+    }
+
+    #[test]
+    fn normal_loop_wraps_at_lea_back_to_lsa() {
+        let mut s = Scsp::new();
+        s.ram.write16(0x100, 0x0A0A);
+        s.ram.write16(0x102, 0x0B0B);
+        s.ram.write16(0x104, 0x0C0C);
+        // LSA = 1, LEA = 3 → after sample index 2, wrap to index 1.
+        keyon_slot0(&mut s, 0x0020, 0x100, 1, 3, 0); // LPCTL = 1 (bits 6:5)
+        assert_eq!(s.slot_sample(0), 0x0A0A); // idx 0
+        assert_eq!(s.slot_sample(0), 0x0B0B); // idx 1
+        assert_eq!(s.slot_sample(0), 0x0C0C); // idx 2 → wrap to 1
+        assert_eq!(s.slot_sample(0), 0x0B0B, "looped back to LSA");
+    }
+
+    #[test]
+    fn no_loop_stops_at_lea() {
+        let mut s = Scsp::new();
+        s.ram.write16(0x100, 0x7777);
+        keyon_slot0(&mut s, 0, 0x100, 0, 2, 0); // LEA = 2, LPCTL = 0
+        s.slot_sample(0); // idx 0
+        s.slot_sample(0); // idx 1 → addr reaches 2 (>= LEA) → stop
+        assert!(!s.slot_active(0), "no-loop slot stops at LEA");
+    }
+
+    #[test]
+    fn key_off_silences_the_slot() {
+        let mut s = Scsp::new();
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
+        assert!(s.slot_active(0));
+        // Clear KYONB, strobe KYONEX → key off.
+        s.ctrl.write16(0x00, 0x1000);
+        assert!(!s.slot_active(0));
+        assert_eq!(s.slot_sample(0), 0, "silent once keyed off");
     }
 
     #[test]
