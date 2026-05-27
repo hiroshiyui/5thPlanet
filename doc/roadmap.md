@@ -115,7 +115,7 @@ hardware manuals stay authoritative.
 |---|------|--------|
 | 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
 | 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅; remaining: gouraud, double-buffer swap (FBCR), draw-end timing | 🚧 partial |
-| 3 | **MC68EC000** — new `m68k` CPU crate (SCSP sound CPU), structured like `sh2` | 🚧 in progress |
+| 3 | **MC68EC000** — `m68k` CPU crate ✅ (ISA + exceptions) + SCSP host wiring ✅ (sound RAM/registers, hosted+scheduled 68k, SNDON/SNDOFF). Audio engine = M6 | ✅ done |
 | 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅, RBG0/1 rotation ✅; remaining: windows, line-scroll, colour calc | 🚧 partial |
 
 ### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 18 tests)
@@ -153,9 +153,20 @@ complete for user-mode code plus the interrupt model SCSP needs:
   `SR.imask`-gated, level-7 NMI). `raise_interrupt()` is the host's entry point.
 
 Cycle model counts the 68000's 4-clock bus cycle per word; per-instruction timing
-tables are a later refinement. **Remaining:** MOVEP, memory shift-by-1,
-address/bus-error frames, and the **SCSP host wiring** (the SCSP crate that maps
-the 68k into sound RAM + control registers and drives it from the scheduler).
+tables are a later refinement.
+
+**SCSP host wiring landed** (`crates/saturn/src/scsp/`): the SCSP owns the 512 KiB
+sound RAM, the control/slot/DSP register bank, and the hosted 68k. The 68k's
+`M68kView` maps sound RAM at 0 and the registers at 0x100000; the SH-2 sees them
+at 0x05A0_0000 / 0x05B0_0000 (shared RAM). `Scsp::run` paces the 68k at the
+11.2896 MHz SCSP clock from the Saturn run loop; SMPC `SNDON`/`SNDOFF` release /
+re-hold it. End-to-end: SH-2 stages a program into sound RAM → SNDON → the
+scheduler runs the 68k from it (9 tests).
+
+**Remaining for the chip:** MOVEP, memory shift-by-1, address/bus-error frames
+(rare), and — as the **M6 audio milestone** — the SCSP slot/FM engine, the SCSP
+DSP, the mixer/DAC, and the timer/sound interrupt sources feeding
+`Scsp::raise_interrupt`.
 
 ### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 31 tests)
 
