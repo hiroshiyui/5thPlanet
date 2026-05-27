@@ -28,13 +28,16 @@
 //!   0xF8         VER  — version, reads 0x0000_0004 (read-only)
 //! ```
 //!
-//! DMA triggering for M3: a 32-bit write to `D*EN` with bit 8 (DGO) set
-//! while the channel's transfer count is non-zero queues a synchronous
-//! block-transfer for the next [`Scu::take_pending_dma`] call. The
-//! Saturn aggregate's `run_for` loop drains pending DMAs after each
-//! scheduler batch and performs the actual byte movement through
-//! `SaturnBus`. Cycle-stealing accuracy, indirect-mode DMA, and start
-//! factors other than "manual" are out of M3 scope.
+//! DMA: a channel armed via `D*EN` (bit 8) transfers when its start factor
+//! (`D*MD` bits 2..0) fires — the manual factor (7) on the `D*EN` go bit, or a
+//! hardware event (VBlank-IN/-OUT, HBlank, timers, sound-request,
+//! sprite-draw-end) routed through [`Scu::trigger_dma_factor`]. Both direct
+//! and indirect (table-driven) modes are supported, honouring the `D*AD`
+//! source/destination strides and the `D*MD` RUP/WUP address-update bits.
+//! [`Scu::take_pending_dma`] hands a [`DmaRequest`] to the Saturn aggregate's
+//! `run_for` loop, which performs the byte movement through `SaturnBus` (the
+//! SCU can't reach the bus itself). Cycle-stealing bus timing remains a
+//! refinement — the transfer is a synchronous block.
 
 pub const SCU_BASE: u32 = 0x05FE_0000;
 pub const SCU_END: u32 = 0x05FE_00FF;
