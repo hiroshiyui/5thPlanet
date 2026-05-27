@@ -20,6 +20,7 @@
 pub mod cram;
 pub mod regs;
 pub mod renderer;
+pub mod rotation;
 pub mod vram;
 
 pub use cram::Cram;

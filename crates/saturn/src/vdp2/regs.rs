@@ -307,6 +307,58 @@ impl Vdp2Regs {
         ((self.read16(reg) >> shift) & 0x7) as u8
     }
 
+    // ---- Rotation backgrounds (RBG0 / RBG1) ----
+    //
+    // RBG0 (BGON bit 4) uses rotation parameter set A, its colour/map/priority
+    // from the R0* fields (CHCTLB, MPOFR.RAMP, PRIR). RBG1 (BGON bit 5) uses
+    // parameter set B and MPOFR.RBMP; its priority shares the NBG0 slot
+    // (N0PRIN). The parameter-table address comes from RPTAU/RPTAL.
+
+    /// RBG`which` (0/1) enable — BGON bits 4 (R0ON) / 5 (R1ON).
+    pub fn rbg_enabled(&self, which: usize) -> bool {
+        self.bgon() & (0x10 << which) != 0
+    }
+    /// RBG`which` priority: RBG0 from PRIR (R0PRIN, 0x0FC bits 2..0); RBG1
+    /// shares NBG0's priority (PRINA bits 2..0). 0 = not shown.
+    pub fn rbg_priority(&self, which: usize) -> u8 {
+        if which == 0 {
+            (self.read16(0x0FC) & 0x7) as u8
+        } else {
+            (self.read16(0x0F8) & 0x7) as u8
+        }
+    }
+    /// RBG colour number (CHCTLB R0CHCN, bits 14..12): 0=16, 1=256, 2=2048,
+    /// 3=32K RGB, 4=16M RGB. Both rotation backgrounds use this field here.
+    pub fn rbg_color_mode(&self) -> u8 {
+        ((self.chctlb() >> 12) & 0x7) as u8
+    }
+    /// RBG bitmap-format enable (CHCTLB R0BMEN, bit 9).
+    pub fn rbg_bitmap_enabled(&self) -> bool {
+        self.chctlb() & 0x0200 != 0
+    }
+    /// RBG bitmap size (CHCTLB R0BMSZ, bit 10): 0 = 512×256, 1 = 512×512.
+    pub fn rbg_bitmap_size(&self) -> u8 {
+        ((self.chctlb() >> 10) & 0x1) as u8
+    }
+    /// Rotation map offset (MPOFR at 0x03E): RA in bits 1..0, RB in bits 5..4.
+    pub fn rbg_map_offset(&self, which: usize) -> u32 {
+        let shift = if which == 0 { 0 } else { 4 };
+        ((self.read16(0x03E) >> shift) & 0x3) as u32
+    }
+    /// RBG bitmap base: `map_offset × 0x20000` bytes.
+    pub fn rbg_bitmap_base(&self, which: usize) -> u32 {
+        self.rbg_map_offset(which) * 0x2_0000
+    }
+    /// Rotation parameter-table byte address: `(RPTAU << 16 | RPTAL) << 1`.
+    pub fn rotation_table_addr(&self) -> u32 {
+        (((self.read16(0x0BC) & 0x7) as u32) << 16 | self.read16(0x0BE) as u32) << 1
+    }
+    /// Rotation plane-A map number (low 6 bits): RA from MPABRA (0x050), RB
+    /// from MPABRB (0x060). Only plane A is read for now (single-page tile).
+    pub fn rbg_plane_a_map(&self, which: usize) -> u16 {
+        self.read16(if which == 0 { 0x050 } else { 0x060 })
+    }
+
     // ---- NBG0 wrappers (kept for existing callers/tests) ----
 
     pub fn nbg0_map_offset(&self) -> u32 {
