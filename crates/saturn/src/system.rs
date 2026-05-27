@@ -217,6 +217,7 @@ impl Saturn {
         self.drain_scu_dma();
         self.drain_scu_dsp();
         self.drain_vdp1();
+        self.drain_scsp();
         self.drain_scu_intc();
     }
 
@@ -325,6 +326,7 @@ impl Saturn {
             self.drain_scu_dma();
             self.drain_scu_dsp();
             self.drain_vdp1();
+            self.drain_scsp();
             self.drain_scu_intc();
         }
     }
@@ -359,6 +361,7 @@ impl Saturn {
             self.drain_scu_dma();
             self.drain_scu_dsp();
             self.drain_vdp1();
+            self.drain_scsp();
             self.drain_scu_intc();
         }
     }
@@ -566,6 +569,15 @@ impl Saturn {
     fn drain_vdp1(&mut self) {
         if self.bus.vdp1.take_draw_end() {
             self.bus.scu.raise(crate::scu::Source::SpriteDrawEnd);
+        }
+    }
+
+    /// Forward the SCSP's main-CPU sound interrupt (e.g. timer A via
+    /// `MCIPD`/`MCIEB`) to the SCU `SoundRequest` source. Level-triggered:
+    /// stays raised while the SCSP holds it, until software clears `MCIPD`.
+    fn drain_scsp(&mut self) {
+        if self.bus.scsp.take_main_interrupt() {
+            self.bus.scu.raise(crate::scu::Source::SoundRequest);
         }
     }
 
