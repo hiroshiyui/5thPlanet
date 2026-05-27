@@ -18,7 +18,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SMPC | ✅ | Slave hold/release, staged INTBACK, NMIREQ, SNDON/SNDOFF, RTC/region |
 | SCU (+ DMA + INTC) | ✅ | 3 DMA channels, interrupt aggregation → master INTC |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
-| VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows + sprite shadow; **remaining:** line-scroll, line windows, 4×4-page planes, CRAM modes 1/2 |
+| VDP2 | 🟡 | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation + VDP1 sprite layer, priority composited; colour calc (alpha/additive) + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll; CRAM modes 0/1/2 (RGB555 + RGB888); **remaining:** rotation 4×4-page planes, line-coefficient table, vertical-cell-scroll / line-zoom, sprite window plane |
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full user-mode ISA + exception/interrupt model (`m68k` crate) |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
@@ -30,9 +30,10 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ⏸ parked on a cycle-phase
 question · M5 (chip-coverage: VDP1 ✅ / MC68EC000 ✅ / VDP2 🟡) — VDP1 complete
-(gouraud + double-buffer + cycle-accurate draw-end), VDP2 has line-scroll /
-line-windows left · M6 (SCSP audio) ✅ · **next: M7** (CD-block SH-1 + games +
-cartridge slot).
+(gouraud + double-buffer + cycle-accurate draw-end); VDP2 has CRAM RGB888,
+per-line scroll + windows done, with rotation 4×4-page planes / line-coefficient
+table / vertical-cell-scroll left · M6 (SCSP audio) ✅ · **next: M7** (CD-block
+SH-1 + games + cartridge slot).
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -145,7 +146,7 @@ hardware manuals stay authoritative.
 | 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
 | 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅, gouraud shading ✅, double-buffer swap (FBCR) ✅, cycle-accurate draw-end ✅ | ✅ done |
 | 3 | **MC68EC000** — `m68k` CPU crate ✅ (ISA + exceptions) + SCSP host wiring ✅ (sound RAM/registers, hosted+scheduled 68k, SNDON/SNDOFF). Audio engine = M6 | ✅ done |
-| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅, RBG0/1 rotation ✅, background fidelity (full PN formats + 16×16 cells + flip + 2×2-page planes + 8bpp banks) ✅, colour calc + W0/W1 windows + sprite shadow ✅; remaining: line-scroll, line windows | 🚧 partial |
+| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅, RBG0/1 rotation ✅, background fidelity (full PN formats + 16×16 cells + flip + 2×2-page planes + 8bpp banks) ✅, colour calc + W0/W1 windows + sprite shadow ✅, CRAM modes 0/1/2 ✅, per-line scroll ✅, per-line windows ✅; remaining: rotation 4×4-page planes, line-coefficient table, vertical-cell-scroll | 🚧 partial |
 
 ### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 22 tests)
 
@@ -206,7 +207,7 @@ scheduler runs the 68k from it (9 tests).
 DSP, the mixer/DAC, and the timer/sound interrupt sources feeding
 `Scsp::raise_interrupt`.
 
-### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 54 tests)
+### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 58 tests)
 
 The NBG0-only renderer became a per-pixel priority compositor over NBG0–3.
 Generalized per-layer register accessors drive it; two register-map bugs found
@@ -248,9 +249,15 @@ AND/OR combine logic; windowed-out dots are suppressed (rectangles from
 WPSX/WPSY/WPEX/WPEY, X at half-dot resolution). An MSB-only sprite word on a
 shadow-capable sprite type halves the layer beneath.
 
+**CRAM modes + line scroll/windows** (done): palette lookups honour RAMCTL.CRMD
+— RGB555 (modes 0/1) or true RGB888 (modes 2/3). NBG0/NBG1 apply per-line scroll
+from the SCRCTL/LSTAn table (integer H/V, LSS interval), and W0/W1 can take their
+horizontal extent per scanline from the LWTAn line-window table (vertical bounds
+still from WPSY/WPEY).
+
 **Remaining:** the rotation line-coefficient table + dual-parameter window
-selection, per-line windows, the sprite window plane, line-scroll, 4×4-page
-plane sizes, and CRAM modes 1/2.
+selection, the sprite window plane, vertical-cell-scroll / line-zoom, and
+rotation 4×4-page plane composition.
 
 ## Milestone 6 — SCSP audio ✅ complete
 
