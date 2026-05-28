@@ -84,6 +84,27 @@ fn dram_cart_volatile_ram_survives_but_rom_is_regrafted() {
 }
 
 #[test]
+fn internal_backup_is_preformatted_and_persists() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    // A fresh (charged-battery) console shows the BIOS format signature.
+    assert_eq!(&sat.internal_backup()[..16], b"BackUpRam Format");
+
+    // A game writes a save (odd byte lanes hold data); the unpacked image
+    // that battery persistence writes out should capture it.
+    sat.bus.write8(0x0018_0000 + 0x101, 0x42, AccessKind::Data);
+    let image = sat.internal_backup().to_vec();
+    assert_eq!(image[0x101 >> 1], 0x42);
+
+    // Persisted image reloads into a fresh console (the battery survived).
+    let mut next = Saturn::with_blank_bios();
+    next.reset();
+    next.load_internal_backup(&image);
+    let (v, _) = next.bus.read8(0x0018_0000 + 0x101, AccessKind::Data);
+    assert_eq!(v, 0x42);
+}
+
+#[test]
 fn bad_magic_is_rejected() {
     let mut sat = Saturn::with_blank_bios();
     sat.reset();

@@ -140,6 +140,98 @@ impl Ram {
     }
 }
 
+/// Capacity of the Saturn's internal battery-backed backup RAM, in *data*
+/// bytes (32 KiB). The address window is twice this because of the odd-byte
+/// packing below.
+pub const INTERNAL_BACKUP_BYTES: usize = 32 * 1024;
+
+/// The Saturn's internal battery-backed backup RAM at `0x0018_0000` — the
+/// built-in "memory card" games write saves to.
+///
+/// Hardware exposes the 32 KiB across a 64 KiB window with **odd-byte
+/// packing**: each 16-bit word carries one data byte in its low half and
+/// reads 0 in its high half (data byte `n` lives at byte address `2n+1`).
+/// This matches MAME `backupram_r/w` (`saturn_m.cpp`) and the backup-RAM
+/// *cartridge* packing in [`crate::cartridge`]. Out-of-window offsets fold
+/// modulo the data size, so the 512 KiB bus region mirrors transparently.
+///
+/// On power-on a charged-battery console shows the BIOS "BackUpRam Format"
+/// signature, so a fresh instance is pre-formatted the same way
+/// (MAME `nvram_init`); the frontend overwrites it with the persisted file
+/// when one exists.
+#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BackupRam {
+    data: Vec<u8>,
+}
+
+impl Default for BackupRam {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackupRam {
+    pub fn new() -> Self {
+        let mut data = vec![0u8; INTERNAL_BACKUP_BYTES];
+        // nvram_init: the 16-byte "BackUpRam Format" tag, four times.
+        const TAG: &[u8; 16] = b"BackUpRam Format";
+        for chunk in data.chunks_mut(16).take(4) {
+            chunk.copy_from_slice(TAG);
+        }
+        Self { data }
+    }
+
+    /// The raw 32 KiB of *data* bytes (unpacked) — for battery persistence.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Replace the contents from a persisted image (length-clamped to the
+    /// 32 KiB capacity; a shorter file leaves the tail untouched).
+    pub fn load(&mut self, src: &[u8]) {
+        let n = src.len().min(self.data.len());
+        self.data[..n].copy_from_slice(&src[..n]);
+    }
+
+    pub fn read8(&self, offset: u32) -> u8 {
+        if offset & 1 == 0 {
+            0 // even byte lanes are wired to 0
+        } else {
+            self.data[(offset as usize >> 1) % self.data.len()]
+        }
+    }
+    pub fn read16(&self, offset: u32) -> u16 {
+        u16::from_be_bytes([self.read8(offset), self.read8(offset.wrapping_add(1))])
+    }
+    pub fn read32(&self, offset: u32) -> u32 {
+        u32::from_be_bytes([
+            self.read8(offset),
+            self.read8(offset.wrapping_add(1)),
+            self.read8(offset.wrapping_add(2)),
+            self.read8(offset.wrapping_add(3)),
+        ])
+    }
+    pub fn write8(&mut self, offset: u32, val: u8) {
+        if offset & 1 == 1 {
+            let i = (offset as usize >> 1) % self.data.len();
+            self.data[i] = val;
+        }
+    }
+    pub fn write16(&mut self, offset: u32, val: u16) {
+        let b = val.to_be_bytes();
+        self.write8(offset, b[0]);
+        self.write8(offset.wrapping_add(1), b[1]);
+    }
+    pub fn write32(&mut self, offset: u32, val: u32) {
+        let b = val.to_be_bytes();
+        self.write8(offset, b[0]);
+        self.write8(offset.wrapping_add(1), b[1]);
+        self.write8(offset.wrapping_add(2), b[2]);
+        self.write8(offset.wrapping_add(3), b[3]);
+    }
+}
+
 /// Stand-in for a region of registers that hasn't been modeled yet
 /// (SMPC, SCU, VDP1/2, SCSP, A-bus, etc.). Reads return 0; writes are
 /// dropped. Holds a name for traceable debug output.

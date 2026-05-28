@@ -583,6 +583,18 @@ impl Saturn {
         self.bus.cartridge = cart;
     }
 
+    /// The internal battery-backed backup RAM as raw 32 KiB of data bytes
+    /// (unpacked) — write this to a host file on exit to emulate the battery.
+    pub fn internal_backup(&self) -> &[u8] {
+        self.bus.backup.bytes()
+    }
+
+    /// Restore the internal backup RAM from a persisted image (e.g. loaded on
+    /// startup). Length-clamped to the 32 KiB capacity.
+    pub fn load_internal_backup(&mut self, bytes: &[u8]) {
+        self.bus.backup.load(bytes);
+    }
+
     /// Run any DMA transfers that the SCU queued during the last
     /// scheduler batch. For M3 each transfer is synchronous: we move
     /// the full byte count in 32-bit chunks (plus a byte tail) via

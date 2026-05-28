@@ -58,13 +58,18 @@ fn high_wram_round_trip_and_independent_of_low_wram() {
 }
 
 #[test]
-fn backup_ram_round_trip_and_mirrors() {
+fn backup_ram_odd_byte_packing_and_mirrors() {
     let mut bus = fresh();
-    bus.write8(BACKUP_BASE + 0x10, 0x77, AccessKind::Data);
-    let (v, _) = bus.read8(BACKUP_BASE + 0x10, AccessKind::Data);
-    assert_eq!(v, 0x77);
-    // 32 KiB region mirrored within the 512 KiB window.
-    let (mirror, _) = bus.read8(BACKUP_BASE + 0x8000 + 0x10, AccessKind::Data);
+    // Internal backup RAM is odd-byte packed: data lives only on odd byte
+    // addresses; even bytes read 0 and ignore writes (hardware / MAME).
+    bus.write8(BACKUP_BASE + 0x11, 0x77, AccessKind::Data); // odd → stored
+    bus.write8(BACKUP_BASE + 0x10, 0x55, AccessKind::Data); // even → dropped
+    let (odd, _) = bus.read8(BACKUP_BASE + 0x11, AccessKind::Data);
+    let (even, _) = bus.read8(BACKUP_BASE + 0x10, AccessKind::Data);
+    assert_eq!(odd, 0x77);
+    assert_eq!(even, 0x00, "even byte lanes are wired to 0");
+    // 32 KiB of data spans a 64 KiB window, then mirrors within 512 KiB.
+    let (mirror, _) = bus.read8(BACKUP_BASE + 0x1_0000 + 0x11, AccessKind::Data);
     assert_eq!(mirror, 0x77);
 }
 

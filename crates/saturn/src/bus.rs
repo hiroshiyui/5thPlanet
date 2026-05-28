@@ -32,7 +32,7 @@ use crate::cd_block::{CD_BLOCK_BASE, CD_BLOCK_END, CdBlock};
 /// the register/FIFO window at [`CD_BLOCK_BASE`].
 const CD_DATA_PORT: u32 = 0x0581_8000;
 const CD_DATA_PORT_END: u32 = 0x0581_8003;
-use crate::memory::{BiosRom, Ram, StubRegisterBank};
+use crate::memory::{BackupRam, BiosRom, Ram, StubRegisterBank};
 use crate::scsp::Scsp;
 use crate::scu::{SCU_BASE, SCU_END, Scu};
 use crate::smpc::Smpc;
@@ -74,7 +74,8 @@ const STUB_WAITS: u32 = 0;
 pub struct SaturnBus {
     pub bios: BiosRom,
     pub smpc: Smpc,
-    pub backup: Ram,
+    /// Internal battery-backed backup RAM (32 KiB, odd-byte packed).
+    pub backup: BackupRam,
     pub low_wram: Ram,
     pub sound: StubRegisterBank,
     pub scu: Scu,
@@ -102,7 +103,7 @@ impl SaturnBus {
         Self {
             bios: BiosRom::new(bios),
             smpc: Smpc::new(),
-            backup: Ram::new(32 * 1024),
+            backup: BackupRam::new(),
             low_wram: Ram::new(1024 * 1024),
             sound: StubRegisterBank::new("SOUND"),
             scu: Scu::new(),
