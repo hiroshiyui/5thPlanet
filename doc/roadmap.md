@@ -23,7 +23,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
 | CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. Remaining: CDDA→SCSP playback, MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
-| Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
+| Cartridge slot | ✅ | Extension DRAM (1 MB / 4 MB, two banks), battery backup-RAM (odd-byte packing), and game ROM carts, mapped at `0x0200_0000..0x04FF_FFFF` with the probed cart-ID byte at `0x04FF_FFFF`; `--cart=` frontend flag. (CDDA→SCSP, MPEG card, move/copy ops still deferred within M7) |
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
 
@@ -31,10 +31,12 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
 plus a post-M6 fidelity pass that made the SH-2 on-chip peripherals (FRT/WDT/
 DMAC), SCU DMA (start factors / indirect / strides), and SMPC (live RTC / region)
-behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE) 🚧 active** —
-all five CD-block HLE phases (disc/TOC, buffer/filter/partition, read pump +
-data transfer, ISO9660 FS, authentication) are ✅ done; the **cartridge slot**
-(Extension RAM / backup / ROM carts) remains. See the Milestone 7 section.
+behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE + cartridge
+slot) ✅** — all five CD-block HLE phases (disc/TOC, buffer/filter/partition,
+read pump + data transfer, ISO9660 FS, authentication) and the **cartridge
+slot** (Extension DRAM / backup / ROM carts + cart-ID) are done. See the
+Milestone 7 section. (Deferred within M7: CDDA→SCSP, MPEG card, move/copy
+sector ops.)
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -492,16 +494,18 @@ M7 grows it into the full engine, in independently-testable phases:
 | 3 | **Sector pump + data transfer** ✅ done | 75/150 Hz read pump (extends `CdBlockEntity`) disc→filter→partition; Get/Get-and-Delete Sector Data (`0x60`–`0x63`) streaming the data port + the SCU-DMA path. **Address-map fix:** the data-transfer port is at `0x2581_8000` (the SCU DMA already special-cases `0x0581_8000`) — outside the current `0x0589_xxxx` window, so the bus needs that region. |
 | 4 | **CD-ROM filesystem** ✅ done | ISO9660 directory parse (PVD at FAD 166, `direntryT` records). Change Dir / Get File Scope / Get File Info / Read File (`0x70`–`0x75`). |
 | 5 | **Authentication + game boot** ✅ done | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
+| 6 | **Cartridge slot** ✅ done | `cartridge.rs`: Extension DRAM (1 MB / 4 MB, two mirrored banks), battery backup-RAM (Saturn odd-byte packing + "BackUpRam Format" tag), and game ROM carts, at `0x0200_0000..0x04FF_FFFF` with the cart-ID byte at `0x04FF_FFFF` (empty slot floats high to `0xFF`). `Saturn::insert_cartridge` + frontend `--cart=ram1m|ram4m|bram[4|8|16|32]|rom:<path>`. 5 tests. |
 
 **Deferred within M7:** CDDA audio playback into the SCSP, the MPEG card
 (`0x90`+), Move/Copy sector ops, and realistic seek timing — none block game
 boot. (The BIOS splash park at `0x060108BA` is a VDP2-only path and may be
 independent of the disc; treated as a possible side-benefit, not the M7 goal.)
 
-Also in M7: the **cartridge slot** — Extension RAM carts (1 MB at `0x0240_0000`;
-4 MB as two banks at `0x0240_0000` / `0x0260_0000`), the backup-RAM cart, and
-game ROM carts, selected per game with the probed cart-ID. Open-bus today;
-small RAM/ROM regions + an ID byte, needed by Street Fighter Zero 3 / KOF '97.
+Also in M7 (task #6, ✅ done): the **cartridge slot** — Extension DRAM carts
+(1 MB at `0x0240_0000`; 4 MB as two banks at `0x0240_0000` / `0x0260_0000`),
+the battery backup-RAM cart, and game ROM carts (`0x0200_0000`), selected per
+game with the probed cart-ID byte at `0x04FF_FFFF`. The 4 MB Extension DRAM
+cart is what Street Fighter Zero 3 and The King of Fighters '97 require.
 
 ## Later milestones (queued)
 

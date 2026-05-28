@@ -71,6 +71,18 @@ to disambiguate cached vs. cache-through.
 (enable), ID (instruction disable), OD (data disable), TW (two-way
 mode override), CP (purge — write-only).
 
+**Cartridge** — The rear expansion connector on the [A-bus],
+`0x0200_0000..0x04FF_FFFF`. Three families share the window and are
+told apart by a **cart-ID byte at `0x04FF_FFFF`** (an empty slot floats
+high, reading `0xFF`): **Extension DRAM** carts (1 MB ID `0x5A` / 4 MB
+ID `0x5C`, each two independent banks at `0x0240_0000` / `0x0260_0000`,
+needed by Street Fighter Zero 3 & KOF '97); **battery backup-RAM** carts
+(IDs `0x21`–`0x24` for 4/8/16/32 Mbit, stored in the Saturn odd-byte
+packing — one data byte in bits 23–16 and another in 7–0 of each 32-bit
+word); and **game ROM** carts at `0x0200_0000` (ID `0xFF`). Modeled in
+`crates/saturn/src/cartridge.rs`; plugged in via `Saturn::insert_cartridge`
+or the frontend `--cart=` flag.
+
 **CD-block** — Saturn's CD-ROM controller subsystem, built around an
 [SH-1] running internal firmware. Handles disc reading, sub-Q, error
 correction, and audio CD playback. M4 adds an **address-space presence
