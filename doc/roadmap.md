@@ -22,7 +22,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
-| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. Remaining: CDDA→SCSP playback, MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
+| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. **M10** adds CDDA→SCSP playback and live physical-disc reads (via the `SectorSource` trait + the `physdisc`/libcdio crate). Remaining: MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
 | Cartridge slot | ✅ | Extension DRAM (1 MB / 4 MB, two banks), battery backup-RAM (odd-byte packing), and game ROM carts, mapped at `0x0200_0000..0x04FF_FFFF` with the probed cart-ID byte at `0x04FF_FFFF`; `--cart=` frontend flag. (CDDA→SCSP, MPEG card, move/copy ops still deferred within M7) |
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad, F5/F9 save-state hotkeys |
 | Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
@@ -45,7 +45,10 @@ internal backup RAM. See the Milestone 8 section. · **M9 (frontend OSD) 🚧
 active** — Phase 1 done: a hand-rolled, software-composited in-window menu
 (ADR-0008) with save/load slots, reset, eject/insert disc, and quit; Esc opens
 it. Graphics / controller / region-BIOS / cartridge submenus are the remaining
-phases.
+phases. · **M10 (live physical disc + CDDA→SCSP) ✅** — the `SectorSource`
+trait, CD-audio BGM mixed into the SCSP, and live optical-drive reads via the
+feature-gated `physdisc`/libcdio crate (ADR-0009; the libcdio backend needs
+on-hardware verification). See the Milestone 10 section.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -505,10 +508,12 @@ M7 grows it into the full engine, in independently-testable phases:
 | 5 | **Authentication + game boot** ✅ done | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
 | 6 | **Cartridge slot** ✅ done | `cartridge.rs`: Extension DRAM (1 MB / 4 MB, two mirrored banks), battery backup-RAM (Saturn odd-byte packing + "BackUpRam Format" tag), and game ROM carts, at `0x0200_0000..0x04FF_FFFF` with the cart-ID byte at `0x04FF_FFFF` (empty slot floats high to `0xFF`). `Saturn::insert_cartridge` + frontend `--cart=ram1m|ram4m|bram[4|8|16|32]|rom:<path>`. 5 tests. |
 
-**Deferred within M7:** CDDA audio playback into the SCSP, the MPEG card
-(`0x90`+), Move/Copy sector ops, and realistic seek timing — none block game
-boot. (The BIOS splash park at `0x060108BA` is a VDP2-only path and may be
-independent of the disc; treated as a possible side-benefit, not the M7 goal.)
+**Deferred within M7 → done in M10:** CDDA audio playback into the SCSP, and
+(beyond M7's image-only model) live physical-disc reads. **Still remaining:** the
+MPEG card (`0x90`+), Move/Copy sector ops, and realistic seek timing — none
+block game boot. (The BIOS splash park at `0x060108BA` is a VDP2-only path and
+may be independent of the disc; treated as a possible side-benefit, not the M7
+goal.)
 
 Also in M7 (task #6, ✅ done): the **cartridge slot** — Extension DRAM carts
 (1 MB at `0x0240_0000`; 4 MB as two banks at `0x0240_0000` / `0x0260_0000`),
@@ -545,6 +550,18 @@ A hand-rolled, ZSNES/fwNES-style on-screen menu in the SDL2 frontend
 
 **Related fix landed alongside Phase 1:** with no disc the CD-block now reports
 status `NODISC` (`0x07`) instead of `PAUSE`, matching MAME's no-image reset.
+
+## Milestone 10 — Live physical disc + CDDA→SCSP audio ✅
+
+The two CD capabilities deferred from M7: playing CD-audio BGM, and reading an
+original disc from a host drive (see ADR-0009). The security ring is a non-issue
+— our authentication is HLE/header-only.
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **`SectorSource` trait** ✅ done | `disc::SectorSource` (+ `TrackInfo`) decouples the CD-block from the in-memory `Disc`: reads fill a caller buffer, so a live drive can back the source and reads are on-demand. `CdBlock.disc` is now `Option<Box<dyn SectorSource>>`; `insert_disc` is generic; save-state media identity uses `fingerprint()`. `SaturnBus`/`CdBlock` drop `Clone`. Pure refactor — suite green, golden unchanged. |
+| 2 | **CDDA→SCSP** ✅ done | Audio tracks decode to a CD-DA FIFO in the read pump (2352-byte sector → 588 stereo frames); `Saturn::take_audio` sums it with the SCSP output. Games with CD-audio BGM (e.g. Romance of the Three Kingdoms V) now play their music. 2 tests. Full level for now (SCSP CD-input level/pan deferred). |
+| 3 | **Physical drive (`physdisc` + libcdio)** ✅ done | New feature-gated `crates/physdisc`: `PhysicalDisc` impls `SectorSource` via libcdio (TOC + raw sectors + CD-DA), cross-platform. Default = stub (no libcdio); the frontend's `physical-disc` feature + a `cdrom:<device>` disc spec enable it. The crate is the sole ADR-0007 unsafe exception (ADR-0009). Verified in the default config; the libcdio backend needs on-hardware verification (no drive/libcdio in CI). |
 
 ## Later milestones (queued)
 

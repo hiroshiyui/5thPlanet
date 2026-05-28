@@ -100,8 +100,16 @@ a read pump feeding partitions; data transfer (16-bit FIFO + the 32-bit
 SCU-DMA port at `0x0581_8000`); the [ISO9660] filesystem; and disc
 authentication (`0xE0`/`0xE1`). `insert_disc` / `eject_disc` move the drive
 between disc-present (status `PAUSE`) and empty (status `NODISC` `0x07`, what a
-closed empty drive reports, matching MAME). Remaining: CDDA→[SCSP] playback,
-the MPEG card, and move/copy sector ops.
+closed empty drive reports, matching MAME). Reads go through a
+[SectorSource] — an in-memory image or a live drive (see [physical disc]).
+M10 adds [CDDA]→[SCSP] playback; remaining: the MPEG card and move/copy ops.
+
+**CDDA** — Compact Disc Digital Audio (Red Book): the audio tracks many
+games stream as BGM (e.g. Romance of the Three Kingdoms V). The [CD-block]'s
+read pump decodes each 2352-byte audio sector to 588 interleaved 16-bit
+stereo frames at 44.1 kHz into a FIFO; `Saturn::take_audio` sums it with the
+[SCSP] output (M10). Distinct from sequenced [SCSP] music, which always
+worked.
 
 **Chunky** vs. **planar** — Pixel-storage modes. VDP1 / VDP2 use
 chunky (one pixel = N consecutive bits in memory); some legacy modes
@@ -353,6 +361,15 @@ OREG0..OREG31 for software to read after polling SF.
 
 ## P
 
+**Physical disc** — Reading an *original* Saturn disc from a host optical
+drive instead of a ripped image. Implemented by the feature-gated
+`crates/physdisc` crate (M10): a `PhysicalDisc` [SectorSource] backed by the
+cross-platform **libcdio** C library (TOC + raw sectors + [CDDA] extraction).
+Works because our authentication is HLE/header-only — the copy-protection
+security ring (unreadable by PC drives) is never consulted. The frontend
+opens it with a `cdrom:<device>` disc spec under the `physical-disc` feature.
+The only crate that opts out of `unsafe_code = "forbid"` (the FFI; ADR-0009).
+
 **Pipeline (SH7604)** — 5-stage in-order: IF (Instruction Fetch),
 ID (Decode), EX (Execute), MA (Memory Access), WB (Write Back). Most
 ALU ops are 1 cycle; loads have a 1-cycle delay before the loaded
@@ -395,6 +412,14 @@ slot. Used by the BIOS to return from `TRAPA` / interrupts.
 ---
 
 ## S
+
+**SectorSource** — `crates/saturn/src/disc.rs` — the trait the [CD-block]
+reads sectors through, so the drive can be an in-memory image
+(`disc::Disc`) or a live [physical disc]. Reads fill a caller-supplied
+buffer (a live drive has no borrowable backing store) and happen on demand.
+Provides `toc`, `read_sector` (2048) / `read_full_sector` (2352),
+`track_at_fad` (a `TrackInfo`), `subheader`, and a `fingerprint` for
+save-state media identity. Introduced in M10 to enable CD-audio + live discs.
 
 **SaturnBus** — `crates/saturn/src/bus.rs` — the workspace's
 implementation of `sh2::Bus`. Owns all Saturn memory regions and

@@ -23,8 +23,9 @@ foundation stays solid.
 | M7        | CD-block (HLE) + game boot + cartridge slot                 | ✅ complete  |
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
+| M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 
-Current test count: **521 workspace-wide, 0 failures.** Task-by-task
+Current test count: **523 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -49,6 +50,16 @@ quicksave / F9 quickload**. M8 also makes the **internal 32 KiB backup RAM** (th
 console's built-in "memory card") hardware-faithful, with the odd-byte packing
 real hardware uses, and persists it to a host `.bup` file so game saves survive a
 restart like a battery-backed console.
+
+**M10 adds CD-audio and live discs.** Games that stream Red Book CD-audio
+tracks as BGM (e.g. Romance of the Three Kingdoms V) now play their music —
+the CD-block decodes audio tracks and mixes them into the SCSP output. The
+CD-block also reads sectors through a `SectorSource` trait, so besides ripped
+images it can read an **original disc from a host optical drive**: build with
+`--features physical-disc` and pass `cdrom:<device>` (e.g. `cdrom:/dev/sr0`).
+That path uses **libcdio** and is the one place the workspace's
+`unsafe_code = "forbid"` is relaxed, confined to the feature-gated
+[`physdisc`](crates/physdisc) crate (see [ADR-0009](doc/adr/0009-physdisc-libcdio-ffi-crate.md)).
 
 **M9 is building an in-window OSD menu** (ZSNES/fwNES-style, ADR-0008): press
 **Esc** for a hand-rolled, software-composited menu — save/load state slots,
@@ -95,6 +106,9 @@ cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
   MC68EC000 + SCSP-DSP), the CD-block (HLE: disc image + TOC,
   buffer/filter/partition, read pump + transfer, ISO9660 FS, authentication),
   and the cartridge slot (Extension DRAM / backup-RAM / ROM carts).
+- [`crates/physdisc`](crates/physdisc) — live optical-drive `SectorSource`
+  via libcdio, feature-gated (`libcdio`); the only crate that uses `unsafe`
+  (FFI). Default build is a stub.
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
