@@ -49,8 +49,13 @@ fn main() -> ExitCode {
     let bios_path = match positionals.first() {
         Some(p) => p.clone(),
         None => {
-            eprintln!("usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd] [--cart=<kind>]");
+            eprintln!(
+                "usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd | cdrom:<device>] [--cart=<kind>]"
+            );
             eprintln!();
+            eprintln!(
+                "  cdrom:<device>         live optical drive (needs the physical-disc feature)"
+            );
             eprintln!("  --cart=ram1m | ram4m   Extension DRAM cart (1 MiB / 4 MiB)");
             eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
             eprintln!("  --cart=rom:<path>      game ROM cart image");
@@ -76,17 +81,10 @@ fn main() -> ExitCode {
         );
     }
 
-    // Optional game disc (CUE/BIN, raw ISO, or CloneCD CCD/IMG).
-    let disc = match positionals.get(1) {
-        Some(path) => match load_disc(path) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!("failed to load disc {path}: {e}");
-                return ExitCode::from(1);
-            }
-        },
-        None => None,
-    };
+    // Optional game disc, given as a spec: an image path (CUE/BIN, raw ISO, or
+    // CloneCD CCD/IMG) or a live drive `cdrom:<device>` (needs the
+    // `physical-disc` feature). Loaded in `run` via `insert_from_spec`.
+    let disc_spec = positionals.get(1).cloned();
 
     // Optional expansion cartridge.
     let cart = match cart_spec {
@@ -104,7 +102,7 @@ fn main() -> ExitCode {
     // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
     let save_base = std::path::PathBuf::from(&bios_path);
 
-    run(bios, disc, cart, save_base)
+    run(bios, disc_spec, cart, save_base)
 }
 
 /// Parse a `--cart=` spec into a [`Cartridge`]. Accepts `ram1m`/`ram4m`
@@ -128,10 +126,24 @@ fn parse_cart(spec: &str) -> Result<Cartridge, String> {
     }
 }
 
+/// Open a disc spec and insert it into the machine. A `cdrom:<device>` spec
+/// opens a live optical drive (via the `physdisc` crate; errors without the
+/// `physical-disc` feature); anything else is an image path. Both the launch
+/// and the OSD "Insert Disc" re-insert go through here, so the source type
+/// (image vs. live drive) stays in one place.
+fn insert_from_spec(sat: &mut saturn::Saturn, spec: &str) -> Result<(), String> {
+    if let Some(device) = spec.strip_prefix("cdrom:") {
+        sat.insert_disc(physdisc::PhysicalDisc::open(device)?);
+    } else {
+        sat.insert_disc(load_image_disc(spec)?);
+    }
+    Ok(())
+}
+
 /// Load a disc image, picking the parser by file extension: `.iso` (raw
 /// 2048-byte data track), `.cue` (CUE sheet + its `.bin`s), or `.ccd`
 /// (CloneCD control file + sibling `.img`).
-fn load_disc(path: &str) -> Result<saturn::disc::Disc, String> {
+fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
     use saturn::disc::Disc;
     use std::path::Path;
 
@@ -161,7 +173,7 @@ fn load_disc(path: &str) -> Result<saturn::disc::Disc, String> {
 #[cfg(feature = "sdl2-frontend")]
 fn run(
     bios: Vec<u8>,
-    disc: Option<saturn::disc::Disc>,
+    disc_spec: Option<String>,
     cart: Cartridge,
     save_base: std::path::PathBuf,
 ) -> ExitCode {
@@ -182,12 +194,15 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
-    // Keep a clone of the launched disc so the OSD "Insert Disc" can re-insert
-    // it after an eject.
-    let launched_disc = disc.clone();
-    if let Some(d) = disc {
-        saturn.insert_disc(d);
+    // Insert the launched disc (image or live drive); keep its spec so the OSD
+    // "Insert Disc" can re-insert it after an eject.
+    if let Some(spec) = &disc_spec
+        && let Err(e) = insert_from_spec(&mut saturn, spec)
+    {
+        eprintln!("failed to load disc {spec}: {e}");
+        return ExitCode::from(1);
     }
+    let launched_spec = disc_spec;
     saturn.insert_cartridge(cart);
 
     // Save-state quickslot and the persisted battery (internal backup RAM),
@@ -286,7 +301,7 @@ fn run(
                         _ => None,
                     };
                     if let Some(action) = action
-                        && dispatch_osd(action, &mut osd, &mut saturn, &save_base, &launched_disc)
+                        && dispatch_osd(action, &mut osd, &mut saturn, &save_base, &launched_spec)
                     {
                         break 'main; // Quit
                     }
@@ -394,7 +409,7 @@ fn dispatch_osd(
     osd: &mut osd::Osd,
     saturn: &mut saturn::Saturn,
     save_base: &std::path::Path,
-    launched_disc: &Option<saturn::disc::Disc>,
+    launched_spec: &Option<String>,
 ) -> bool {
     use osd::OsdAction;
     let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
@@ -424,11 +439,11 @@ fn dispatch_osd(
             saturn.eject_disc();
             osd.set_toast("Disc ejected", 120);
         }
-        OsdAction::ReinsertDisc => match launched_disc {
-            Some(d) => {
-                saturn.insert_disc(d.clone());
-                osd.set_toast("Disc inserted", 120);
-            }
+        OsdAction::ReinsertDisc => match launched_spec {
+            Some(spec) => match insert_from_spec(saturn, spec) {
+                Ok(()) => osd.set_toast("Disc inserted", 120),
+                Err(e) => osd.set_toast(format!("Insert failed: {e}"), 180),
+            },
             None => osd.set_toast("No disc to insert", 120),
         },
     }
@@ -438,7 +453,7 @@ fn dispatch_osd(
 #[cfg(not(feature = "sdl2-frontend"))]
 fn run(
     bios: Vec<u8>,
-    disc: Option<saturn::disc::Disc>,
+    disc_spec: Option<String>,
     cart: Cartridge,
     save_base: std::path::PathBuf,
 ) -> ExitCode {
@@ -452,8 +467,11 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
-    if let Some(d) = disc {
-        saturn.insert_disc(d);
+    if let Some(spec) = &disc_spec
+        && let Err(e) = insert_from_spec(&mut saturn, spec)
+    {
+        eprintln!("failed to load disc {spec}: {e}");
+        return ExitCode::from(1);
     }
     saturn.insert_cartridge(cart);
 

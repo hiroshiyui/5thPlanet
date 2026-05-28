@@ -572,8 +572,8 @@ impl Saturn {
     /// Insert a disc image into the CD-block. The drive moves to PAUSE at the
     /// start of the disc; the BIOS/game can then read the TOC, query sessions,
     /// and (in later M7 phases) read sectors and boot the game.
-    pub fn insert_disc(&mut self, disc: crate::disc::Disc) {
-        self.bus.cd_block.insert_disc(disc);
+    pub fn insert_disc<S: crate::disc::SectorSource + 'static>(&mut self, source: S) {
+        self.bus.cd_block.insert_disc(source);
     }
 
     /// Eject the current disc (inverse of [`insert_disc`]): the drive returns

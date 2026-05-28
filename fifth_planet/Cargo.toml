@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 saturn = { path = "../crates/saturn" }
 sh2 = { path = "../crates/sh2" }
+physdisc = { path = "../crates/physdisc" }
 sdl2 = { version = "0.37", optional = true }
 
 [features]
@@ -18,6 +19,10 @@ default = ["sdl2-frontend"]
 # runs a fixed number of frames, and dumps a one-line status report —
 # useful for the BIOS-boot regression in M3 task #8.
 sdl2-frontend = ["dep:sdl2"]
+# Enable live physical-disc support via libcdio (`--disc=cdrom:<device>`).
+# Off by default so the standard build needs no libcdio; enabling it links
+# the system library through the `physdisc` crate.
+physical-disc = ["physdisc/libcdio"]
 
 [lints]
 workspace = true

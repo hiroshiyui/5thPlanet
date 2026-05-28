@@ -1,0 +1,23 @@
+[package]
+name = "physdisc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Live optical-drive SectorSource for 5thPlanet (libcdio, feature-gated)."
+
+[dependencies]
+saturn = { path = "../saturn" }
+
+[features]
+# Off by default: without it the crate compiles to a stub whose `open` errors,
+# so `cargo build --workspace` and CI need no libcdio. Enabling `libcdio` links
+# the system library and provides live physical-disc reads (needs libcdio-dev
+# + an optical drive).
+libcdio = []
+
+# NOTE: this crate intentionally does NOT set `[lints] workspace = true`, so it
+# does not inherit the workspace `unsafe_code = "forbid"` lint — the libcdio FFI
+# requires `unsafe`. This is the documented exception; see ADR-0009. The unsafe
+# is confined to this one feature-gated crate; the cores + `saturn` stay
+# forbid-unsafe.

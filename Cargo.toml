@@ -5,6 +5,7 @@ members = [
     "crates/saturn",
     "crates/scu_dsp",
     "crates/m68k",
+    "crates/physdisc",
     "fifth_planet",
 ]
 
