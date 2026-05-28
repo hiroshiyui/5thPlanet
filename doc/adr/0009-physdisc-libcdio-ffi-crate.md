@@ -40,6 +40,11 @@ crate `crates/physdisc`** that is the single, documented exception to ADR-0007:
   `physical-disc` feature turns it on (`cdrom:<device>` disc specs).
 - `PhysicalDisc` implements `saturn::disc::SectorSource` (ADR-introduced in M10
   Phase 1), so the CD-block is unaware whether it's reading an image or a drive.
+- **Data sectors are read through the kernel's cooked block device**
+  (`read_at`/`seek_read`), not libcdio. libcdio's sector reads issue SG_IO
+  `READ CD`, which needs `CAP_SYS_RAWIO`; the cooked block read returns the
+  2048-byte payload to an ordinary `cdrom`-group user. libcdio is used for what
+  the block device can't give: the TOC (track types/LSNs) and CD-DA extraction.
 
 ## Consequences
 
@@ -51,10 +56,11 @@ crate `crates/physdisc`** that is the single, documented exception to ADR-0007:
   the opt-in feature; the FFI signatures/enum values are hand-bound to the
   documented libcdio API and must track it; CD-DA extraction quality varies by
   drive; Mode-2 subheader filtering isn't reconstructed from a drive's cooked
-  reads (image discs still expose it). The FFI is functionally verified
-  against a CUE/BIN image (open + TOC + data + CD-DA reads, `libcdio` feature,
-  `#[ignore]`d); reading from a physical *device* (vs. an image) still wants a
-  real drive to confirm. CI stays libcdio-free (the test is feature-gated).
+  reads (image discs still expose it). Verified end to end on a **real drive**
+  (Virtua Fighter 2, `/dev/sr0`): TOC (34 tracks), data via the cooked block
+  read, and CD-DA via libcdio — all as a normal `cdrom`-group user, and the
+  emulator boots from the disc. Also covered by a `#[ignore]`d CUE/BIN image
+  test. CI stays libcdio-free (the libcdio paths are feature-gated + ignored).
 
 ## Alternatives considered
 

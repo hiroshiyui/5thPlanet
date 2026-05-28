@@ -47,8 +47,8 @@ active** — Phase 1 done: a hand-rolled, software-composited in-window menu
 it. Graphics / controller / region-BIOS / cartridge submenus are the remaining
 phases. · **M10 (live physical disc + CDDA→SCSP) ✅** — the `SectorSource`
 trait, CD-audio BGM mixed into the SCSP, and live optical-drive reads via the
-feature-gated `physdisc`/libcdio crate (ADR-0009; the FFI is verified against a
-CUE/BIN image, a physical drive still to confirm). See the Milestone 10 section.
+feature-gated `physdisc`/libcdio crate (ADR-0009; verified on a real drive with
+Virtua Fighter 2). See the Milestone 10 section.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -561,7 +561,7 @@ original disc from a host drive (see ADR-0009). The security ring is a non-issue
 |---|-------|-------|
 | 1 | **`SectorSource` trait** ✅ done | `disc::SectorSource` (+ `TrackInfo`) decouples the CD-block from the in-memory `Disc`: reads fill a caller buffer, so a live drive can back the source and reads are on-demand. `CdBlock.disc` is now `Option<Box<dyn SectorSource>>`; `insert_disc` is generic; save-state media identity uses `fingerprint()`. `SaturnBus`/`CdBlock` drop `Clone`. Pure refactor — suite green, golden unchanged. |
 | 2 | **CDDA→SCSP** ✅ done | Audio tracks decode to a CD-DA FIFO in the read pump (2352-byte sector → 588 stereo frames); `Saturn::take_audio` sums it with the SCSP output. Games with CD-audio BGM (e.g. Romance of the Three Kingdoms V) now play their music. 2 tests. Full level for now (SCSP CD-input level/pan deferred). |
-| 3 | **Physical drive (`physdisc` + libcdio)** ✅ done | New feature-gated `crates/physdisc`: `PhysicalDisc` impls `SectorSource` via libcdio (TOC + raw sectors + CD-DA), cross-platform. Default = stub (no libcdio); the frontend's `physical-disc` feature + a `cdrom:<device>` disc spec enable it. The crate is the sole ADR-0007 unsafe exception (ADR-0009). The libcdio FFI is functionally verified against a CUE/BIN image (TOC + data + CD-DA reads; `#[ignore]`d, feature-gated test); reading a physical *device* still wants a drive to confirm. |
+| 3 | **Physical drive (`physdisc` + libcdio)** ✅ done | New feature-gated `crates/physdisc`: `PhysicalDisc` impls `SectorSource` via libcdio (TOC + raw sectors + CD-DA), cross-platform. Default = stub (no libcdio); the frontend's `physical-disc` feature + a `cdrom:<device>` disc spec enable it. The crate is the sole ADR-0007 unsafe exception (ADR-0009). Data sectors read through the kernel's cooked block device (no `CAP_SYS_RAWIO`); libcdio handles the TOC + CD-DA. **Verified on a real drive** (Virtua Fighter 2 on `/dev/sr0`): TOC, data, CD-DA, and the emulator boots from the disc — as a normal `cdrom`-group user. |
 
 ## Later milestones (queued)
 
