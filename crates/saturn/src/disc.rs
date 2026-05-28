@@ -91,6 +91,46 @@ impl Track {
     }
 }
 
+/// A track's geometry by value — the trait-object form of [`Track`] (which the
+/// CD-block consumes without borrowing the source's internals).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackInfo {
+    pub number: u8,
+    /// `(control << 4) | adr`: `0x41` data, `0x01` audio.
+    pub ctrl_addr: u8,
+    pub is_audio: bool,
+    pub start_fad: u32,
+    pub length: u32,
+}
+
+/// A source of CD sectors the CD-block reads from: an in-memory image
+/// ([`Disc`]) or — behind the `physdisc` crate — a live optical drive.
+///
+/// Reads fill a caller-supplied buffer rather than returning a borrow, so a
+/// live drive (which has no persistent backing buffer) can implement it; the
+/// read pump copies the bytes into a block anyway. Implementors must be
+/// `Send` (the bus is moved across the scheduler) and `Debug`.
+pub trait SectorSource: core::fmt::Debug + Send {
+    /// The 408-byte Saturn TOC (see [`Disc::toc`]).
+    fn toc(&self) -> [u8; 408];
+    fn first_track(&self) -> u8;
+    fn last_track(&self) -> u8;
+    fn lead_out_fad(&self) -> u32;
+    /// The track containing `fad`, by value.
+    fn track_at_fad(&self, fad: u32) -> Option<TrackInfo>;
+    /// Fill `out[..2048]` with the sector's user payload; `true` on success.
+    fn read_sector(&self, fad: u32, out: &mut [u8]) -> bool;
+    /// Fill `out` with the full on-disc sector (2352 raw, or 2048 cooked) and
+    /// return the byte count written (`0` = no such sector). `out` must be
+    /// ≥ 2352 bytes.
+    fn read_full_sector(&self, fad: u32, out: &mut [u8]) -> usize;
+    /// Mode-2 subheader `(chan, fnum, subm, cinf)`, if any (see [`Disc::subheader`]).
+    fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)>;
+    /// A stable identity for save-state media validation (replaces hashing the
+    /// whole in-memory image, which a live drive doesn't have).
+    fn fingerprint(&self) -> u64;
+}
+
 /// A parsed disc image: the concatenated sector bytes plus the track table.
 #[derive(Clone, Debug)]
 pub struct Disc {
@@ -408,6 +448,63 @@ impl Disc {
         toc[101 * 4 + 2] = (self.lead_out_fad >> 8) as u8;
         toc[101 * 4 + 3] = self.lead_out_fad as u8;
         toc
+    }
+}
+
+impl SectorSource for Disc {
+    fn toc(&self) -> [u8; 408] {
+        Disc::toc(self)
+    }
+    fn first_track(&self) -> u8 {
+        Disc::first_track(self)
+    }
+    fn last_track(&self) -> u8 {
+        Disc::last_track(self)
+    }
+    fn lead_out_fad(&self) -> u32 {
+        Disc::lead_out_fad(self)
+    }
+    fn track_at_fad(&self, fad: u32) -> Option<TrackInfo> {
+        Disc::track_at_fad(self, fad).map(|t| TrackInfo {
+            number: t.number,
+            ctrl_addr: t.ctrl_addr(),
+            is_audio: t.mode == TrackMode::Audio,
+            start_fad: t.start_fad,
+            length: t.length,
+        })
+    }
+    fn read_sector(&self, fad: u32, out: &mut [u8]) -> bool {
+        match Disc::read_sector(self, fad) {
+            Some(s) => {
+                let n = s.len().min(out.len());
+                out[..n].copy_from_slice(&s[..n]);
+                n == SECTOR_USER
+            }
+            None => false,
+        }
+    }
+    fn read_full_sector(&self, fad: u32, out: &mut [u8]) -> usize {
+        match Disc::read_full_sector(self, fad) {
+            Some(s) => {
+                let n = s.len().min(out.len());
+                out[..n].copy_from_slice(&s[..n]);
+                n
+            }
+            None => 0,
+        }
+    }
+    fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
+        Disc::subheader(self, fad)
+    }
+    fn fingerprint(&self) -> u64 {
+        // FNV-1a over the image bytes (same identity the M8 save-state media
+        // check used before the trait existed).
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &self.image {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
     }
 }
 

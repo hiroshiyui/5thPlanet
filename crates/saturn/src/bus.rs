@@ -69,7 +69,9 @@ const LOW_WRAM_WAITS: u32 = 3;
 const HIGH_WRAM_WAITS: u32 = 1;
 const STUB_WAITS: u32 = 0;
 
-#[derive(Clone, Debug)]
+// Not `Clone`: the CD-block holds a `Box<dyn SectorSource>` (an image or a
+// live drive) that isn't cloneable, and nothing clones the bus anyway.
+#[derive(Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SaturnBus {
     pub bios: BiosRom,

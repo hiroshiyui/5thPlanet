@@ -102,7 +102,7 @@ impl Saturn {
             magic: MAGIC,
             version: VERSION,
             bios_fp: fnv1a(self.bus.bios.image()),
-            disc_fp: self.bus.cd_block.disc().map(|d| fnv1a(d.image())),
+            disc_fp: self.bus.cd_block.disc().map(|d| d.fingerprint()),
         };
         // (&Header, &Saturn) so the decode side reads them back in order.
         bincode::serde::encode_to_vec((&header, self), bincode_config())
@@ -131,7 +131,7 @@ impl Saturn {
         if header.bios_fp != fnv1a(self.bus.bios.image()) {
             return Err(SaveStateError::BiosMismatch);
         }
-        let current_disc_fp = self.bus.cd_block.disc().map(|d| fnv1a(d.image()));
+        let current_disc_fp = self.bus.cd_block.disc().map(|d| d.fingerprint());
         if header.disc_fp != current_disc_fp {
             return Err(SaveStateError::DiscMismatch);
         }

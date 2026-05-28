@@ -32,7 +32,7 @@
 //! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
 //! status is `PAUSE`.
 
-use crate::disc::{Disc, FAD_OFFSET};
+use crate::disc::{FAD_OFFSET, SectorSource};
 
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
 pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
@@ -186,7 +186,9 @@ fn le32(b: &[u8], o: usize) -> u32 {
 /// corrected to 479_151 — don't re-tie it to the frame length.
 const PERIODIC_CYCLES: u64 = 477_273;
 
-#[derive(Clone, Debug)]
+// Not `Clone`: holds a `Box<dyn SectorSource>` (image or live drive) that
+// isn't cloneable; nothing clones a CdBlock.
+#[derive(Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CdBlock {
     pub hirq: u16,
@@ -230,12 +232,13 @@ pub struct CdBlock {
     /// The inserted disc image, if any. `None` is the power-on "no disc"
     /// state the existing no-disc command subset already models.
     ///
-    /// `#[serde(skip)]`: the disc image can be hundreds of MB and is external
-    /// media, so save states reference it rather than embedding it. The
-    /// *logical* playback position (FAD, status, partitions) lives in the
-    /// fields above and is serialized; `load_state` re-grafts the live `Disc`.
+    /// `#[serde(skip)]`: the sector source is external media (an image, maybe
+    /// hundreds of MB, or a live drive), so save states reference it rather
+    /// than embedding it. The *logical* playback position (FAD, status,
+    /// partitions) lives in the fields above and is serialized; `load_state`
+    /// re-grafts the live source.
     #[serde(skip)]
-    disc: Option<Disc>,
+    disc: Option<Box<dyn SectorSource>>,
 
     /// Host-readable data staged by a command (Get TOC for now), streamed out
     /// 16-bit big-endian through the data FIFO at `0x8000`. `xfer_pos` is the
@@ -380,15 +383,15 @@ impl CdBlock {
     /// Insert (or replace) a disc. The drive returns to PAUSE at the start of
     /// track 1 (FAD 150), the geometry the status reports now carry, and a
     /// disc-change is flagged (`HIRQ.DCHG`) so the BIOS re-reads the TOC.
-    pub fn insert_disc(&mut self, disc: Disc) {
-        self.ctrladdr = disc
+    pub fn insert_disc<S: SectorSource + 'static>(&mut self, source: S) {
+        self.ctrladdr = source
             .track_at_fad(FAD_OFFSET)
-            .map_or(0x41, |t| t.ctrl_addr());
-        self.track = disc.first_track();
+            .map_or(0x41, |t| t.ctrl_addr);
+        self.track = source.first_track();
         self.index = 1;
         self.fad = FAD_OFFSET;
         self.status = STAT_PAUSE;
-        self.disc = Some(disc);
+        self.disc = Some(Box::new(source));
         self.disk_changed = true;
         self.hirq |= HIRQ_DCHG;
     }
@@ -412,23 +415,23 @@ impl CdBlock {
         self.hirq |= HIRQ_DCHG;
     }
 
-    /// Borrow the inserted disc, if any — used to fingerprint the media for
-    /// save-state validation (the disc is `#[serde(skip)]`'d).
-    pub fn disc(&self) -> Option<&Disc> {
-        self.disc.as_ref()
+    /// Borrow the inserted sector source, if any — used to fingerprint the
+    /// media for save-state validation (the source is `#[serde(skip)]`'d).
+    pub fn disc(&self) -> Option<&dyn SectorSource> {
+        self.disc.as_deref()
     }
 
-    /// Move the disc out (leaving the drive disc-less). Used by
-    /// `Saturn::load_state` to re-graft the live disc onto a decoded state,
-    /// which never carries the (skipped) disc image itself.
-    pub fn take_disc(&mut self) -> Option<Disc> {
+    /// Move the sector source out (leaving the drive disc-less). Used by
+    /// `Saturn::load_state` to re-graft the live source onto a decoded state,
+    /// which never carries the (skipped) media itself.
+    pub fn take_disc(&mut self) -> Option<Box<dyn SectorSource>> {
         self.disc.take()
     }
 
-    /// Re-attach a disc moved out by [`take_disc`] without disturbing the
+    /// Re-attach a source moved out by [`take_disc`] without disturbing the
     /// already-restored logical state (status/FAD/partitions). Unlike
     /// [`insert_disc`], it does *not* reset the drive or raise `DCHG`.
-    pub fn restore_disc(&mut self, disc: Option<Disc>) {
+    pub fn restore_disc(&mut self, disc: Option<Box<dyn SectorSource>>) {
         self.disc = disc;
     }
 
@@ -575,18 +578,20 @@ impl CdBlock {
             let Some(disc) = self.disc.as_ref() else {
                 return false;
             };
+            let mut buf = [0u8; 2352];
             // Store `sectlenin` bytes: the 2048 user payload for the common
             // case, else a leading slice of the full on-disc sector.
             let data = if len == 2048 {
-                match disc.read_sector(fad) {
-                    Some(s) => s.to_vec(),
-                    None => return false,
+                if !disc.read_sector(fad, &mut buf[..2048]) {
+                    return false;
                 }
+                buf[..2048].to_vec()
             } else {
-                match disc.read_full_sector(fad) {
-                    Some(s) => s[..len.min(s.len())].to_vec(),
-                    None => return false,
+                let n = disc.read_full_sector(fad, &mut buf);
+                if n == 0 {
+                    return false;
                 }
+                buf[..len.min(n)].to_vec()
             };
             (data, disc.subheader(fad))
         };
@@ -766,9 +771,12 @@ impl CdBlock {
         if fileno == 0xFF_FFFF {
             let mut pvd = None;
             if let Some(disc) = self.disc.as_ref() {
+                let mut sect = [0u8; 2048];
                 for cfad in 166..200u32 {
-                    let Some(sect) = disc.read_sector(cfad) else { break };
-                    if sect.len() >= 6 && &sect[1..6] == b"CD001" {
+                    if !disc.read_sector(cfad, &mut sect) {
+                        break;
+                    }
+                    if &sect[1..6] == b"CD001" {
                         match sect[0] {
                             1 => {
                                 pvd = Some(sect.to_vec());
@@ -803,10 +811,12 @@ impl CdBlock {
         let nsect = dirlen.div_ceil(2048);
         let mut buf: Vec<u8> = Vec::with_capacity(nsect * 2048);
         if let Some(disc) = self.disc.as_ref() {
+            let mut sect = [0u8; 2048];
             for i in 0..nsect as u32 {
-                match disc.read_sector(fad + i) {
-                    Some(s) => buf.extend_from_slice(s),
-                    None => buf.resize(buf.len() + 2048, 0),
+                if disc.read_sector(fad + i, &mut sect) {
+                    buf.extend_from_slice(&sect);
+                } else {
+                    buf.resize(buf.len() + 2048, 0);
                 }
             }
         }
