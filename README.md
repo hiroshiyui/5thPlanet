@@ -22,7 +22,7 @@ foundation stays solid.
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
 | M7        | CD-block (HLE) + game boot + cartridge slot                 | 🚧 active    |
 
-Current test count: **471 workspace-wide, 0 failures.** Task-by-task
+Current test count: **483 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
