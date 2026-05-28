@@ -86,10 +86,13 @@ met** — see M4.
 Goal: boot a real BIOS to the SEGA logo, confirmed visually. **Achieved
 (2026-05-28):** the BIOS boots to the animated SEGA splash (blue ringed-planet
 on green, "TM & © 1995 SEGA. All rights reserved."), the framebuffer settles to
-a stable image by frame ~285, and the `bios_boot` golden is committed
+a stable image by frame ~285, and the `bios_boot` golden was committed
 (`0xF862E76BE919D7A6` at 300 frames). The blocker turned out to be a **single
 missing interrupt**, found via a re-syncing PC diff against the verified MAME
 reference (see below) — not the "cycle-phase" question we'd parked on.
+*(Post-M4, five more fixes completed the renderer so the splash pixel-matches MAME's
+bright brushed-metal logo; the golden was retargeted to frame 200 and is now
+`0x2C379F92CE1B63F7` — see "Splash now renders fully" below.)*
 
 | # | Task | Status |
 |---|------|--------|
@@ -239,17 +242,39 @@ Diagnosis: an env-gated `SMPC_LOG` trace in `system.rs::drain_smpc` showed the p
 poll stop with `IMS=0x1FF01FF0`; cross-checking that offset against MAME's `regs_map`
 exposed the `0x10` shift.)*
 
-### Post-splash menu rendering — open (2026-05-28)
+### Splash now renders fully — pixel-matches MAME (2026-05-28)
 
-With the boot unblocked, the post-splash screen renders **garbage**: a diagonal tile
-scatter + starfield = a VDP2 **RBG0 rotation background** (`BGON=0x1011`) our rotation
-path mis-renders. The MAME-style **full-logo still-frame** (brushed-metal background +
-"SEGA SATURN" wordmark) is also never drawn — our path goes planet-anim → green →
-rotation-menu. **Next:** debug VDP2 RBG0/rotation rendering for the BIOS menu and locate
-the full-logo draw path. (The MAME reference boots to the "Set Language" menu — verify
-against it.)
+With the boot unblocked, four further fixes took the splash from a frozen dark blob to
+the genuine bright brushed-metal "SEGA SATURN" logo, byte-verified against MAME at the
+`BGON=0x080C` phase (identical CRAM / VRAM char data / registers → identical pixels):
 
-## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
+- **VDP1 automatic-draw, `7842133`** — the splash uses `PTMR` PTM=`0b10` (re-render the
+  command list every frame), not a one-shot draw on the register write. We only redrew
+  on the write, so the single populated frame buffer ping-ponged under the per-frame
+  swap and the logo strobed at 30 Hz. Now `frame_change` re-renders in auto-draw mode.
+- **VDP2 8bpp char addressing, `bafa590`** — character numbers are in `0x20`-byte units;
+  an 8bpp cell is `0x40` bytes (two units), so the byte base is `char × 0x20`. We used
+  `char × 64` and read the wrong VRAM region, so NBG2/NBG3 (the metal layers) drew
+  garbage.
+- **VDP2 colour-RAM address offset, `ca97b38`** — CRAOFA/CRAOFB (`NxCAOS << 8`) select a
+  CRAM bank per layer; NBG3's silver palette is at CRAM `0x300+`. We ignored the offset
+  and read the dark bank 0, rendering the logo dark maroon.
+- **VDP2 transparent-pen-as-solid, `122db98`** — BGON `NxTPON`/`R0TPON` draw palette code
+  0 as the opaque colour `CRAM[offset]` rather than transparent. NBG3 sets it; we always
+  treated code 0 as transparent, leaving black speckle in the metal.
+
+`bios_boot` golden retargeted to frame 200 (the stable splash plateau) and tracked the
+renders: `0xED48761869D728FD` → `0x871FD74D6C91AF08` → `0x2D966904356AFCC3` →
+`0x2C379F92CE1B63F7` (final). Boot speed: the debug build runs ~5–6 fps; `--release`
+runs ~74 fps (use it to see the splash quickly).
+
+**Open follow-up:** the post-splash **CD-player "Drive empty" screen** (the `BGON=0x1011`
+phase — NBG0 bitmap + RBG0 rotation) benefits from the same VDP2 fixes but hasn't been
+re-verified against MAME's snapshot; check it when M7 brings a disc in. A minor ~2×
+*emulated-time* slowness in BIOS init (our cycle model charges a touch high) is also
+noted for a later look.
+
+## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) ✅ complete
 
 Turn the remaining presence-stubs into real chips, in the order set by the user —
 **VDP1, then MC68EC000, then VDP2**. Each is a self-contained, independently
