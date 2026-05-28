@@ -197,6 +197,26 @@ impl Vdp2Regs {
         }
     }
 
+    /// Colour-RAM address offset for NBG`n` (CRAOFA, 0x0E4 — 3 bits per layer,
+    /// N0..N3 at bits 2:0 / 6:4 / 10:8 / 14:12). The value selects a CRAM bank
+    /// by supplying the high bits of the palette index (`offset × 0x100`); a
+    /// layer's effective colour is `CRAM[(offset << 8) | dot]`. The BIOS splash
+    /// puts NBG3's silver palette at offset 3 (CRAM 0x300+), so ignoring this
+    /// read the dark CRAM 0x000+ bank instead.
+    pub fn nbg_color_ram_offset(&self, n: usize) -> usize {
+        (((self.read16(0x0E4) >> (n * 4)) & 0x7) as usize) << 8
+    }
+
+    /// Colour-RAM address offset for rotation `which` (CRAOFB, 0x0E6 — RBG0 at
+    /// bits 2:0). RBG1 (rare) reuses NBG0's offset.
+    pub fn rbg_color_ram_offset(&self, which: usize) -> usize {
+        if which == 0 {
+            ((self.read16(0x0E6) & 0x7) as usize) << 8
+        } else {
+            self.nbg_color_ram_offset(0)
+        }
+    }
+
     /// Cell size for NBG`n`: 0 = 1×1 cell (8×8 px), 1 = 2×2 cells (16×16 px).
     pub fn nbg_char_size_2x2(&self, n: usize) -> bool {
         let bit = match n {
