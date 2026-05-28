@@ -17,16 +17,21 @@ foundation stays solid.
 | M1        | Cycle-accurate SH-2 (SH7604) core                           | ✅ complete  |
 | M2        | Saturn bus, dual SH-2, event-driven scheduler               | ✅ complete  |
 | M3        | SCU, SMPC, VDP2 minimal, SCU-DSP, SDL2 window (scaffolding)  | ✅ complete  |
-| M4        | Finish the M3 stretch — SEGA splash on screen               | 🚧 active   |
-| M5+       | VDP1 rendering, audio (SCSP+M68k), save states, CD-block     | queued       |
+| M4        | BIOS splash on screen                                       | ✅ complete  |
+| M5        | Chip-coverage build-out — VDP1, MC68EC000, full VDP2        | ✅ complete  |
+| M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
+| M7        | CD-block (HLE) + game boot + cartridge slot                 | 🚧 active    |
 
-Current test count: **278 workspace-wide, 0 failures.** Task-by-task
+Current test count: **471 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
-M4 is the splash push. A real BIOS now boots far past M3's early init —
-verified bit-for-bit against a reference emulator (see
-[Acknowledgements](#acknowledgements)) — onto the genuine boot path;
-the remaining gap is VDP2 raster-timing precision.
+A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
+against the primary reference emulator (see [Acknowledgements](#acknowledgements)):
+the bright brushed-metal "SEGA SATURN" logo, correct down to the VDP2 colour-RAM
+banking and transparent-pen handling. All eight chips are modelled — the two
+SH-2s, MC68EC000, VDP1 (full sprite/polygon plotter), VDP2 (multi-layer NBG/RBG
+compositor with rotation), SCU + SCU-DSP, and SCSP (slot/FM audio + SCSP-DSP).
+M7 is now building the CD-block (high-level-emulated) so commercial discs boot.
 
 ## Quick start
 
@@ -50,15 +55,17 @@ cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
 
 - [`crates/sh2`](crates/sh2) — cycle-accurate SH-2 (SH7604) CPU core.
   `no_std` + `alloc`, no I/O.
-- [`crates/saturn`](crates/saturn) — Saturn system: memory map, dual
-  SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator, VDP2 (minimal
-  NBG0 renderer + live raster timing), and address-space stubs for VDP1
-  and the CD-block. SCSP and full VDP1 rendering to follow.
+- [`crates/m68k`](crates/m68k) — MC68EC000 core (the Saturn's SCSP sound
+  CPU). `no_std` + `alloc`, library-shaped like `sh2`.
 - [`crates/scu_dsp`](crates/scu_dsp) — SCU's embedded 32-bit DSP.
-  Standalone for now; wired into the SCU host as later microcode
-  needs surface.
+- [`crates/saturn`](crates/saturn) — Saturn system glue: memory map, dual
+  SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator, VDP1 (full
+  sprite/polygon plotter), VDP2 (multi-layer NBG/RBG compositor with
+  rotation + live raster timing), SCSP (slot/FM audio engine + hosted
+  MC68EC000 + SCSP-DSP), and the CD-block (HLE host interface; full HLE
+  engine is M7).
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
-  framebuffer upload, or headless), behind a default-on feature.
+  framebuffer upload + audio, or headless), behind a default-on feature.
 
 ## BIOS
 

@@ -17,8 +17,14 @@
 //!   IST interrupt aggregator, A-bus configuration, version. The DSP
 //!   itself is the standalone `scu_dsp` crate.
 //! - [`vdp2`] — background generator: registers + VRAM + CRAM + a
-//!   minimal NBG0 renderer. [`vdp1`] and [`cd_block`] are address-space
-//!   presence stubs (no plotter / no SH-1 yet).
+//!   multi-layer NBG/RBG compositor (`vdp2::renderer`) with rotation,
+//!   colour calculation, windows, and per-line scroll/zoom.
+//! - [`vdp1`] — sprite/polygon engine: a full command-list plotter
+//!   (`vdp1::plotter`) into a double-buffered frame buffer.
+//! - [`scsp`] — Sound Processor: 32-slot FM/PCM engine + SCSP-DSP +
+//!   the hosted MC68EC000 (`m68k` crate) in sound RAM.
+//! - [`cd_block`] — CD-block, high-level-emulated: the host-interface
+//!   command protocol is done; the full HLE engine is M7.
 //! - [`scheduler`] — `SchedEntity` trait + linear-scan `Scheduler`.
 //!   `Sh2Entity` wraps `sh2::Cpu`; `CdBlockEntity` is the CD-block's
 //!   sub-frame periodic-firmware timer; `SaturnEntity` is the
@@ -29,11 +35,12 @@
 //!
 //! # Milestone status
 //!
-//! - M2 (bus + scheduler + dual SH-2) and M3 (SCU + SMPC + VDP2
-//!   minimal + SCU-DSP + SDL2 scaffolding) complete.
-//! - M4 (BIOS-to-splash) active: SMPC INTBACK timing, VDP1/CD-block
-//!   presence stubs, VDP2 register-decode fidelity, and VDP2 raster
-//!   timing have landed; remaining is raster-timing precision.
+//! - M2–M6 complete: bus + scheduler + dual SH-2 (M2); SCU + SMPC +
+//!   VDP2-minimal + SCU-DSP + SDL2 (M3); BIOS-to-splash, now pixel-
+//!   matching MAME (M4); VDP1 plotter + MC68EC000 + full VDP2 (M5);
+//!   SCSP audio (M6).
+//! - M7 active: the CD-block (HLE) — disc images, buffer/filter engine,
+//!   ISO9660 filesystem, and game boot.
 //!
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 

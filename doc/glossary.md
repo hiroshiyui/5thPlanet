@@ -37,6 +37,10 @@ M3 stub as A-bus.
 `0x0018_0000..0x001F_FFFF`. Stored in `crates/saturn/src/memory.rs`
 as `Ram`; mirrors across its 512 KiB window.
 
+**BGON** — VDP2 Screen Display Enable register (`0x05F8_0020`). Bits
+0..5 enable [NBG]0–3 / [RBG]0–1; bits 8..12 ([TPON]) make each layer's
+palette code 0 a solid colour instead of transparent.
+
 **BIOS** — Saturn boot ROM, 512 KiB at `0x0000_0000..0x000F_FFFF`
 (mirrored to `0x0010_0000`). Copyrighted by SEGA — see `bios/README.md`
 for the don't-commit policy.
@@ -94,6 +98,14 @@ between scheduler batches.
 **CRAM** — Color RAM. VDP2's 4 KiB palette memory at
 `0x05F0_0000..0x05F0_0FFF`. 1024 entries, 16 bits each (RGB555).
 Modeled in `crates/saturn/src/vdp2/cram.rs`.
+
+**CRAOFA / CRAOFB** — Colour-RAM Address Offset registers (VDP2,
+`0x05F8_00E4` / `0x05F8_00E6`). 3 bits per layer; the value `<< 8` is
+the high bits of that layer's [CRAM] index, selecting one of eight
+256-entry banks. A paletted dot's colour is `CRAM[(NxCAOS << 8) | dot]`.
+The BIOS splash puts NBG3's silver palette in bank 3 (`CRAM 0x300+`),
+so ignoring this draws the wrong (dark) bank — see the renderer's
+`nbg_color_ram_offset` / `rbg_color_ram_offset`.
 
 **Cycle-stealing** — DMA mode where the controller takes single bus
 cycles between SH-2 accesses rather than holding the bus for the
@@ -156,9 +168,10 @@ on-chip peripherals.
 ## F
 
 **Framebuffer** — VDP1 has a 256 KiB dual framebuffer at
-`0x05C8_0000`. VDP2 composites its layers + the VDP1 framebuffer per
-pixel into the final video output. M3 renders a synthetic RGBA8888
-frame from VDP2 layers only; VDP1 stays unimplemented.
+`0x05C8_0000`: the plotter draws into the *draw* buffer while VDP2
+composites the *display* buffer, swapped at the frame boundary (see
+[PTMR]). VDP2 composites its NBG/RBG layers + the VDP1 framebuffer per
+pixel into the final RGBA8888 output.
 
 **FNV-1a** — Hash function used by `harness::state_digest` to
 fingerprint CPU + memory state in the ROM regression harness.
@@ -296,13 +309,21 @@ scoreboard in `sh2::pipeline::Pipeline`.
 **PR** — Procedure Register. SH-2 holds the return address for
 `BSR` / `BSRF` / `JSR` here. `RTS` jumps to PR (with a delay slot).
 
+**PTMR / PTM** — [VDP1] Plot Trigger register (`0x05D0_0004`); PTM =
+bits 1:0. `0b00` idle, `0b01` "draw by request" (plot once on this
+write), `0b10` "automatic" (re-render the command list every frame at
+the [framebuffer] swap). The BIOS splash uses automatic mode — drawing
+only on the register write left one buffer empty and strobed the logo.
+
 ---
 
 ## R
 
 **RBG0 / RBG1** — Rotation Background layers in VDP2. Like [NBG]s but
-support per-pixel rotation/scale via a rotation parameter table.
-Out of M3 scope.
+mapped through a rotation parameter table (affine transform) before
+sampling. Fully rendered (M5): bitmap or 4×4-plane tile field, per-line
+coefficient table, and screen-over modes — `crates/saturn/src/vdp2/
+rotation.rs` + `renderer.rs`.
 
 **RESENAB / RESDISA** — SMPC commands **0x19 / 0x1A**. Enable /
 disable the reset button (which, when enabled, makes the SMPC NMI the
@@ -397,6 +418,13 @@ by `BT` / `BF` / `BT/S` / `BF/S`.
 **TCR (DMA)** — Transfer Count Register. Per-DMA-channel byte count.
 Channel 0 carries 20 bits; channels 1+2 carry 12.
 
+**TPON (NxTPON / R0TPON)** — "Transparent-pen as solid" bits in VDP2
+[BGON] (bits 8..12, one per background layer). When set, palette **code
+0 is drawn as the opaque colour** `CRAM[offset]` instead of being
+treated as transparent. The BIOS splash sets it on NBG3 so the metal's
+code-0 dots fill with silver rather than showing the backdrop through
+them — see the renderer's `nbg_transparent_pen_solid`.
+
 **TVMD** — VDP2 TV Mode register. Selects resolution, interlace,
 border colour. Master switch — bit 15 enables video output entirely.
 
@@ -427,18 +455,23 @@ synchronize with the raster. `Saturn::update_video_timing` derives it
 live from the global cycle (≈1813 cycles per line) so it isn't a
 frozen stub.
 
-**VDP1** — Video Display Processor 1. Draws sprites and polygons into
-a 256 KiB dual framebuffer. The framebuffer is composited with VDP2's
-layers by VDP2's compositor. M4 adds an **address-space presence stub**
-(`crates/saturn/src/vdp1/`): VRAM (512 KiB at `0x05C0_0000`), frame
-buffer (256 KiB at `0x05C8_0000`), 11 registers at `0x05D0_0000` with
-the PTMR→EDSR draw-end handshake — no plotter. Sprite/polygon rendering
-is M5.
+**VDP1** — Video Display Processor 1. Draws sprites and polygons into a
+256 KiB dual [framebuffer], composited with VDP2's layers by VDP2's
+compositor. `crates/saturn/src/vdp1/` is a **full plotter** (M5):
+VRAM (512 KiB at `0x05C0_0000`), the dual frame buffer (`0x05C8_0000`),
+11 registers at `0x05D0_0000`, and a command-list rasteriser
+(`plotter.rs`) for textured / scaled / distorted sprites, polygons and
+lines with gouraud shading and the colour-calc modes. Draw is kicked by
+[PTMR]; draw-end latches `EDSR.CEF` and raises the SCU sprite-draw-end
+interrupt.
 
 **VDP2** — Video Display Processor 2. Background generator with 4
-NBG + 2 RBG layers, sprite-layer compositing, and the final video
-output. Owns VRAM (512 KiB at `0x05E0_0000`) and CRAM (4 KiB at
-`0x05F0_0000`). Minimal M3 renderer handles NBG0 only.
+[NBG] + 2 [RBG] layers, [VDP1] sprite-layer compositing, and the final
+video output. Owns VRAM (512 KiB at `0x05E0_0000`) and [CRAM] (4 KiB at
+`0x05F0_0000`). The renderer (`crates/saturn/src/vdp2/renderer.rs`) is a
+full multi-layer compositor: NBG0–3 (tile/bitmap, 4/8bpp + RGB), RBG0/1
+rotation, priority + colour calculation, windows, per-line scroll/zoom,
+[CRAOFA]-banked palettes, and [TPON] handling.
 
 **Vectors** — SH-2 exception/interrupt vector numbers. Loaded from
 `VBR + N × 4`. Notable ones:

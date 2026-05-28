@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The one deliberate exception is the **SH-1 CD-block, which is high-level-emulated (HLE), not low-level-emulated** — its CD-ROM firmware is undumped (on-die mask ROM) and half its job is an analog servo with no observable digital ground truth, so there's nothing to be cycle-accurate *against*. Like every Saturn emulator (MAME/Yabause/Mednafen), we model the host command interface + the buffer/filter/partition engine + the CD-ROM filesystem, reading sectors from a disc image. This is M7; see `doc/roadmap.md` and `crates/saturn/src/cd_block.rs`.
 
-**M1 (cycle-accurate SH-2 core), M2 (Saturn bus + dual SH-2 + event-driven scheduler), and M3 (SCU + SMPC + VDP2 minimal + SCU-DSP + SDL2 scaffolding) are complete.** M4 is active: finish M3's stretch goal — get the SEGA splash on screen by closing the remaining BIOS-boot gaps (SMPC INTBACK timing, VDP1/CD-block presence stubs, VDP2 register-decode fidelity, VDP2 raster timing). See `doc/roadmap.md` for task-by-task status and `doc/glossary.md` for the Saturn-specific vocabulary (chip names, address ranges, register acronyms) used throughout this file.
+**M1–M6 are complete.** M1 (cycle-accurate SH-2 core), M2 (Saturn bus + dual SH-2 + event-driven scheduler), M3 (SCU + SMPC + VDP2 minimal + SCU-DSP + SDL2 scaffolding), M4 (BIOS boots to the SEGA splash — now pixel-matching MAME), M5 (chip-coverage build-out: VDP1 full plotter, MC68EC000 core, full VDP2 NBG/RBG compositor), and M6 (SCSP slot/FM audio engine). **M7 is active: the CD-block, high-level-emulated** (see below) — disc-image loading, the buffer/filter/partition engine, the ISO9660 filesystem, and game boot. See `doc/roadmap.md` for task-by-task status and `doc/glossary.md` for the Saturn-specific vocabulary (chip names, address ranges, register acronyms) used throughout this file.
 
 ## Common commands
 
@@ -33,15 +33,18 @@ Run the binary with `cargo run -p fifth_planet -- <bios.bin>` — the SDL2 front
 ```
 crates/sh2/        — M1 deliverable: standalone SH-2 (SH7604) core.
                      no_std + extern alloc. Library-shaped, no I/O.
+crates/m68k/       — M5 deliverable: MC68EC000 core (SCSP sound CPU).
+                     no_std + alloc, library-shaped like sh2.
+crates/scu_dsp/    — M3 deliverable: SCU's embedded 32-bit DSP.
 crates/saturn/     — M2+ deliverable: Saturn system glue (bus, scheduler,
-                     SMPC, SCU + DMA + INTC, VDP2 + minimal NBG0 renderer
-                     + raster timing). VDP1 and CD-block are address-space
-                     presence stubs (M4); SCSP + full VDP1 render to follow.
-crates/scu_dsp/    — M3 deliverable: SCU's embedded 32-bit DSP. Standalone
-                     for now; SCU host wiring lands when target microcode
-                     surfaces in M4+.
-fifth_planet/      — SDL2 frontend binary (window + framebuffer upload, or
-                     headless), behind the default-on `sdl2-frontend` feature.
+                     SMPC, SCU + DMA + INTC, VDP1 full plotter, VDP2
+                     multi-layer NBG/RBG compositor + raster timing, SCSP
+                     audio + hosted MC68EC000 + SCSP-DSP). CD-block is HLE:
+                     host-interface command protocol done; full HLE engine
+                     (disc image, buffers/filters, ISO9660 FS) is M7.
+fifth_planet/      — SDL2 frontend binary (window + framebuffer upload +
+                     audio, or headless), behind the default-on
+                     `sdl2-frontend` feature.
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```
@@ -65,8 +68,10 @@ The root `Cargo.toml` is a `[workspace]` with `resolver = "3"` and edition 2024.
 - **`memory::{BiosRom, Ram, StubRegisterBank}`** are typed region structs. Each owns its bytes with big-endian `read*/write*` at *region-local* offsets and folds out-of-range offsets modulo the region size (so any image that's smaller than its window mirrors transparently).
 - **`bus::SaturnBus`** impls `sh2::Bus`. Dispatches every access through one `match addr` against `*_BASE..=*_END` region constants in `bus.rs`. Unmapped addresses behave as open bus (0 read, drop write). Wait states are SH7604 BSC defaults; later refinement keys on real BSC register values.
 - **`smpc::Smpc`** is the System Manager + Peripheral Control. Register bank at *odd* byte offsets (every other byte reserved). A write to COMREG decodes the byte and queues a `Command` in `pending`; `SF` (status flag) goes busy. The Saturn aggregate drains queued commands between scheduler batches via `take_pending` / `mark_command_done`. `Command` discriminants are `#[repr(u8)]` and **match the hardware codes exactly** — `SshOn = 0x02`, **`IntBack = 0x10`**, `SetTime = 0x16`, **`NmiReq = 0x18`**, `ResEnab = 0x19`, `ResDisa = 0x1A` (these were verified against the SMPC manual; getting INTBACK/NMIREQ swapped silently breaks BIOS boot). **INTBACK is not instantaneous**: it keeps SF busy for `INTBACK_EXEC_CYCLES` (~250 µs ≈ 7150 cycles) via `intback_complete_at`, then fills OREG + raises the maskable SMPC interrupt + clears SF — the BIOS polls SF in a wait loop and derails if it clears too early.
-- **`vdp2::Vdp2`** is the background generator: register bank + VRAM (512 KiB at `0x05E0_0000`) + CRAM (4 KiB) + a minimal NBG0 renderer (`render_frame`, bitmap/4-cell-tile). Renderer reads map-offset/plane/scroll registers (`MPOFN`/`MPABN0`/`SCXIN0`…) rather than hardcoded bases. `Vdp2::owns(addr)` gates bus dispatch. Raster registers (`VCNT`, `TVSTAT` VBLANK/HBLANK/ODD) are **live** — see `Saturn::update_video_timing`.
-- **`vdp1::Vdp1` / `cd_block::CdBlock`** are M4 *presence stubs* (no plotter, no SH-1): defined register/VRAM/framebuffer storage at `0x05C0_0000`/`0x05D0_0000` (VDP1) and `0x05898000` (CD-block), with just enough behaviour (VDP1 PTMR→EDSR draw-end, CD-block HIRQ CMOK) that BIOS init doesn't hang on open bus.
+- **`vdp2::Vdp2`** is the background generator: register bank + VRAM (512 KiB at `0x05E0_0000`) + CRAM (4 KiB) + a multi-layer compositor (`render_frame` in `vdp2/renderer.rs`). It composites NBG0–3 (tile or bitmap) and RBG0/1 (rotation, via `vdp2/rotation.rs`) by priority, plus the VDP1 sprite layer, with colour calculation, windows, and per-line scroll/zoom/cell-scroll. **Paletted-colour gotchas the BIOS splash exercised:** 8bpp character base is `char × 0x20` (an 8bpp cell is two `0x20` units), the per-layer colour-RAM address offset (`CRAOFA`/`CRAOFB`, `NxCAOS << 8`) selects the CRAM bank, and BGON `NxTPON`/`R0TPON` draw palette code 0 as the *solid* colour `CRAM[offset]` rather than transparent. `Vdp2::owns(addr)` gates bus dispatch. Raster registers (`VCNT`, `TVSTAT` VBLANK/HBLANK/ODD) are **live** — see `Saturn::update_video_timing`.
+- **`vdp1::Vdp1`** is the sprite/polygon engine: a full command-list plotter (`vdp1/plotter.rs`) rasterising textured/scaled/distorted sprites, polygons and lines with gouraud shading and the colour-calc modes, into a double-buffered frame buffer (`0x05C8_0000`) that VDP2 composites. `PTMR` PTM=`0b01` draws once on the write; PTM=`0b10` (automatic) re-renders the list every frame at the buffer swap (`frame_change`).
+- **`scsp::Scsp`** is the Sound Processor: 32-slot FM/PCM engine + SCSP-DSP (`scsp/dsp.rs`) + the hosted MC68EC000 (`m68k` crate) in sound RAM at `0x05A0_0000`, released by SMPC `SNDON`. `Saturn::take_audio` drains the mixed 44.1 kHz stereo each frame.
+- **`cd_block::CdBlock`** is HLE (the SH-1 firmware is undumped — see above). The host-interface command protocol + status reads are done (enough for BIOS init); the full HLE engine (disc image, buffer/filter/partition, ISO9660 FS, game boot) is M7.
 - **`scu::Scu`** is the System Control Unit. Holds three DMA channels plus timers/IMS/IST/AIACK/ASR/RSEL/VER. DMA trigger fires *only* on 32-bit writes to `D*EN` with bit 8 (DGO) set and non-zero transfer count — byte/halfword writes deliberately don't fire, because software builds the register up piece-by-piece. `take_pending_dma` / `finish_dma` mirror the SMPC drain pattern.
 - **`scheduler::SchedEntity`** trait has an associated `Context` so real chips (`SaturnBus`) and test fakes (`()`) can both use it. `next_deadline()` is the global cycle the entity wants to run at; `step(ctx)` advances one unit of work. `Sh2Entity` wraps `sh2::Cpu`; when its `halted` flag is set, `next_deadline()` returns `u64::MAX` so the scheduler's "smallest deadline wins" rule naturally skips it.
 - **`scheduler::Scheduler<E>`** linear-scans `entities` per step. Ties resolve to insertion order — this is the entire determinism contract. Once entity count grows past a handful in M3+, swap the scan for a `BinaryHeap`.
