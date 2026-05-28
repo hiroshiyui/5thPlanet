@@ -145,6 +145,26 @@ struct Xfer32 {
 /// SH-2 master clock (Hz) — sectors stream at 75×speed of these.
 const MASTER_HZ: u64 = 28_636_400;
 
+/// One ISO9660 directory record (MAME `direntryT`, fields we use).
+#[derive(Clone, Debug, Default)]
+struct DirEntry {
+    firstfad: u32,
+    length: u32,
+    flags: u8,
+    file_unit_size: u8,
+    interleave_gap_size: u8,
+    #[allow(dead_code)] // retained for Get File Info / debugging
+    name: Vec<u8>,
+}
+
+/// Little-endian u32 from a byte slice at `o` (0 if out of range).
+fn le32(b: &[u8], o: usize) -> u32 {
+    match b.get(o..o + 4) {
+        Some(s) => u32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        None => 0,
+    }
+}
+
 /// SH-2 master cycles between periodic CD status reports. The CD-block
 /// firmware emits one report per interval; with no disc playing that interval
 /// is ~16.67 ms (Yabause `_periodictiming = 50000` against its µs×3 clock →
@@ -251,6 +271,16 @@ pub struct CdBlock {
     /// Active 32-bit sector-data transfer, if any.
     xfer32: Option<Xfer32>,
 
+    // ---- ISO9660 filesystem (M7 phase 4) ----
+    /// Root directory record (from the primary volume descriptor).
+    curroot: DirEntry,
+    /// Entries of the current directory.
+    curdir: Vec<DirEntry>,
+    /// Number of entries in the current directory.
+    numfiles: u32,
+    /// Index of the first non-directory entry (Get File Scope).
+    firstfile: u32,
+
     /// Set once the host has issued its first command. Until then the
     /// power-on `"CDBLOCK"` signature is held in CR1..CR4 and **no**
     /// unsolicited periodic report is emitted — the BIOS reads that
@@ -321,6 +351,10 @@ impl CdBlock {
             curblock: Block::free(),
             curblock_mode2: false,
             xfer32: None,
+            curroot: DirEntry::default(),
+            curdir: Vec::new(),
+            numfiles: 0,
+            firstfile: 0,
             command_pending: false,
             cr_written: 0,
             periodic_accum: 0,
@@ -674,6 +708,92 @@ impl CdBlock {
             self.xfer_pos = (p + 2).min(self.xfer.len());
         }
         word
+    }
+
+    /// Load a directory (MAME `read_new_dir`). `0xFFFFFF` finds the primary
+    /// volume descriptor (FAD 166..200), parses the root record, and reads the
+    /// root directory; otherwise it reads the sub-directory at entry `fileno`.
+    fn read_new_dir(&mut self, fileno: u32) {
+        if fileno == 0xFF_FFFF {
+            let mut pvd = None;
+            if let Some(disc) = self.disc.as_ref() {
+                for cfad in 166..200u32 {
+                    let Some(sect) = disc.read_sector(cfad) else { break };
+                    if sect.len() >= 6 && &sect[1..6] == b"CD001" {
+                        match sect[0] {
+                            1 => {
+                                pvd = Some(sect.to_vec());
+                                break;
+                            }
+                            0xFF => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let Some(sect) = pvd else { return };
+            // Root directory record sits at offset 156 in the PVD.
+            self.curroot = DirEntry {
+                firstfad: le32(&sect, 158) + FAD_OFFSET,
+                length: le32(&sect, 166),
+                flags: *sect.get(181).unwrap_or(&0),
+                ..Default::default()
+            };
+            self.make_dir_current(self.curroot.firstfad);
+        } else if let Some(e) = self.curdir.get(fileno as usize) {
+            let fad = e.firstfad;
+            self.make_dir_current(fad);
+        }
+    }
+
+    /// Parse the directory at `fad` into `curdir` (MAME `make_dir_current`):
+    /// variable-length records, jumping the 0-padded gap at each 0x800 sector
+    /// boundary; `firstfile` is the first non-directory entry.
+    fn make_dir_current(&mut self, fad: u32) {
+        let dirlen = self.curroot.length.max(2048) as usize;
+        let nsect = dirlen.div_ceil(2048);
+        let mut buf: Vec<u8> = Vec::with_capacity(nsect * 2048);
+        if let Some(disc) = self.disc.as_ref() {
+            for i in 0..nsect as u32 {
+                match disc.read_sector(fad + i) {
+                    Some(s) => buf.extend_from_slice(s),
+                    None => buf.resize(buf.len() + 2048, 0),
+                }
+            }
+        }
+        let mut entries: Vec<DirEntry> = Vec::new();
+        let mut pos = 0usize;
+        let mut sector_number = 0usize;
+        while pos < buf.len() {
+            let rec = buf[pos] as usize;
+            if rec == 0 {
+                if sector_number < self.curroot.length as usize {
+                    sector_number += 0x800;
+                    pos = sector_number;
+                    continue;
+                }
+                break;
+            }
+            if pos + 33 > buf.len() {
+                break;
+            }
+            let namelen = buf[pos + 32] as usize;
+            entries.push(DirEntry {
+                firstfad: le32(&buf, pos + 2) + FAD_OFFSET,
+                length: le32(&buf, pos + 10),
+                file_unit_size: buf[pos + 26],
+                interleave_gap_size: buf[pos + 27],
+                flags: buf[pos + 25],
+                name: buf.get(pos + 33..pos + 33 + namelen).unwrap_or(&[]).to_vec(),
+            });
+            pos += rec;
+        }
+        self.numfiles = entries.len() as u32;
+        self.firstfile = entries
+            .iter()
+            .position(|e| e.flags & 0x02 == 0)
+            .unwrap_or(0) as u32;
+        self.curdir = entries;
     }
 
     /// Allocate a free pool block (its `size` set to `sectlenin`), returning the
@@ -1104,6 +1224,82 @@ impl CdBlock {
                     self.cd_report();
                     self.hirq |= HIRQ_CMOK | HIRQ_EHST;
                 }
+            }
+            0x70 => {
+                // Change directory: CR3 low + CR4 = file id (0xFFFFFF = root).
+                let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                self.read_new_dir(temp);
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+            }
+            0x71 => {
+                // Read directory: just (re)connect the filter for the read.
+                let f = (self.cr3 >> 8) as u8;
+                self.cd_device_filter = if (f as usize) < MAX_FILTERS { f } else { NO_FILTER };
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+            }
+            0x72 => {
+                // Get file-system scope: file count + first file id.
+                self.cr1 = self.cd_stat();
+                self.cr2 = self.numfiles as u16;
+                self.cr3 = 0x0100;
+                self.cr4 = self.firstfile as u16;
+                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+            }
+            0x73 => {
+                // Get target file info: stage a 12-byte record for the host to
+                // read through the FIFO (FAD, length, gap/unit size, id, flags).
+                let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                if temp != 0xFF_FFFF {
+                    if let Some(e) = self.curdir.get(temp as usize) {
+                        let mut f = vec![0u8; 12];
+                        f[0..4].copy_from_slice(&e.firstfad.to_be_bytes());
+                        f[4..8].copy_from_slice(&e.length.to_be_bytes());
+                        f[8] = e.interleave_gap_size;
+                        f[9] = e.file_unit_size;
+                        f[10] = temp as u8;
+                        f[11] = e.flags;
+                        self.xfer = f;
+                        self.xfer_pos = 0;
+                    }
+                    self.cr1 = self.cd_stat() | STAT_TRANS;
+                    self.cr2 = 6; // 6 words for a single file
+                } else {
+                    self.cr1 = self.cd_stat() | STAT_TRANS;
+                    self.cr2 = 0x5F4; // all entries (whole-directory form)
+                }
+                self.cr3 = 0;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
+            }
+            0x74 => {
+                // Read file: start the read pump over a file's sectors.
+                let file_offset = ((self.cr1 as u32 & 0xFF) << 8) | (self.cr2 as u32 & 0xFF);
+                let file_filter = (self.cr3 >> 8) as u8;
+                let file_id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                if let Some(e) = self.curdir.get(file_id as usize) {
+                    let nsect = e.length.div_ceil(self.sectlenin.max(1));
+                    self.cd_curfad = e.firstfad + file_offset;
+                    self.fadstoplay = nsect.saturating_sub(file_offset) as i64;
+                    self.status = STAT_PLAY;
+                    self.cd_device_filter = if (file_filter as usize) < MAX_FILTERS {
+                        file_filter
+                    } else {
+                        NO_FILTER
+                    };
+                    self.sectorstore = false;
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_EHST;
+            }
+            0x75 => {
+                // Abort file: stop any read / transfer, return to PAUSE.
+                self.fadstoplay = -1;
+                self.status = STAT_PAUSE;
+                self.xfer32 = None;
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
             }
             _ => {
                 // Default: most commands answer with a status report.
@@ -1573,6 +1769,73 @@ mod tests {
         // The SCU-DMA data-port alias at 0x0581_8000 streams the same bytes.
         let (w, _) = sat.bus.read32(0x0581_8000, AccessKind::Data);
         assert_eq!(w, 0xDEAD_BEEF);
+    }
+
+    /// A minimal ISO9660 disc: PVD at FAD 166 → root dir at FAD 167 with
+    /// `.`, `..`, and one file `X` (FAD 170, 2048 B = 0xCAFEBABE…).
+    fn fs_disc() -> Disc {
+        let mut img = vec![0u8; 2048 * 21];
+        let put = |img: &mut [u8], off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        // Primary volume descriptor at sector 16.
+        let pvd = 16 * 2048;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        let r = pvd + 156; // root directory record
+        img[r] = 34;
+        put(&mut img, r + 2, 17); // root dir LBA
+        put(&mut img, r + 10, 2048); // root dir length
+        img[r + 25] = 0x02; // directory
+        img[r + 32] = 1;
+        // Root directory at sector 17: ".", "..", file "X".
+        let d = 17 * 2048;
+        img[d] = 34;
+        put(&mut img, d + 2, 17);
+        put(&mut img, d + 10, 2048);
+        img[d + 25] = 0x02;
+        img[d + 32] = 1;
+        img[d + 34] = 34;
+        put(&mut img, d + 36, 17);
+        put(&mut img, d + 44, 2048);
+        img[d + 59] = 0x02;
+        img[d + 66] = 1;
+        img[d + 67] = 0x01;
+        img[d + 68] = 34;
+        put(&mut img, d + 70, 20); // file LBA 20 → FAD 170
+        put(&mut img, d + 78, 2048); // file length
+        img[d + 93] = 0x00; // not a directory
+        img[d + 100] = 1;
+        img[d + 101] = b'X';
+        // File content at sector 20.
+        img[20 * 2048..20 * 2048 + 4].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        Disc::from_iso(img)
+    }
+
+    #[test]
+    fn iso9660_change_dir_lists_files_and_read_file_streams_content() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        // Change directory to root (file id 0xFFFFFF).
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.numfiles, 3, ". / .. / one file");
+        assert_eq!(c.firstfile, 2, "first non-directory entry");
+        // Get file-system scope.
+        cmd(&mut c, 0x7200, 0, 0, 0);
+        assert_eq!(c.read16(0x001C), 3); // CR2 = file count
+        assert_eq!(c.read16(0x0024), 2); // CR4 = first file id
+        // Get file info for file id 2: FAD 170 (0xAA), length 2048 (0x0800).
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002);
+        assert_eq!(c.read16(0x8000), 0x0000); // FAD hi
+        assert_eq!(c.read16(0x8000), 0x00AA); // FAD lo = 170
+        assert_eq!(c.read16(0x8000), 0x0000); // length hi
+        assert_eq!(c.read16(0x8000), 0x0800); // length lo = 2048
+        // Read file id 2 via filter 0 → partition 0; pump one sector.
+        cmd(&mut c, 0x7400, 0x0000, 0x0000, 0x0002);
+        c.tick(MASTER_HZ / (75 * 2) + 100);
+        assert_eq!(c.partitions[0].blocks.len(), 1, "file sector buffered");
+        cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
+        assert_eq!(c.read32(0x8000), 0xCAFE_BABE, "file content streamed");
     }
 
     #[test]
