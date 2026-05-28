@@ -318,6 +318,30 @@ impl Disc {
         self.image.get(base..base + SECTOR_USER)
     }
 
+    /// The full on-disc sector bytes at `fad` (2352 for raw tracks, 2048 for a
+    /// cooked ISO). Used by the read pump, which stores `sectlenin` bytes.
+    pub fn read_full_sector(&self, fad: u32) -> Option<&[u8]> {
+        let t = self.track_at_fad(fad)?;
+        let rel = (fad - t.start_fad) as usize;
+        let base = t.image_offset + rel * t.sector_size;
+        self.image.get(base..base + t.sector_size)
+    }
+
+    /// The Mode-2 subheader `(chan, fnum, subm, cinf)` of a raw 2352 sector, or
+    /// `None` for a Mode-1 / audio / cooked sector (no subheader to filter on).
+    pub fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
+        let t = self.track_at_fad(fad)?;
+        if t.sector_size != 2352 {
+            return None;
+        }
+        let raw = self.read_full_sector(fad)?;
+        // The 4-byte header's mode byte (offset 15) is 2 for Mode 2.
+        if raw.get(15) != Some(&2) {
+            return None;
+        }
+        Some((raw[17], raw[16], raw[18], raw[19]))
+    }
+
     /// The track containing `fad`, if any.
     pub fn track_at_fad(&self, fad: u32) -> Option<&Track> {
         self.tracks

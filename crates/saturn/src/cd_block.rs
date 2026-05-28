@@ -59,8 +59,11 @@ const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
 // Further status bytes (high byte of the 16-bit status word, MAME `CD_STAT_*`).
 const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
-#[allow(dead_code)] // M7 phase 3 (read pump / seek)
 const STAT_SEEK: u8 = 0x04; // drive seeking
+const STAT_PLAY: u8 = 0x03; // read/playback in progress
+
+// HIRQ playback-complete bit.
+const HIRQ_PEND: u16 = 0x0010; // CD playback / read range completed
 
 // HIRQ bits used by the buffer/filter/partition + filesystem engine.
 #[allow(dead_code)] // M7 phase 4 (filesystem)
@@ -125,6 +128,22 @@ struct Filter {
 struct Partition {
     blocks: Vec<usize>,
 }
+
+/// In-flight 32-bit sector-data transfer (Get / Get-and-Delete Sector Data):
+/// streams `num` blocks of partition `part` starting at index `pos`, tracking
+/// the current block (`sect`) and byte offset within it (`offs`).
+#[derive(Clone, Debug)]
+struct Xfer32 {
+    delete: bool,
+    part: usize,
+    pos: usize,
+    num: usize,
+    sect: usize,
+    offs: usize,
+}
+
+/// SH-2 master clock (Hz) — sectors stream at 75×speed of these.
+const MASTER_HZ: u64 = 28_636_400;
 
 /// SH-2 master cycles between periodic CD status reports. The CD-block
 /// firmware emits one report per interval; with no disc playing that interval
@@ -215,6 +234,23 @@ pub struct CdBlock {
     /// Result of the last Calculate Actual Data Size, in 16-bit words.
     calcsize: u32,
 
+    // ---- read pump + data transfer (M7 phase 3) ----
+    /// FAD the read pump is currently at.
+    cd_curfad: u32,
+    /// Sectors left to read in the active PLAY; `< 0` means idle.
+    fadstoplay: i64,
+    /// Read speed multiplier (1× or 2×; default 2×).
+    cd_speed: u32,
+    /// Cycles accumulated toward the next sector read.
+    sector_accum: u64,
+    /// At least one sector has been buffered since the last empty.
+    sectorstore: bool,
+    /// Working sector being filtered, and whether it carries a Mode-2 subheader.
+    curblock: Block,
+    curblock_mode2: bool,
+    /// Active 32-bit sector-data transfer, if any.
+    xfer32: Option<Xfer32>,
+
     /// Set once the host has issued its first command. Until then the
     /// power-on `"CDBLOCK"` signature is held in CR1..CR4 and **no**
     /// unsolicited periodic report is emitted — the BIOS reads that
@@ -277,6 +313,14 @@ impl CdBlock {
             sectlenin: 2048,
             sectlenout: 2048,
             calcsize: 0,
+            cd_curfad: FAD_OFFSET,
+            fadstoplay: -1,
+            cd_speed: 2,
+            sector_accum: 0,
+            sectorstore: false,
+            curblock: Block::free(),
+            curblock_mode2: false,
+            xfer32: None,
             command_pending: false,
             cr_written: 0,
             periodic_accum: 0,
@@ -313,18 +357,9 @@ impl CdBlock {
 
     pub fn read16(&mut self, offset: u32) -> u16 {
         if offset & 0xFFFF >= DATA_FIFO {
-            // Data FIFO: stream the staged transfer buffer (e.g. the TOC) as
-            // 16-bit big-endian words, advancing the cursor. Empty / past-end
-            // reads return 0. Phase 3 adds sector data + the SCU-DMA port.
-            let p = self.xfer_pos;
-            let word = match (self.xfer.get(p), self.xfer.get(p + 1)) {
-                (Some(&hi), Some(&lo)) => ((hi as u16) << 8) | lo as u16,
-                _ => 0,
-            };
-            if p < self.xfer.len() {
-                self.xfer_pos = (p + 2).min(self.xfer.len());
-            }
-            return word;
+            // Data FIFO (16-bit): stream the staged TOC / file-info buffer.
+            // 32-bit sector-data transfers go through `read32` / the data port.
+            return self.read_fifo16();
         }
         match Self::slot(offset & 0xFFFF) {
             0x0008 => {
@@ -413,7 +448,17 @@ impl CdBlock {
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
+        // The data port (FIFO) carries 32-bit sector-data transfers.
+        if offset & 0xFFFF >= DATA_FIFO {
+            return self.read_data_port32();
+        }
         ((self.read16(offset) as u32) << 16) | self.read16(offset + 2) as u32
+    }
+
+    /// Read the CD data-transfer port (the SCU-DMA alias at `0x0581_8000`),
+    /// one 32-bit big-endian word of the active sector-data transfer.
+    pub fn read_data_port(&mut self) -> u32 {
+        self.read_data_port32()
     }
 
     pub fn write32(&mut self, offset: u32, val: u32) {
@@ -436,10 +481,203 @@ impl CdBlock {
         (self.status as u16) << 8
     }
 
+    /// Read one sector at `fad` into the working block and route it through the
+    /// connected filter into a partition (MAME `cd_read_filtered_sector`).
+    fn read_filtered_sector(&mut self, fad: u32) -> bool {
+        if self.cd_device_filter == NO_FILTER || self.buf_full {
+            return false;
+        }
+        let len = self.sectlenin as usize;
+        let (data, sub) = {
+            let Some(disc) = self.disc.as_ref() else {
+                return false;
+            };
+            // Store `sectlenin` bytes: the 2048 user payload for the common
+            // case, else a leading slice of the full on-disc sector.
+            let data = if len == 2048 {
+                match disc.read_sector(fad) {
+                    Some(s) => s.to_vec(),
+                    None => return false,
+                }
+            } else {
+                match disc.read_full_sector(fad) {
+                    Some(s) => s[..len.min(s.len())].to_vec(),
+                    None => return false,
+                }
+            };
+            (data, disc.subheader(fad))
+        };
+        let (chan, fnum, subm, cinf) = sub.unwrap_or((0, 0, 0, 0));
+        self.curblock = Block {
+            size: len as i32,
+            fad: fad as i32,
+            data,
+            chan,
+            fnum,
+            subm,
+            cinf,
+        };
+        self.curblock_mode2 = sub.is_some();
+        self.filter_data()
+    }
+
+    /// Whether the working sector matches filter `f` (FAD range + Mode-2
+    /// subheader conditions, with the reverse-conditions bit).
+    fn filter_match(&self, f: &Filter) -> bool {
+        let mut m = true;
+        if f.mode & 0x40 != 0 {
+            let fad = self.curblock.fad as u32;
+            if fad < f.fad || fad > f.fad.wrapping_add(f.range) {
+                m = false;
+            }
+        }
+        if self.curblock_mode2 {
+            if f.mode & 0x01 != 0 && self.curblock.fnum != f.fid {
+                m = false;
+            }
+            if f.mode & 0x02 != 0 && self.curblock.chan != f.chan {
+                m = false;
+            }
+            if f.mode & 0x04 != 0 && (self.curblock.subm & f.smmask) != f.smval {
+                m = false;
+            }
+            if f.mode & 0x08 != 0 && (self.curblock.cinf & f.cimask) != f.cival {
+                m = false;
+            }
+            if f.mode & 0x10 != 0 {
+                m = !m;
+            }
+        }
+        m
+    }
+
+    /// Route the working sector to a partition via the filter chain: a match
+    /// goes to the filter's true-connector partition; a miss chases the
+    /// false-connector (up to two hops) before the sector is dropped
+    /// (MAME `cd_filterdata`).
+    fn filter_data(&mut self) -> bool {
+        let mut fidx = self.cd_device_filter as usize;
+        if fidx >= MAX_FILTERS {
+            return false;
+        }
+        let mut last = self.filters[fidx].condtrue;
+        let mut keepgoing = 2;
+        loop {
+            let f = self.filters[fidx].clone();
+            if self.filter_match(&f) {
+                break;
+            }
+            last = f.condfalse;
+            if last == NO_FILTER || keepgoing == 0 {
+                return false;
+            }
+            fidx = last as usize;
+            if fidx >= MAX_FILTERS {
+                return false;
+            }
+            keepgoing -= 1;
+        }
+        let part = last as usize;
+        if part >= MAX_FILTERS {
+            return false;
+        }
+        self.last_buffer = last;
+        let Some(b) = self.alloc_block() else {
+            return false;
+        };
+        self.blocks[b].fad = self.curblock.fad;
+        self.blocks[b].data = self.curblock.data.clone();
+        self.blocks[b].chan = self.curblock.chan;
+        self.blocks[b].fnum = self.curblock.fnum;
+        self.blocks[b].subm = self.curblock.subm;
+        self.blocks[b].cinf = self.curblock.cinf;
+        self.partitions[part].blocks.push(b);
+        true
+    }
+
+    /// Advance the read pump one sector (MAME `cd_playdata`): a seek completes
+    /// to PLAY; in PLAY each tick reads one filtered sector until the range is
+    /// exhausted, then pauses and raises `PEND`.
+    fn play_data(&mut self) {
+        match self.status {
+            STAT_SEEK => self.status = STAT_PLAY,
+            STAT_PLAY if self.fadstoplay > 0 => {
+                let fad = self.cd_curfad;
+                if self.read_filtered_sector(fad) {
+                    self.cd_curfad += 1;
+                    self.fadstoplay -= 1;
+                    self.hirq |= HIRQ_CSCT;
+                    self.sectorstore = true;
+                    if self.fadstoplay == 0 {
+                        self.status = STAT_PAUSE;
+                        self.hirq |= HIRQ_PEND;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
+    fn delete_partition_sectors(&mut self, buf: usize, ofs: usize, num: usize) {
+        let end = (ofs + num).min(self.partitions[buf].blocks.len());
+        if ofs > end {
+            return;
+        }
+        let removed: Vec<usize> = self.partitions[buf].blocks.drain(ofs..end).collect();
+        for b in removed {
+            self.free_block(b);
+        }
+    }
+
+    /// One 32-bit big-endian word from the active sector-data transfer (the
+    /// data port at `0x..18000` / FIFO offset `0x8000`). When the blocks are
+    /// drained, a Get-and-Delete frees them. Falls back to the 16-bit TOC
+    /// stream (as two words) when no 32-bit transfer is active.
+    fn read_data_port32(&mut self) -> u32 {
+        let Some(x) = self.xfer32.clone() else {
+            return ((self.read_fifo16() as u32) << 16) | self.read_fifo16() as u32;
+        };
+        if x.sect >= x.num {
+            if x.delete {
+                self.delete_partition_sectors(x.part, x.pos, x.num);
+            }
+            self.xfer32 = None;
+            return 0xFFFF_FFFF;
+        }
+        let bi = self.partitions[x.part].blocks[x.pos + x.sect];
+        let size = self.blocks[bi].size.max(0) as usize;
+        let o = x.offs;
+        let d = &self.blocks[bi].data;
+        let rv = ((*d.get(o).unwrap_or(&0) as u32) << 24)
+            | ((*d.get(o + 1).unwrap_or(&0) as u32) << 16)
+            | ((*d.get(o + 2).unwrap_or(&0) as u32) << 8)
+            | (*d.get(o + 3).unwrap_or(&0) as u32);
+        if let Some(xm) = self.xfer32.as_mut() {
+            xm.offs += 4;
+            if xm.offs >= size {
+                xm.offs = 0;
+                xm.sect += 1;
+            }
+        }
+        rv
+    }
+
+    /// One 16-bit big-endian word from the staged TOC/file-info buffer.
+    fn read_fifo16(&mut self) -> u16 {
+        let p = self.xfer_pos;
+        let word = match (self.xfer.get(p), self.xfer.get(p + 1)) {
+            (Some(&hi), Some(&lo)) => ((hi as u16) << 8) | lo as u16,
+            _ => 0,
+        };
+        if p < self.xfer.len() {
+            self.xfer_pos = (p + 2).min(self.xfer.len());
+        }
+        word
+    }
+
     /// Allocate a free pool block (its `size` set to `sectlenin`), returning the
     /// index, or `None` (latching buffer-full) when the pool is exhausted.
-    /// Used by the M7-phase-3 read pump.
-    #[allow(dead_code)]
     fn alloc_block(&mut self) -> Option<usize> {
         for i in 0..self.blocks.len() {
             if self.blocks[i].size < 0 {
@@ -773,6 +1011,100 @@ impl CdBlock {
                 }
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
+            0x10 => {
+                // Play disc: start = (CR1&0xFF)<<16|CR2, end = (CR3&0xFF)<<16|CR4.
+                // Bit 0x800000 selects FAD addressing (the BIOS/game read path);
+                // an end without it plays to the lead-out.
+                let start = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
+                let end = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                self.status = STAT_PLAY;
+                if start & 0x80_0000 != 0 && start != 0xFF_FFFF {
+                    self.cd_curfad = start & 0x0F_FFFF;
+                }
+                if end & 0x80_0000 != 0 {
+                    if end != 0xFF_FFFF {
+                        self.fadstoplay = (end & 0x0F_FFFF) as i64;
+                    }
+                } else if let Some(d) = &self.disc {
+                    self.fadstoplay = d.lead_out_fad().saturating_sub(self.cd_curfad) as i64;
+                }
+                self.sectorstore = false;
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x60 => {
+                // Set sector length (CR1 low = input code, CR2 high = output).
+                let len = |code: u16| match code {
+                    0 => 2048,
+                    1 => 2336,
+                    2 => 2340,
+                    3 => 2352,
+                    _ => 0,
+                };
+                let lin = len(self.cr1 & 0xFF);
+                if lin != 0 {
+                    self.sectlenin = lin;
+                }
+                let lout = len((self.cr2 >> 8) & 0xFF);
+                if lout != 0 {
+                    self.sectlenout = lout;
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x61 | 0x63 => {
+                // Get (and optionally delete) sector data: set up a 32-bit
+                // transfer over a partition's blocks; the host reads the data
+                // port. CR4 = count (0xFFFF = all from offset), CR2 = offset.
+                let delete = command == 0x63;
+                let bufnum = (self.cr3 >> 8) as usize;
+                let mut sectnum = self.cr4 as usize;
+                let sectofs = self.cr2 as usize;
+                let avail = self.partitions.get(bufnum).map_or(0, |p| p.blocks.len());
+                if bufnum >= MAX_FILTERS || (sectnum != 0xFFFF && avail < sectnum) {
+                    self.cr1 = STAT_REJECT;
+                    self.cr2 = 0;
+                    self.cr3 = 0;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_CMOK | HIRQ_EHST;
+                } else {
+                    if sectnum == 0xFFFF {
+                        sectnum = avail.saturating_sub(sectofs);
+                    }
+                    self.xfer32 = Some(Xfer32 {
+                        delete,
+                        part: bufnum,
+                        pos: sectofs,
+                        num: sectnum,
+                        sect: 0,
+                        offs: 0,
+                    });
+                    self.cd_report();
+                    self.cr1 |= STAT_TRANS;
+                    self.hirq |= HIRQ_CMOK | HIRQ_EHST | HIRQ_DRDY;
+                }
+            }
+            0x62 => {
+                // Delete sector data: free a range of a partition's blocks.
+                let bufnum = (self.cr3 >> 8) as usize;
+                let mut sectnum = self.cr4 as usize;
+                let sectofs = self.cr2 as usize;
+                let avail = self.partitions.get(bufnum).map_or(0, |p| p.blocks.len());
+                if bufnum >= MAX_FILTERS || avail == 0 {
+                    self.cr1 = STAT_REJECT;
+                    self.cr2 = 0;
+                    self.cr3 = 0;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_CMOK | HIRQ_EHST;
+                } else {
+                    if sectnum == 0xFFFF {
+                        sectnum = avail.saturating_sub(sectofs);
+                    }
+                    self.delete_partition_sectors(bufnum, sectofs, sectnum);
+                    self.cd_report();
+                    self.hirq |= HIRQ_CMOK | HIRQ_EHST;
+                }
+            }
             _ => {
                 // Default: most commands answer with a status report.
                 self.cd_report();
@@ -805,6 +1137,15 @@ impl CdBlock {
         while self.periodic_accum >= PERIODIC_CYCLES {
             self.periodic_accum -= PERIODIC_CYCLES;
             self.emit_periodic();
+        }
+        // Read pump: one sector per 1/(75×speed) second while a disc is in.
+        if self.disc.is_some() {
+            self.sector_accum += cycles;
+            let per = MASTER_HZ / (75 * self.cd_speed.max(1) as u64);
+            while self.sector_accum >= per {
+                self.sector_accum -= per;
+                self.play_data();
+            }
         }
     }
 
@@ -1143,6 +1484,95 @@ mod tests {
         // Get Sector Information (0x54) on an empty partition → REJECT in CR1.
         cmd(&mut c, 0x5400, 0x0000, 0x0000, 0x0000);
         assert_eq!(c.read16(0x0018) & STAT_REJECT, STAT_REJECT);
+    }
+
+    /// A 4-sector ISO with recognisable longwords at the start of sectors 0/1.
+    fn data_disc() -> Disc {
+        let mut img = vec![0u8; 2048 * 4];
+        img[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // FAD 150
+        img[2048..2052].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]); // FAD 151
+        Disc::from_iso(img)
+    }
+
+    /// Connect the drive to filter 0 (which, with default conditions, routes
+    /// every sector to partition 0) and play `count` sectors from `fad`.
+    fn play(c: &mut CdBlock, fad: u32, count: u32) {
+        cmd(c, 0x3000, 0, 0x0000, 0); // Set CD device connection → filter 0
+        let start = 0x80_0000 | fad;
+        let end = 0x80_0000 | count;
+        cmd(
+            c,
+            0x1000 | ((start >> 16) & 0xFF) as u16,
+            (start & 0xFFFF) as u16,
+            ((end >> 16) & 0xFF) as u16,
+            (end & 0xFFFF) as u16,
+        );
+    }
+
+    #[test]
+    fn set_sector_length_decodes_size_codes() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x6003, 0x0300, 0x0000, 0x0000); // in=2352(3), out=2352(3)
+        assert_eq!(c.sectlenin, 2352);
+        assert_eq!(c.sectlenout, 2352);
+        cmd(&mut c, 0x6000, 0x0000, 0x0000, 0x0000); // both back to 2048(0)
+        assert_eq!(c.sectlenin, 2048);
+    }
+
+    #[test]
+    fn play_pumps_sectors_into_a_partition_then_streams_the_data_port() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        // Pump two sectors (75×2 Hz) plus slack.
+        let per = MASTER_HZ / (75 * 2);
+        c.tick(per * 2 + 100);
+        assert_eq!(c.partitions[0].blocks.len(), 2, "two sectors buffered");
+        assert_eq!(c.status, STAT_PAUSE, "paused after the read range");
+        assert_eq!(c.hirq & HIRQ_PEND, HIRQ_PEND, "PEND on range complete");
+        // Get Sector Data: partition 0, offset 0, 2 sectors.
+        cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0002);
+        assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY, "data ready");
+        // Stream the 32-bit data port: sector 0's first longword, then sector 1.
+        assert_eq!(c.read32(0x8000), 0xDEAD_BEEF);
+        for _ in 1..512 {
+            let _ = c.read32(0x8000); // rest of sector 0 (2048 B = 512 words)
+        }
+        assert_eq!(c.read32(0x8000), 0x1234_5678, "second sector");
+    }
+
+    #[test]
+    fn get_and_delete_sector_data_frees_the_blocks_when_drained() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 1);
+        c.tick(MASTER_HZ / (75 * 2) + 100);
+        assert_eq!(c.partitions[0].blocks.len(), 1);
+        let free_before = c.free_blocks;
+        // Get-and-delete (0x63): 1 sector from partition 0.
+        cmd(&mut c, 0x6300, 0x0000, 0x0000, 0x0001);
+        // Drain the sector (512 longwords) then one more read to hit the end.
+        for _ in 0..512 {
+            let _ = c.read32(0x8000);
+        }
+        let _ = c.read32(0x8000); // past end → frees the blocks
+        assert!(c.partitions[0].blocks.is_empty(), "partition emptied");
+        assert_eq!(c.free_blocks, free_before + 1, "block returned to the pool");
+    }
+
+    #[test]
+    fn data_port_alias_routes_through_the_bus() {
+        use crate::Saturn;
+        use sh2::bus::{AccessKind, Bus};
+        let mut sat = Saturn::with_blank_bios();
+        sat.insert_disc(data_disc());
+        let cd = &mut sat.bus.cd_block;
+        play(cd, 150, 1);
+        cd.tick(MASTER_HZ / (75 * 2) + 100);
+        cmd(cd, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
+        // The SCU-DMA data-port alias at 0x0581_8000 streams the same bytes.
+        let (w, _) = sat.bus.read32(0x0581_8000, AccessKind::Data);
+        assert_eq!(w, 0xDEAD_BEEF);
     }
 
     #[test]

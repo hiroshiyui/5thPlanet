@@ -25,6 +25,12 @@
 use sh2::bus::{AccessKind, Bus};
 
 use crate::cd_block::{CD_BLOCK_BASE, CD_BLOCK_END, CdBlock};
+
+/// CD-block data-transfer port — the 32-bit alias the SCU DMA reads sector
+/// data from (`src == 0x0581_8000`, special-cased in the SCU). Distinct from
+/// the register/FIFO window at [`CD_BLOCK_BASE`].
+const CD_DATA_PORT: u32 = 0x0581_8000;
+const CD_DATA_PORT_END: u32 = 0x0581_8003;
 use crate::memory::{BiosRom, Ram, StubRegisterBank};
 use crate::scsp::Scsp;
 use crate::scu::{SCU_BASE, SCU_END, Scu};
@@ -186,6 +192,8 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read32(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read32(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read32(addr - SOUND_BASE),
+            // CD data-transfer port alias (the SCU-DMA path; see saturn_scu).
+            CD_DATA_PORT..=CD_DATA_PORT_END => self.cd_block.read_data_port(),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read32(addr - CD_BLOCK_BASE),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
