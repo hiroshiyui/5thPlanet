@@ -132,3 +132,44 @@ fn real_ccd_disc_get_toc_over_the_bus() {
     let (w0, _) = sat.bus.read16(CD_BLOCK_BASE + 0x8000, AccessKind::Data);
     assert_eq!(w0 >> 8, 0x41, "TOC track 1 is a data track");
 }
+
+/// Phase-5 end-to-end against the real boot disc, if present: the IP sector
+/// carries the "SEGA SEGASATURN" security header, and the authentication +
+/// region commands report a valid Saturn disc. Skipped (passing) with no disc.
+#[test]
+fn real_disc_authenticates_as_a_saturn_disc() {
+    use std::path::PathBuf;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let (Ok(ccd), Ok(img)) = (
+        std::fs::read_to_string(root.join("roms/SS - Boot Disc.ccd")),
+        std::fs::read(root.join("roms/SS - Boot Disc.img")),
+    ) else {
+        println!("no roms/ boot disc; real-disc auth test skipped");
+        return;
+    };
+    let disc = saturn::disc::Disc::from_ccd(&ccd, img).expect("parse CCD/IMG");
+    // The first data sector carries the Saturn security header.
+    let ip = disc.read_sector(150).expect("FAD 150 user data");
+    assert_eq!(&ip[0..15], b"SEGA SEGASATURN", "Saturn IP header");
+
+    let mut sat = Saturn::with_blank_bios();
+    sat.insert_disc(disc);
+    // Check copy protection (0xE0): authentication HIRQ pattern (ECPY = 0x100).
+    sat.bus.write16(CR1, 0xE000, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR4, 0x0000, AccessKind::Data);
+    let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
+    assert_ne!(hirq & 0x0100, 0, "authentication complete (ECPY)");
+    // Get disc region (0xE1): 4 = Saturn data disc.
+    sat.bus.write16(CR1, 0xE100, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR4, 0x0000, AccessKind::Data);
+    let (region, _) = sat.bus.read16(CR2, AccessKind::Data);
+    assert_eq!(region, 0x0004, "real disc reports as a Saturn disc");
+}

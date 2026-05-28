@@ -1301,6 +1301,40 @@ impl CdBlock {
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
             }
+            0xE0 => {
+                // Check copy protection (authentication). A genuine Saturn data
+                // disc succeeds: raise MAME's auth HIRQ pattern 0x07C5
+                // (CMOK|CSCT|ESEL|EHST|ECPY|EFLS|SCDQ — ECPY = auth done) so the
+                // BIOS proceeds to read the IP and boot. MPEG card / no disc
+                // just acknowledge.
+                let mpeg = self.cr2 == 0x0001;
+                if self.disc.is_some() {
+                    self.status = STAT_PAUSE;
+                }
+                if !mpeg && self.disc.is_some() {
+                    self.sectorstore = true;
+                    self.hirq = 0x07C5;
+                } else {
+                    self.hirq |= HIRQ_CMOK;
+                }
+                self.cd_report();
+            }
+            0xE1 => {
+                // Get disc region: 4 = Saturn data disc, 2 = MPEG, 0 = no CD.
+                // The BIOS gates booting on this being a Saturn disc.
+                let mpeg = self.cr2 == 0x0001;
+                self.cr1 = self.cd_stat();
+                self.cr2 = if mpeg {
+                    0x0002
+                } else if self.disc.is_some() {
+                    0x0004
+                } else {
+                    0x0000
+                };
+                self.cr3 = 0;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK;
+            }
             _ => {
                 // Default: most commands answer with a status report.
                 self.cd_report();
@@ -1836,6 +1870,22 @@ mod tests {
         assert_eq!(c.partitions[0].blocks.len(), 1, "file sector buffered");
         cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
         assert_eq!(c.read32(0x8000), 0xCAFE_BABE, "file content streamed");
+    }
+
+    #[test]
+    fn authentication_and_disc_region() {
+        let mut c = CdBlock::new();
+        // No disc → region 0 (no CD).
+        cmd(&mut c, 0xE100, 0x0000, 0, 0);
+        assert_eq!(c.read16(0x001C), 0x0000, "no disc → region 0");
+        c.insert_disc(iso_disc());
+        // Check copy protection (0xE0): the auth HIRQ pattern incl. ECPY (0x100).
+        cmd(&mut c, 0xE000, 0x0000, 0, 0);
+        assert_eq!(c.hirq, 0x07C5, "authentication HIRQ pattern");
+        assert_ne!(c.hirq & 0x0100, 0, "ECPY (authentication done)");
+        // Get disc region (0xE1): 4 = Saturn data disc.
+        cmd(&mut c, 0xE100, 0x0000, 0, 0);
+        assert_eq!(c.read16(0x001C), 0x0004, "Saturn data-disc region");
     }
 
     #[test]
