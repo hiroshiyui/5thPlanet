@@ -37,12 +37,12 @@ the sector read pump + data transfer, walks the ISO9660 filesystem, and
 authenticates a Saturn disc — pass a game as the second argument. The cartridge
 slot is the remaining M7 piece.
 
-A real BIOS booting in the SDL2 frontend — the metal-and-planet splash, then the
-"SEGA SATURN" boot logo, rendered pixel-for-pixel against the MAME reference:
+Real BIOS images booting in the SDL2 frontend, rendered pixel-for-pixel against
+the MAME reference — each region's BIOS shows its own splash:
 
-| BIOS splash | Boot logo |
+| USA BIOS | Japanese BIOS (v1.01) |
 | --- | --- |
-| ![SEGA Saturn BIOS splash](doc/screenshots/bios-splash.png) | ![SEGA Saturn boot logo](doc/screenshots/bios-logo.png) |
+| ![USA BIOS splash](doc/screenshots/bios-splash-usa.png) | ![Japanese v1.01 BIOS splash](doc/screenshots/bios-splash-jp.png) |
 
 ## Quick start
 
