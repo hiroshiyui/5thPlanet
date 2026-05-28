@@ -575,6 +575,13 @@ impl Saturn {
         self.bus.cd_block.insert_disc(disc);
     }
 
+    /// Plug a cartridge into the rear expansion slot (Extension RAM, backup
+    /// RAM, or game ROM). The cart-ID byte at `0x04FF_FFFF` updates so the
+    /// BIOS/game probes the right cart; the default slot is empty.
+    pub fn insert_cartridge(&mut self, cart: crate::cartridge::Cartridge) {
+        self.bus.cartridge = cart;
+    }
+
     /// Run any DMA transfers that the SCU queued during the last
     /// scheduler batch. For M3 each transfer is synchronous: we move
     /// the full byte count in 32-bit chunks (plus a byte tail) via

@@ -24,6 +24,7 @@
 
 use sh2::bus::{AccessKind, Bus};
 
+use crate::cartridge::Cartridge;
 use crate::cd_block::{CD_BLOCK_BASE, CD_BLOCK_END, CdBlock};
 
 /// CD-block data-transfer port — the 32-bit alias the SCU DMA reads sector
@@ -80,6 +81,9 @@ pub struct SaturnBus {
     pub vdp2: Vdp2,
     pub cd_block: CdBlock,
     pub scsp: Scsp,
+    /// Rear expansion connector: Extension RAM / backup / ROM cart, or an
+    /// empty slot (the default). Mapped at `0x0200_0000..0x04FF_FFFF`.
+    pub cartridge: Cartridge,
     pub abus_bbus: StubRegisterBank,
     pub high_wram: Ram,
     /// Current global cycle, refreshed by the scheduler before each CPU
@@ -105,6 +109,7 @@ impl SaturnBus {
             vdp2: Vdp2::new(),
             cd_block: CdBlock::new(),
             scsp: Scsp::new(),
+            cartridge: Cartridge::None,
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
             cycle: 0,
@@ -140,6 +145,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read8(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read8(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read8(addr - SOUND_BASE),
+            a if Cartridge::owns(a) => self.cartridge.read8(a),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read8(addr - CD_BLOCK_BASE),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
@@ -166,6 +172,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read16(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
+            a if Cartridge::owns(a) => self.cartridge.read16(a),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read16(addr - CD_BLOCK_BASE),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
@@ -192,6 +199,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.read32(addr - BACKUP_BASE),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read32(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read32(addr - SOUND_BASE),
+            a if Cartridge::owns(a) => self.cartridge.read32(a),
             // CD data-transfer port alias (the SCU-DMA path; see saturn_scu).
             CD_DATA_PORT..=CD_DATA_PORT_END => self.cd_block.read_data_port(),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read32(addr - CD_BLOCK_BASE),
@@ -217,6 +225,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write8(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write8(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write8(addr - SOUND_BASE, val),
+            a if Cartridge::owns(a) => self.cartridge.write8(a, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write8(addr - CD_BLOCK_BASE, val),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
@@ -240,6 +249,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write16(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write16(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write16(addr - SOUND_BASE, val),
+            a if Cartridge::owns(a) => self.cartridge.write16(a, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write16(addr - CD_BLOCK_BASE, val),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
@@ -263,6 +273,7 @@ impl Bus for SaturnBus {
             BACKUP_BASE..=BACKUP_END => self.backup.write32(addr - BACKUP_BASE, val),
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write32(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write32(addr - SOUND_BASE, val),
+            a if Cartridge::owns(a) => self.cartridge.write32(a, val),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write32(addr - CD_BLOCK_BASE, val),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);

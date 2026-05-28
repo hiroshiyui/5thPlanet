@@ -17,6 +17,8 @@ use std::fs;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use saturn::cartridge::Cartridge;
+
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
 /// somehow before the epoch). Used to seed the Saturn RTC.
 fn host_unix_secs() -> u64 {
@@ -27,10 +29,25 @@ fn host_unix_secs() -> u64 {
 }
 
 fn main() -> ExitCode {
-    let bios_path = match env::args().nth(1) {
-        Some(p) => p,
+    // Split flags (`--cart=…`) from positional args (BIOS, then disc).
+    let mut positionals: Vec<String> = Vec::new();
+    let mut cart_spec: Option<String> = None;
+    for arg in env::args().skip(1) {
+        if let Some(spec) = arg.strip_prefix("--cart=") {
+            cart_spec = Some(spec.to_string());
+        } else {
+            positionals.push(arg);
+        }
+    }
+
+    let bios_path = match positionals.first() {
+        Some(p) => p.clone(),
         None => {
-            eprintln!("usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd]");
+            eprintln!("usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd] [--cart=<kind>]");
+            eprintln!();
+            eprintln!("  --cart=ram1m | ram4m   Extension DRAM cart (1 MiB / 4 MiB)");
+            eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
+            eprintln!("  --cart=rom:<path>      game ROM cart image");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -54,8 +71,8 @@ fn main() -> ExitCode {
     }
 
     // Optional game disc (CUE/BIN, raw ISO, or CloneCD CCD/IMG).
-    let disc = match env::args().nth(2) {
-        Some(path) => match load_disc(&path) {
+    let disc = match positionals.get(1) {
+        Some(path) => match load_disc(path) {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("failed to load disc {path}: {e}");
@@ -65,7 +82,40 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    run(bios, disc)
+    // Optional expansion cartridge.
+    let cart = match cart_spec {
+        Some(spec) => match parse_cart(&spec) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bad --cart: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        None => Cartridge::None,
+    };
+
+    run(bios, disc, cart)
+}
+
+/// Parse a `--cart=` spec into a [`Cartridge`]. Accepts `ram1m`/`ram4m`
+/// (Extension DRAM), `bram[4|8|16|32]` (battery backup RAM, in Mbit), and
+/// `rom:<path>` (a game ROM image loaded from disk).
+fn parse_cart(spec: &str) -> Result<Cartridge, String> {
+    if let Some(path) = spec.strip_prefix("rom:") {
+        let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(Cartridge::rom(bytes));
+    }
+    match spec {
+        "ram1m" => Ok(Cartridge::ext_ram_1mb()),
+        "ram4m" => Ok(Cartridge::ext_ram_4mb()),
+        "bram" | "bram32" => Ok(Cartridge::backup_ram(0x0040_0000)),
+        "bram4" => Ok(Cartridge::backup_ram(0x0008_0000)),
+        "bram8" => Ok(Cartridge::backup_ram(0x0010_0000)),
+        "bram16" => Ok(Cartridge::backup_ram(0x0020_0000)),
+        other => Err(format!(
+            "unknown cart kind '{other}' (use ram1m / ram4m / bram[4|8|16|32] / rom:<path>)"
+        )),
+    }
 }
 
 /// Load a disc image, picking the parser by file extension: `.iso` (raw
@@ -99,7 +149,7 @@ fn load_disc(path: &str) -> Result<saturn::disc::Disc, String> {
 }
 
 #[cfg(feature = "sdl2-frontend")]
-fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
+fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
     use sdl2::keyboard::{Keycode, Scancode};
@@ -118,6 +168,7 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
     if let Some(d) = disc {
         saturn.insert_disc(d);
     }
+    saturn.insert_cartridge(cart);
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
@@ -232,7 +283,7 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
 }
 
 #[cfg(not(feature = "sdl2-frontend"))]
-fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
+fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::FRAMEBUFFER_BYTES;
 
@@ -246,6 +297,7 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
     if let Some(d) = disc {
         saturn.insert_disc(d);
     }
+    saturn.insert_cartridge(cart);
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
     for _ in 0..HEADLESS_FRAMES {
         saturn.run_frame(&mut framebuffer);

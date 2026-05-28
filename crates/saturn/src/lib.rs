@@ -45,6 +45,7 @@
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 
 pub mod bus;
+pub mod cartridge;
 pub mod cd_block;
 pub mod disc;
 pub mod memory;
@@ -57,6 +58,7 @@ pub mod vdp1;
 pub mod vdp2;
 
 pub use bus::SaturnBus;
+pub use cartridge::Cartridge;
 pub use cd_block::CdBlock;
 pub use memory::{BiosRom, Ram, StubRegisterBank};
 pub use scheduler::{CdBlockEntity, EntityId, SaturnEntity, SchedEntity, Scheduler, Sh2Entity};
