@@ -489,7 +489,7 @@ M7 grows it into the full engine, in independently-testable phases:
 | 2 | **Buffer/filter/partition core** ✅ done | 200 blocks, 24 filters (FAD-range / file-id / channel / submode / coding-info), partitions. Reset Selector / Set Filter\* / Get Buffer\* (`0x40`–`0x54`). Pure-logic tests. |
 | 3 | **Sector pump + data transfer** ✅ done | 75/150 Hz read pump (extends `CdBlockEntity`) disc→filter→partition; Get/Get-and-Delete Sector Data (`0x60`–`0x63`) streaming the data port + the SCU-DMA path. **Address-map fix:** the data-transfer port is at `0x2581_8000` (the SCU DMA already special-cases `0x0581_8000`) — outside the current `0x0589_xxxx` window, so the bus needs that region. |
 | 4 | **CD-ROM filesystem** ✅ done | ISO9660 directory parse (PVD at FAD 166, `direntryT` records). Change Dir / Get File Scope / Get File Info / Read File (`0x70`–`0x75`). |
-| 5 | **Authentication + game boot** | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
+| 5 | **Authentication + game boot** ✅ done | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
 
 **Deferred within M7:** CDDA audio playback into the SCSP, the MPEG card
 (`0x90`+), Move/Copy sector ops, and realistic seek timing — none block game
