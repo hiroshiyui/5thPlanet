@@ -51,8 +51,10 @@ crate `crates/physdisc`** that is the single, documented exception to ADR-0007:
   the opt-in feature; the FFI signatures/enum values are hand-bound to the
   documented libcdio API and must track it; CD-DA extraction quality varies by
   drive; Mode-2 subheader filtering isn't reconstructed from a drive's cooked
-  reads (image discs still expose it). The FFI cannot be exercised in a CI/
-  sandbox without a drive — it needs on-hardware verification.
+  reads (image discs still expose it). The FFI is functionally verified
+  against a CUE/BIN image (open + TOC + data + CD-DA reads, `libcdio` feature,
+  `#[ignore]`d); reading from a physical *device* (vs. an image) still wants a
+  real drive to confirm. CI stays libcdio-free (the test is feature-gated).
 
 ## Alternatives considered
 
