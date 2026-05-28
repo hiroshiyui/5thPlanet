@@ -14,18 +14,18 @@
 //!   0x40..0x54   DMA channel 2
 //!   0x60         DSTP — DMA force stop
 //!   0x7C         DSTA — DMA status
-//!   0x80..0x9C   DSP control (task #17)
-//!   0xA0         T0C  — timer 0 compare
-//!   0xA4         T1S  — timer 1 set value
-//!   0xA8         T1MD — timer 1 mode
-//!   0xB0         IMS  — interrupt mask (1 = masked)
-//!   0xB4         IST  — interrupt status (W1C in hardware; raw in M3)
-//!   0xB8         AIACK — A-bus interrupt acknowledge
-//!   0xC4         ASR0 — A-bus set 0
-//!   0xC8         ASR1 — A-bus set 1
-//!   0xCC         AREF — A-bus refresh
-//!   0xF4         RSEL — SCU register select
-//!   0xF8         VER  — version, reads 0x0000_0004 (read-only)
+//!   0x80..0x8C   DSP control ports (PPAF / PPD / PDA / PDD)
+//!   0x90         T0C  — timer 0 compare
+//!   0x94         T1S  — timer 1 set value
+//!   0x98         T1MD — timer 1 mode
+//!   0xA0         IMS  — interrupt mask (1 = masked)
+//!   0xA4         IST  — interrupt status (W1C)
+//!   0xA8         AIACK — A-bus interrupt acknowledge
+//!   0xB0         ASR0 — A-bus set 0
+//!   0xB4         ASR1 — A-bus set 1
+//!   0xB8         AREF — A-bus refresh
+//!   0xC4         RSEL — SCU SDRAM/register select
+//!   0xC8         VER  — version, reads 0x0000_0004 (read-only)
 //! ```
 //!
 //! DMA: a channel armed via `D*EN` (bit 8) transfers when its start factor
@@ -190,14 +190,12 @@ pub struct Scu {
     pub aref: u32,
     pub rsel: u32,
     /// The SCU's embedded 32-bit DSP. Host software drives it through the
-    /// PPAF/PPD/PDA/PDD ports at 0x80/0x84/0x88/0x8C; the upper part of the
-    /// 0x80..0x9C window (0x90..0x9C) is plain storage.
+    /// PPAF/PPD/PDA/PDD ports at 0x80/0x84/0x88/0x8C.
     pub dsp: scu_dsp::Dsp,
     /// Set when host software starts the DSP (PPAF EXF bit). The Saturn
     /// aggregate drains this and runs the DSP at the top level, where its
     /// DMA can reach the system bus (it can't from inside the bus).
     dsp_run: bool,
-    pub dsp_ctrl: [u32; 8],
     /// Sources that have been asserted since the last drain. The
     /// Saturn aggregate's `drain_scu_intc` pops one per call and
     /// raises it on the master SH-2's INTC. Distinct from `ist`: `ist`
@@ -250,18 +248,17 @@ impl Scu {
             0x84 => self.dsp.regs.pc as u32, // PPD is write-only; report PC
             0x88 => self.dsp.regs.ra as u32, // PDA is write-only; report RA
             0x8C => self.dsp_pdd_read(),     // data-RAM data port (RA auto-inc)
-            0x90..=0x9C => self.dsp_ctrl[((offset - 0x80) / 4) as usize],
-            0xA0 => self.t0c,
-            0xA4 => self.t1s,
-            0xA8 => self.t1md,
-            0xB0 => self.ims,
-            0xB4 => self.ist,
-            0xB8 => self.aiack,
-            0xC4 => self.asr0,
-            0xC8 => self.asr1,
-            0xCC => self.aref,
-            0xF4 => self.rsel,
-            0xF8 => 0x0000_0004, // version: SCU revision
+            0x90 => self.t0c,
+            0x94 => self.t1s,
+            0x98 => self.t1md,
+            0xA0 => self.ims,
+            0xA4 => self.ist,
+            0xA8 => self.aiack,
+            0xB0 => self.asr0,
+            0xB4 => self.asr1,
+            0xB8 => self.aref,
+            0xC4 => self.rsel,
+            0xC8 => 0x0000_0004, // version: SCU revision
             _ => 0,
         }
     }
@@ -275,22 +272,19 @@ impl Scu {
             0x84 => self.dsp_ppd_write(val),  // program-RAM data port (PC++)
             0x88 => self.dsp.regs.ra = val as u8, // data-RAM address port
             0x8C => self.dsp_pdd_write(val),  // data-RAM data port (RA auto-inc)
-            0x90..=0x9C => {
-                self.dsp_ctrl[((offset - 0x80) / 4) as usize] = val;
-            }
-            0xA0 => self.t0c = val,
-            0xA4 => self.t1s = val,
-            0xA8 => self.t1md = val,
-            0xB0 => self.ims = val,
+            0x90 => self.t0c = val,
+            0x94 => self.t1s = val,
+            0x98 => self.t1md = val,
+            0xA0 => self.ims = val,
             // IST is write-1-to-clear: software acknowledges interrupts
             // by writing the bit it wants to clear.
-            0xB4 => self.ist &= !val,
-            0xB8 => self.aiack = val,
-            0xC4 => self.asr0 = val,
-            0xC8 => self.asr1 = val,
-            0xCC => self.aref = val,
-            0xF4 => self.rsel = val,
-            // 0xF8 VER is read-only.
+            0xA4 => self.ist &= !val,
+            0xA8 => self.aiack = val,
+            0xB0 => self.asr0 = val,
+            0xB4 => self.asr1 = val,
+            0xB8 => self.aref = val,
+            0xC4 => self.rsel = val,
+            // 0xC8 VER is read-only.
             _ => {}
         }
     }
@@ -579,9 +573,9 @@ mod tests {
     #[test]
     fn version_register_is_read_only_and_returns_four() {
         let mut s = Scu::new();
-        assert_eq!(s.read32(0xF8), 0x04);
-        s.write32(0xF8, 0xDEAD_BEEF);
-        assert_eq!(s.read32(0xF8), 0x04, "VER ignores writes");
+        assert_eq!(s.read32(0xC8), 0x04);
+        s.write32(0xC8, 0xDEAD_BEEF);
+        assert_eq!(s.read32(0xC8), 0x04, "VER ignores writes");
     }
 
     #[test]
@@ -646,13 +640,21 @@ mod tests {
     }
 
     #[test]
-    fn dsp_ctrl_storage_window_round_trips() {
-        // 0x80..0x8C are the live DSP ports now; 0x90..0x9C is plain storage.
+    fn timer_and_interrupt_registers_use_hardware_offsets() {
+        // T0C/T1S/T1MD at 0x90/0x94/0x98, IMS at 0xA0, IST at 0xA4 — the
+        // hardware map (SCU User's Manual, cross-checked with MAME). Getting
+        // IMS at 0xA0 (not 0xB0) is what lets the BIOS unmask the SMPC
+        // interrupt; an off-by-0x10 map silently masked it.
         let mut s = Scu::new();
-        s.write32(0x90, 0xAAAA_BBBB);
-        s.write32(0x9C, 0xCCCC_DDDD);
-        assert_eq!(s.read32(0x90), 0xAAAA_BBBB);
-        assert_eq!(s.read32(0x9C), 0xCCCC_DDDD);
+        s.write32(0x90, 0x0000_1234); // T0C
+        s.write32(0x94, 0x0000_5678); // T1S
+        s.write32(0x98, 0x0000_0001); // T1MD
+        s.write32(0xA0, 0x0000_FF00); // IMS
+        assert_eq!(s.read32(0x90), 0x0000_1234);
+        assert_eq!(s.read32(0x94), 0x0000_5678);
+        assert_eq!(s.read32(0x98), 0x0000_0001);
+        assert_eq!(s.read32(0xA0), 0x0000_FF00, "IMS at 0xA0");
+        assert_eq!(s.ims, 0x0000_FF00, "0xA0 write reaches the mask field");
     }
 
     #[test]
@@ -791,11 +793,11 @@ mod tests {
             s.ist,
             (1 << Source::Timer0.bit()) | (1 << Source::SoundRequest.bit())
         );
-        // W1C bit Timer0.
-        s.write32(0xB4, 1 << Source::Timer0.bit());
+        // W1C bit Timer0 (IST at 0xA4).
+        s.write32(0xA4, 1 << Source::Timer0.bit());
         assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
         // Writing 0 doesn't clear anything.
-        s.write32(0xB4, 0);
+        s.write32(0xA4, 0);
         assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
     }
 }

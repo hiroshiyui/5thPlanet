@@ -46,7 +46,7 @@ fn build() -> Saturn {
 #[test]
 fn version_register_is_read_through_the_bus() {
     let mut sat = build();
-    let (v, _) = sat.bus.read32(SCU_BASE + 0xF8, AccessKind::Data);
+    let (v, _) = sat.bus.read32(SCU_BASE + 0xC8, AccessKind::Data);
     assert_eq!(v, 0x0000_0004);
 }
 
@@ -242,7 +242,7 @@ fn dma_completion_raises_level0_dma_end_through_the_drainer() {
     sat.bus.write32(D0EN, DGO, AccessKind::Data);
     sat.run_for(512);
     // IST bit for Level0DmaEnd should be set; software hasn't W1C'd it yet.
-    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xA4, AccessKind::Data);
     assert_ne!(ist & (1 << ScuSource::Level0DmaEnd.bit()), 0);
 }
 
@@ -253,11 +253,11 @@ fn ist_is_w1c_via_bus_write() {
     sat.bus.scu.raise(ScuSource::HBlankIn);
     // Acknowledge only Timer0 via W1C.
     sat.bus.write32(
-        SCU_BASE + 0xB4,
+        SCU_BASE + 0xA4,
         1 << ScuSource::Timer0.bit(),
         AccessKind::Data,
     );
-    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xA4, AccessKind::Data);
     assert_eq!(
         ist,
         1 << ScuSource::HBlankIn.bit(),
@@ -333,7 +333,7 @@ fn scu_dsp_runs_program_and_raises_dsp_end_interrupt() {
     dsp_start_at_zero(&mut sat);
     sat.run_for(512);
     assert!(sat.bus.scu.dsp.stopped(), "DSP halted at ENDI");
-    let (ist, _) = sat.bus.read32(SCU_BASE + 0xB4, AccessKind::Data);
+    let (ist, _) = sat.bus.read32(SCU_BASE + 0xA4, AccessKind::Data);
     assert_ne!(
         ist & (1 << ScuSource::DspEnd.bit()),
         0,
