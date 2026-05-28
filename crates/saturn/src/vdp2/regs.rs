@@ -217,6 +217,21 @@ impl Vdp2Regs {
         }
     }
 
+    /// "Transparent-pen as solid" for NBG`n` (BGON NxTPON, bits 8..11). When
+    /// set, palette code 0 is drawn as the opaque colour `CRAM[offset]` instead
+    /// of being treated as transparent — the BIOS splash sets this on NBG3 so
+    /// the metal's code-0 dots fill with silver rather than showing the
+    /// backdrop through them.
+    pub fn nbg_transparent_pen_solid(&self, n: usize) -> bool {
+        self.bgon() & (1 << (8 + n)) != 0
+    }
+
+    /// "Transparent-pen as solid" for rotation `which` (R0TPON bit 12).
+    pub fn rbg_transparent_pen_solid(&self, which: usize) -> bool {
+        let bit = if which == 0 { 12 } else { 8 };
+        self.bgon() & (1 << bit) != 0
+    }
+
     /// Cell size for NBG`n`: 0 = 1×1 cell (8×8 px), 1 = 2×2 cells (16×16 px).
     pub fn nbg_char_size_2x2(&self, n: usize) -> bool {
         let bit = match n {

@@ -391,6 +391,7 @@ fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(
     let (w, h) = bitmap_dims(vdp2.regs.nbg_bitmap_size(n));
     let (px, py) = (sx % w, sy % h);
     let coff = vdp2.regs.nbg_color_ram_offset(n);
+    let tpon = vdp2.regs.nbg_transparent_pen_solid(n);
     match depth {
         // 16bpp RGB555 direct colour.
         3 => {
@@ -401,14 +402,14 @@ fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(
         // 8bpp paletted (256 colour).
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0).then(|| cram(vdp2, coff | idx))
+            (idx != 0 || tpon).then(|| cram(vdp2, coff | idx))
         }
         // 4bpp paletted (16 colour). The BMPNA palette bank is a later
         // refinement; the nibble indexes the low palette directly.
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0).then(|| cram(vdp2, coff | nibble))
+            (nibble != 0 || tpon).then(|| cram(vdp2, coff | nibble))
         }
     }
 }
@@ -490,6 +491,7 @@ fn sample_pattern_cell(
     mut in_x: u32,
     mut in_y: u32,
     coff: usize,
+    tpon: bool,
 ) -> Option<(u8, u8, u8)> {
     let cell_px = if two_cells { 16 } else { 8 };
     if pat.hflip {
@@ -509,13 +511,13 @@ fn sample_pattern_cell(
         // 8bpp cell: 0x40 bytes, one byte/pixel; palette is the colour bank.
         let cell = pat.cell + subcell * 2;
         let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
-        (byte != 0).then(|| cram(vdp2, coff | (pat.palette as usize) << 8 | byte))
+        (byte != 0 || tpon).then(|| cram(vdp2, coff | (pat.palette as usize) << 8 | byte))
     } else {
         // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
         let cell = pat.cell + subcell;
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
         let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
-        (nibble != 0).then(|| cram(vdp2, coff | (pat.palette as usize) << 4 | nibble))
+        (nibble != 0 || tpon).then(|| cram(vdp2, coff | (pat.palette as usize) << 4 | nibble))
     }
 }
 
@@ -575,7 +577,8 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
     };
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
     let coff = r.nbg_color_ram_offset(n);
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff)
+    let tpon = r.nbg_transparent_pen_solid(n);
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon)
 }
 
 // Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
@@ -765,6 +768,7 @@ fn sample_rot_bitmap(
     };
     let w = w as u32;
     let coff = vdp2.regs.rbg_color_ram_offset(which);
+    let tpon = vdp2.regs.rbg_transparent_pen_solid(which);
     match depth {
         3 => {
             let entry = vdp2.vram.read16(base + (py * w + px) * 2);
@@ -772,12 +776,12 @@ fn sample_rot_bitmap(
         }
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0).then(|| cram(vdp2, coff | idx))
+            (idx != 0 || tpon).then(|| cram(vdp2, coff | idx))
         }
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0).then(|| cram(vdp2, coff | nibble))
+            (nibble != 0 || tpon).then(|| cram(vdp2, coff | nibble))
         }
     }
 }
@@ -856,7 +860,8 @@ fn sample_rot_tile(
     };
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
     let coff = r.rbg_color_ram_offset(which);
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff)
+    let tpon = r.rbg_transparent_pen_solid(which);
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon)
 }
 
 #[cfg(test)]
