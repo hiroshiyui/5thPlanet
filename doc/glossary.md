@@ -34,8 +34,13 @@ verbatim in M3; SH-2 BSC integration is queued for later.
 M3 stub as A-bus.
 
 **Backup RAM** — 32 KiB battery-backed save memory at
-`0x0018_0000..0x001F_FFFF`. Stored in `crates/saturn/src/memory.rs`
-as `Ram`; mirrors across its 512 KiB window.
+`0x0018_0000..0x001F_FFFF` (the console's built-in "memory card").
+Modeled by `memory::BackupRam` with hardware **odd-byte packing** — data
+lives only on odd byte addresses, even bytes read 0 (`data[(off>>1) %
+0x8000]`), matching MAME `backupram_r/w` and the [cartridge] backup cart —
+and pre-formatted with the "BackUpRam Format" tag. Persisted to a host
+`.bup` file by the frontend (battery emulation). Mirrors across its
+512 KiB window. See also [Save state].
 
 **BGON** — VDP2 Screen Display Enable register (`0x05F8_0020`). Bits
 0..5 enable [NBG]0–3 / [RBG]0–1; bits 8..12 ([TPON]) make each layer's
@@ -377,6 +382,15 @@ slot. Used by the BIOS to return from `TRAPA` / interrupts.
 **SaturnBus** — `crates/saturn/src/bus.rs` — the workspace's
 implementation of `sh2::Bus`. Owns all Saturn memory regions and
 peripherals, dispatches by address.
+
+**Save state** — A full deterministic snapshot of the machine
+(`crates/saturn/src/savestate.rs`): `Saturn::save_state` / `load_state`
+serialize every volatile state type via [serde] + `bincode`, behind a
+magic + version header. External media — [BIOS], the disc image, and a ROM
+[cartridge]'s bytes — is **referenced, not embedded** (`#[serde(skip)]` +
+re-grafted on load, guarded by an FNV-1a fingerprint), since it's large
+and/or copyrighted. The cores' derives are behind an optional `serde`
+feature `saturn` enables. See also [Backup RAM].
 
 **Scheduler** — `crates/saturn/src/scheduler.rs` — event-driven
 runner. Each `SchedEntity` reports a `next_deadline()`; the scheduler

@@ -24,8 +24,9 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
 | CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. Remaining: CDDA→SCSP playback, MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
 | Cartridge slot | ✅ | Extension DRAM (1 MB / 4 MB, two banks), battery backup-RAM (odd-byte packing), and game ROM carts, mapped at `0x0200_0000..0x04FF_FFFF` with the probed cart-ID byte at `0x04FF_FFFF`; `--cart=` frontend flag. (CDDA→SCSP, MPEG card, move/copy ops still deferred within M7) |
-| SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
-| Save states | ⬜ | Deferred until the peripheral set stabilises |
+| SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad, F5/F9 save-state hotkeys |
+| Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
+| Backup RAM (battery) | ✅ | Internal 32 KiB backup RAM with hardware odd-byte packing + "BackUpRam Format" default; persisted to a host `.bup` file by the frontend. M8 |
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ✅ — SEGA splash renders
 · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
@@ -36,7 +37,10 @@ slot) ✅** — all five CD-block HLE phases (disc/TOC, buffer/filter/partition,
 read pump + data transfer, ISO9660 FS, authentication) and the **cartridge
 slot** (Extension DRAM / backup / ROM carts + cart-ID) are done. See the
 Milestone 7 section. (Deferred within M7: CDDA→SCSP, MPEG card, move/copy
-sector ops.)
+sector ops.) · **M8 (save states + battery-backed backup RAM) ✅** — full
+deterministic snapshot/restore (`save_state`/`load_state`, bincode + versioned
+header, media referenced not embedded) and a hardware-faithful, host-persisted
+internal backup RAM. See the Milestone 8 section.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -507,7 +511,21 @@ the battery backup-RAM cart, and game ROM carts (`0x0200_0000`), selected per
 game with the probed cart-ID byte at `0x04FF_FFFF`. The 4 MB Extension DRAM
 cart is what Street Fighter Zero 3 and The King of Fighters '97 require.
 
+## Milestone 8 — Save states + battery-backed backup RAM ✅
+
+Snapshot/restore the whole machine, and persist the console's battery.
+
+| # | Task | Notes |
+|---|------|-------|
+| 1 | **serde derives (cores)** ✅ done | Feature-gated `Serialize`/`Deserialize` on the sh2 / m68k / scu_dsp state types (off by default; the cores stay dependency-free). Big arrays via serde-big-array; the scu_dsp `[[u32;64];4]` data RAM via a no_std flat-tuple codec. |
+| 2 | **serde derives (saturn) + save-state API** ✅ done | Derives across the bus, every peripheral, the scheduler, and `Saturn`. `savestate.rs`: `save_state`/`load_state` over bincode with a magic + version header; external media (BIOS / disc image / ROM-cart bytes) `#[serde(skip)]`'d and re-grafted on load, guarded by FNV-1a fingerprints. 8 tests incl. a snapshot-then-equal-runs determinism check. |
+| 3 | **Battery-backed backup RAM** ✅ done | `memory::BackupRam` (32 KiB) with hardware odd-byte packing (matches MAME `backupram_r/w` + the M7 cart) + "BackUpRam Format" default; `Saturn::internal_backup`/`load_internal_backup`. BIOS-boot golden unchanged. |
+| 4 | **Frontend** ✅ done | F5 quicksave / F9 quickload to `<bios>.state`; internal backup RAM loaded from / written to `<bios>.bup` (battery) on both builds. |
+
+**Deferred (queued):** save-state migration across `VERSION` bumps (v1 rejects
+mismatches), rewind/run-ahead, compressed states, and multiple slots / a
+save-state UI.
+
 ## Later milestones (queued)
 
-- **Save states** — versioned serde across the crates, once the peripheral set stabilises.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).

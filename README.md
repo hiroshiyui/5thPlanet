@@ -21,8 +21,9 @@ foundation stays solid.
 | M5        | Chip-coverage build-out — VDP1, MC68EC000, full VDP2        | ✅ complete  |
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
 | M7        | CD-block (HLE) + game boot + cartridge slot                 | ✅ complete  |
+| M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 
-Current test count: **500 workspace-wide, 0 failures.** Task-by-task
+Current test count: **508 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -38,6 +39,15 @@ authenticates a Saturn disc — pass a game as the second argument. The
 **cartridge slot** rounds out M7: Extension DRAM (1 MB / 4 MB), battery
 backup-RAM, and game ROM carts plug into the rear expansion connector via
 `--cart=` (the 4 MB DRAM cart is what Street Fighter Zero 3 / KOF '97 need).
+
+**M8 adds save states**: `Saturn::save_state` / `load_state` snapshot the entire
+deterministic machine state (both SH-2s, the 68k, every peripheral, all RAM, the
+scheduler) to a versioned `bincode` blob — external media (BIOS, disc, ROM cart)
+is referenced by fingerprint, not embedded. The SDL2 frontend binds **F5
+quicksave / F9 quickload**. M8 also makes the **internal 32 KiB backup RAM** (the
+console's built-in "memory card") hardware-faithful, with the odd-byte packing
+real hardware uses, and persists it to a host `.bup` file so game saves survive a
+restart like a battery-backed console.
 
 Real BIOS images booting in the SDL2 frontend, rendered pixel-for-pixel against
 the MAME reference — each region's BIOS shows its own splash:
