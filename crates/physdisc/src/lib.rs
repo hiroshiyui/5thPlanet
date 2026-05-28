@@ -34,6 +34,14 @@ const SECTOR_RAW: usize = 2352;
 pub struct PhysicalDisc {
     #[cfg(feature = "libcdio")]
     inner: ffi::Cdio,
+    /// The raw block device, when the source is an actual drive (not an image).
+    /// Data sectors are read through this with a plain *cooked* positioned read
+    /// (`read_at`/`seek_read`) — the kernel hands back 2048-byte Mode-1/2 user
+    /// data and, unlike libcdio's SG_IO `READ CD`, it needs no `CAP_SYS_RAWIO`,
+    /// so it works for an ordinary `cdrom`-group user. libcdio is still used for
+    /// the TOC and for CD-DA (audio) extraction.
+    #[cfg(feature = "libcdio")]
+    dev_file: Option<std::fs::File>,
     /// Cached track table (number, ctrl/addr, audio?, start FAD, length).
     tracks: Vec<TrackInfo>,
     lead_out_fad: u32,
@@ -60,10 +68,41 @@ impl PhysicalDisc {
         let fingerprint = toc_fingerprint(&tracks, lead_out_fad);
         Ok(Self {
             inner,
+            dev_file: open_block_device(device),
             tracks,
             lead_out_fad,
             fingerprint,
         })
+    }
+
+    /// Cooked positioned read of one 2048-byte data sector via the block device
+    /// (no `&mut self`, no `CAP_SYS_RAWIO`). `false` if there's no block device
+    /// (e.g. an image source) or the read fails.
+    #[cfg(feature = "libcdio")]
+    fn read_block(&self, lsn: i32, out: &mut [u8]) -> bool {
+        let Some(file) = &self.dev_file else {
+            return false;
+        };
+        if lsn < 0 || out.len() < SECTOR_USER {
+            return false;
+        }
+        let offset = lsn as u64 * SECTOR_USER as u64;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut out[..SECTOR_USER], offset).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(&mut out[..SECTOR_USER], offset)
+                .is_ok_and(|n| n == SECTOR_USER)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = offset;
+            false
+        }
     }
 
     /// Stub when built without the `libcdio` feature.
@@ -79,6 +118,29 @@ impl PhysicalDisc {
             .iter()
             .find(|t| fad >= t.start_fad && fad < t.start_fad + t.length)
     }
+}
+
+/// Open `path` as a raw block device for cooked data reads — `Some` only for
+/// an actual device, not an image file (a `.cue` is a regular file, read via
+/// libcdio instead). Best-effort: `None` disables the block-read fast path.
+#[cfg(all(feature = "libcdio", unix))]
+fn open_block_device(path: &str) -> Option<std::fs::File> {
+    use std::os::unix::fs::FileTypeExt;
+    let file = std::fs::File::open(path).ok()?;
+    let is_device = file.metadata().ok()?.file_type().is_block_device();
+    is_device.then_some(file)
+}
+#[cfg(all(feature = "libcdio", windows))]
+fn open_block_device(path: &str) -> Option<std::fs::File> {
+    // A Windows raw device path is like `\\.\D:`; treat a non-regular open as
+    // the device. Best-effort — falls back to libcdio reads if this is None.
+    let file = std::fs::File::open(path).ok()?;
+    let regular = file.metadata().ok()?.is_file();
+    (!regular).then_some(file)
+}
+#[cfg(all(feature = "libcdio", not(any(unix, windows))))]
+fn open_block_device(_path: &str) -> Option<std::fs::File> {
+    None
 }
 
 /// FNV-1a over the track table — a cheap, stable disc identity (no full image
@@ -159,7 +221,9 @@ impl SectorSource for PhysicalDisc {
                 _ => return false,
             }
             let lsn = fad as i32 - FAD_OFFSET as i32;
-            self.inner.read_mode1(lsn, &mut out[..SECTOR_USER])
+            // Prefer the cooked block read (works without rawio); fall back to
+            // libcdio's SG_IO read (images, or drives with rawio).
+            self.read_block(lsn, out) || self.inner.read_mode1(lsn, &mut out[..SECTOR_USER])
         }
         #[cfg(not(feature = "libcdio"))]
         false
@@ -181,14 +245,14 @@ impl SectorSource for PhysicalDisc {
                 } else {
                     0
                 }
+            } else if self.read_block(lsn, &mut out[..SECTOR_USER])
+                || self.inner.read_mode1(lsn, &mut out[..SECTOR_USER])
+            {
+                // Cooked 2048 user payload; the read pump's common path only
+                // needs that (the full 2352 raw isn't reconstructed for data).
+                SECTOR_USER
             } else {
-                // libcdio hands back cooked 2048 data; the read pump's common
-                // path only needs the 2048 user payload.
-                if self.inner.read_mode1(lsn, &mut out[..SECTOR_USER]) {
-                    SECTOR_USER
-                } else {
-                    0
-                }
+                0
             }
         }
         #[cfg(not(feature = "libcdio"))]
@@ -211,6 +275,61 @@ impl SectorSource for PhysicalDisc {
 mod libcdio_tests {
     use super::*;
     use std::io::Write;
+
+    /// TEMP manual probe of a real drive (`SAT_CDROM`, default `/dev/sr0`):
+    /// dumps the TOC and checks the Saturn IP header at FAD 150.
+    #[test]
+    #[ignore = "manual: probe a real optical drive"]
+    fn probe_physical_drive() {
+        let dev = std::env::var("SAT_CDROM").unwrap_or_else(|_| "/dev/sr0".into());
+        let disc = match PhysicalDisc::open(&dev) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("open {dev} failed: {e}");
+                return;
+            }
+        };
+        println!(
+            "drive {dev}: first={} last={} lead_out_fad={}",
+            disc.first_track(),
+            disc.last_track(),
+            disc.lead_out_fad()
+        );
+        for t in &disc.tracks {
+            println!(
+                "  track {:2}  {}  start_fad={:>7}  len={:>7}  ctrl=0x{:02X}",
+                t.number,
+                if t.is_audio { "AUDIO" } else { "DATA " },
+                t.start_fad,
+                t.length,
+                t.ctrl_addr
+            );
+        }
+        let mut buf = [0u8; SECTOR_RAW];
+        if disc.read_sector(FAD_OFFSET, &mut buf[..SECTOR_USER]) {
+            println!(
+                "Saturn disc (SEGA SEGASATURN header): {}",
+                &buf[..15] == b"SEGA SEGASATURN"
+            );
+            println!("maker = {:?}", String::from_utf8_lossy(&buf[16..32]).trim());
+            println!(
+                "product = {:?}",
+                String::from_utf8_lossy(&buf[32..42]).trim()
+            );
+            println!(
+                "title = {:?}",
+                String::from_utf8_lossy(&buf[0x60..0x70]).trim()
+            );
+        } else {
+            println!("read_sector(FAD 150) failed");
+        }
+        // CD-DA (audio) read of the first audio track via libcdio DAE.
+        if let Some(a) = disc.tracks.iter().find(|t| t.is_audio) {
+            let lsn = a.start_fad as i32 - FAD_OFFSET as i32;
+            let ok = disc.inner.read_audio(lsn, &mut buf);
+            println!("CD-DA read of track {} (lsn {lsn}): {ok}", a.number);
+        }
+    }
 
     /// Open a synthetic CUE/BIN image through libcdio (it reads images as well
     /// as devices) and verify the TOC + a data-sector read end to end. Needs
