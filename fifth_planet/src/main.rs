@@ -94,7 +94,11 @@ fn main() -> ExitCode {
         None => Cartridge::None,
     };
 
-    run(bios, disc, cart)
+    // Sibling files for the quicksave state (`.state`) and the persisted
+    // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
+    let save_base = std::path::PathBuf::from(&bios_path);
+
+    run(bios, disc, cart, save_base)
 }
 
 /// Parse a `--cart=` spec into a [`Cartridge`]. Accepts `ram1m`/`ram4m`
@@ -149,7 +153,12 @@ fn load_disc(path: &str) -> Result<saturn::disc::Disc, String> {
 }
 
 #[cfg(feature = "sdl2-frontend")]
-fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> ExitCode {
+fn run(
+    bios: Vec<u8>,
+    disc: Option<saturn::disc::Disc>,
+    cart: Cartridge,
+    save_base: std::path::PathBuf,
+) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
     use sdl2::keyboard::{Keycode, Scancode};
@@ -169,6 +178,16 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> Exit
         saturn.insert_disc(d);
     }
     saturn.insert_cartridge(cart);
+
+    // Save-state quickslot and the persisted battery (internal backup RAM),
+    // both keyed to the BIOS path. F5/F9 use the former; the latter is the
+    // console's "memory card", loaded here and written back on exit.
+    let state_path = save_base.with_extension("state");
+    let battery_path = save_base.with_extension("bup");
+    if let Ok(bytes) = fs::read(&battery_path) {
+        saturn.load_internal_backup(&bytes);
+        eprintln!("loaded backup RAM from {}", battery_path.display());
+    }
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
@@ -233,6 +252,25 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> Exit
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'main,
+                // F5 quicksave: snapshot the whole machine to <bios>.state.
+                Event::KeyDown {
+                    keycode: Some(Keycode::F5),
+                    ..
+                } => match fs::write(&state_path, saturn.save_state()) {
+                    Ok(()) => eprintln!("saved state to {}", state_path.display()),
+                    Err(e) => eprintln!("save state failed: {e}"),
+                },
+                // F9 quickload: restore that snapshot (same BIOS/disc required).
+                Event::KeyDown {
+                    keycode: Some(Keycode::F9),
+                    ..
+                } => match fs::read(&state_path) {
+                    Ok(bytes) => match saturn.load_state(&bytes) {
+                        Ok(()) => eprintln!("loaded state from {}", state_path.display()),
+                        Err(e) => eprintln!("load state failed: {e}"),
+                    },
+                    Err(e) => eprintln!("no state to load ({e})"),
+                },
                 _ => {}
             }
         }
@@ -279,11 +317,21 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> Exit
         canvas.present(); // present_vsync caps us at the display rate
     }
 
+    // Persist the internal backup RAM ("battery") so game saves survive.
+    if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
+        eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
+    }
+
     ExitCode::SUCCESS
 }
 
 #[cfg(not(feature = "sdl2-frontend"))]
-fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> ExitCode {
+fn run(
+    bios: Vec<u8>,
+    disc: Option<saturn::disc::Disc>,
+    cart: Cartridge,
+    save_base: std::path::PathBuf,
+) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::FRAMEBUFFER_BYTES;
 
@@ -298,9 +346,20 @@ fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>, cart: Cartridge) -> Exit
         saturn.insert_disc(d);
     }
     saturn.insert_cartridge(cart);
+
+    // Persist the internal backup RAM ("battery") across headless runs too.
+    let battery_path = save_base.with_extension("bup");
+    if let Ok(bytes) = fs::read(&battery_path) {
+        saturn.load_internal_backup(&bytes);
+    }
+
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
     for _ in 0..HEADLESS_FRAMES {
         saturn.run_frame(&mut framebuffer);
+    }
+
+    if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
+        eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
     }
 
     let master_pc = saturn.master().regs.pc;
