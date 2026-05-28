@@ -207,6 +207,82 @@ impl SectorSource for PhysicalDisc {
     }
 }
 
+#[cfg(all(test, feature = "libcdio"))]
+mod libcdio_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Open a synthetic CUE/BIN image through libcdio (it reads images as well
+    /// as devices) and verify the TOC + a data-sector read end to end. Needs
+    /// libcdio at link time, so it's gated + `#[ignore]`d:
+    /// `cargo test -p physdisc --features libcdio -- --ignored`.
+    #[test]
+    #[ignore = "needs libcdio; reads a synthetic CUE/BIN image"]
+    fn reads_toc_and_sector_from_a_cue_image() {
+        let dir = std::env::temp_dir();
+        let bin = dir.join("physdisc_t.bin");
+        let cue = dir.join("physdisc_t.cue");
+        // Two tracks in one BIN: 4 Mode-1/2352 data sectors (user marker at the
+        // 2048-payload offset 16), then 4 Red Book audio sectors (marker at the
+        // raw start).
+        let mut data = vec![0u8; SECTOR_RAW * 8];
+        for s in 0..4 {
+            let base = s * SECTOR_RAW + 16;
+            data[base..base + 8].copy_from_slice(b"SATTEST\0");
+            data[base + 7] = s as u8;
+        }
+        for s in 0..4 {
+            let base = (4 + s) * SECTOR_RAW;
+            data[base..base + 6].copy_from_slice(b"AUDIO!");
+            data[base + 6] = s as u8;
+        }
+        std::fs::File::create(&bin)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"physdisc_t.bin\" BINARY\n\
+             \x20 TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n\
+             \x20 TRACK 02 AUDIO\n    INDEX 01 00:00:04\n",
+        )
+        .unwrap();
+
+        let disc = PhysicalDisc::open(cue.to_str().unwrap()).expect("open cue via libcdio");
+        assert_eq!(disc.first_track(), 1);
+        assert_eq!(disc.last_track(), 2);
+        assert!(
+            !disc.track_at_fad(FAD_OFFSET).unwrap().is_audio,
+            "track 1 is data"
+        );
+        assert!(
+            disc.track_at_fad(FAD_OFFSET + 4).unwrap().is_audio,
+            "track 2 is audio"
+        );
+
+        // FAD 150 == LSN 0: the first user data sector.
+        let mut buf = [0u8; SECTOR_RAW];
+        assert!(
+            disc.read_sector(FAD_OFFSET, &mut buf[..SECTOR_USER]),
+            "read data sector 0"
+        );
+        assert_eq!(&buf[..7], b"SATTEST");
+        assert_eq!(buf[7], 0);
+        assert!(disc.read_sector(FAD_OFFSET + 2, &mut buf[..SECTOR_USER]));
+        assert_eq!(buf[7], 2);
+
+        // FAD 154 == LSN 4: the first audio sector, read raw (2352) via DAE.
+        let mut audio = [0u8; SECTOR_RAW];
+        assert_eq!(
+            disc.read_full_sector(FAD_OFFSET + 4, &mut audio),
+            SECTOR_RAW,
+            "read audio sector"
+        );
+        assert_eq!(&audio[..6], b"AUDIO!");
+        assert_eq!(audio[6], 0);
+    }
+}
+
 /// libcdio FFI — the only `unsafe` in the workspace (ADR-0009). Confined here,
 /// behind the `libcdio` feature, and wrapped in a safe [`Cdio`] handle.
 #[cfg(feature = "libcdio")]
