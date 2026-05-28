@@ -97,6 +97,7 @@ cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
   and the cartridge slot (Extension DRAM / backup-RAM / ROM carts).
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
+  Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
 
 ## BIOS
 

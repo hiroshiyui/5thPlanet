@@ -88,12 +88,20 @@ word); and **game ROM** carts at `0x0200_0000` (ID `0xFF`). Modeled in
 `crates/saturn/src/cartridge.rs`; plugged in via `Saturn::insert_cartridge`
 or the frontend `--cart=` flag.
 
-**CD-block** — Saturn's CD-ROM controller subsystem, built around an
-[SH-1] running internal firmware. Handles disc reading, sub-Q, error
-correction, and audio CD playback. M4 adds an **address-space presence
-stub** at `0x0589_8000` (`crates/saturn/src/cd_block.rs`): defined HIRQ
-/ CR register reads ("drive present, no disc, ready") so BIOS init
-doesn't hang on open bus. The real SH-1 + firmware is M6.
+**CD-block** — Saturn's CD-ROM controller subsystem, built on real
+hardware around an [SH-1] running undumped on-die firmware. Because that
+firmware can't be low-level-emulated, we model it **HLE** (M7,
+`crates/saturn/src/cd_block.rs`), like every Saturn emulator — modelled on
+MAME `saturn_cd_hle.cpp`. The host interface (HIRQ + CR1–4 at `0x0589_8000`,
+`cmd_pending == 0xF` command dispatch, the 75 Hz periodic report) drives the
+full engine: the disc image (ISO / CUE-BIN / CCD parsers, [FAD]
+addressing, [TOC]); a 200-block buffer pool with 24 [Filter]s / partitions;
+a read pump feeding partitions; data transfer (16-bit FIFO + the 32-bit
+SCU-DMA port at `0x0581_8000`); the [ISO9660] filesystem; and disc
+authentication (`0xE0`/`0xE1`). `insert_disc` / `eject_disc` move the drive
+between disc-present (status `PAUSE`) and empty (status `NODISC` `0x07`, what a
+closed empty drive reports, matching MAME). Remaining: CDDA→[SCSP] playback,
+the MPEG card, and move/copy sector ops.
 
 **Chunky** vs. **planar** — Pixel-storage modes. VDP1 / VDP2 use
 chunky (one pixel = N consecutive bits in memory); some legacy modes
@@ -323,6 +331,15 @@ its encoding is fixed and it takes exactly 1 cycle.
 ---
 
 ## O
+
+**OSD** — On-Screen Display: the frontend's hand-rolled in-window menu
+(M9, `fifth_planet/src/osd/`, ZSNES/fwNES-style; see ADR-0008). Software-
+composited into the 320×224 RGBA framebuffer with an embedded 8×8 bitmap
+font; **Esc** opens it. The module is deliberately `sdl2`-free and core-free
+(it draws into a `&mut [u8]` buffer and consumes a `Nav` enum), so it's
+unit-tested without a window; `main.rs` bridges SDL keys → `Nav`/pad and
+runs the resulting actions (save/load [save state] slots, reset, eject/insert
+disc, quit).
 
 **On-chip peripherals** — SH7604 builds INTC, DMAC, DIVU, FRT, BSC,
 WDT, SCI, UBC right into the CPU package. Mapped at

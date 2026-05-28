@@ -8,6 +8,10 @@
 //!
 //! **Status:** increment 1 of the chip — the data-movement and control-flow
 //! core. See [`interpreter`] for the implemented instruction scope.
+//!
+//! Optional `serde` feature (off by default): derives `Serialize`/`Deserialize`
+//! on the CPU state (`Cpu` + registers) for host save states; the Saturn crate
+//! enables it.
 
 #![no_std]
 

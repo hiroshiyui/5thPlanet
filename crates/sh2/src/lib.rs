@@ -2,6 +2,11 @@
 //!
 //! Designed to be driven by a host bus that owns memory, wait-states, and the
 //! Saturn-wide scheduler. The core itself is library-shaped and free of I/O.
+//!
+//! Optional `serde` feature (off by default): derives `Serialize`/`Deserialize`
+//! on the CPU state types (`Cpu`, registers, pipeline, cache, on-chip
+//! peripherals) so the host can snapshot them. The Saturn crate enables it for
+//! save states; standalone users stay dependency-free.
 
 #![no_std]
 

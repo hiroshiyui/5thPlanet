@@ -33,6 +33,11 @@
 //! INTC. That host-side glue is deferred to a later milestone (when a
 //! target microcode program surfaces); this crate stands alone in the
 //! interim.
+//!
+//! Optional `serde` feature (off by default): derives `Serialize`/
+//! `Deserialize` on the DSP state (`Dsp`, registers, program + data RAM) for
+//! host save states; the Saturn crate enables it. `no_std` without `alloc`, so
+//! the >32-element RAM arrays use serde-big-array / a small flat-tuple codec.
 
 #![no_std]
 
