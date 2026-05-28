@@ -213,45 +213,41 @@ staged-INTBACK **peripheral** response reports a phantom port-1 pad (`OREG0=0xF1
 OREG1=0x02`) where M4's plan was "no controller" — verify that doesn't send the BIOS
 down a divergent peripheral path.
 
-### Post-splash menu transition — open (diagnosed 2026-05-28)
+### Post-splash menu transition — root cause fixed (2026-05-28)
 
-After the splash fix the boot runs **far** past the logo (through WRAM `0x6011xxx`,
-a long `imask=14` loop at `0x6028DD4`, BIOS `0x0003300`) but the **screen stays on
-the splash** — MAME advances to the "Set Language" menu (~25 s), we don't. New park:
-`0x06028F9E` waits for the byte `[0x060100AB]` to become `1`; in MAME that flag is
-`0x01` by ~6 s, in ours it never sets (park spins 5 M× over 800 frames).
+The boot parked in a per-frame callback dispatcher (~`0x06028DD4`) waiting for the byte
+`[0x060100AB]` to become `1`. That flag is set by the SCU **SMPC interrupt (vector
+`0x47`, SCU source 7)**, which was **masked and never delivered** — but the mask was
+bogus. **Our SCU register map was off by `0x10` from offset `0x90` up:** IMS was decoded
+at `0xB0` (hardware IMS is `0xA0`), IST at `0xB4` (`0xA4`), and the timers at
+`0xA0/0xA4/0xA8` instead of `0x90/0x94/0x98`, with a bogus `dsp_ctrl` window eating
+`0x90..0x9C`. So the BIOS's *real* interrupt mask (SMPC unmasked) — written to `0xA0` —
+was stored in `t0c` and ignored, while the BIOS's A-bus `ASR0` write to `0xB0`
+(`0x1FF01FF0`, bit 7 set) landed in our `ims` field and **spuriously masked SMPC**. The
+periodic peripheral poll then died after ~11 frames and the flag never advanced.
 
-**Behavioral divergence (trampoline-hit counting, ours-800f vs MAME-10s):** the SCU
-**SMPC interrupt (vector `0x47`)** fires **236× in MAME, 0× in ours**. It is *not*
-masked (`IMS=0`, `imask=0`) — it's simply never raised, because **our BIOS issues no
-SMPC commands post-splash** (`SF` idle, 0 command-busy edges over 5 frames) while
-MAME's does. So MAME's post-splash path runs periodic peripheral polling (SMPC
-command → vec `0x47` → handler sets `[0x060100AB]`); **ours takes a different path
-that never starts it.** Root is a *control-flow* divergence, likely a callback-install
-or handler branch we miss.
+**Fix** (`crates/saturn/src/scu.rs`, commit `d51cfca`): corrected the map to the SCU
+User's Manual / MAME `saturn_scu.cpp` `regs_map` — `0x90` T0C, `0x94` T1S, `0x98` T1MD,
+`0xA0` IMS, `0xA4` IST, `0xA8` AIACK, `0xB0/B4` ASR0/1, `0xB8` AREF, `0xC4` RSEL, `0xC8`
+VER. All 142 lib + integration tests pass; `bios_boot` golden unchanged (divergence is
+post-frame-300). The boot now advances past the park (master PC → `0x0604xxxx`, `BGON`
+`0` → `0x1011`, steady BIOS main loop by frame ~1000).
 
-**Ruled out:** the phantom pad (forcing the INTBACK peripheral response to
-"no controller" gives a byte-identical stuck trajectory); SMPC interrupt masking.
+*(The earlier "vec `0x47` not masked, `IMS=0`" note was stale — measured before the
+M5/M6 work; the post-fix `IMS=0x1FF01FF0` reading is exactly the misrouted `ASR0` value.
+Diagnosis: an env-gated `SMPC_LOG` trace in `system.rs::drain_smpc` showed the periodic
+poll stop with `IMS=0x1FF01FF0`; cross-checking that offset against MAME's `regs_map`
+exposed the `0x10` shift.)*
 
-**Methodology notes (carry forward):**
-- The interrupt **trampoline table is not in vector order** — `0x42` (HBlank-IN) is
-  relocated to `0x060008F0`, so entry `0x06000840 + k*6` maps `k=0→0x40, k=1→0x41,
-  k≥2→0x41+k`. An earlier naive `0x40+(entry−base)/6` mislabel pointed at vector
-  `0x46` (sound) — a **red herring**: MAME's SCSP regs (`TIMA/MCIEB/MCIPD`) match ours
-  exactly, and the real missing vector is `0x47` (SMPC).
-- The **re-syncing diff can't cross the post-splash region**: every frame-wait park
-  spins a full frame's worth of iterations at a *timing-dependent* count (ours vs
-  MAME differ), which exceeds any practical resync window. **Trampoline-hit counting
-  is the right tool here**, not the PC diff.
-- Probes for all of this are in `crates/saturn/tests/trace_boot.rs` (`analyze_park2`,
-  `scsp_state_at_park`, `scu_state_at_park2`, `smpc_activity_at_park`,
-  `splash_timeline`), all `#[ignore]`d.
+### Post-splash menu rendering — open (2026-05-28)
 
-**Next step:** find what *drives* the post-splash periodic SMPC peripheral polling on
-real HW (which sets `[0x060100AB]`) and why our BIOS path never starts it — locate the
-flag-writer (the MAME Lua memory write-tap didn't fire on this RAM; try a debugger
-watchpoint via Lua execution-state polling, or correlate the MAME trace) and trace
-back to the install/branch we diverge on.
+With the boot unblocked, the post-splash screen renders **garbage**: a diagonal tile
+scatter + starfield = a VDP2 **RBG0 rotation background** (`BGON=0x1011`) our rotation
+path mis-renders. The MAME-style **full-logo still-frame** (brushed-metal background +
+"SEGA SATURN" wordmark) is also never drawn — our path goes planet-anim → green →
+rotation-menu. **Next:** debug VDP2 RBG0/rotation rendering for the BIOS menu and locate
+the full-logo draw path. (The MAME reference boots to the "Set Language" menu — verify
+against it.)
 
 ## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) 🚧 active
 
