@@ -57,6 +57,75 @@ const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
 // 16-bit CR1 status bits that live above the status byte (MAME `CD_STAT_*`).
 const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
+// Further status bytes (high byte of the 16-bit status word, MAME `CD_STAT_*`).
+const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
+#[allow(dead_code)] // M7 phase 3 (read pump / seek)
+const STAT_SEEK: u8 = 0x04; // drive seeking
+
+// HIRQ bits used by the buffer/filter/partition + filesystem engine.
+#[allow(dead_code)] // M7 phase 4 (filesystem)
+const HIRQ_EFLS: u16 = 0x0200; // file-system processing complete
+
+// Buffer/filter/partition engine sizes (MAME `saturn_cd_hle`): a shared pool of
+// 200 sector blocks, and 24 filter/partition selectors.
+const MAX_BLOCKS: usize = 200;
+const MAX_FILTERS: usize = 24;
+/// "No filter / device disconnected" sentinel (MAME's `cddevicenum == 0xff`).
+const NO_FILTER: u8 = 0xFF;
+
+/// One buffered sector in the 200-block pool. `size < 0` marks the slot free;
+/// otherwise it holds `size` bytes of user data plus the sector's disc
+/// coordinates and subheader fields (used by filtering).
+#[derive(Clone, Debug)]
+struct Block {
+    size: i32,
+    fad: i32,
+    data: Vec<u8>,
+    chan: u8,
+    fnum: u8,
+    subm: u8,
+    cinf: u8,
+}
+
+impl Block {
+    /// A free pool slot.
+    fn free() -> Self {
+        Block {
+            size: -1,
+            fad: 0,
+            data: Vec::new(),
+            chan: 0,
+            fnum: 0,
+            subm: 0,
+            cinf: 0,
+        }
+    }
+}
+
+/// A sector-selection filter (MAME `filterT`): FAD-range and subheader-condition
+/// matching, plus the true/false partition each matched sector routes to.
+#[derive(Clone, Debug, Default)]
+struct Filter {
+    mode: u8,
+    chan: u8,
+    smmask: u8,
+    cimask: u8,
+    fid: u8,
+    smval: u8,
+    cival: u8,
+    condtrue: u8,
+    condfalse: u8,
+    fad: u32,
+    range: u32,
+}
+
+/// A partition (output buffer): an ordered list of pool-block indices. Unlike
+/// MAME's fixed array + null-defragment, we keep it compact in a `Vec`.
+#[derive(Clone, Debug, Default)]
+struct Partition {
+    blocks: Vec<usize>,
+}
+
 /// SH-2 master cycles between periodic CD status reports. The CD-block
 /// firmware emits one report per interval; with no disc playing that interval
 /// is ~16.67 ms (Yabause `_periodictiming = 50000` against its µs×3 clock →
@@ -122,6 +191,30 @@ pub struct CdBlock {
     xfer: Vec<u8>,
     xfer_pos: usize,
 
+    // ---- buffer/filter/partition engine (M7 phase 2) ----
+    /// Shared 200-block sector pool; free slots have `size < 0`.
+    blocks: Vec<Block>,
+    /// Count of free pool slots (mirrors MAME `freeblocks`).
+    free_blocks: i32,
+    /// Buffer-full latch (mirrors MAME `buffull`).
+    buf_full: bool,
+    /// 24 sector filters.
+    filters: Vec<Filter>,
+    /// 24 output partitions (one selectable per filter index).
+    partitions: Vec<Partition>,
+    /// Filter the CD drive's output connects to (`0xFF` = disconnected).
+    cd_device_filter: u8,
+    /// Last partition a sector was delivered to (Get Last Buffer destination).
+    last_buffer: u8,
+    /// Sector data length the next read stores / the host transfers (Set Sector
+    /// Length; default 2048). Read by the M7-phase-3 read pump / transfer.
+    #[allow(dead_code)]
+    sectlenin: u32,
+    #[allow(dead_code)]
+    sectlenout: u32,
+    /// Result of the last Calculate Actual Data Size, in 16-bit words.
+    calcsize: u32,
+
     /// Set once the host has issued its first command. Until then the
     /// power-on `"CDBLOCK"` signature is held in CR1..CR4 and **no**
     /// unsolicited periodic report is emitted — the BIOS reads that
@@ -174,6 +267,16 @@ impl CdBlock {
             disc: None,
             xfer: Vec::new(),
             xfer_pos: 0,
+            blocks: vec![Block::free(); MAX_BLOCKS],
+            free_blocks: MAX_BLOCKS as i32,
+            buf_full: false,
+            filters: vec![Filter::default(); MAX_FILTERS],
+            partitions: vec![Partition::default(); MAX_FILTERS],
+            cd_device_filter: NO_FILTER,
+            last_buffer: NO_FILTER,
+            sectlenin: 2048,
+            sectlenout: 2048,
+            calcsize: 0,
             command_pending: false,
             cr_written: 0,
             periodic_accum: 0,
@@ -328,6 +431,89 @@ impl CdBlock {
         self.cr4 = self.fad as u16;
     }
 
+    /// The 16-bit status word (status code in the high byte) — MAME `cd_stat`.
+    fn cd_stat(&self) -> u16 {
+        (self.status as u16) << 8
+    }
+
+    /// Allocate a free pool block (its `size` set to `sectlenin`), returning the
+    /// index, or `None` (latching buffer-full) when the pool is exhausted.
+    /// Used by the M7-phase-3 read pump.
+    #[allow(dead_code)]
+    fn alloc_block(&mut self) -> Option<usize> {
+        for i in 0..self.blocks.len() {
+            if self.blocks[i].size < 0 {
+                self.free_blocks -= 1;
+                if self.free_blocks <= 0 {
+                    self.buf_full = true;
+                }
+                self.blocks[i].size = self.sectlenin as i32;
+                return Some(i);
+            }
+        }
+        self.buf_full = true;
+        None
+    }
+
+    /// Return a pool block to the free list (clearing the buffer-full latch).
+    fn free_block(&mut self, idx: usize) {
+        self.blocks[idx].size = -1;
+        self.blocks[idx].data = Vec::new();
+        self.free_blocks += 1;
+        self.buf_full = false;
+        self.hirq &= !HIRQ_BFUL;
+    }
+
+    /// Free every block held by partition `p` and empty it.
+    fn clear_partition(&mut self, p: usize) {
+        let idxs = core::mem::take(&mut self.partitions[p].blocks);
+        for b in idxs {
+            self.free_block(b);
+        }
+    }
+
+    /// Reset Selector (cmd 0x48): clear a single partition (CR1 low = 0) or,
+    /// per CR1 flag bits, reset filter conditions / all filters / all
+    /// partitions (MAME `cmd_reset_selector`).
+    fn reset_selector(&mut self) {
+        let cr1 = self.cr1;
+        if cr1 & 0xFF == 0x00 {
+            let buf = (self.cr3 >> 8) as usize;
+            if buf < MAX_FILTERS {
+                self.clear_partition(buf);
+            }
+            self.cd_report();
+            self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            return;
+        }
+        if cr1 & 0x80 != 0 {
+            for f in &mut self.filters {
+                f.condfalse = 0;
+            }
+        }
+        if cr1 & 0x40 != 0 {
+            for f in &mut self.filters {
+                f.condtrue = 0;
+            }
+        }
+        if cr1 & 0x10 != 0 {
+            for f in &mut self.filters {
+                *f = Filter {
+                    range: 0xFFFF_FFFF,
+                    ..Filter::default()
+                };
+            }
+        }
+        if cr1 & 0x04 != 0 {
+            for p in 0..MAX_FILTERS {
+                self.clear_partition(p);
+            }
+            self.buf_full = false;
+        }
+        self.cd_report();
+        self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+    }
+
     /// Process the command latched in CR1..CR4. Real hardware runs this on
     /// the SH-1 after a timing delay then raises `HIRQ.CMOK`; we execute
     /// synchronously and set CMOK immediately, which is observationally
@@ -425,6 +611,167 @@ impl CdBlock {
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
                 self.hirq |= HIRQ_CMOK | HIRQ_EHST;
+            }
+            0x30 => {
+                // Set CD device connection: CR3 high byte = filter (0xFF=none).
+                self.cd_device_filter = (self.cr3 >> 8) as u8;
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x31 => {
+                // Get CD device connection.
+                self.cr1 = self.cd_stat();
+                self.cr2 = 0;
+                self.cr3 = (self.cd_device_filter as u16) << 8;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x32 => {
+                // Get last buffer destination.
+                self.cr1 = self.cd_stat();
+                self.cr2 = 0;
+                self.cr3 = (self.last_buffer as u16) << 8;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x40 => {
+                // Set filter range: FAD0 = (CR1&0xFF)<<16|CR2,
+                // range = (CR3&0xFF)<<16|CR4; CR3 high = filter #.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if f < MAX_FILTERS {
+                    self.filters[f].fad = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
+                    self.filters[f].range = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x42 => {
+                // Set filter subheader conditions.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if f < MAX_FILTERS {
+                    let fl = &mut self.filters[f];
+                    fl.chan = self.cr1 as u8;
+                    fl.smmask = (self.cr2 >> 8) as u8;
+                    fl.cimask = self.cr2 as u8;
+                    fl.fid = self.cr3 as u8;
+                    fl.smval = (self.cr4 >> 8) as u8;
+                    fl.cival = self.cr4 as u8;
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x43 => {
+                // Get filter subheader conditions.
+                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
+                let fl = self.filters[f].clone();
+                self.cr1 = self.cd_stat() | fl.chan as u16;
+                self.cr2 = ((fl.smmask as u16) << 8) | fl.cimask as u16;
+                self.cr3 = fl.fid as u16;
+                self.cr4 = ((fl.smval as u16) << 8) | fl.cival as u16;
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x44 => {
+                // Set filter mode (CR1 low; bit 7 = re-initialise the filter).
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                let mode = self.cr1 as u8;
+                if f < MAX_FILTERS {
+                    if mode & 0x80 != 0 {
+                        self.filters[f] = Filter::default();
+                    } else {
+                        self.filters[f].mode = mode;
+                    }
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x45 => {
+                // Get filter mode.
+                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
+                self.cr1 = self.cd_stat() | self.filters[f].mode as u16;
+                self.cr2 = 0;
+                self.cr3 = 0;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x46 => {
+                // Set filter connection: CR1 bit0=true cond, bit1=false cond.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if f < MAX_FILTERS {
+                    if self.cr1 & 1 != 0 {
+                        self.filters[f].condtrue = (self.cr2 >> 8) as u8;
+                    }
+                    if self.cr1 & 2 != 0 {
+                        self.filters[f].condfalse = self.cr2 as u8;
+                    }
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x48 => self.reset_selector(),
+            0x50 => {
+                // Get buffer size: free blocks, max block size words, total.
+                self.cr1 = self.cd_stat();
+                self.cr2 = self.free_blocks.clamp(0, MAX_BLOCKS as i32) as u16;
+                self.cr3 = 0x1800;
+                self.cr4 = MAX_BLOCKS as u16;
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x51 => {
+                // Get buffer partition sector number (CR4 = block count).
+                let buf = (self.cr3 >> 8) as usize;
+                self.cr1 = self.cd_stat();
+                self.cr2 = 0;
+                self.cr3 = 0;
+                self.cr4 = self.partitions.get(buf).map_or(0, |p| p.blocks.len() as u16);
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x52 => {
+                // Calculate actual data size (in words) over a sector range.
+                let buf = (self.cr3 >> 8) as usize;
+                let offs = self.cr2 as usize;
+                let num = self.cr4 as usize;
+                self.calcsize = 0;
+                if let Some(p) = self.partitions.get(buf) {
+                    let idxs: Vec<usize> = p.blocks.clone();
+                    for i in 0..num {
+                        if let Some(&b) = idxs.get(offs + i) {
+                            self.calcsize += (self.blocks[b].size.max(0) as u32) / 2;
+                        }
+                    }
+                }
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+            }
+            0x53 => {
+                // Get actual data size (result of the last 0x52).
+                self.cr1 = self.cd_stat() | ((self.calcsize >> 16) & 0xFF) as u16;
+                self.cr2 = self.calcsize as u16;
+                self.cr3 = 0;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x54 => {
+                // Get sector information for one buffered sector.
+                let offs = (self.cr2 & 0xFF) as usize;
+                let buf = (self.cr3 >> 8) as usize;
+                let blk = self
+                    .partitions
+                    .get(buf)
+                    .and_then(|p| p.blocks.get(offs).copied());
+                match blk {
+                    Some(b) => {
+                        let (fad, fnum, chan, subm, cinf) = {
+                            let bl = &self.blocks[b];
+                            (bl.fad, bl.fnum, bl.chan, bl.subm, bl.cinf)
+                        };
+                        self.cr1 = self.cd_stat() | ((fad >> 16) & 0xFF) as u16;
+                        self.cr2 = (fad & 0xFFFF) as u16;
+                        self.cr3 = ((fnum as u16) << 8) | chan as u16;
+                        self.cr4 = ((subm as u16) << 8) | cinf as u16;
+                    }
+                    None => self.cr1 |= STAT_REJECT,
+                }
+                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             _ => {
                 // Default: most commands answer with a status report.
@@ -723,6 +1070,79 @@ mod tests {
         c.write16(0x0024, 0x0000);
         assert_eq!(c.read16(0x0020), 0x0100, "1 session, lead-out FAD hi 0");
         assert_eq!(c.read16(0x0024), 154, "lead-out FAD 154");
+    }
+
+    /// Issue a full 4-CR command (high byte of CR1 = command) and run it.
+    fn cmd(c: &mut CdBlock, cr1: u16, cr2: u16, cr3: u16, cr4: u16) {
+        c.write16(0x0018, cr1);
+        c.write16(0x001C, cr2);
+        c.write16(0x0020, cr3);
+        c.write16(0x0024, cr4);
+    }
+
+    #[test]
+    fn set_and_get_filter_range_round_trips() {
+        let mut c = CdBlock::new();
+        // Set Filter Range (0x40) on filter 2: FAD0 = 0x012345, range = 0x000678.
+        cmd(&mut c, 0x4001, 0x2345, 0x0200, 0x0678);
+        assert_eq!(c.filters[2].fad, 0x01_2345);
+        assert_eq!(c.filters[2].range, 0x00_0678);
+        assert_eq!(c.hirq & HIRQ_ESEL, HIRQ_ESEL);
+    }
+
+    #[test]
+    fn set_and_get_filter_subheader_and_mode() {
+        let mut c = CdBlock::new();
+        // Set Filter Subheader Conditions (0x42) on filter 1.
+        cmd(&mut c, 0x4205, 0x1122, 0x0133, 0x4455);
+        assert_eq!(c.filters[1].chan, 0x05);
+        assert_eq!(c.filters[1].smmask, 0x11);
+        assert_eq!(c.filters[1].cimask, 0x22);
+        assert_eq!(c.filters[1].fid, 0x33);
+        assert_eq!(c.filters[1].smval, 0x44);
+        assert_eq!(c.filters[1].cival, 0x55);
+        // Get Filter Subheader Conditions (0x43) reads them back.
+        cmd(&mut c, 0x4300, 0x0000, 0x0100, 0x0000);
+        assert_eq!(c.read16(0x0018) & 0xFF, 0x05); // chan in CR1 low
+        assert_eq!(c.read16(0x001C), 0x1122); // smmask/cimask
+        // Set Filter Mode (0x44): mode 0x07.
+        cmd(&mut c, 0x4407, 0x0000, 0x0100, 0x0000);
+        assert_eq!(c.filters[1].mode, 0x07);
+        // Get Filter Mode (0x45).
+        cmd(&mut c, 0x4500, 0x0000, 0x0100, 0x0000);
+        assert_eq!(c.read16(0x0018) & 0xFF, 0x07);
+    }
+
+    #[test]
+    fn cd_device_connection_round_trips() {
+        let mut c = CdBlock::new();
+        // Set CD Device Connection (0x30): connect drive to filter 3 (CR3 hi).
+        cmd(&mut c, 0x3000, 0x0000, 0x0300, 0x0000);
+        assert_eq!(c.cd_device_filter, 3);
+        // Get CD Device Connection (0x31): filter # in CR3 high byte.
+        cmd(&mut c, 0x3100, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x0020) >> 8, 3);
+    }
+
+    #[test]
+    fn get_buffer_size_reports_the_full_pool_when_idle() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x5000, 0x0000, 0x0000, 0x0000); // Get Buffer Size
+        assert_eq!(c.read16(0x001C), MAX_BLOCKS as u16, "all blocks free");
+        assert_eq!(c.read16(0x0024), MAX_BLOCKS as u16, "total blocks");
+    }
+
+    #[test]
+    fn reset_selector_clears_filters_and_get_sector_info_rejects_when_empty() {
+        let mut c = CdBlock::new();
+        c.filters[0].fad = 0x1234;
+        // Reset Selector (0x48) with CR1 bit 4: reset filter conditions.
+        cmd(&mut c, 0x4810, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.filters[0].fad, 0, "filter FAD reset");
+        assert_eq!(c.filters[0].range, 0xFFFF_FFFF, "filter range reset to all");
+        // Get Sector Information (0x54) on an empty partition → REJECT in CR1.
+        cmd(&mut c, 0x5400, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x0018) & STAT_REJECT, STAT_REJECT);
     }
 
     #[test]
