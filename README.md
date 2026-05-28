@@ -124,6 +124,27 @@ Each is set up as a local, **never-committed** build (gitignored
 by this project** — they serve purely as behavioral references for
 cross-checking.
 
+## Trademarks & copyrights
+
+5thPlanet is an independent, unofficial project and is **not affiliated with,
+endorsed by, or sponsored by SEGA**. "SEGA", "Sega Saturn", and the Sega Saturn
+logos are trademarks of their respective owners (SEGA Corporation and/or its
+affiliates). They are referenced here only for identification and
+interoperability — to describe the hardware this emulator targets.
+
+The Sega Saturn BIOS, games, and any disc images are **copyrighted by their
+respective owners and are not distributed with this project** (see
+[BIOS](#bios)); supply your own legally-obtained copies. The screenshots in
+[`doc/screenshots/`](doc/screenshots) show SEGA's copyrighted boot logos and are
+included solely to document the emulator's output.
+
+No SEGA code, firmware, or assets are included in or derived by this project; it
+is a clean-room behavioral re-implementation cross-checked against the
+[reference emulators](#acknowledgements). Only the original source in this
+repository is covered by the licence below.
+
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE). This licence applies to 5thPlanet's own source
+code only, not to any third-party trademarks or copyrighted material referenced
+above.
