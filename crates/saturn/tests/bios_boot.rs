@@ -32,12 +32,14 @@ const BIOS_CANDIDATES: &[&str] = &[
     "bios/Sega Saturn BIOS v1.00 (JAP).bin",
 ];
 
-/// Splash-render budget: ~5 seconds of virtual time at 60 Hz. The BIOS
-/// spends ~2 s on hardware init, then animates the logo in (frames
-/// ~120–270 alternate as it draws), and the framebuffer settles to the
-/// complete, static SEGA splash by frame ~285. 300 lands comfortably in
-/// that stable region — a mid-animation frame would make a fragile golden.
-const FRAMES_TO_RUN: u32 = 300;
+/// Splash-render budget: the BIOS spends ~2 s on hardware init, then the
+/// SEGA logo holds as a stable image across frames ~110–270 (VDP1 redraws
+/// it into the back buffer every frame in automatic-draw mode, so the
+/// displayed sprite layer is steady). Past frame ~275 the boot moves on
+/// toward the setup menu and the framebuffer changes again, so 200 lands
+/// squarely in the stable splash plateau — a frame after it would make a
+/// fragile golden.
+const FRAMES_TO_RUN: u32 = 200;
 
 const GOLDEN_PATH: &str = "tests/golden/bios_splash.hash";
 

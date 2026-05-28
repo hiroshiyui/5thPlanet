@@ -117,16 +117,36 @@ impl Vdp1 {
         self.busy_until.is_some()
     }
 
-    /// `FBCR`-driven frame-buffer change, called at the VBlank boundary.
-    /// Automatic 1-cycle mode (FCM=0) swaps every frame; manual mode (FCM=1)
-    /// swaps only when the one-shot change trigger FCT is set.
-    pub fn frame_change(&mut self) {
+    /// `FBCR`/`PTMR`-driven frame-buffer change, called at the VBlank boundary
+    /// with the current global cycle `now`.
+    ///
+    /// Two coupled behaviours, mirroring MAME `saturn_v.cpp`'s VBlank handler:
+    ///
+    /// * **Buffer swap** — automatic 1-cycle mode (FCM=0) swaps every frame;
+    ///   manual mode (FCM=1) swaps only when the one-shot change trigger FCT is
+    ///   set. A swap marks the frame buffers "changed".
+    /// * **Automatic draw** (`PTMR` PTM bits = `0b10`) — VDP1 re-renders the
+    ///   whole command list into the (freshly swapped-in) draw buffer *every
+    ///   frame the buffers change*, with no new `PTMR` write. This is what
+    ///   animates the BIOS splash: drawing once per frame into the back buffer
+    ///   keeps both buffers populated, so the displayed sprite layer holds
+    ///   steady instead of strobing present/absent every other frame. (The
+    ///   one-shot PTM=`0b01` "draw by request" mode plots on the `PTMR` write
+    ///   instead — see [`Self::after_reg_write`].)
+    pub fn frame_change(&mut self, now: u64) {
+        self.now = now;
         let fbcr = self.regs.read16(0x02);
         let manual = fbcr & 0x02 != 0; // FCM
         let trigger = fbcr & 0x01 != 0; // FCT
-        if !manual || trigger {
+        let changed = !manual || trigger;
+        if changed {
             core::mem::swap(&mut self.fb, &mut self.display);
             self.regs.write16(0x02, fbcr & !0x01); // clear the one-shot FCT
+        }
+        // Automatic-draw mode: redraw the list into the back buffer each time
+        // the buffers change (MAME gates `vdp1_process_list` on the swap).
+        if changed && self.regs.ptmr() & 0x03 == 0x02 {
+            self.begin_plot();
         }
     }
 
@@ -208,12 +228,14 @@ impl Vdp1 {
         }
     }
 
-    /// React to a control-register write. `PTMR` (0x04) kicks the plotter
-    /// (a timed draw) when its mode bits are set; `ENDR` (0x0C)
+    /// React to a control-register write. `PTMR` (0x04) kicks a one-shot plot
+    /// only in "draw by request" mode (PTM = `0b01`); automatic-draw mode
+    /// (PTM = `0b10`) draws at the frame change instead (see
+    /// [`Self::frame_change`]), not on the register write. `ENDR` (0x0C)
     /// force-terminates the current draw, completing it immediately.
     fn after_reg_write(&mut self, off: u32) {
         match off {
-            0x04 if self.regs.ptmr() & 0x03 != 0 => self.begin_plot(),
+            0x04 if self.regs.ptmr() & 0x03 == 0x01 => self.begin_plot(),
             0x0C => self.finish_draw(),
             _ => {}
         }
@@ -325,7 +347,7 @@ mod tests {
         v.fb.set_pixel(3, 3, 0x7FFF);
         assert_eq!(v.display_fb().pixel(3, 3), 0, "display blank before swap");
         // FBCR power-on = 0 → automatic 1-cycle mode → swap every frame.
-        v.frame_change();
+        v.frame_change(0);
         assert_eq!(
             v.display_fb().pixel(3, 3),
             0x7FFF,
@@ -338,11 +360,30 @@ mod tests {
         let mut v = Vdp1::new();
         v.fb.set_pixel(1, 1, 0x1234);
         v.write16(REGS_BASE + 0x02, 0x0002); // FBCR: FCM=1 (manual), FCT=0
-        v.frame_change();
+        v.frame_change(0);
         assert_eq!(v.display_fb().pixel(1, 1), 0, "manual mode: no swap");
         v.write16(REGS_BASE + 0x02, 0x0003); // FCM=1, FCT=1 → change now
-        v.frame_change();
+        v.frame_change(0);
         assert_eq!(v.display_fb().pixel(1, 1), 0x1234, "FCT triggered the swap");
         assert_eq!(v.read16(REGS_BASE + 0x02) & 0x0001, 0, "FCT is one-shot");
+    }
+
+    #[test]
+    fn automatic_draw_redraws_at_frame_change_not_on_ptmr_write() {
+        // PTM = 0b10 (automatic draw): the BIOS splash mode. A write to PTMR
+        // must NOT kick a plot — VDP1 re-renders the list at each frame change
+        // instead (with FBCR=0 automatic mode), which keeps both buffers
+        // populated so the displayed sprite layer doesn't strobe.
+        let mut v = Vdp1::new();
+        v.write16(REGS_BASE + 0x04, 0x0002); // PTMR: PTM = automatic
+        assert!(
+            !v.is_drawing(),
+            "automatic-draw mode: the PTMR write itself must not plot"
+        );
+        v.frame_change(100); // FBCR=0 (auto) → swap + redraw
+        assert!(
+            v.is_drawing(),
+            "automatic-draw mode: the frame change re-renders the list"
+        );
     }
 }

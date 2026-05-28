@@ -355,9 +355,10 @@ fn ptmr_write_through_registers_triggers_the_plot() {
         ],
     );
     put(&mut v, 1, END);
-    // Kick the plot the way the BIOS does: write PTMR with the
-    // immediate-draw mode bit set.
-    v.write16(REGS_BASE + 0x04, 0x0002);
+    // Kick a one-shot plot: write PTMR with PTM = 0b01 ("draw by request"),
+    // which renders immediately on the write. (PTM = 0b10 is automatic draw,
+    // which plots at the frame change instead — see Vdp1::frame_change.)
+    v.write16(REGS_BASE + 0x04, 0x0001);
 
     // The pixels are rendered immediately, but draw-end is timed: CEF stays
     // clear until the modelled draw duration elapses.
@@ -534,7 +535,7 @@ fn plot_raises_the_scu_sprite_draw_end_interrupt() {
     sat.reset();
     // Stage an (empty) command list and kick the plot through the bus.
     sat.bus.write32(VRAM_BASE, 0x8000_0000, AccessKind::Data); // END
-    sat.bus.write16(REGS_BASE + 0x04, 0x0002, AccessKind::Data); // PTMR
+    sat.bus.write16(REGS_BASE + 0x04, 0x0001, AccessKind::Data); // PTMR: one-shot draw
     // The draw is timed; advance past its duration so it completes, then let
     // the aggregate drain the VDP1 draw-end into the SCU.
     sat.bus.vdp1.settle(u64::MAX);
@@ -552,7 +553,7 @@ fn timed_draw_end_fires_after_the_draw_duration_via_run_for() {
     let mut sat = Saturn::with_blank_bios();
     sat.reset();
     sat.bus.write32(VRAM_BASE, 0x8000_0000, AccessKind::Data); // END
-    sat.bus.write16(REGS_BASE + 0x04, 0x0002, AccessKind::Data); // PTMR
+    sat.bus.write16(REGS_BASE + 0x04, 0x0001, AccessKind::Data); // PTMR: one-shot draw
 
     // The draw is in progress and has not yet raised the SCU source.
     assert!(

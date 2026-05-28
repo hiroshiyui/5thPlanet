@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn ptmr_round_trips_for_the_aggregate_to_inspect() {
         let mut r = Vdp1Regs::new();
-        r.write16(0x04, 0x0002); // PTMR — immediate plot
+        r.write16(0x04, 0x0002); // PTMR — PTM = automatic draw
         assert_eq!(r.ptmr() & 0x03, 0x02);
         // Writing PTMR no longer auto-acks; the plotter owns CEF now.
         assert_eq!(r.read16(0x10) & EDSR_CEF, 0);

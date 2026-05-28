@@ -291,8 +291,10 @@ impl Saturn {
             self.bus.scu.raise(crate::scu::Source::VBlankIn);
             // VBlank-IN is SCU DMA start factor 0.
             self.bus.scu.trigger_dma_factor(0);
-            // VDP1 swaps its draw/display buffers at the frame boundary.
-            self.bus.vdp1.frame_change();
+            // VDP1 swaps its draw/display buffers at the frame boundary and,
+            // in automatic-draw mode, re-renders the command list into the
+            // back buffer.
+            self.bus.vdp1.frame_change(now);
         }
         // VBlank-OUT edge (VBLANK → active, i.e. the start of the next frame's
         // active display): raise the SCU VBlank-OUT interrupt and fire SCU DMA
