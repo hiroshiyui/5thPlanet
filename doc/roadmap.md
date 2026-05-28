@@ -531,6 +531,21 @@ Snapshot/restore the whole machine, and persist the console's battery.
 mismatches), rewind/run-ahead, compressed states, and multiple slots / a
 save-state UI.
 
+## Milestone 9 — Frontend OSD (in-window menu) 🚧 active
+
+A hand-rolled, ZSNES/fwNES-style on-screen menu in the SDL2 frontend
+(see ADR-0008). Pure-frontend; the core stays UI-agnostic.
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **OSD framework + core actions** ✅ done | `fifth_planet/src/osd/` — `font.rs` (embedded CC0 8×8 font + RGBA `fill_rect`/`draw_text`/`dim` primitives) and `mod.rs` (menu state machine). Software-composited into the 320×224 framebuffer; **Esc** opens it; arrows/Enter navigate. Actions: save/load state to 10 slots (`<bios>.<n>.state`), Reset, Eject/Insert disc, Quit; transient toasts. The module is `sdl2`-free + core-free (`&mut [u8]` buffer + a `Nav` enum), so it's unit-tested without a window. Core add: `Saturn::eject_disc`. **Tests:** 12 OSD (font draw + nav state machine, run even with `--no-default-features`) + 1 cd-block (insert→eject NODISC round-trip). |
+| 2 | **Graphics settings** ⬜ | Window scale 1×/2×/3×, fullscreen, integer/aspect scaling. Introduces a serde-backed config file persisted next to the BIOS. |
+| 3 | **Controller settings** ⬜ | Keyboard rebind (config-driven map + press-to-bind UI) + SDL2 GameController (gamepad) support. Persisted. |
+| 4 | **Region/BIOS + cartridge management** ⬜ | Scan `bios/` and power-cycle into a chosen BIOS + matching `set_region`; cartridge submenu over the `Cartridge` variants via `insert_cartridge`. Persisted. |
+
+**Related fix landed alongside Phase 1:** with no disc the CD-block now reports
+status `NODISC` (`0x07`) instead of `PAUSE`, matching MAME's no-image reset.
+
 ## Later milestones (queued)
 
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
