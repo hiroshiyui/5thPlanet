@@ -495,15 +495,21 @@ fn sample_pattern_cell(
     if pat.vflip {
         in_y = (cell_px - 1) - in_y;
     }
-    // For 16×16 characters the four 8×8 cells are consecutive (TL,TR,BL,BR).
-    let cell = pat.cell + (in_y / 8) * 2 + (in_x / 8);
+    // The pattern-name character number addresses VRAM in 0x20-byte units (one
+    // 4bpp 8×8 cell). An 8bpp cell is 0x40 bytes = *two* units, so 8bpp steps
+    // the character number by 2 — both between adjacent cells and between the
+    // four 8×8 sub-cells of a 16×16 character (TL,TR,BL,BR). The cell's byte
+    // base is therefore always `char × 0x20`.
+    let subcell = (in_y / 8) * 2 + (in_x / 8);
     let (px, py) = (in_x % 8, in_y % 8);
     if depth == 1 {
-        // 8bpp cell: 64 bytes, one byte/pixel; palette is the colour bank.
-        let byte = vdp2.vram.read8(cell * 64 + py * 8 + px) as usize;
+        // 8bpp cell: 0x40 bytes, one byte/pixel; palette is the colour bank.
+        let cell = pat.cell + subcell * 2;
+        let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
         (byte != 0).then(|| cram(vdp2, (pat.palette as usize) << 8 | byte))
     } else {
-        // 4bpp cell: 32 bytes, two pixels/byte (high nibble = even column).
+        // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
+        let cell = pat.cell + subcell;
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
         let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
         (nibble != 0).then(|| cram(vdp2, (pat.palette as usize) << 4 | nibble))
@@ -986,7 +992,9 @@ mod tests {
         v.regs.write16(0x028, 0x0010); // N0CHCN = 1 (256 colour)
         v.regs.write16(0x030, 0x8000); // PNCN0: 1-word pattern name
         v.vram.write16(0, 3); // char 3 at tile (0,0)
-        v.vram.write8(3 * 64, 0x42); // pixel (0,0) = index 0x42
+        // 8bpp cell base = char × 0x20 (char numbers are in 0x20-byte units;
+        // an 8bpp cell spans two of them), so char 3's pixel (0,0) is at 3·32.
+        v.vram.write8(3 * 32, 0x42); // pixel (0,0) = index 0x42
         v.cram.write16(0x42 * 2, 0x001F); // red
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
