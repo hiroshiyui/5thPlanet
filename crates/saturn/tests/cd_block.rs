@@ -66,6 +66,31 @@ fn hirq_write_and_to_clear_then_command_relatches_cmok_via_the_bus() {
 }
 
 #[test]
+fn insert_then_eject_round_trips_to_nodisc() {
+    let mut sat = Saturn::with_blank_bios();
+    // A small synthetic ISO is enough to flip the drive to disc-present.
+    sat.insert_disc(saturn::disc::Disc::from_iso(vec![0u8; 2048 * 4]));
+    assert!(sat.has_disc(), "disc present after insert");
+    // Get Status now reports PAUSE (0x01 in the high byte).
+    sat.bus.write16(CR1, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR4, 0x0000, AccessKind::Data);
+    let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
+    assert_eq!(cr1 >> 8, 0x01, "PAUSE while a disc is loaded");
+
+    sat.eject_disc();
+    assert!(!sat.has_disc(), "no disc after eject");
+    // Get Status now reports NODISC (0x07), like a cold empty drive.
+    sat.bus.write16(CR1, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR4, 0x0000, AccessKind::Data);
+    let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
+    assert_eq!(cr1 >> 8, 0x07, "NODISC after eject");
+}
+
+#[test]
 fn cd_block_does_not_collide_with_scu_or_vdp2() {
     let mut sat = Saturn::with_blank_bios();
     sat.bus.write32(0x05FE_0000, 0xAAAA_BBBB, AccessKind::Data); // SCU D0R

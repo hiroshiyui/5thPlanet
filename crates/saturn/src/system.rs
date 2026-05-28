@@ -576,6 +576,18 @@ impl Saturn {
         self.bus.cd_block.insert_disc(disc);
     }
 
+    /// Eject the current disc (inverse of [`insert_disc`]): the drive returns
+    /// to the empty-tray `NODISC` state and flags a disc change. Used by the
+    /// frontend's eject menu item.
+    pub fn eject_disc(&mut self) {
+        self.bus.cd_block.eject();
+    }
+
+    /// Whether a disc is currently inserted.
+    pub fn has_disc(&self) -> bool {
+        self.bus.cd_block.has_disc()
+    }
+
     /// Plug a cartridge into the rear expansion slot (Extension RAM, backup
     /// RAM, or game ROM). The cart-ID byte at `0x04FF_FFFF` updates so the
     /// BIOS/game probes the right cart; the default slot is empty.

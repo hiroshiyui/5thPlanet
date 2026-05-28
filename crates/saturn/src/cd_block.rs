@@ -398,6 +398,20 @@ impl CdBlock {
         self.disc.is_some()
     }
 
+    /// Eject the disc: the inverse of [`insert_disc`]. The drive returns to the
+    /// empty-tray `NODISC` state with zeroed geometry, and a disc-change is
+    /// flagged (`HIRQ.DCHG`) so the BIOS/game notices the media left.
+    pub fn eject(&mut self) {
+        self.disc = None;
+        self.status = STAT_NODISC;
+        self.ctrladdr = 0;
+        self.track = 0;
+        self.index = 0;
+        self.fad = 0;
+        self.disk_changed = true;
+        self.hirq |= HIRQ_DCHG;
+    }
+
     /// Borrow the inserted disc, if any — used to fingerprint the media for
     /// save-state validation (the disc is `#[serde(skip)]`'d).
     pub fn disc(&self) -> Option<&Disc> {
