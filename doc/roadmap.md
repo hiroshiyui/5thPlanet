@@ -27,6 +27,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad, F5/F9 save-state hotkeys |
 | Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
 | Backup RAM (battery) | ✅ | Internal 32 KiB backup RAM with hardware odd-byte packing + "BackUpRam Format" default; persisted to a host `.bup` file by the frontend. M8 |
+| On-screen menu (OSD) | 🟡 | Hand-rolled, software-composited in-window menu (ADR-0008): Esc opens it; save/load slots, reset, eject/insert disc, quit. M9 Phase 1 done; graphics / controller / region-BIOS / cartridge submenus pending |
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ✅ — SEGA splash renders
 · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
@@ -40,7 +41,11 @@ Milestone 7 section. (Deferred within M7: CDDA→SCSP, MPEG card, move/copy
 sector ops.) · **M8 (save states + battery-backed backup RAM) ✅** — full
 deterministic snapshot/restore (`save_state`/`load_state`, bincode + versioned
 header, media referenced not embedded) and a hardware-faithful, host-persisted
-internal backup RAM. See the Milestone 8 section.
+internal backup RAM. See the Milestone 8 section. · **M9 (frontend OSD) 🚧
+active** — Phase 1 done: a hand-rolled, software-composited in-window menu
+(ADR-0008) with save/load slots, reset, eject/insert disc, and quit; Esc opens
+it. Graphics / controller / region-BIOS / cartridge submenus are the remaining
+phases.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 

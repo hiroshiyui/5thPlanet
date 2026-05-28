@@ -22,8 +22,9 @@ foundation stays solid.
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
 | M7        | CD-block (HLE) + game boot + cartridge slot                 | ✅ complete  |
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
+| M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 
-Current test count: **508 workspace-wide, 0 failures.** Task-by-task
+Current test count: **521 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -48,6 +49,12 @@ quicksave / F9 quickload**. M8 also makes the **internal 32 KiB backup RAM** (th
 console's built-in "memory card") hardware-faithful, with the odd-byte packing
 real hardware uses, and persists it to a host `.bup` file so game saves survive a
 restart like a battery-backed console.
+
+**M9 is building an in-window OSD menu** (ZSNES/fwNES-style, ADR-0008): press
+**Esc** for a hand-rolled, software-composited menu — save/load state slots,
+reset, eject/insert disc, quit — drawn with an embedded bitmap font over a
+dimmed frame. The menu logic is `sdl2`-free and unit-tested. Graphics,
+controller, region/BIOS, and cartridge submenus are the remaining M9 phases.
 
 Real BIOS images booting in the SDL2 frontend, rendered pixel-for-pixel against
 the MAME reference — each region's BIOS shows its own splash:

@@ -45,7 +45,11 @@ crates/saturn/     — M2+ deliverable: Saturn system glue (bus, scheduler,
                      (M7); cartridge slot remains.
 fifth_planet/      — SDL2 frontend binary (window + framebuffer upload +
                      audio, or headless), behind the default-on
-                     `sdl2-frontend` feature.
+                     `sdl2-frontend` feature. The `osd` module (in-window
+                     menu, ADR-0008) is hand-rolled + software-composited and
+                     deliberately sdl2-free/core-free (operates on a `&mut [u8]`
+                     RGBA buffer + a `Nav` enum), so it's unit-tested without a
+                     window; `main.rs` bridges SDL events → `Nav`/pad.
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```
