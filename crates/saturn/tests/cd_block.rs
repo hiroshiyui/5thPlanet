@@ -91,3 +91,44 @@ fn addresses_past_the_window_open_bus_through_abus_stub() {
     assert_eq!(v, 0);
     let _ = CD_BLOCK_END;
 }
+
+/// End-to-end Phase-1 check against a real disc image, if one is present in
+/// `roms/` (gitignored — copyrighted). Inserts the CloneCD boot disc, issues
+/// Get TOC over the bus, and confirms the streamed TOC describes a data track 1
+/// and a sensible lead-out. Skipped (passing) when no disc is available.
+#[test]
+fn real_ccd_disc_get_toc_over_the_bus() {
+    use std::path::PathBuf;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let ccd_path = root.join("roms/SS - Boot Disc.ccd");
+    let img_path = root.join("roms/SS - Boot Disc.img");
+    let (Ok(ccd), Ok(img)) = (
+        std::fs::read_to_string(&ccd_path),
+        std::fs::read(&img_path),
+    ) else {
+        println!("no roms/ boot disc; real-disc Get TOC test skipped");
+        return;
+    };
+
+    let disc = saturn::disc::Disc::from_ccd(&ccd, img).expect("parse CCD/IMG");
+    assert_eq!(disc.first_track(), 1);
+    assert!(disc.lead_out_fad() > 150, "lead-out past the lead-in");
+    assert_eq!(disc.tracks()[0].ctrl_addr(), 0x41, "track 1 is data");
+
+    let mut sat = Saturn::with_blank_bios();
+    sat.insert_disc(disc);
+    // Get TOC: write CR1 = 0x0200, CR2..CR4 = 0 (CR4 triggers the command).
+    sat.bus.write16(CR1, 0x0200, AccessKind::Data);
+    sat.bus.write16(CR2, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR3, 0x0000, AccessKind::Data);
+    sat.bus.write16(CR4, 0x0000, AccessKind::Data);
+    let (cr2, _) = sat.bus.read16(CR2, AccessKind::Data);
+    assert_eq!(cr2, 0x00CC, "TOC length = 102 words");
+    // First TOC word from the data FIFO: ctrl/adr 0x41 in the high byte.
+    let (w0, _) = sat.bus.read16(CD_BLOCK_BASE + 0x8000, AccessKind::Data);
+    assert_eq!(w0 >> 8, 0x41, "TOC track 1 is a data track");
+}

@@ -568,6 +568,13 @@ impl Saturn {
         self.bus.smpc.set_rtc_unix(unix_secs, now);
     }
 
+    /// Insert a disc image into the CD-block. The drive moves to PAUSE at the
+    /// start of the disc; the BIOS/game can then read the TOC, query sessions,
+    /// and (in later M7 phases) read sectors and boot the game.
+    pub fn insert_disc(&mut self, disc: crate::disc::Disc) {
+        self.bus.cd_block.insert_disc(disc);
+    }
+
     /// Run any DMA transfers that the SCU queued during the last
     /// scheduler batch. For M3 each transfer is synchronous: we move
     /// the full byte count in 32-bit chunks (plus a byte tail) via

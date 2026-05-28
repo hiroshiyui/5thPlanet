@@ -46,6 +46,7 @@
 
 pub mod bus;
 pub mod cd_block;
+pub mod disc;
 pub mod memory;
 pub mod scheduler;
 pub mod scsp;

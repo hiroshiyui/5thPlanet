@@ -32,6 +32,8 @@
 //! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
 //! status is `PAUSE`.
 
+use crate::disc::{Disc, FAD_OFFSET};
+
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
 pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
 
@@ -110,6 +112,16 @@ pub struct CdBlock {
     /// overshoot is carried forward, keeping the average cadence exact.
     periodic_accum: u64,
 
+    /// The inserted disc image, if any. `None` is the power-on "no disc"
+    /// state the existing no-disc command subset already models.
+    disc: Option<Disc>,
+
+    /// Host-readable data staged by a command (Get TOC for now), streamed out
+    /// 16-bit big-endian through the data FIFO at `0x8000`. `xfer_pos` is the
+    /// byte cursor. Phase 3 generalises this to sector data + the SCU-DMA port.
+    xfer: Vec<u8>,
+    xfer_pos: usize,
+
     /// Set once the host has issued its first command. Until then the
     /// power-on `"CDBLOCK"` signature is held in CR1..CR4 and **no**
     /// unsolicited periodic report is emitted — the BIOS reads that
@@ -159,11 +171,35 @@ impl CdBlock {
             index: 0x00,
             fad: 0,
             disk_changed: true,
+            disc: None,
+            xfer: Vec::new(),
+            xfer_pos: 0,
             command_pending: false,
             cr_written: 0,
             periodic_accum: 0,
             host_initialized: false,
         }
+    }
+
+    /// Insert (or replace) a disc. The drive returns to PAUSE at the start of
+    /// track 1 (FAD 150), the geometry the status reports now carry, and a
+    /// disc-change is flagged (`HIRQ.DCHG`) so the BIOS re-reads the TOC.
+    pub fn insert_disc(&mut self, disc: Disc) {
+        self.ctrladdr = disc
+            .track_at_fad(FAD_OFFSET)
+            .map_or(0x41, |t| t.ctrl_addr());
+        self.track = disc.first_track();
+        self.index = 1;
+        self.fad = FAD_OFFSET;
+        self.status = STAT_PAUSE;
+        self.disc = Some(disc);
+        self.disk_changed = true;
+        self.hirq |= HIRQ_DCHG;
+    }
+
+    /// Whether a disc is present.
+    pub fn has_disc(&self) -> bool {
+        self.disc.is_some()
     }
 
     /// Map an access offset to its register slot (each register occupies a
@@ -174,7 +210,18 @@ impl CdBlock {
 
     pub fn read16(&mut self, offset: u32) -> u16 {
         if offset & 0xFFFF >= DATA_FIFO {
-            return 0; // no disc → no data
+            // Data FIFO: stream the staged transfer buffer (e.g. the TOC) as
+            // 16-bit big-endian words, advancing the cursor. Empty / past-end
+            // reads return 0. Phase 3 adds sector data + the SCU-DMA port.
+            let p = self.xfer_pos;
+            let word = match (self.xfer.get(p), self.xfer.get(p + 1)) {
+                (Some(&hi), Some(&lo)) => ((hi as u16) << 8) | lo as u16,
+                _ => 0,
+            };
+            if p < self.xfer.len() {
+                self.xfer_pos = (p + 2).min(self.xfer.len());
+            }
+            return word;
         }
         match Self::slot(offset & 0xFFFF) {
             0x0008 => {
@@ -324,6 +371,12 @@ impl CdBlock {
                 // Get TOC (MAME `cmd_get_toc`): status becomes TRANS|PAUSE
                 // (we don't track the TRANS status bit separately, so set it
                 // directly in CR1); CR2 = TOC length in words = 102*2 = 0xCC.
+                // With a disc, stage the real 408-byte TOC for the host to read
+                // through the data FIFO.
+                if let Some(d) = &self.disc {
+                    self.xfer = d.toc().to_vec();
+                    self.xfer_pos = 0;
+                }
                 self.cr1 = STAT_TRANS | ((self.status as u16) << 8);
                 self.cr2 = 0x00CC;
                 self.cr3 = 0x0000;
@@ -331,15 +384,27 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
             }
             0x03 => {
-                // Get session info (MAME `cmd_get_session_info`, no-disc /
-                // total-session case): CR3 = sessions(1) in high byte, CR4 = 0.
-                // (Was 0xFFFF/0xFFFF, Yabause-style — MAME warns CR4 must be
-                // > 1 and < 100 or the BIOS rejects it.)
+                // Get session info (MAME `cmd_get_session_info`). CR1 low byte
+                // selects which session; the BIOS reads CR3 (session count in
+                // the high byte) and CR4. With a disc, session 0 ("total / disc
+                // end") returns the lead-out FAD; otherwise the disc start.
+                // (MAME warns CR4 must be > 1 and < 100 or the BIOS rejects the
+                // no-disc default — hence CR3=0x0100, CR4=0 there.)
+                let which = (self.cr1 & 0xFF) as u8;
                 self.status = STAT_PAUSE;
                 self.cr1 = (self.status as u16) << 8;
                 self.cr2 = 0x0000;
-                self.cr3 = 0x0100;
-                self.cr4 = 0x0000;
+                match (&self.disc, which) {
+                    (Some(d), 0) => {
+                        let lo = d.lead_out_fad();
+                        self.cr3 = 0x0100 | ((lo >> 16) & 0xFF) as u16;
+                        self.cr4 = lo as u16;
+                    }
+                    _ => {
+                        self.cr3 = 0x0100;
+                        self.cr4 = 0x0000;
+                    }
+                }
                 self.hirq |= HIRQ_CMOK;
             }
             0x04 => {
@@ -599,5 +664,76 @@ mod tests {
         let mut c = CdBlock::new();
         assert_eq!(c.read16(0x8000), 0);
         assert_eq!(c.read32(0x9000), 0);
+    }
+
+    use crate::disc::Disc;
+
+    /// A 4-sector raw-ISO disc (one Mode-1 data track from FAD 150).
+    fn iso_disc() -> Disc {
+        Disc::from_iso(vec![0u8; 2048 * 4])
+    }
+
+    #[test]
+    fn insert_disc_flags_change_and_reports_real_geometry() {
+        let mut c = CdBlock::new();
+        c.hirq = 0;
+        c.insert_disc(iso_disc());
+        assert!(c.has_disc());
+        assert_eq!(c.hirq & HIRQ_DCHG, HIRQ_DCHG, "disc change flagged");
+        // Get Status (cmd 0x00) now reports track 1 / data (0x41) / FAD 150.
+        c.write16(0x0018, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000);
+        assert_eq!(c.read16(0x0018), 0x0100, "PAUSE status");
+        assert_eq!(c.read16(0x001C), 0x4101, "ctrl/adr 0x41, track 1");
+        assert_eq!(c.read16(0x0020), 0x0100, "index 1, FAD hi 0");
+        assert_eq!(c.read16(0x0024), 0x0096, "FAD 150");
+    }
+
+    #[test]
+    fn get_toc_streams_the_toc_through_the_fifo() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        // Get TOC (cmd 0x02).
+        c.write16(0x0018, 0x0200);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000);
+        assert_eq!(c.read16(0x001C), 0x00CC, "TOC length = 102 words");
+        assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY, "data ready");
+        // The data FIFO streams the TOC: track 1 = 0x41,0x00,0x00,0x96.
+        assert_eq!(c.read16(0x8000), 0x4100); // ctrl/adr + FAD hi
+        assert_eq!(c.read16(0x8000), 0x0096); // FAD lo
+        // Entry 99 (first track) begins at byte 396 = word 198.
+        for _ in 2..198 {
+            let _ = c.read16(0x8000);
+        }
+        assert_eq!(c.read16(0x8000), 0x4101, "first-track meta: ctrl 0x41, #1");
+    }
+
+    #[test]
+    fn get_session_returns_the_lead_out_fad() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc()); // lead-out FAD = 150 + 4 = 154
+        // Get Session, session 0 (total / disc end): CR1 = 0x0300.
+        c.write16(0x0018, 0x0300);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000);
+        assert_eq!(c.read16(0x0020), 0x0100, "1 session, lead-out FAD hi 0");
+        assert_eq!(c.read16(0x0024), 154, "lead-out FAD 154");
+    }
+
+    #[test]
+    fn no_disc_commands_unchanged() {
+        // Without a disc, Get Status still returns the no-disc report.
+        let mut c = CdBlock::new();
+        c.write16(0x0018, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000);
+        assert_eq!(c.read16(0x001C), 0x0000);
+        assert_eq!(c.read16(0x0024), 0x0000);
     }
 }

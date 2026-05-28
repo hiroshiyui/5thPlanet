@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     let bios_path = match env::args().nth(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: fifth_planet <BIOS.bin>");
+            eprintln!("usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd]");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -53,11 +53,53 @@ fn main() -> ExitCode {
         );
     }
 
-    run(bios)
+    // Optional game disc (CUE/BIN, raw ISO, or CloneCD CCD/IMG).
+    let disc = match env::args().nth(2) {
+        Some(path) => match load_disc(&path) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("failed to load disc {path}: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+
+    run(bios, disc)
+}
+
+/// Load a disc image, picking the parser by file extension: `.iso` (raw
+/// 2048-byte data track), `.cue` (CUE sheet + its `.bin`s), or `.ccd`
+/// (CloneCD control file + sibling `.img`).
+fn load_disc(path: &str) -> Result<saturn::disc::Disc, String> {
+    use saturn::disc::Disc;
+    use std::path::Path;
+
+    let p = Path::new(path);
+    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "iso" => Ok(Disc::from_iso(fs::read(p).map_err(|e| e.to_string())?)),
+        "cue" => {
+            let cue = fs::read_to_string(p).map_err(|e| e.to_string())?;
+            Disc::from_cue(&cue, |name| fs::read(dir.join(name)).ok())
+        }
+        "ccd" => {
+            let ccd = fs::read_to_string(p).map_err(|e| e.to_string())?;
+            let img = p.with_extension("img");
+            let bytes = fs::read(&img).map_err(|e| format!("{}: {e}", img.display()))?;
+            Disc::from_ccd(&ccd, bytes)
+        }
+        other => Err(format!("unknown disc format '.{other}' (use .cue / .iso / .ccd)")),
+    }
 }
 
 #[cfg(feature = "sdl2-frontend")]
-fn run(bios: Vec<u8>) -> ExitCode {
+fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
     use sdl2::keyboard::{Keycode, Scancode};
@@ -73,6 +115,9 @@ fn run(bios: Vec<u8>) -> ExitCode {
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
+    if let Some(d) = disc {
+        saturn.insert_disc(d);
+    }
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
@@ -187,7 +232,7 @@ fn run(bios: Vec<u8>) -> ExitCode {
 }
 
 #[cfg(not(feature = "sdl2-frontend"))]
-fn run(bios: Vec<u8>) -> ExitCode {
+fn run(bios: Vec<u8>, disc: Option<saturn::disc::Disc>) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::FRAMEBUFFER_BYTES;
 
@@ -198,6 +243,9 @@ fn run(bios: Vec<u8>) -> ExitCode {
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
+    if let Some(d) = disc {
+        saturn.insert_disc(d);
+    }
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
     for _ in 0..HEADLESS_FRAMES {
         saturn.run_frame(&mut framebuffer);
