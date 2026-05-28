@@ -830,6 +830,18 @@ impl Saturn {
     /// Take the SCSP's generated audio for this period (interleaved L,R at
     /// 44.1 kHz). The frontend queues it to the audio device each frame.
     pub fn take_audio(&mut self) -> Vec<i16> {
-        self.bus.scsp.take_audio()
+        let mut samples = self.bus.scsp.take_audio();
+        // Mix in any CD-DA (Red Book) audio the CD-block decoded this span — at
+        // the aggregate, so neither chip borrows the other. Both streams are
+        // interleaved 16-bit stereo at 44.1 kHz, so they line up frame-for-frame
+        // (the CD FIFO absorbs the 75 Hz sector granularity). CD audio mixes at
+        // full level for now; SCSP CD-input level/pan fidelity is a refinement.
+        if !samples.is_empty() {
+            let cd = self.bus.cd_block.take_cd_audio(samples.len());
+            for (out, c) in samples.iter_mut().zip(cd) {
+                *out = (*out as i32 + c as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+        }
+        samples
     }
 }

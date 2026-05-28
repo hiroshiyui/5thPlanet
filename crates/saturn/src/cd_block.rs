@@ -32,6 +32,8 @@
 //! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
 //! status is `PAUSE`.
 
+use std::collections::VecDeque;
+
 use crate::disc::{FAD_OFFSET, SectorSource};
 
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
@@ -246,6 +248,11 @@ pub struct CdBlock {
     xfer: Vec<u8>,
     xfer_pos: usize,
 
+    /// Decoded CD-DA (Red Book) samples awaiting mix into the SCSP output —
+    /// interleaved 16-bit stereo at 44.1 kHz. The read pump fills this while an
+    /// **audio** track plays (M10); `Saturn::take_audio` drains and mixes it.
+    cd_audio: VecDeque<i16>,
+
     // ---- buffer/filter/partition engine (M7 phase 2) ----
     /// Shared 200-block sector pool; free slots have `size < 0`.
     blocks: Vec<Block>,
@@ -351,6 +358,7 @@ impl CdBlock {
             disc: None,
             xfer: Vec::new(),
             xfer_pos: 0,
+            cd_audio: VecDeque::new(),
             blocks: vec![Block::free(); MAX_BLOCKS],
             free_blocks: MAX_BLOCKS as i32,
             buf_full: false,
@@ -691,7 +699,23 @@ impl CdBlock {
             STAT_SEEK => self.status = STAT_PLAY,
             STAT_PLAY if self.fadstoplay > 0 => {
                 let fad = self.cd_curfad;
-                if self.read_filtered_sector(fad) {
+                let is_audio = self
+                    .disc
+                    .as_ref()
+                    .and_then(|d| d.track_at_fad(fad))
+                    .is_some_and(|t| t.is_audio);
+                if is_audio {
+                    // CDDA: stream the sector to the audio mixer, don't buffer it
+                    // as data (no CSCT / sector store — the host isn't reading).
+                    if self.read_cd_audio_sector(fad) {
+                        self.cd_curfad += 1;
+                        self.fadstoplay -= 1;
+                        if self.fadstoplay == 0 {
+                            self.status = STAT_PAUSE;
+                            self.hirq |= HIRQ_PEND;
+                        }
+                    }
+                } else if self.read_filtered_sector(fad) {
                     self.cd_curfad += 1;
                     self.fadstoplay -= 1;
                     self.hirq |= HIRQ_CSCT;
@@ -704,6 +728,38 @@ impl CdBlock {
             }
             _ => {}
         }
+    }
+
+    /// Decode one Red Book audio sector at `fad` into the CD-DA FIFO: 2352 raw
+    /// bytes = 588 interleaved 16-bit little-endian stereo frames. Capped at ~1 s
+    /// so the buffer can't grow unbounded if the host stops draining audio.
+    fn read_cd_audio_sector(&mut self, fad: u32) -> bool {
+        let Some(disc) = self.disc.as_ref() else {
+            return false;
+        };
+        let mut buf = [0u8; 2352];
+        if disc.read_full_sector(fad, &mut buf) < 2352 {
+            return false;
+        }
+        for frame in buf.chunks_exact(2) {
+            self.cd_audio
+                .push_back(i16::from_le_bytes([frame[0], frame[1]]));
+        }
+        const CAP: usize = 44_100 * 2; // ~1 second of stereo samples
+        while self.cd_audio.len() > CAP {
+            self.cd_audio.pop_front();
+        }
+        true
+    }
+
+    /// Drain up to `n` decoded CD-DA samples (interleaved stereo), padding with
+    /// silence if fewer are buffered. Called by `Saturn::take_audio` to mix CD
+    /// audio with the SCSP output.
+    pub fn take_cd_audio(&mut self, n: usize) -> Vec<i16> {
+        let take = n.min(self.cd_audio.len());
+        let mut v: Vec<i16> = self.cd_audio.drain(..take).collect();
+        v.resize(n, 0);
+        v
     }
 
     /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
@@ -1648,6 +1704,41 @@ mod tests {
     /// A 4-sector raw-ISO disc (one Mode-1 data track from FAD 150).
     fn iso_disc() -> Disc {
         Disc::from_iso(vec![0u8; 2048 * 4])
+    }
+
+    /// A 2-sector Red Book audio disc, with known PCM in the first frame.
+    fn audio_disc() -> Disc {
+        let mut bin = vec![0u8; 2352 * 2];
+        bin[0..2].copy_from_slice(&0x1234i16.to_le_bytes()); // L, frame 0
+        bin[2..4].copy_from_slice(&(-2i16).to_le_bytes()); // R, frame 0
+        Disc::from_cue(
+            "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("audio cue")
+    }
+
+    #[test]
+    fn cdda_audio_track_decodes_to_stereo_pcm() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        // Play the audio track from FAD 150; one play_data tick = one sector.
+        c.status = STAT_PLAY;
+        c.cd_curfad = FAD_OFFSET;
+        c.fadstoplay = 2;
+        c.play_data();
+        let pcm = c.take_cd_audio(1176); // 588 interleaved stereo frames
+        assert_eq!(pcm.len(), 1176);
+        assert_eq!(pcm[0], 0x1234, "left, frame 0");
+        assert_eq!(pcm[1], -2, "right, frame 0");
+        // CDDA is mixed to audio, not buffered as data for the host to read.
+        assert!(!c.sectorstore);
+    }
+
+    #[test]
+    fn take_cd_audio_pads_with_silence_when_empty() {
+        let mut c = CdBlock::new();
+        assert_eq!(c.take_cd_audio(8), vec![0i16; 8]);
     }
 
     #[test]
