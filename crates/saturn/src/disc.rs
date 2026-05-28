@@ -101,6 +101,12 @@ pub struct Disc {
 }
 
 impl Disc {
+    /// The raw concatenated sector image — used to fingerprint the disc for
+    /// save-state media validation (the image itself is never serialized).
+    pub fn image(&self) -> &[u8] {
+        &self.image
+    }
+
     /// A raw ISO: a single Mode-1 data track of 2048-byte sectors at FAD 150.
     /// Trailing bytes that don't fill a sector are ignored.
     pub fn from_iso(image: Vec<u8>) -> Disc {

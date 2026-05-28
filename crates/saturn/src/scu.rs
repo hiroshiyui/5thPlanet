@@ -53,6 +53,7 @@ const DGO_BIT: u32 = 1 << 8;
 /// the SCU manual.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Source {
     VBlankIn = 0,
     VBlankOut = 1,
@@ -124,6 +125,7 @@ const ALL_SOURCES: &[Source] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DmaChannel {
     pub read_addr: u32,
     pub write_addr: u32,
@@ -175,6 +177,7 @@ impl DmaChannel {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scu {
     pub channels: [DmaChannel; NUM_CHANNELS],
     pub dstp: u32,
@@ -209,6 +212,7 @@ pub struct Scu {
 /// (`system::drain_scu_dma`) performs the byte movement through the bus,
 /// since the SCU itself can't reach it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DmaRequest {
     pub channel: usize,
     pub src: u32,

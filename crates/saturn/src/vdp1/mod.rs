@@ -51,6 +51,7 @@ const DRAW_CMD_CYCLES: u64 = 16;
 const DRAW_PIXEL_CYCLES: u64 = 1;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp1 {
     pub vram: Vram,
     /// Draw buffer — the plotter renders here.

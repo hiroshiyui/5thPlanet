@@ -31,6 +31,7 @@ const REG_BYTES: usize = 0x18;
 pub const EDSR_CEF: u16 = 0x0002;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp1Regs {
     /// Writeable control registers, flat big-endian (offsets 0x00..0x0E).
     raw: [u8; REG_BYTES],

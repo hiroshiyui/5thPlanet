@@ -36,6 +36,7 @@ pub const REGS_BASE: u32 = 0x05F8_0000;
 pub const REGS_END: u32 = 0x05F8_01FF;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp2 {
     pub regs: Vdp2Regs,
     pub vram: Vram,

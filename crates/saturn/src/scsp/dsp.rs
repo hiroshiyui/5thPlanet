@@ -12,6 +12,7 @@
 //! SCSP register bank; `step` runs one full pass per output sample.
 
 use crate::memory::Ram;
+use serde_big_array::BigArray;
 
 const SOUND_RAM_MASK: u32 = (super::SOUND_RAM_BYTES as u32) - 1;
 
@@ -65,10 +66,14 @@ fn unpack(val: u16) -> i32 {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Dsp {
+    #[serde(with = "BigArray")]
     pub coef: [i16; 64],
     pub madrs: [u16; 32],
+    #[serde(with = "BigArray")]
     pub mpro: [u16; 128 * 4],
+    #[serde(with = "BigArray")]
     pub temp: [i32; 128],
     pub mems: [i32; 32],
     pub mixs: [i32; 16],

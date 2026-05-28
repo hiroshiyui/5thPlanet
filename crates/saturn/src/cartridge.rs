@@ -57,6 +57,7 @@ const ID_BRAM_32MBIT: u8 = 0x24; // 4 MiB
 
 /// What is plugged into the slot. Defaults to [`Cartridge::None`].
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Cartridge {
     /// Empty slot — ID byte reads `0xFF`, all cart space floats high.
     #[default]
@@ -68,7 +69,14 @@ pub enum Cartridge {
     /// presents them in the Saturn odd-byte packing (see module docs).
     Bram { bytes: Vec<u8>, id: u8 },
     /// Game ROM cart, mirrored across its 4 MiB window. ID reads `0xFF`.
-    Rom { bytes: Vec<u8> },
+    /// The image is read-only external media, so it's `#[serde(skip)]`'d out
+    /// of save states (like the BIOS and disc) and re-grafted by
+    /// `Saturn::load_state`; only `Dram`/`Bram` carry volatile state worth
+    /// snapshotting.
+    Rom {
+        #[serde(skip)]
+        bytes: Vec<u8>,
+    },
 }
 
 impl Cartridge {

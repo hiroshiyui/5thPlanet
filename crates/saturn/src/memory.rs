@@ -16,8 +16,19 @@
 /// offset that's already been folded into the region's range; the ROM
 /// then folds *that* into `rom.len()` so any image size mirrors cleanly.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BiosRom {
+    // The BIOS image is read-only external media (and copyrighted), so save
+    // states reference it rather than embedding it: `#[serde(skip)]` omits
+    // the bytes, and `Saturn::load_state` re-grafts the live image. The
+    // placeholder is a single 0xFF byte so the mirror-fold modulo never
+    // divides by zero before the graft.
+    #[serde(skip, default = "placeholder_bios")]
     rom: Vec<u8>,
+}
+
+fn placeholder_bios() -> Vec<u8> {
+    vec![0xFF]
 }
 
 impl BiosRom {
@@ -31,6 +42,12 @@ impl BiosRom {
     }
     pub fn is_empty(&self) -> bool {
         self.rom.is_empty()
+    }
+
+    /// The raw BIOS bytes — used to fingerprint the image for save-state
+    /// media validation (the image itself is never serialized).
+    pub fn image(&self) -> &[u8] {
+        &self.rom
     }
 
     pub fn read8(&self, offset: u32) -> u8 {
@@ -57,6 +74,7 @@ impl BiosRom {
 /// backup RAM. `size` is the region's byte length; addresses are folded
 /// modulo `size` so mirrored aliases work transparently.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ram {
     bytes: Vec<u8>,
 }
@@ -126,8 +144,18 @@ impl Ram {
 /// (SMPC, SCU, VDP1/2, SCSP, A-bus, etc.). Reads return 0; writes are
 /// dropped. Holds a name for traceable debug output.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StubRegisterBank {
+    // Debug-only label, and a borrowed `&'static str` at that, so it's not
+    // serialized; a reloaded stub carries no state to lose (reads return 0,
+    // writes are dropped) and keeps its compile-time name via the field's
+    // default on the deserialize path being irrelevant to behaviour.
+    #[serde(skip, default = "stub_name")]
     name: &'static str,
+}
+
+fn stub_name() -> &'static str {
+    "STUB"
 }
 
 impl StubRegisterBank {

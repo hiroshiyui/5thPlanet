@@ -29,6 +29,7 @@ mod dsp;
 
 use crate::memory::Ram;
 use m68k::bus::{AccessKind, Bus};
+use serde_big_array::BigArray;
 
 pub const SOUND_RAM_BYTES: usize = 512 * 1024;
 pub const REG_BYTES: usize = 0x1000;
@@ -72,6 +73,7 @@ const EG_SHIFT: u32 = 16;
 
 /// The four ADSR phases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum EgState {
     Attack,
     Decay1,
@@ -83,6 +85,7 @@ enum EgState {
 /// Per-slot envelope-generator state. Rates are cached at key-on (they depend
 /// on OCT/KRS); `volume` is the log loudness index (`0` silent … `0x3FF` full).
 #[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Eg {
     state: EgState,
     volume: i32,
@@ -97,6 +100,7 @@ struct Eg {
 /// One PCM slot's runtime state (the configuration lives in the register bank;
 /// this is the per-sample playback state set up at key-on).
 #[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Slot {
     active: bool,
     backwards: bool,
@@ -207,6 +211,7 @@ static PAN_TABLES: std::sync::LazyLock<([i32; 256], [i32; 256])> = std::sync::La
 
 /// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Timer {
     count: u16,
     subtick: u32,
@@ -241,7 +246,9 @@ impl Timer {
 /// interrupt lines. Register reads are plain; writes to the interrupt-control
 /// window have side effects (pending/reset/recompute).
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ScspCtrl {
+    #[serde(with = "BigArray")]
     raw: [u8; REG_BYTES],
     timers: [Timer; 3],
     slots: [Slot; NUM_SLOTS],
@@ -692,6 +699,7 @@ impl ScspCtrl {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
     /// 512 KiB sound RAM, shared between the SH-2 (at 0x05A0_0000) and the 68k.
     pub ram: Ram,

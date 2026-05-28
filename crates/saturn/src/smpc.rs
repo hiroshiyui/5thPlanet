@@ -38,6 +38,7 @@
 /// `last_unknown_command` for trace tooling and otherwise ignored.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// MSHON — request master SH-2 on. No-op for us (master is always on).
     MshOn = 0x00,
@@ -96,6 +97,7 @@ impl Command {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Smpc {
     pub ireg: [u8; 7],
     pub oreg: [u8; 32],

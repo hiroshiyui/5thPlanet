@@ -17,6 +17,7 @@ pub const FB_STRIDE: i32 = 512;
 pub const FB_HEIGHT: i32 = 256;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Framebuffer {
     bytes: Vec<u8>,
 }

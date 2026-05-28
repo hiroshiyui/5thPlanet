@@ -36,6 +36,7 @@ pub trait SchedEntity {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scheduler<E: SchedEntity> {
     entities: Vec<E>,
 }
@@ -141,6 +142,7 @@ impl<E: SchedEntity> Scheduler<E> {
 
 /// Opaque handle into a [`Scheduler`] returned by [`Scheduler::add`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct EntityId(pub(crate) usize);
 
 // ---- Concrete entity: SH-2 wrapped for the Saturn bus context. -----------
@@ -152,6 +154,7 @@ pub struct EntityId(pub(crate) usize);
 /// casing in the scheduler. The slave SH-2 lives in this halted state
 /// from power-on until SMPC's `SETSL` command releases it.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Sh2Entity {
     pub cpu: sh2::Cpu,
     halted: bool,
@@ -214,6 +217,7 @@ impl SchedEntity for Sh2Entity {
 /// through the shared bus context. When the full CD-block arrives, a proper
 /// SH-1 core entity replaces this timer.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CdBlockEntity {
     /// Global cycle of the next tick.
     next: u64,
@@ -263,6 +267,7 @@ impl SchedEntity for CdBlockEntity {
 /// the hottest path to save a few KB. Not worth it; the lint is allowed.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SaturnEntity {
     Sh2(Sh2Entity),
     CdBlock(CdBlockEntity),

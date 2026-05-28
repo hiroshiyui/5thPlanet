@@ -83,6 +83,7 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 /// One emulated SEGA Saturn — a Saturn-shaped memory map populated with
 /// a caller-supplied BIOS image, plus master and slave SH-2 cores wired
 /// into a shared event-driven scheduler.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Saturn {
     pub bus: SaturnBus,
     pub scheduler: Scheduler<SaturnEntity>,

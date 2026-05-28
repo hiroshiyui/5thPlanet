@@ -6,9 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-sh2 = { path = "../sh2" }
-scu_dsp = { path = "../scu_dsp" }
-m68k = { path = "../m68k" }
+sh2 = { path = "../sh2", features = ["serde"] }
+scu_dsp = { path = "../scu_dsp", features = ["serde"] }
+m68k = { path = "../m68k", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+bincode = { version = "2", features = ["serde"] }
 
 [lints]
 workspace = true

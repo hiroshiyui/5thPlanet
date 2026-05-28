@@ -14,6 +14,7 @@
 const CRAM_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cram {
     bytes: Vec<u8>,
 }

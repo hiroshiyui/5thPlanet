@@ -70,6 +70,7 @@ const HIGH_WRAM_WAITS: u32 = 1;
 const STUB_WAITS: u32 = 0;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SaturnBus {
     pub bios: BiosRom,
     pub smpc: Smpc,

@@ -9,6 +9,7 @@
 pub const VRAM_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vram {
     bytes: Vec<u8>,
 }

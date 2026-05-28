@@ -80,6 +80,7 @@ const NO_FILTER: u8 = 0xFF;
 /// otherwise it holds `size` bytes of user data plus the sector's disc
 /// coordinates and subheader fields (used by filtering).
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Block {
     size: i32,
     fad: i32,
@@ -108,6 +109,7 @@ impl Block {
 /// A sector-selection filter (MAME `filterT`): FAD-range and subheader-condition
 /// matching, plus the true/false partition each matched sector routes to.
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Filter {
     mode: u8,
     chan: u8,
@@ -125,6 +127,7 @@ struct Filter {
 /// A partition (output buffer): an ordered list of pool-block indices. Unlike
 /// MAME's fixed array + null-defragment, we keep it compact in a `Vec`.
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Partition {
     blocks: Vec<usize>,
 }
@@ -133,6 +136,7 @@ struct Partition {
 /// streams `num` blocks of partition `part` starting at index `pos`, tracking
 /// the current block (`sect`) and byte offset within it (`offs`).
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Xfer32 {
     delete: bool,
     part: usize,
@@ -147,6 +151,7 @@ const MASTER_HZ: u64 = 28_636_400;
 
 /// One ISO9660 directory record (MAME `direntryT`, fields we use).
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DirEntry {
     firstfad: u32,
     length: u32,
@@ -181,6 +186,7 @@ fn le32(b: &[u8], o: usize) -> u32 {
 const PERIODIC_CYCLES: u64 = 477_273;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CdBlock {
     pub hirq: u16,
     pub hirq_mask: u16,
@@ -222,6 +228,12 @@ pub struct CdBlock {
 
     /// The inserted disc image, if any. `None` is the power-on "no disc"
     /// state the existing no-disc command subset already models.
+    ///
+    /// `#[serde(skip)]`: the disc image can be hundreds of MB and is external
+    /// media, so save states reference it rather than embedding it. The
+    /// *logical* playback position (FAD, status, partitions) lives in the
+    /// fields above and is serialized; `load_state` re-grafts the live `Disc`.
+    #[serde(skip)]
     disc: Option<Disc>,
 
     /// Host-readable data staged by a command (Get TOC for now), streamed out
@@ -381,6 +393,26 @@ impl CdBlock {
     /// Whether a disc is present.
     pub fn has_disc(&self) -> bool {
         self.disc.is_some()
+    }
+
+    /// Borrow the inserted disc, if any — used to fingerprint the media for
+    /// save-state validation (the disc is `#[serde(skip)]`'d).
+    pub fn disc(&self) -> Option<&Disc> {
+        self.disc.as_ref()
+    }
+
+    /// Move the disc out (leaving the drive disc-less). Used by
+    /// `Saturn::load_state` to re-graft the live disc onto a decoded state,
+    /// which never carries the (skipped) disc image itself.
+    pub fn take_disc(&mut self) -> Option<Disc> {
+        self.disc.take()
+    }
+
+    /// Re-attach a disc moved out by [`take_disc`] without disturbing the
+    /// already-restored logical state (status/FAD/partitions). Unlike
+    /// [`insert_disc`], it does *not* reset the drive or raise `DCHG`.
+    pub fn restore_disc(&mut self, disc: Option<Disc>) {
+        self.disc = disc;
     }
 
     /// Map an access offset to its register slot (each register occupies a

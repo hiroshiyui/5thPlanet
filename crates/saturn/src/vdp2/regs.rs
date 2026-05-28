@@ -40,7 +40,9 @@
 const REG_BYTES: usize = 0x200;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp2Regs {
+    #[serde(with = "serde_big_array::BigArray")]
     raw: [u8; REG_BYTES],
 }
 
