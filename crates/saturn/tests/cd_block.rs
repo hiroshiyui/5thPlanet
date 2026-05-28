@@ -42,10 +42,10 @@ fn get_status_command_round_trips_through_the_bus() {
     sat.bus.write16(CR4, 0x0000, AccessKind::Data);
     let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
     assert_eq!(hirq & 0x0001, 0x0001, "CMOK set after command");
-    // Disc-present PAUSE status report: CR1 = 0x0100 (status 0x01 in the
-    // high byte, options/repcnt 0).
+    // No disc inserted → NODISC status report: CR1 = 0x0700 (status 0x07 in
+    // the high byte, options/repcnt 0), matching MAME's no-image reset.
     let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
-    assert_eq!(cr1, 0x0100);
+    assert_eq!(cr1, 0x0700);
 }
 
 #[test]

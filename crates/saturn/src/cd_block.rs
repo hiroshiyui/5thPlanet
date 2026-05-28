@@ -52,6 +52,7 @@ const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
 
 // CD status codes — high byte of CR1 (cs2.c / MAME `CD_STAT_*`).
 const STAT_PAUSE: u8 = 0x01; // drive ready, disc present, not playing
+const STAT_NODISC: u8 = 0x07; // door closed, no disc present
 const STAT_PERI: u8 = 0x20; // OR'd in for periodic (unsolicited) reports
 
 // 16-bit CR1 status bits that live above the status byte (MAME `CD_STAT_*`).
@@ -327,14 +328,16 @@ impl CdBlock {
             cr2: ((b'D' as u16) << 8) | b'B' as u16,
             cr3: ((b'L' as u16) << 8) | b'O' as u16,
             cr4: ((b'C' as u16) << 8) | b'K' as u16,
-            // No CD image present. Status is `PAUSE` (MAME resets `cd_stat`
-            // to PAUSE even with no image), but the disc *geometry* is all
-            // zero: MAME's `cr_standard_return` returns CR2=CR3=CR4=0 when
-            // `!cdrom_image->exists()`. (Yabause's `DummyCD` instead reports
-            // a present disc with FAD 150 / ctrl-addr 0x41 / track 1 — the
-            // earlier model here; MAME is now the primary reference.) Real
-            // disc-image geometry lands with the full CD-block in M6.
-            status: STAT_PAUSE,
+            // No CD image present → status `NODISC` (door closed, empty
+            // drive), matching MAME's reset (`saturn_cd_hle.cpp`: it sets
+            // `cd_stat = CD_STAT_PAUSE` but immediately overrides to
+            // `CD_STAT_NODISC` when `!m_cdrom_image->exists()`). The disc
+            // *geometry* is all zero: MAME's `cr_standard_return` returns
+            // CR2=CR3=CR4=0 with no image. `insert_disc` switches this to
+            // PAUSE with real geometry. (Verified against MAME v0.287 with
+            // both the USA v1.00 and JP v1.01 BIOS; the splash boot path is
+            // unaffected by PAUSE-vs-NODISC, but the host-visible status is.)
+            status: STAT_NODISC,
             options: 0x00,
             repcnt: 0x00,
             ctrladdr: 0x00,
@@ -1483,9 +1486,9 @@ mod tests {
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000); // triggers execute
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
-        // No-disc PAUSE report (MAME `cr_standard_return`, no image): status
-        // PAUSE in CR1, zero geometry in CR2..CR4.
-        assert_eq!(c.read16(0x0018), 0x0100);
+        // No-disc NODISC report (MAME `cr_standard_return`, no image): status
+        // NODISC (0x07) in CR1, zero geometry in CR2..CR4.
+        assert_eq!(c.read16(0x0018), 0x0700);
         assert_eq!(c.read16(0x001C), 0x0000);
         assert_eq!(c.read16(0x0020), 0x0000);
         assert_eq!(c.read16(0x0024), 0x0000);
@@ -1532,7 +1535,7 @@ mod tests {
         let mut c = activated();
         c.tick(PERIODIC_CYCLES);
         // PERI (0x20) is OR'd into the status byte of CR1; SCDQ is raised.
-        assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+        assert_eq!(c.read16(0x0018) >> 8, (STAT_NODISC | STAT_PERI) as u16);
         assert_eq!(c.hirq & HIRQ_SCDQ, HIRQ_SCDQ);
     }
 
@@ -1546,7 +1549,7 @@ mod tests {
         // One more cycle crosses the interval; the report lands. The
         // accumulator carries the overshoot forward (cadence stays exact).
         c.tick(1);
-        assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+        assert_eq!(c.read16(0x0018) >> 8, (STAT_NODISC | STAT_PERI) as u16);
     }
 
     #[test]
@@ -1561,7 +1564,7 @@ mod tests {
             acc += step;
         }
         // Exactly one PERI report so far (status byte has PERI, SCDQ set).
-        assert_eq!(fine.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+        assert_eq!(fine.read16(0x0018) >> 8, (STAT_NODISC | STAT_PERI) as u16);
         assert_eq!(fine.hirq & HIRQ_SCDQ, HIRQ_SCDQ);
     }
 
@@ -1584,7 +1587,7 @@ mod tests {
         // Read CR4 (consumes response), then a periodic may land.
         let _ = c.read16(0x0024);
         c.tick(PERIODIC_CYCLES);
-        assert_eq!(c.read16(0x0018) >> 8, (STAT_PAUSE | STAT_PERI) as u16);
+        assert_eq!(c.read16(0x0018) >> 8, (STAT_NODISC | STAT_PERI) as u16);
     }
 
     #[test]
