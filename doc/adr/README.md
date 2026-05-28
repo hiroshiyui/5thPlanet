@@ -46,6 +46,7 @@ We use Michael Nygard's lightweight format — see
 | [0005](0005-queue-and-drain-side-effects.md) | Queue a side effect, drain it at the aggregate | Accepted |
 | [0006](0006-scu-dsp-standalone-crate.md) | SCU-DSP is a standalone crate, not a `saturn` module | Accepted |
 | [0007](0007-forbid-unsafe-code.md) | Workspace-wide `unsafe_code = "forbid"` | Accepted |
+| [0008](0008-frontend-osd-software-composite.md) | Hand-rolled, software-composited frontend OSD | Accepted |
 
 ### Decisions worth recording (backlog)
 
