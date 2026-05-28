@@ -1119,7 +1119,7 @@ fn catch_divergent_memcmp() {
     println!(
         "memcmp entry at step {steps}: R7=0x{r7:08X} R5=0x{r5:08X} len R6=0x{r6:08X} PR=0x{pr:08X}"
     );
-    let n = (r6.min(24)) as u32;
+    let n = r6.min(24);
     let dump = |sat: &mut Saturn, base: u32, label: &str| {
         let mut s = String::new();
         for i in 0..n {

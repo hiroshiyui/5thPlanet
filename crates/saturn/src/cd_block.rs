@@ -311,7 +311,7 @@ impl CdBlock {
             hirq_mask: 0xFFFF,
             // Power-on identity string "CDBLOCK" — the BIOS reads CR1..CR4
             // to confirm the CD subsystem is present.
-            cr1: (0 << 8) | b'C' as u16,
+            cr1: b'C' as u16, // high byte 0, low byte 'C'
             cr2: ((b'D' as u16) << 8) | b'B' as u16,
             cr3: ((b'L' as u16) << 8) | b'O' as u16,
             cr4: ((b'C' as u16) << 8) | b'K' as u16,
@@ -1408,7 +1408,7 @@ mod tests {
     fn power_on_presents_cdblock_signature() {
         let mut c = CdBlock::new();
         // "CDBLOCK" across CR1..CR4 (CR1 high byte is the status = 0).
-        assert_eq!(c.read16(0x0018), (0 << 8) | b'C' as u16);
+        assert_eq!(c.read16(0x0018), b'C' as u16);
         assert_eq!(c.read16(0x001C), ((b'D' as u16) << 8) | b'B' as u16);
         assert_eq!(c.read16(0x0020), ((b'L' as u16) << 8) | b'O' as u16);
         assert_eq!(c.read16(0x0024), ((b'C' as u16) << 8) | b'K' as u16);
@@ -1470,7 +1470,7 @@ mod tests {
         for _ in 0..10 {
             c.tick(PERIODIC_CYCLES);
         }
-        assert_eq!(c.read16(0x0018), (0 << 8) | b'C' as u16);
+        assert_eq!(c.read16(0x0018), b'C' as u16);
         assert_eq!(c.read16(0x001C), ((b'D' as u16) << 8) | b'B' as u16);
         assert_eq!(c.read16(0x0020), ((b'L' as u16) << 8) | b'O' as u16);
         assert_eq!(c.read16(0x0024), ((b'C' as u16) << 8) | b'K' as u16);

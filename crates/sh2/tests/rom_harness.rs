@@ -12,6 +12,10 @@
 //! once with `--nocapture` to read the new actual hash and update the
 //! `expected` constant.
 
+// `state_digest` takes a slice of memory-region ranges; passing a single
+// region as `&[a..b]` is intentional, not a mis-initialised range-vec.
+#![allow(clippy::single_range_in_vec_init)]
+
 use sh2::Cpu;
 use sh2::harness::{MemBus, state_digest};
 

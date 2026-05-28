@@ -27,7 +27,7 @@ fn cram_writes_through_bus_show_up_in_palette_lookup() {
 #[test]
 fn tvmd_display_enable_visible_via_named_accessor_after_bus_write() {
     let mut sat = Saturn::with_blank_bios();
-    sat.bus.write16(REGS_BASE + 0x000, 0x8000, AccessKind::Data); // TVMD.DISP
+    sat.bus.write16(REGS_BASE, 0x8000, AccessKind::Data); // TVMD.DISP (offset 0x000)
     assert!(sat.bus.vdp2.regs.display_enabled());
 }
 

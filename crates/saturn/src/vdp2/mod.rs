@@ -136,7 +136,7 @@ mod tests {
         let mut v = Vdp2::new();
         v.write32(VRAM_BASE + 0x100, 0xDEAD_BEEF);
         v.write16(CRAM_BASE + 0x10, 0xCAFE);
-        v.write16(REGS_BASE + 0x000, 0x8000); // TVMD.DISP
+        v.write16(REGS_BASE, 0x8000); // TVMD.DISP (offset 0x000)
         assert_eq!(v.read32(VRAM_BASE + 0x100), 0xDEAD_BEEF);
         assert_eq!(v.read16(CRAM_BASE + 0x10), 0xCAFE);
         assert!(v.regs.display_enabled());
