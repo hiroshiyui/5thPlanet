@@ -42,6 +42,7 @@ use wdt::Wdt;
 pub const ONCHIP_BASE: u32 = 0xFFFF_FE00;
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OnChip {
     pub sci: Sci,
     pub frt: Frt,

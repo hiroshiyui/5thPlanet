@@ -19,6 +19,7 @@
 //! and external clock sources are out of scope.
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Frt {
     pub tier: u8,
     pub ftcsr: u8,

@@ -7,6 +7,7 @@
 
 /// Generic 16-byte register bank covering the BSC address span.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Bsc {
     pub raw: [u8; 32],
 }

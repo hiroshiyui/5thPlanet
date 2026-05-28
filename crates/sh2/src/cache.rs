@@ -31,12 +31,16 @@
 //! cache pure (no Bus dependency) and makes the line-fill timing visible
 //! to the interpreter's cycle accounting.
 
+#[cfg(feature = "serde")]
+use serde_big_array::BigArray;
+
 /// Bytes per cache line.
 pub const LINE_BYTES: usize = 16;
 const WAYS: usize = 4;
 const SETS: usize = 64; // 4096 / (16 * 4)
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Line {
     tag: u32,
     valid: bool,
@@ -54,11 +58,17 @@ impl Default for Line {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cache {
     ccr: u8,
+    // SETS (64) exceeds serde's built-in 32-element array impls, so the
+    // outer dimension goes through serde-big-array; the inner `[_; WAYS]`
+    // (4) serializes natively.
+    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
     sets: [[Line; WAYS]; SETS],
     /// Per-set access order. Index 0 is the most-recently used way; index
     /// `WAYS-1` is the least-recently used (next eviction victim).
+    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
     lru: [[u8; WAYS]; SETS],
 }
 

@@ -25,6 +25,7 @@
 const CKS_PERIODS: [u32; 8] = [2, 64, 128, 256, 512, 1024, 4096, 8192];
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Wdt {
     pub wtcsr: u8,
     pub wtcnt: u8,

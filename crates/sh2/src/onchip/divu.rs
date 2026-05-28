@@ -19,6 +19,7 @@
 //! quotient.
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Divu {
     pub dvsr: u32,
     pub dvdnth: u32,

@@ -12,6 +12,7 @@
 /// Condition codes + system byte, kept as named fields and packed/unpacked
 /// to the 16-bit SR on demand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Sr {
     pub c: bool,
     pub v: bool,
@@ -70,6 +71,7 @@ impl Sr {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
     pub d: [u32; 8],
     /// A0..A7; `a[7]` is the *active* stack pointer.

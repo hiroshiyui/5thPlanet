@@ -42,6 +42,7 @@ pub enum Source {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Intc {
     pub ipra: u16,
     pub iprb: u16,

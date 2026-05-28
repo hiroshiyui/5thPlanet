@@ -17,9 +17,55 @@ use crate::regs::{
     DATA_RAM_BANKS, DATA_RAM_WORDS_PER_BANK, PROGRAM_WORDS, Registers, sign_extend48,
 };
 
+/// Serde codec for the `[[u32; 64]; 4]` data RAM: a flat 256-element tuple
+/// (no `alloc`, so this works in the crate's `no_std` build). Needed because
+/// the inner dimension (64) exceeds serde's built-in array impls and
+/// serde-big-array only covers a single dimension.
+#[cfg(feature = "serde")]
+mod data_ram_serde {
+    use crate::regs::{DATA_RAM_BANKS, DATA_RAM_WORDS_PER_BANK};
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+
+    type Ram = [[u32; DATA_RAM_WORDS_PER_BANK]; DATA_RAM_BANKS];
+    const N: usize = DATA_RAM_BANKS * DATA_RAM_WORDS_PER_BANK;
+
+    pub fn serialize<S: Serializer>(ram: &Ram, s: S) -> Result<S::Ok, S::Error> {
+        let mut t = s.serialize_tuple(N)?;
+        for bank in ram {
+            for word in bank {
+                t.serialize_element(word)?;
+            }
+        }
+        t.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Ram, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Ram;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                write!(f, "{N} SCU-DSP data-RAM words")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Ram, A::Error> {
+                let mut ram = [[0u32; DATA_RAM_WORDS_PER_BANK]; DATA_RAM_BANKS];
+                for (i, slot) in ram.iter_mut().flatten().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(ram)
+            }
+        }
+        d.deserialize_tuple(N, V)
+    }
+}
+
 /// A DMA transfer the DSP requested but hasn't performed (it moves data
 /// between DSP data RAM and the A/B-bus, which only the host can reach).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DmaRequest {
     /// `true` = DSP RAM → A/B-bus (via WA0); `false` = A/B-bus → DSP RAM (RA0).
     pub from_dsp: bool,
@@ -36,9 +82,15 @@ pub struct DmaRequest {
 
 /// One emulated SCU-DSP instance.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dsp {
     pub regs: Registers,
+    // PROGRAM_WORDS (256) exceeds serde's built-in 32-element array impls.
+    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub program: [u32; PROGRAM_WORDS],
+    // The inner `[u32; 64]` also exceeds 32, which serde-big-array's 1-D
+    // helper can't reach, so the 4×64 data RAM uses a flat tuple codec.
+    #[cfg_attr(feature = "serde", serde(with = "data_ram_serde"))]
     pub data_ram: [[u32; DATA_RAM_WORDS_PER_BANK]; DATA_RAM_BANKS],
     /// Delay-slot address: the instruction after a taken jump/loop executes
     /// once before control resumes at the target (the DSP has a 1-slot delay).

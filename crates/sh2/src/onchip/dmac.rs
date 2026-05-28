@@ -23,6 +23,7 @@
 //! Saturn bus arbitration.
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Channel {
     pub sar: u32,
     pub dar: u32,
@@ -31,6 +32,7 @@ pub struct Channel {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dmac {
     pub channels: [Channel; 2],
     pub dmaor: u32,

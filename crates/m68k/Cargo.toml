@@ -7,8 +7,17 @@ license.workspace = true
 description = "Cycle-accurate Motorola MC68EC000 CPU core (Saturn SCSP sound CPU)."
 
 [dependencies]
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "alloc",
+], optional = true }
 
 [dev-dependencies]
+
+[features]
+# Opt-in Serialize/Deserialize on the CPU state types (used by the Saturn
+# save-state machinery). Off by default so the core stays dependency-free.
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

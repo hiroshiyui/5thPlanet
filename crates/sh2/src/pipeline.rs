@@ -17,6 +17,7 @@
 //! (to record what the just-issued instruction left pending).
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pipeline {
     /// Total cycles executed since reset.
     pub cycles: u64,

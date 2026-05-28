@@ -33,6 +33,7 @@ pub const DATA_RAM_BANKS: usize = 4;
 /// progress; `end` is the program-end flag the host reads (raises the SCU
 /// DSP-end interrupt); `exec` is the executing flag (cleared by END).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Flags {
     pub z: bool,
     pub s: bool,
@@ -44,6 +45,7 @@ pub struct Flags {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
     pub pc: u8,
     pub top: u8,

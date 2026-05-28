@@ -7,8 +7,18 @@ license.workspace = true
 description = "Cycle-accurate Hitachi SH-2 (SH7604) CPU core."
 
 [dependencies]
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "alloc",
+], optional = true }
+serde-big-array = { version = "0.5", optional = true }
 
 [dev-dependencies]
+
+[features]
+# Opt-in Serialize/Deserialize on the CPU state types (used by the Saturn
+# save-state machinery). Off by default so the core stays dependency-free.
+serde = ["dep:serde", "dep:serde-big-array"]
 
 [lints]
 workspace = true

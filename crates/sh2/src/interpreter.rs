@@ -37,6 +37,7 @@ const CCR_ADDR: u32 = 0xFFFF_FE92;
 
 /// One Hitachi SH-2 (SH7604) core.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cpu {
     pub regs: Registers,
     pub pipeline: Pipeline,

@@ -11,6 +11,7 @@
 ///   0       T       true/false flag
 /// ```
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Sr(pub u32);
 
 impl Sr {
@@ -85,6 +86,7 @@ impl Sr {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
     /// General-purpose R0..R15. R15 is the stack pointer.
     pub r: [u32; 16],

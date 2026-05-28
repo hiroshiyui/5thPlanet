@@ -40,6 +40,7 @@ enum Ea {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cpu {
     pub regs: Registers,
     /// Total clock cycles consumed since construction.
