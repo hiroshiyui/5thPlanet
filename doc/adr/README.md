@@ -47,6 +47,7 @@ We use Michael Nygard's lightweight format — see
 | [0006](0006-scu-dsp-standalone-crate.md) | SCU-DSP is a standalone crate, not a `saturn` module | Accepted |
 | [0007](0007-forbid-unsafe-code.md) | Workspace-wide `unsafe_code = "forbid"` | Accepted |
 | [0008](0008-frontend-osd-software-composite.md) | Hand-rolled, software-composited frontend OSD | Accepted |
+| [0009](0009-physdisc-libcdio-ffi-crate.md) | Live physical-disc reads via a feature-gated libcdio FFI crate | Accepted |
 
 ### Decisions worth recording (backlog)
 
