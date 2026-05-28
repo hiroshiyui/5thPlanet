@@ -19,6 +19,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use saturn::cartridge::Cartridge;
 
+// The OSD menu is pure logic (no sdl2): compile it for the SDL2 frontend and
+// for tests (so its unit tests run even with `--no-default-features`), but not
+// in a headless non-test build where nothing uses it.
+#[cfg(any(feature = "sdl2-frontend", test))]
+mod osd;
+
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
 /// somehow before the epoch). Used to seed the Saturn RTC.
 fn host_unix_secs() -> u64 {
@@ -164,6 +170,8 @@ fn run(
     use sdl2::keyboard::{Keycode, Scancode};
     use sdl2::pixels::PixelFormatEnum;
 
+    use osd::{Nav, Osd, OsdCtx};
+
     use saturn::smpc::pad;
 
     use saturn::Saturn;
@@ -174,6 +182,9 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
+    // Keep a clone of the launched disc so the OSD "Insert Disc" can re-insert
+    // it after an eject.
+    let launched_disc = disc.clone();
     if let Some(d) = disc {
         saturn.insert_disc(d);
     }
@@ -232,6 +243,14 @@ fn run(
     let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
+    // Scratch buffer for compositing the OSD without corrupting the frozen
+    // last frame (we redraw the menu over the same frame while it's open).
+    let mut compose = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut osd = Osd::new();
+
+    // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
+    // the slot-less `<bios>.state`).
+    let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
 
     'main: loop {
         // The host SDL2 library on a modern Linux desktop emits event
@@ -245,28 +264,54 @@ fn run(
         // events; widen if a future SDL adds more.
         event_subsystem.flush_events(0x201, 0x20F);
 
+        // Live context for the menu (disc presence + which slots are filled).
+        let ctx = OsdCtx {
+            disc_present: saturn.has_disc(),
+            slot_used: std::array::from_fn(|n| slot_path(n as u8).exists()),
+        };
+
         for ev in events.poll_iter() {
             match ev {
-                Event::Quit { .. }
-                | Event::KeyDown {
+                Event::Quit { .. } => break 'main,
+                Event::KeyDown {
+                    keycode: Some(kc), ..
+                } if osd.is_open() => {
+                    // Menu navigation. Esc/Backspace backs out (closing at root).
+                    let action = match kc {
+                        Keycode::Up => osd.handle(Nav::Up, &ctx),
+                        Keycode::Down => osd.handle(Nav::Down, &ctx),
+                        Keycode::Return | Keycode::Z => osd.handle(Nav::Select, &ctx),
+                        Keycode::Backspace | Keycode::X => osd.handle(Nav::Back, &ctx),
+                        Keycode::Escape => osd.toggle(),
+                        _ => None,
+                    };
+                    if let Some(action) = action
+                        && dispatch_osd(action, &mut osd, &mut saturn, &save_base, &launched_disc)
+                    {
+                        break 'main; // Quit
+                    }
+                }
+                // Esc opens the menu (when closed).
+                Event::KeyDown {
                     keycode: Some(Keycode::Escape),
                     ..
-                } => break 'main,
-                // F5 quicksave: snapshot the whole machine to <bios>.state.
+                } => {
+                    osd.toggle();
+                }
+                // F5/F9 quick save/load to the slot-less quickslot.
                 Event::KeyDown {
                     keycode: Some(Keycode::F5),
                     ..
                 } => match fs::write(&state_path, saturn.save_state()) {
-                    Ok(()) => eprintln!("saved state to {}", state_path.display()),
+                    Ok(()) => osd.set_toast("Quicksave", 90),
                     Err(e) => eprintln!("save state failed: {e}"),
                 },
-                // F9 quickload: restore that snapshot (same BIOS/disc required).
                 Event::KeyDown {
                     keycode: Some(Keycode::F9),
                     ..
                 } => match fs::read(&state_path) {
                     Ok(bytes) => match saturn.load_state(&bytes) {
-                        Ok(()) => eprintln!("loaded state from {}", state_path.display()),
+                        Ok(()) => osd.set_toast("Quickload", 90),
                         Err(e) => eprintln!("load state failed: {e}"),
                     },
                     Err(e) => eprintln!("no state to load ({e})"),
@@ -275,43 +320,59 @@ fn run(
             }
         }
 
-        // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
-        // Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter = Start.
-        let keys = events.keyboard_state();
-        let mut held = 0u16;
-        for (sc, bit) in [
-            (Scancode::Up, pad::UP),
-            (Scancode::Down, pad::DOWN),
-            (Scancode::Left, pad::LEFT),
-            (Scancode::Right, pad::RIGHT),
-            (Scancode::Z, pad::A),
-            (Scancode::X, pad::B),
-            (Scancode::C, pad::C),
-            (Scancode::A, pad::X),
-            (Scancode::S, pad::Y),
-            (Scancode::D, pad::Z),
-            (Scancode::Q, pad::L),
-            (Scancode::W, pad::R),
-            (Scancode::Return, pad::START),
-        ] {
-            if keys.is_scancode_pressed(sc) {
-                held |= bit;
+        if osd.is_open() {
+            // Frozen: don't advance the machine or feed the pad. Composite the
+            // menu over a dimmed copy of the last frame.
+            saturn.set_pad1(0);
+            osd.tick_toast();
+            compose.copy_from_slice(&framebuffer);
+            osd.render_overlay(&mut compose, FRAME_WIDTH, FRAME_HEIGHT, &ctx);
+            texture
+                .update(None, &compose, FRAME_WIDTH * 4)
+                .expect("upload framebuffer");
+        } else {
+            // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
+            // Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter = Start.
+            let keys = events.keyboard_state();
+            let mut held = 0u16;
+            for (sc, bit) in [
+                (Scancode::Up, pad::UP),
+                (Scancode::Down, pad::DOWN),
+                (Scancode::Left, pad::LEFT),
+                (Scancode::Right, pad::RIGHT),
+                (Scancode::Z, pad::A),
+                (Scancode::X, pad::B),
+                (Scancode::C, pad::C),
+                (Scancode::A, pad::X),
+                (Scancode::S, pad::Y),
+                (Scancode::D, pad::Z),
+                (Scancode::Q, pad::L),
+                (Scancode::W, pad::R),
+                (Scancode::Return, pad::START),
+            ] {
+                if keys.is_scancode_pressed(sc) {
+                    held |= bit;
+                }
             }
+            saturn.set_pad1(held);
+
+            saturn.run_frame(&mut framebuffer);
+
+            // Queue this frame's SCSP audio, unless we're already buffered well
+            // ahead (keeps latency bounded if the host runs faster than realtime).
+            let audio_samples = saturn.take_audio();
+            if audio_queue.size() < 44_100 * 2 * 2 / 4 {
+                audio_queue.queue_audio(&audio_samples).ok();
+            }
+
+            // A lingering toast (e.g. "Quicksave") is drawn over the live frame.
+            osd.tick_toast();
+            osd.render_overlay(&mut framebuffer, FRAME_WIDTH, FRAME_HEIGHT, &ctx);
+            texture
+                .update(None, &framebuffer, FRAME_WIDTH * 4)
+                .expect("upload framebuffer");
         }
-        saturn.set_pad1(held);
 
-        saturn.run_frame(&mut framebuffer);
-
-        // Queue this frame's SCSP audio, unless we're already buffered well
-        // ahead (keeps latency bounded if the host runs faster than realtime).
-        let audio_samples = saturn.take_audio();
-        if audio_queue.size() < 44_100 * 2 * 2 / 4 {
-            audio_queue.queue_audio(&audio_samples).ok();
-        }
-
-        texture
-            .update(None, &framebuffer, FRAME_WIDTH * 4)
-            .expect("upload framebuffer");
         canvas.clear();
         canvas.copy(&texture, None, None).expect("blit to canvas");
         canvas.present(); // present_vsync caps us at the display rate
@@ -323,6 +384,55 @@ fn run(
     }
 
     ExitCode::SUCCESS
+}
+
+/// Carry out a menu action against the running machine. Returns `true` if the
+/// emulator should quit. Save-state slots live at `<bios>.<n>.state`.
+#[cfg(feature = "sdl2-frontend")]
+fn dispatch_osd(
+    action: osd::OsdAction,
+    osd: &mut osd::Osd,
+    saturn: &mut saturn::Saturn,
+    save_base: &std::path::Path,
+    launched_disc: &Option<saturn::disc::Disc>,
+) -> bool {
+    use osd::OsdAction;
+    let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
+    match action {
+        OsdAction::Resume => osd.close(),
+        OsdAction::Quit => return true,
+        OsdAction::Reset => {
+            saturn.reset();
+            osd.set_toast("Reset", 120);
+            osd.close();
+        }
+        OsdAction::Save(n) => match fs::write(slot_path(n), saturn.save_state()) {
+            Ok(()) => osd.set_toast(format!("Saved slot {n}"), 120),
+            Err(e) => osd.set_toast(format!("Save failed: {e}"), 180),
+        },
+        OsdAction::Load(n) => match fs::read(slot_path(n)) {
+            Ok(bytes) => match saturn.load_state(&bytes) {
+                Ok(()) => {
+                    osd.set_toast(format!("Loaded slot {n}"), 120);
+                    osd.close();
+                }
+                Err(e) => osd.set_toast(format!("Load failed: {e}"), 180),
+            },
+            Err(_) => osd.set_toast(format!("Slot {n} empty"), 120),
+        },
+        OsdAction::EjectDisc => {
+            saturn.eject_disc();
+            osd.set_toast("Disc ejected", 120);
+        }
+        OsdAction::ReinsertDisc => match launched_disc {
+            Some(d) => {
+                saturn.insert_disc(d.clone());
+                osd.set_toast("Disc inserted", 120);
+            }
+            None => osd.set_toast("No disc to insert", 120),
+        },
+    }
+    false
 }
 
 #[cfg(not(feature = "sdl2-frontend"))]

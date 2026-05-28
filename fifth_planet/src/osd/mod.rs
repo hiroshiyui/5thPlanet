@@ -1,0 +1,429 @@
+//! Hand-rolled on-screen menu (ZSNES/fwNES-style), software-composited into
+//! the emulator's RGBA framebuffer.
+//!
+//! This module is deliberately **`sdl2`-free and core-free**: it operates on a
+//! `&mut [u8]` RGBA buffer ([`font::Canvas`]) and an abstract [`Nav`] input,
+//! and emits [`OsdAction`]s the frontend executes against the `Saturn` API. So
+//! the whole menu — navigation and rendering — is unit-testable without a
+//! window. The frontend (`main.rs`) bridges SDL key events → `Nav` and passes
+//! dynamic labels in via [`OsdCtx`].
+
+mod font;
+
+use font::{Canvas, Rgb};
+
+/// Number of save-state slots the menu exposes.
+pub const SLOTS: usize = 10;
+
+// Palette (chunky retro blue).
+const PANEL_BG: Rgb = (0x10, 0x12, 0x40);
+const PANEL_BORDER: Rgb = (0xC8, 0xC8, 0xD8);
+const TITLE: Rgb = (0xF8, 0xE0, 0x40);
+const ITEM: Rgb = (0xD0, 0xD0, 0xE0);
+const ITEM_SEL: Rgb = (0xFF, 0xFF, 0xFF);
+const HILITE_BAR: Rgb = (0x28, 0x2C, 0x80);
+const TOAST_BG: Rgb = (0x00, 0x00, 0x00);
+const TOAST_FG: Rgb = (0x80, 0xF8, 0x80);
+
+/// Abstract navigation input (the frontend maps keys/pad to these).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nav {
+    Up,
+    Down,
+    Select,
+    Back,
+}
+
+/// An effect the frontend must carry out. The OSD itself never touches the
+/// emulator; it just says what the user chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsdAction {
+    Resume,
+    Reset,
+    Save(u8),
+    Load(u8),
+    EjectDisc,
+    ReinsertDisc,
+    Quit,
+}
+
+/// Dynamic context the frontend supplies each draw so labels reflect live
+/// state without the OSD depending on the core.
+#[derive(Clone, Copy)]
+pub struct OsdCtx {
+    pub disc_present: bool,
+    /// Whether each save slot already has a file on disk.
+    pub slot_used: [bool; SLOTS],
+}
+
+/// Which screen is on top of the stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Main,
+    /// Slot picker; `saving` selects Save vs Load semantics.
+    Slots {
+        saving: bool,
+    },
+}
+
+/// One menu item: its label is computed from [`OsdCtx`] at draw time.
+struct Item {
+    label: String,
+    /// What activating it does: push a screen, emit an action, or close.
+    on_select: Select,
+}
+
+#[derive(Clone, Copy)]
+enum Select {
+    Push(Screen),
+    Emit(OsdAction),
+    /// Close the menu (emits `Resume`).
+    Close,
+}
+
+pub struct Osd {
+    open: bool,
+    /// Screen stack with the selection index for each level.
+    stack: Vec<(Screen, usize)>,
+    /// Transient status line: (message, frames remaining).
+    toast: Option<(String, u32)>,
+}
+
+impl Default for Osd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Osd {
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            stack: vec![(Screen::Main, 0)],
+            toast: None,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Esc handler: open the menu, or (if already open) back out one level /
+    /// close. Returns an action if backing out of the root closes the menu.
+    pub fn toggle(&mut self) -> Option<OsdAction> {
+        if self.open {
+            self.back()
+        } else {
+            self.open = true;
+            self.stack = vec![(Screen::Main, 0)];
+            None
+        }
+    }
+
+    /// Set a transient status message (shown for ~`frames` frames).
+    pub fn set_toast(&mut self, msg: impl Into<String>, frames: u32) {
+        self.toast = Some((msg.into(), frames));
+    }
+
+    /// Close the menu and resume emulation.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.stack = vec![(Screen::Main, 0)];
+    }
+
+    fn back(&mut self) -> Option<OsdAction> {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+            None
+        } else {
+            self.open = false;
+            Some(OsdAction::Resume)
+        }
+    }
+
+    fn screen(&self) -> Screen {
+        self.stack.last().unwrap().0
+    }
+    fn sel(&self) -> usize {
+        self.stack.last().unwrap().1
+    }
+    fn sel_mut(&mut self) -> &mut usize {
+        &mut self.stack.last_mut().unwrap().1
+    }
+
+    /// The items for a screen, with live labels from `ctx`.
+    fn items(&self, screen: Screen, ctx: &OsdCtx) -> Vec<Item> {
+        let mk = |label: &str, on_select: Select| Item {
+            label: label.to_string(),
+            on_select,
+        };
+        match screen {
+            Screen::Main => vec![
+                mk("Resume", Select::Close),
+                mk("Save State", Select::Push(Screen::Slots { saving: true })),
+                mk("Load State", Select::Push(Screen::Slots { saving: false })),
+                mk("Reset", Select::Emit(OsdAction::Reset)),
+                if ctx.disc_present {
+                    mk("Eject Disc", Select::Emit(OsdAction::EjectDisc))
+                } else {
+                    mk("Insert Disc", Select::Emit(OsdAction::ReinsertDisc))
+                },
+                mk("Quit", Select::Emit(OsdAction::Quit)),
+            ],
+            Screen::Slots { saving } => {
+                let mut v = Vec::with_capacity(SLOTS + 1);
+                for s in 0..SLOTS {
+                    let used = ctx.slot_used[s];
+                    let mark = if used { "*" } else { "-" };
+                    let label = format!("Slot {s} [{mark}]");
+                    let act = if saving {
+                        OsdAction::Save(s as u8)
+                    } else {
+                        OsdAction::Load(s as u8)
+                    };
+                    v.push(mk(&label, Select::Emit(act)));
+                }
+                v.push(mk("Back", Select::Close)); // Close here means "pop one"
+                v
+            }
+        }
+    }
+
+    fn title(screen: Screen) -> &'static str {
+        match screen {
+            Screen::Main => "5thPlanet",
+            Screen::Slots { saving: true } => "Save State",
+            Screen::Slots { saving: false } => "Load State",
+        }
+    }
+
+    /// Advance the toast timer one frame (call once per rendered frame).
+    pub fn tick_toast(&mut self) {
+        if let Some((_, frames)) = &mut self.toast {
+            *frames = frames.saturating_sub(1);
+            if *frames == 0 {
+                self.toast = None;
+            }
+        }
+    }
+
+    /// Handle a navigation input. Returns an action for the frontend to run.
+    pub fn handle(&mut self, nav: Nav, ctx: &OsdCtx) -> Option<OsdAction> {
+        if !self.open {
+            return None;
+        }
+        let screen = self.screen();
+        let n = self.items(screen, ctx).len();
+        match nav {
+            Nav::Up => {
+                let s = self.sel();
+                *self.sel_mut() = if s == 0 { n - 1 } else { s - 1 };
+                None
+            }
+            Nav::Down => {
+                let s = self.sel();
+                *self.sel_mut() = if s + 1 >= n { 0 } else { s + 1 };
+                None
+            }
+            Nav::Back => self.back(),
+            Nav::Select => {
+                let idx = self.sel().min(n - 1);
+                let on_select = match self.items(screen, ctx).into_iter().nth(idx) {
+                    Some(it) => it.on_select,
+                    None => return None,
+                };
+                match on_select {
+                    Select::Push(next) => {
+                        self.stack.push((next, 0));
+                        None
+                    }
+                    Select::Close => {
+                        // On a submenu "Back" item this pops; on the root
+                        // "Resume" it closes the menu.
+                        self.back()
+                    }
+                    Select::Emit(action) => Some(action),
+                }
+            }
+        }
+    }
+
+    /// Frontend entry point: composite the OSD onto a `w × h` RGBA buffer
+    /// (`[R,G,B,A]` per pixel). When the menu is open the underlying (frozen)
+    /// frame is dimmed first so the overlay reads clearly; when closed only a
+    /// lingering toast is drawn. Keeps [`Canvas`] private to this module.
+    pub fn render_overlay(&self, buf: &mut [u8], w: usize, h: usize, ctx: &OsdCtx) {
+        let mut c = Canvas { buf, w, h };
+        if self.open {
+            c.dim();
+        }
+        self.draw(&mut c, ctx);
+    }
+
+    /// Composite the menu over the (already-dimmed) framebuffer.
+    fn draw(&self, c: &mut Canvas, ctx: &OsdCtx) {
+        if !self.open {
+            // Even when closed, a lingering toast is still shown.
+            self.draw_toast(c);
+            return;
+        }
+        let screen = self.screen();
+        let items = self.items(screen, ctx);
+        let sel = self.sel().min(items.len().saturating_sub(1));
+
+        // Panel geometry: centred, sized to the content.
+        let rows = items.len();
+        let pw = 180usize;
+        let ph = 28 + rows * 12 + 8;
+        let px = c.w.saturating_sub(pw) / 2;
+        let py = c.h.saturating_sub(ph) / 2;
+
+        c.fill_rect(px, py, pw, ph, PANEL_BG);
+        c.rect_outline(px, py, pw, ph, PANEL_BORDER);
+
+        let title = Self::title(screen);
+        c.draw_text(
+            px + (pw - Canvas::text_width(title)) / 2,
+            py + 8,
+            title,
+            TITLE,
+        );
+        c.fill_rect(px + 6, py + 22, pw - 12, 1, PANEL_BORDER);
+
+        let row0 = py + 28;
+        for (i, it) in items.iter().enumerate() {
+            let ry = row0 + i * 12;
+            let color = if i == sel {
+                c.fill_rect(px + 4, ry - 2, pw - 8, 11, HILITE_BAR);
+                ITEM_SEL
+            } else {
+                ITEM
+            };
+            c.draw_text(px + 12, ry, &it.label, color);
+        }
+
+        self.draw_toast(c);
+    }
+
+    fn draw_toast(&self, c: &mut Canvas) {
+        if let Some((msg, _)) = &self.toast {
+            let tw = Canvas::text_width(msg) + 8;
+            let tx = c.w.saturating_sub(tw) / 2;
+            let ty = c.h.saturating_sub(16);
+            c.fill_rect(tx, ty, tw, 12, TOAST_BG);
+            c.draw_text(tx + 4, ty + 2, msg, TOAST_FG);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(disc: bool) -> OsdCtx {
+        OsdCtx {
+            disc_present: disc,
+            slot_used: [false; SLOTS],
+        }
+    }
+
+    #[test]
+    fn opens_and_backs_out_to_resume() {
+        let mut osd = Osd::new();
+        assert!(!osd.is_open());
+        assert_eq!(osd.toggle(), None);
+        assert!(osd.is_open());
+        // Esc at root closes and resumes.
+        assert_eq!(osd.toggle(), Some(OsdAction::Resume));
+        assert!(!osd.is_open());
+    }
+
+    #[test]
+    fn down_wraps_and_selects_reset() {
+        let mut osd = Osd::new();
+        osd.toggle(); // open at Main, sel=0 (Resume)
+        let c = ctx(true);
+        // Main: Resume, Save, Load, Reset, Eject, Quit
+        osd.handle(Nav::Down, &c); // Save
+        osd.handle(Nav::Down, &c); // Load
+        osd.handle(Nav::Down, &c); // Reset
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Reset));
+    }
+
+    #[test]
+    fn up_wraps_to_quit() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        osd.handle(Nav::Up, &c); // wraps to last item = Quit
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Quit));
+    }
+
+    #[test]
+    fn save_submenu_emits_slot_and_back_pops() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        osd.handle(Nav::Down, &c); // Save State
+        assert_eq!(osd.handle(Nav::Select, &c), None); // pushes Slots
+                                                       // Slots screen: Slot 0 selected → Save(0)
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Save(0)));
+        // Selecting slot 2 then Save.
+        osd.handle(Nav::Down, &c);
+        osd.handle(Nav::Down, &c);
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Save(2)));
+        // Back pops to Main (still open), not Resume.
+        assert_eq!(osd.handle(Nav::Back, &c), None);
+        assert!(osd.is_open());
+        // close() (used by the frontend on Resume/Load/Reset) shuts the menu
+        // and resets to the root.
+        osd.close();
+        assert!(!osd.is_open());
+    }
+
+    #[test]
+    fn eject_label_flips_to_insert_without_disc() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        // No disc → the 5th Main item is Insert Disc.
+        for _ in 0..4 {
+            osd.handle(Nav::Down, &ctx(false));
+        }
+        assert_eq!(
+            osd.handle(Nav::Select, &ctx(false)),
+            Some(OsdAction::ReinsertDisc)
+        );
+    }
+
+    #[test]
+    fn draw_paints_panel_pixels_when_open() {
+        let (w, h) = (320usize, 224usize);
+        let mut buf = vec![0u8; w * h * 4];
+        let mut osd = Osd::new();
+        osd.toggle();
+        osd.render_overlay(&mut buf, w, h, &ctx(true));
+        assert!(buf.iter().any(|&b| b != 0), "open menu paints pixels");
+    }
+
+    #[test]
+    fn closed_menu_draws_nothing_but_toast() {
+        let (w, h) = (320usize, 224usize);
+        let mut buf = vec![0u8; w * h * 4];
+        let mut osd = Osd::new(); // closed
+        osd.render_overlay(&mut buf, w, h, &ctx(true));
+        assert!(buf.iter().all(|&b| b == 0), "closed menu paints nothing");
+        osd.set_toast("hi", 60);
+        osd.render_overlay(&mut buf, w, h, &ctx(true));
+        assert!(buf.iter().any(|&b| b != 0), "toast shows even when closed");
+    }
+
+    #[test]
+    fn toast_expires() {
+        let mut osd = Osd::new();
+        osd.set_toast("x", 2);
+        osd.tick_toast();
+        assert!(osd.toast.is_some());
+        osd.tick_toast();
+        assert!(osd.toast.is_none());
+    }
+}
