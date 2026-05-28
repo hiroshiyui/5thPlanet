@@ -22,7 +22,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
-| CD-block | 🔶 | HLE host-interface command protocol + "no disc, ready" status; full HLE engine (disc image, buffers/filters, CD-ROM FS) = M7 (active). SH-1 LLE is infeasible (undumped firmware + analog servo) and not pursued — HLE is the model, as in every Saturn emulator |
+| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. Remaining: CDDA→SCSP playback, MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
 | Cartridge slot | ⬜ | Extension RAM (1 MB / 4 MB), backup-RAM, and ROM carts; cartridge region currently open-bus. M7, per-game config |
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad |
 | Save states | ⬜ | Deferred until the peripheral set stabilises |
@@ -31,8 +31,10 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
 plus a post-M6 fidelity pass that made the SH-2 on-chip peripherals (FRT/WDT/
 DMAC), SCU DMA (start factors / indirect / strides), and SMPC (live RTC / region)
-behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE + games +
-cartridge slot) 🚧 active** — see the Milestone 7 section for the scoped phases.
+behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE) 🚧 active** —
+all five CD-block HLE phases (disc/TOC, buffer/filter/partition, read pump +
+data transfer, ISO9660 FS, authentication) are ✅ done; the **cartridge slot**
+(Extension RAM / backup / ROM carts) remains. See the Milestone 7 section.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 

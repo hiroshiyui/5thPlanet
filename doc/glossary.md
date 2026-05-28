@@ -167,6 +167,16 @@ on-chip peripherals.
 
 ## F
 
+**FAD** — Frame ADdress. The CD-block addresses sectors by `FAD = LBA +
+150` (the 150-sector / 2-second lead-in), so the first user sector is FAD
+150. Used throughout `disc.rs` and the [CD-block]; the [TOC] and status
+reports carry FADs.
+
+**Filter / Partition** — CD-block selector engine ([CD-block], M7 phase 2).
+A **filter** matches read sectors (FAD range, Mode-2 subheader: file/channel
+/submode/coding-info) and routes them to a true- or false-connector
+**partition** (output buffer); 24 of each, over a shared 200-block pool.
+
 **Framebuffer** — VDP1 has a 256 KiB dual framebuffer at
 `0x05C8_0000`: the plotter draws into the *draw* buffer while VDP2
 composites the *display* buffer, swapped at the frame boundary (see
@@ -206,6 +216,15 @@ specific source; IMS=1 suppresses, IST records pending (write-1-to-
 clear). Wired into the SH-2 master INTC via `Saturn::drain_scu_intc`,
 which forwards the highest-priority unmasked source whose level exceeds
 the master's `SR.imask`.
+
+**IP.BIN** — Initial Program. A Saturn disc's boot header at the start of
+the first data track (FAD 150), beginning with the "SEGA SEGASATURN"
+signature. After the [CD-block] authenticates the disc (`0xE0`/`0xE1`), the
+BIOS reads IP.BIN and jumps to the game's entry point.
+
+**ISO9660** — The CD-ROM filesystem. The [CD-block] (M7 phase 4) parses the
+primary volume descriptor (FAD 166) and directory records to serve the file
+commands (Change Dir / Get File Info / Read File).
 
 **INTBACK** — SMPC command **0x10**. Returns SMPC status + peripheral
 data (region/area code, RTC, controllers) in [OREG]. M4 returns a
@@ -411,6 +430,11 @@ count), interlock stalls (load-use + MAC-read), and DMA cycle-stealing
 ---
 
 ## T
+
+**TOC** — Table Of Contents. The CD's track table; the Saturn form
+([CD-block] Get TOC) is 102 four-byte entries — 99 track slots (`ctrl/adr`
++ start [FAD]) then first-track / last-track / lead-out metadata. Built in
+`disc.rs::toc`.
 
 **T-bit** — Bit 0 of [SR]. Set by `CMP/*` instructions and consumed
 by `BT` / `BF` / `BT/S` / `BF/S`.

@@ -22,7 +22,7 @@ foundation stays solid.
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
 | M7        | CD-block (HLE) + game boot + cartridge slot                 | 🚧 active    |
 
-Current test count: **483 workspace-wide, 0 failures.** Task-by-task
+Current test count: **495 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -31,7 +31,11 @@ the bright brushed-metal "SEGA SATURN" logo, correct down to the VDP2 colour-RAM
 banking and transparent-pen handling. All eight chips are modelled — the two
 SH-2s, MC68EC000, VDP1 (full sprite/polygon plotter), VDP2 (multi-layer NBG/RBG
 compositor with rotation), SCU + SCU-DSP, and SCSP (slot/FM audio + SCSP-DSP).
-M7 is now building the CD-block (high-level-emulated) so commercial discs boot.
+The **CD-block** is high-level-emulated (M7): it mounts a disc image (ISO /
+CUE-BIN / CloneCD), reads the TOC, runs the buffer/filter/partition selector and
+the sector read pump + data transfer, walks the ISO9660 filesystem, and
+authenticates a Saturn disc — pass a game as the second argument. The cartridge
+slot is the remaining M7 piece.
 
 ## Quick start
 
@@ -62,8 +66,8 @@ cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
   SH-2 scheduler, SMPC, SCU + DMA + interrupt aggregator, VDP1 (full
   sprite/polygon plotter), VDP2 (multi-layer NBG/RBG compositor with
   rotation + live raster timing), SCSP (slot/FM audio engine + hosted
-  MC68EC000 + SCSP-DSP), and the CD-block (HLE host interface; full HLE
-  engine is M7).
+  MC68EC000 + SCSP-DSP), and the CD-block (HLE: disc image + TOC,
+  buffer/filter/partition, read pump + transfer, ISO9660 FS, authentication).
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
 
