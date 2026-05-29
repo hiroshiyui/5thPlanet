@@ -727,18 +727,41 @@ fn run(
             // changes until it leaves work RAM (i.e. faults to a BIOS handler),
             // to find the faulting instruction.
             if hle_booted && std::env::var_os("SAT_HLE_DIAG").is_some() {
-                let mut prev = u32::MAX;
-                for _ in 0..2_000_000u64 {
+                use sh2::bus::{AccessKind, Bus};
+                // Single-step the game until it leaves its code region (>=
+                // 0x06004000) — i.e. takes an exception that vectors into a
+                // BIOS handler — then dump the faulting instruction + state.
+                let mut last_game = 0x0600_4000u32;
+                for _ in 0..4_000_000u64 {
                     let pc = saturn.master().regs.pc;
-                    if pc != prev {
-                        eprintln!("DIAG {pc:08X}");
-                        prev = pc;
+                    if pc >= 0x0600_4000 {
+                        last_game = pc;
+                        saturn.debug_step_master();
+                        continue;
                     }
-                    if (0x100..0x0600_0000).contains(&pc) {
-                        eprintln!("DIAG left work-RAM at {pc:08X} (fault/handler)");
-                        break;
+                    let r = saturn.master().regs.r;
+                    eprintln!(
+                        "DIAG fault: vectored to {pc:08X}; last game PC={last_game:08X} \
+                         VBR={:08X} PR={:08X}",
+                        saturn.master().regs.vbr,
+                        saturn.master().regs.pr,
+                    );
+                    for (i, v) in r.iter().enumerate() {
+                        eprintln!("  R{i:<2}={v:08X}");
                     }
-                    saturn.debug_step_master();
+                    eprintln!("  --- caller (last game PC) ---");
+                    for a in (last_game.wrapping_sub(8)..=last_game.wrapping_add(8)).step_by(2) {
+                        let (w, _) = saturn.bus.read16(a, AccessKind::Data);
+                        let m = if a == last_game { "  <== here" } else { "" };
+                        eprintln!("  {a:08X}: {w:04X}  {}{m}", sh2::debug::disasm(sh2::decoder::decode(w)));
+                    }
+                    eprintln!("  --- callee at {pc:08X} (SYS fn) ---");
+                    for a in (pc.wrapping_sub(4)..=pc.wrapping_add(28)).step_by(2) {
+                        let (w, _) = saturn.bus.read16(a, AccessKind::Data);
+                        let m = if a == pc { "  <== entry" } else { "" };
+                        eprintln!("  {a:08X}: {w:04X}  {}{m}", sh2::debug::disasm(sh2::decoder::decode(w)));
+                    }
+                    break;
                 }
                 return ExitCode::SUCCESS;
             }
