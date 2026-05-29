@@ -563,6 +563,19 @@ original disc from a host drive (see ADR-0009). The security ring is a non-issue
 | 2 | **CDDA→SCSP** ✅ done | Audio tracks decode to a CD-DA FIFO in the read pump (2352-byte sector → 588 stereo frames); `Saturn::take_audio` sums it with the SCSP output. Games with CD-audio BGM (e.g. Romance of the Three Kingdoms V) now play their music. 2 tests. Full level for now (SCSP CD-input level/pan deferred). |
 | 3 | **Physical drive (`physdisc` + libcdio)** ✅ done | New feature-gated `crates/physdisc`: `PhysicalDisc` impls `SectorSource` via libcdio (TOC + raw sectors + CD-DA), cross-platform. Default = stub (no libcdio); the frontend's `physical-disc` feature + a `cdrom:<device>` disc spec enable it. The crate is the sole ADR-0007 unsafe exception (ADR-0009). Data sectors read through the kernel's cooked block device (no `CAP_SYS_RAWIO`); libcdio handles the TOC + CD-DA. **Verified on a real drive** (Virtua Fighter 2 on `/dev/sr0`): TOC, data, CD-DA, and the emulator boots from the disc — as a normal `cdrom`-group user. |
 
+## Milestone 11 — Boot a game to gameplay 🚧
+
+A discovery milestone (like M4): get a commercial game (*Virtua Fighter 2*, JP
+`GS-9079`) past the BIOS CD player. Two tracks — the LLE/trace-diff path and an
+optional HLE direct boot (ADR-0010).
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
+| 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture) / `SAT_MEMDUMP` / `SAT_DUMP`. Localized the LLE give-up to a ~200k-instruction work-RAM boot-loader blob. |
+| 3 | **HLE direct boot** (ADR-0010) 🚧 | Optional `--hle-boot` / `SAT_HLE_BOOT`: `Saturn::hle_boot` reads IP.BIN, loads the 1st-read file (`CdBlock::first_read_file`) into work RAM at the IP.BIN load address, and `Cpu::hle_jump`s the master to it. v1 hybrid (reuse the BIOS init, inject at the give-up). The game's own code now **runs** (~40k+ instructions past the CD player); it currently stalls in a BIOS SMPC poll during its loader (the hybrid give-up state isn't a true game-launch state). LLE boot stays the default; HLE off by default. |
+
 ## Later milestones (queued)
 
+- **HLE boot follow-up** — set up a proper game-launch state (toward cold/no-BIOS HLE) or fix the stuck SYS path so the game's early init completes and renders.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
