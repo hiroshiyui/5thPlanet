@@ -138,30 +138,38 @@ maps onto this project's crates and modules, see
 
 ## Acknowledgements
 
-Two open-source emulators are leaned on as **reference oracles for
+Several open-source emulators are leaned on as **reference oracles for
 verifying system architecture** — run headless against the same BIOS so
 their master SH-2 instruction traces can be diffed against ours,
 confirming the SH-2 core, cache, SMPC, SCU, and bus reproduce known-good
-behavior bit-for-bit and pinpointing boot-sequence bugs down to the exact
+behavior and pinpointing boot-sequence bugs down to the exact
 instruction:
 
-- [MAME](https://github.com/mamedev/mame) — the **primary** reference.
-  Its Saturn driver is the accuracy-focused one (the chips are modeled
-  closely, down to a low-level CD-block SH-1), so where the two
-  references disagree MAME wins. Used both to diff the master PC trace
-  and to read its Saturn-subsystem logic when a divergence needs a
-  second opinion — e.g. MAME showed a stuck boot was a wrong-path
-  symptom, then that a periodic report was clobbering the CD-block
-  signature the BIOS checks (Yabause's behavior had masked it).
+- [Mednafen](https://mednafen.github.io/) (Beetle Saturn) — the
+  **accuracy reference for game-level behavior**. Its Saturn module has
+  the highest game compatibility of the open-source emulators (it runs
+  the commercial library, including the dual-SH-2 / SCU-DSP / VDP1 3D
+  titles), so it is the oracle for the game-boot work (M11/M12): a local
+  instrumented build emits VF2's master-SH-2 trace to diff against ours
+  from the 1st-read entry to the first divergence.
+- [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
+  reference. Its Saturn driver models the chips closely (down to a
+  low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
+  behavior, but its *game* compatibility is limited, so it's used for the
+  early boot and subsystem logic rather than full game runs — e.g. it
+  showed a stuck boot was a wrong-path symptom, then that a periodic
+  report was clobbering the CD-block signature the BIOS checks.
 - [Yabause](https://github.com/Yabause/yabause) — the **secondary**
-  reference; the primary during early development (M1–M3) and still a
-  useful second opinion. A patched, headless build emits the master PC
-  stream for diffing.
+  reference; the primary during early development (M1–M3), the blueprint
+  for the HLE BIOS SYS library (its `src/bios.c`), and still a useful
+  second opinion. A patched, headless build emits the master PC stream
+  for diffing.
 
 Each is set up as a local, **never-committed** build (gitignored
-`mameref/` and `yabref/`). **No emulator code is included in or derived
-by this project** — they serve purely as behavioral references for
-cross-checking.
+`mednaref/`, `mameref/`, `yabref/`). **No emulator code is included in or
+derived by this project** — they serve purely as behavioral references for
+cross-checking; each is GPL-licensed and remains entirely separate from
+5thPlanet's MIT-licensed source.
 
 ## Trademarks & copyrights
 

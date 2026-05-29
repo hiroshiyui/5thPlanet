@@ -10,6 +10,13 @@ bios/*
 # never be committed — they are copyrighted. Each developer supplies their own.
 roms/
 
+# Reference emulators, used only as behavioral oracles for trace-diffing —
+# local, never-committed source checkouts/builds. No emulator code is part of
+# this project (it is referenced, not incorporated — see README Acknowledgements).
+/mameref/
+/yabref/
+/mednaref/
+
 # MAME reference runtime artifacts (the ./mameref/ oracle writes these to the
 # repo root when run from here for boot-trace diffing). Never commit them.
 /cfg/
