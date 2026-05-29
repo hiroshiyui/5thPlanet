@@ -103,6 +103,91 @@ fn gen_master_pc_trace() {
     println!("wrote {n} master PCs to /tmp/our_pc.log");
 }
 
+/// M11: per-instruction master PC trace of the **VF2 boot**, for a reference
+/// diff against MAME's `maincpu` trace (to pinpoint the give-up divergence —
+/// the BIOS recognizes the disc, shows the license screen, then falls to the
+/// CD shell instead of loading the game). Replicates the frontend's boot
+/// conditions: JP v1.01 BIOS + its `.bup` clock state + Japan region + the full
+/// VF2 disc image. Logs EVERY PC (no delay-slot skip — MAME logs delay slots),
+/// raising VBlank at run_frame's cadence so the interrupt-driven boot matches.
+///
+/// ```sh
+/// PCTRACE_N=40000000 PCTRACE_OUT=/tmp/our_vf2_pc.log \
+///   cargo test -p saturn --test trace_boot -- --ignored --nocapture gen_vf2_pc_trace
+/// ```
+/// Then capture MAME's side (bounded to ~30M instrs to catch the first
+/// divergence): `mameref/saturn saturnjp -bios 101 -rompath mameref/roms \
+///   -cdrom roms/vf2_full.cue -debug`, console `trace vf2.tr,maincpu` then `go`,
+/// stop after ~10 s, and diff the PC columns to the first sustained divergence.
+#[test]
+#[ignore = "manual: VF2-boot master PC trace for the MAME reference diff (M11)"]
+fn gen_vf2_pc_trace() {
+    use std::io::Write;
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let cue_path = root.join("roms/vf2_full.cue");
+    let Ok(cue) = std::fs::read_to_string(&cue_path) else {
+        println!("no {}; skipped (copyrighted fixture)", cue_path.display());
+        return;
+    };
+    let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cue parse failed: {e}");
+            return;
+        }
+    };
+
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    // Match the frontend: a charged battery (clock set, so the JP BIOS skips
+    // the clock-set screen and boots the disc) + a fixed RTC.
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+
+    let n: u64 = std::env::var("PCTRACE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40_000_000);
+    let out = std::env::var("PCTRACE_OUT").unwrap_or_else(|_| "/tmp/our_vf2_pc.log".into());
+    let f = std::fs::File::create(&out).expect("create trace");
+    let mut w = std::io::BufWriter::new(f);
+    let mut frame_cyc: u64 = 0;
+    let mut vblank_raised = false;
+    for _ in 0..n {
+        let pc = sat.master().regs.pc;
+        writeln!(w, "{pc:08X}").unwrap();
+        let c = sat.debug_step_master_nodrain() as u64;
+        sat.debug_drain();
+        // Mirror run_frame's VBlank cadence at instruction granularity.
+        frame_cyc += c;
+        if !vblank_raised && frame_cyc >= 453_085 {
+            let t = sat.bus.vdp2.regs.read16(0x004);
+            sat.bus.vdp2.regs.write16(0x004, t | 0x0008);
+            sat.bus.scu.raise(saturn::ScuSource::VBlankIn);
+            vblank_raised = true;
+        }
+        if frame_cyc >= 476_932 {
+            let t = sat.bus.vdp2.regs.read16(0x004);
+            sat.bus.vdp2.regs.write16(0x004, t & !0x0008);
+            frame_cyc -= 476_932;
+            vblank_raised = false;
+        }
+    }
+    w.flush().unwrap();
+    println!("wrote {n} VF2-boot master PCs to {out}");
+}
+
 #[test]
 #[ignore = "manual: disassemble the post-INTBACK-poll caller in high WRAM"]
 fn disasm_post_poll_caller() {
