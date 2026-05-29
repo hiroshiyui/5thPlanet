@@ -1455,8 +1455,31 @@ fn hle_loader_loads_full_file() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // SLAVETRACE=1: record the slave's full PC path (the BIOS slave-init it
+    // re-runs when VF2 releases it) and print the unique addresses, to map
+    // where it parks (clear -> poll loop?).
+    let slavetrace = std::env::var_os("SLAVETRACE").is_some();
+    if slavetrace {
+        sat.enable_slave_pc_trace();
+    }
     for g in 0..game {
         sat.run_frame(&mut fb);
         probe(&mut sat, &format!("game frame {g:3}"));
+    }
+    if slavetrace {
+        let t = sat.take_slave_pc_trace();
+        // Collapse to unique addresses in first-seen order (the loop bodies).
+        let mut seen = std::collections::BTreeSet::new();
+        let mut order = Vec::new();
+        for pc in &t {
+            if seen.insert(*pc) {
+                order.push(*pc);
+            }
+        }
+        println!("slave trace: {} PCs, {} unique", t.len(), order.len());
+        for pc in &order {
+            print!("{pc:08X} ");
+        }
+        println!();
     }
 }

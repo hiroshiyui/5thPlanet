@@ -164,6 +164,14 @@ impl Saturn {
     /// batch — time-travelling through stale code and corrupting memory.
     /// (This is what zeroed VF2's freshly-loaded program after its SSHON.)
     pub fn release_slave(&mut self) {
+        #[cfg(not(test))]
+        if std::env::var_os("SAT_SLAVE_TRACE").is_some() {
+            eprintln!(
+                "release_slave: master PC={:08X} now={}",
+                self.master().regs.pc,
+                self.scheduler.now()
+            );
+        }
         let now = self.scheduler.now();
         let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
         if slave.cpu.pipeline.cycles < now {
@@ -217,6 +225,21 @@ impl Saturn {
     pub fn take_master_pc_trace(&mut self) -> Vec<u32> {
         self.scheduler
             .entity_mut(self.master_id)
+            .sh2_mut()
+            .take_pc_trace()
+    }
+
+    /// Debug-only: start / drain a full-speed *slave*-PC trace (M12 slave
+    /// dispatch — map the BIOS slave-init path: clear → poll loop?).
+    pub fn enable_slave_pc_trace(&mut self) {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .enable_pc_trace();
+    }
+    pub fn take_slave_pc_trace(&mut self) -> Vec<u32> {
+        self.scheduler
+            .entity_mut(self.slave_id)
             .sh2_mut()
             .take_pc_trace()
     }
