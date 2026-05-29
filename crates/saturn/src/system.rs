@@ -238,6 +238,23 @@ impl Saturn {
             .take_bp_hit()
     }
 
+    /// Debug-only: arm a full-speed breakpoint on the *slave* SH-2 (M12 — to
+    /// catch the slave running a memory-fill over the HLE-booted program).
+    pub fn set_slave_bp(&mut self, pc: u32) {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_bp(pc);
+    }
+
+    /// Debug-only: take the slave breakpoint hit's (R0..R15, code words).
+    pub fn take_slave_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .take_bp_hit()
+    }
+
     /// Debug-only: step the master SH-2 exactly one instruction, then
     /// drain SMPC/SCU side effects. Used by the reference-emulator PC
     /// trace diff (M4 task #5). Returns the cycles the instruction took.

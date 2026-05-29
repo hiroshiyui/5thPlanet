@@ -618,7 +618,19 @@ fn run(
     // post-frame dumps miss), runs until it fires, then prints regs + disasm.
     if let Ok(s) = std::env::var("SAT_FBP") {
         let bp = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
-        saturn.set_master_bp(bp);
+        // SAT_SLAVE_FBP=1 arms the breakpoint on the slave SH-2 instead.
+        let on_slave = std::env::var_os("SAT_SLAVE_FBP").is_some();
+        if on_slave {
+            saturn.set_slave_bp(bp);
+        } else {
+            saturn.set_master_bp(bp);
+        }
+        // Optional: keep scanning hits until register R<SAT_FBP_RREG> lands in
+        // [SAT_FBP_RLO, SAT_FBP_RHI) — to find the specific call (e.g. the
+        // memory-fill whose destination R3 overlaps the loaded program).
+        let rreg: Option<usize> = std::env::var("SAT_FBP_RREG").ok().and_then(|s| s.parse().ok());
+        let rlo = std::env::var("SAT_FBP_RLO").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        let rhi = std::env::var("SAT_FBP_RHI").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u32::MAX);
         let mut hit = None;
         let mut hle_booted = false;
         for f in 0..headless_frames {
@@ -626,9 +638,23 @@ fn run(
             if hle_boot && !hle_booted {
                 hle_booted = hle_boot_trigger(&mut saturn, f);
             }
-            if let Some(h) = saturn.take_master_bp_hit() {
-                hit = Some(h);
-                break;
+            let h = if on_slave {
+                saturn.take_slave_bp_hit()
+            } else {
+                saturn.take_master_bp_hit()
+            };
+            if let Some(h) = h {
+                let matched = rreg.is_none_or(|r| (rlo..rhi).contains(&h.0[r]));
+                if matched {
+                    hit = Some(h);
+                    break;
+                }
+                // Re-arm and keep scanning for the call we want.
+                if on_slave {
+                    saturn.set_slave_bp(bp);
+                } else {
+                    saturn.set_master_bp(bp);
+                }
             }
         }
         match hit {
