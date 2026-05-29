@@ -35,12 +35,17 @@ fn host_unix_secs() -> u64 {
 }
 
 fn main() -> ExitCode {
-    // Split flags (`--cart=…`) from positional args (BIOS, then disc).
+    // Split flags (`--cart=…`, `--hle-boot`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
+    // HLE direct boot (ADR-0010): skip the BIOS's CD boot loader and jump
+    // straight to the game's 1st-read program. Opt-in via flag or env.
+    let mut hle_boot = std::env::var_os("SAT_HLE_BOOT").is_some();
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
+        } else if arg == "--hle-boot" {
+            hle_boot = true;
         } else {
             positionals.push(arg);
         }
@@ -103,7 +108,39 @@ fn main() -> ExitCode {
     let save_base = std::path::PathBuf::from(&bios_path);
 
     let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region)
+    run(bios, disc_spec, cart, save_base, region, hle_boot)
+}
+
+/// Run the BIOS until it has recognised the disc and is about to drop into its
+/// CD player (the master executing in the work-RAM shell region), or a frame
+/// fallback, then perform an HLE direct boot. Returns whether the boot fired.
+/// The shell-region range is tuned for the JP v1.01 BIOS (ADR-0010).
+#[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
+fn hle_boot_trigger(saturn: &mut saturn::Saturn, frame: u32) -> bool {
+    // Debug override: `SAT_HLE_FRAME=N` fires the HLE boot at exactly frame N
+    // (to probe the cleanest pre-shell handoff point).
+    if let Ok(n) = std::env::var("SAT_HLE_FRAME") {
+        let target: u32 = n.parse().unwrap_or(0);
+        if frame < target {
+            return false;
+        }
+        match saturn.hle_boot() {
+            Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
+            None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
+        }
+        return true;
+    }
+    let pc = saturn.master().regs.pc;
+    let in_shell = (0x0602_0000..0x0605_0000).contains(&pc);
+    if in_shell || frame >= 360 {
+        match saturn.hle_boot() {
+            Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
+            None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
+        }
+        true
+    } else {
+        false
+    }
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
@@ -193,7 +230,9 @@ fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
             let bytes = fs::read(&img).map_err(|e| format!("{}: {e}", img.display()))?;
             Disc::from_ccd(&ccd, bytes)
         }
-        other => Err(format!("unknown disc format '.{other}' (use .cue / .iso / .ccd)")),
+        other => Err(format!(
+            "unknown disc format '.{other}' (use .cue / .iso / .ccd)"
+        )),
     }
 }
 
@@ -204,6 +243,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    hle_boot: bool,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -295,6 +335,10 @@ fn run(
     // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
     // the slot-less `<bios>.state`).
     let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
+
+    // HLE direct-boot state: a frame counter + a fired flag for the trigger.
+    let mut frame: u32 = 0;
+    let mut hle_booted = false;
 
     'main: loop {
         // The host SDL2 library on a modern Linux desktop emits event
@@ -401,6 +445,10 @@ fn run(
             saturn.set_pad1(held);
 
             saturn.run_frame(&mut framebuffer);
+            if hle_boot && !hle_booted {
+                hle_booted = hle_boot_trigger(&mut saturn, frame);
+            }
+            frame = frame.wrapping_add(1);
 
             // Queue this frame's SCSP audio, unless we're already buffered well
             // ahead (keeps latency bounded if the host runs faster than realtime).
@@ -424,7 +472,10 @@ fn run(
 
     // Persist the internal backup RAM ("battery") so game saves survive.
     if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
-        eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
+        eprintln!(
+            "failed to persist backup RAM to {}: {e}",
+            battery_path.display()
+        );
     }
 
     ExitCode::SUCCESS
@@ -486,6 +537,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    hle_boot: bool,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -525,7 +577,10 @@ fn run(
     if let Ok(bps) = std::env::var("SAT_BP") {
         use sh2::bus::{AccessKind, Bus};
         let bp = u32::from_str_radix(bps.trim().trim_start_matches("0x"), 16).unwrap_or(0);
-        let ff: u32 = std::env::var("SAT_BP_FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+        let ff: u32 = std::env::var("SAT_BP_FRAME")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(70);
         for _ in 0..ff {
             saturn.run_frame(&mut framebuffer);
         }
@@ -537,10 +592,13 @@ fn run(
                 eprintln!("BP {bp:08X} hit. regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");
-            }
+                }
                 let (w3, _) = saturn.bus.read32(r[3], AccessKind::Data);
                 let (w4, _) = saturn.bus.read32(r[4], AccessKind::Data);
-                eprintln!("  [R3={:08X}]= {w3:08X}   [R4={:08X}]= {w4:08X}", r[3], r[4]);
+                eprintln!(
+                    "  [R3={:08X}]= {w3:08X}   [R4={:08X}]= {w4:08X}",
+                    r[3], r[4]
+                );
                 hit = true;
                 break;
             }
@@ -571,11 +629,15 @@ fn run(
                 eprintln!("FBP {bp:08X} hit. regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");
-            }
+                }
                 eprintln!("disasm:");
                 for (i, &w) in code.iter().enumerate() {
                     let op = sh2::decoder::decode(w);
-                    eprintln!("  {:08X}: {w:04X}  {}", bp + (i as u32) * 2, sh2::debug::disasm(op));
+                    eprintln!(
+                        "  {:08X}: {w:04X}  {}",
+                        bp + (i as u32) * 2,
+                        sh2::debug::disasm(op)
+                    );
                 }
             }
             None => eprintln!("FBP {bp:08X} not hit"),
@@ -599,9 +661,15 @@ fn run(
             }
         }
         let trace = saturn.take_master_pc_trace();
-        let n: usize = std::env::var("SAT_INLOOP_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let n: usize = std::env::var("SAT_INLOOP_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400);
         let tail = trace.len().saturating_sub(n);
-        eprintln!("in-loop trace: {} PCs, shell-entered={triggered:?}", trace.len());
+        eprintln!(
+            "in-loop trace: {} PCs, shell-entered={triggered:?}",
+            trace.len()
+        );
         for pc in &trace[tail..] {
             eprintln!("PC {pc:08X}");
         }
@@ -613,7 +681,10 @@ fn run(
     // (deduped) until PC enters the work-RAM shell region (0x0602_0000+) or the
     // step cap, to capture the boot give-up branch path.
     if std::env::var_os("SAT_BIOSTRACE").is_some() {
-        let ff: u32 = std::env::var("SAT_BP_FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(220);
+        let ff: u32 = std::env::var("SAT_BP_FRAME")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(220);
         for _ in 0..ff {
             saturn.run_frame(&mut framebuffer);
         }
@@ -647,8 +718,31 @@ fn run(
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
     let mut last_pc = u32::MAX;
+    let mut hle_booted = false;
     for f in 0..headless_frames {
         saturn.run_frame(&mut framebuffer);
+        if hle_boot && !hle_booted {
+            hle_booted = hle_boot_trigger(&mut saturn, f);
+            // SAT_HLE_DIAG: after the handoff, single-step the game logging PC
+            // changes until it leaves work RAM (i.e. faults to a BIOS handler),
+            // to find the faulting instruction.
+            if hle_booted && std::env::var_os("SAT_HLE_DIAG").is_some() {
+                let mut prev = u32::MAX;
+                for _ in 0..2_000_000u64 {
+                    let pc = saturn.master().regs.pc;
+                    if pc != prev {
+                        eprintln!("DIAG {pc:08X}");
+                        prev = pc;
+                    }
+                    if (0x100..0x0600_0000).contains(&pc) {
+                        eprintln!("DIAG left work-RAM at {pc:08X} (fault/handler)");
+                        break;
+                    }
+                    saturn.debug_step_master();
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
         if pctrace {
             let pc = saturn.master().regs.pc;
             if pc != last_pc {
@@ -659,7 +753,10 @@ fn run(
     }
 
     if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
-        eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
+        eprintln!(
+            "failed to persist backup RAM to {}: {e}",
+            battery_path.display()
+        );
     }
 
     // Optional raw memory dump: `SAT_MEMDUMP=0xADDR:N` reads N bytes via the
@@ -672,9 +769,20 @@ fn run(
         let n: u32 = n.parse().unwrap_or(256);
         for row in 0..n.div_ceil(16) {
             let addr = base + row * 16;
-            let bytes: Vec<u8> = (0..16).map(|i| saturn.bus.read8(addr + i, AccessKind::Data).0).collect();
+            let bytes: Vec<u8> = (0..16)
+                .map(|i| saturn.bus.read8(addr + i, AccessKind::Data).0)
+                .collect();
             let hex: String = bytes.iter().map(|b| format!("{b:02x} ")).collect();
-            let asc: String = bytes.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+            let asc: String = bytes
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
             eprintln!("{addr:08X}  {hex} {asc}");
         }
         return ExitCode::SUCCESS;
