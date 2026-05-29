@@ -1391,3 +1391,72 @@ fn smpc_activity_at_park() {
     }
     println!("over ~5 frames: SMPC SF busy rising edges = {sf_busy_edges} (each = a command issued)");
 }
+
+#[test]
+#[ignore = "manual: verify cold_hle_boot loads the full 1st-read file into work RAM (M12)"]
+fn hle_loader_loads_full_file() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_path = root.join("roms/vf2_full.cue");
+    let Ok(cue) = std::fs::read_to_string(&cue_path) else {
+        println!("no vf2_full.cue; skipped");
+        return;
+    };
+    let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cue parse failed: {e}");
+            return;
+        }
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    // Optionally run the BIOS first (BIOSFRAMES=N) so the CD-block is in the same
+    // runtime state the frontend's HLE handoff sees — reproduces the post-boot
+    // loader behaviour, not just the clean-disc case.
+    let pre: u32 = std::env::var("BIOSFRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..pre {
+        sat.run_frame(&mut fb);
+    }
+    let addr = sat.cold_hle_boot().expect("cold_hle_boot");
+    println!("loaded at {addr:08X} (after {pre} BIOS frames)");
+    let probes = [0x0605_8F9Cu32, 0x0605_9B8E, 0x0604_CF68, 0x0604_BD80];
+    let probe = |sat: &mut Saturn, tag: &str| {
+        let mut s = String::new();
+        for a in probes {
+            let w = sat.bus.read16(a, sh2::bus::AccessKind::Data).0;
+            s.push_str(&format!("{a:08X}={w:04X} "));
+        }
+        println!(
+            "  [{tag}] {s} mpc={:08X} slave_halted={} spc={:08X}",
+            sat.master().regs.pc,
+            sat.slave_is_halted(),
+            sat.slave().regs.pc,
+        );
+    };
+    probe(&mut sat, "after load");
+    let game: u32 = std::env::var("GAMEFRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    for g in 0..game {
+        sat.run_frame(&mut fb);
+        probe(&mut sat, &format!("game frame {g:3}"));
+    }
+}

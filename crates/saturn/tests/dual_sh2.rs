@@ -133,3 +133,37 @@ fn reset_loads_pc_and_sp_from_bios_vector() {
     assert_eq!(sat.slave().regs.pc, 0x0020_2000);
     assert_eq!(sat.slave().regs.r[15], 0x0020_8000);
 }
+
+/// Releasing the slave from a long halt must resync its cycle counter to the
+/// global clock, not resume it at the (frozen) cycle it was halted at. A halted
+/// entity reports `next_deadline == u64::MAX`, so the scheduler skips it and its
+/// `pipeline.cycles` freezes; if `release_slave` left that stale value in place,
+/// the scheduler would see the slave as millions of cycles "behind" the master
+/// and run it that many catch-up steps in a single batch — "time travelling"
+/// through stale code. (This zeroed VF2's freshly HLE-loaded program right after
+/// its SSHON.) Regression for `Saturn::release_slave`.
+#[test]
+fn releasing_slave_resyncs_its_cycle_no_time_travel() {
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    sat.reset(); // power-on: slave held halted at its reset cycle (~0)
+    assert!(sat.slave_is_halted());
+
+    // Advance the master far past the slave's frozen cycle.
+    sat.run_for(2_000_000);
+    let now = sat.now();
+    let slave_frozen = sat.slave().pipeline.cycles;
+    assert!(
+        slave_frozen < now,
+        "slave cycle ({slave_frozen}) should be behind the global clock ({now}) while halted",
+    );
+
+    sat.release_slave();
+    let slave_resumed = sat.slave().pipeline.cycles;
+    assert!(
+        slave_resumed >= now,
+        "release_slave must resync the slave cycle to the global clock \
+         (got {slave_resumed}, now {now}); leaving it at {slave_frozen} would make the \
+         scheduler run ~{} catch-up cycles in one batch",
+        now - slave_frozen,
+    );
+}

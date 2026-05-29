@@ -155,11 +155,21 @@ impl Saturn {
     /// The slave resumes from whatever PC/SP it was last left at — on
     /// real hardware this is the BIOS reset vector, which is also what
     /// our [`reset`] sets up.
+    ///
+    /// Resyncs the slave's cycle counter to the current global cycle first:
+    /// while halted its `next_deadline` is `u64::MAX` so the scheduler skips
+    /// it and its `pipeline.cycles` freezes at the cycle it was halted at. If
+    /// it were released without resyncing, the scheduler would see it as far
+    /// "behind" the master and run it millions of catch-up cycles in one
+    /// batch — time-travelling through stale code and corrupting memory.
+    /// (This is what zeroed VF2's freshly-loaded program after its SSHON.)
     pub fn release_slave(&mut self) {
-        self.scheduler
-            .entity_mut(self.slave_id)
-            .sh2_mut()
-            .set_halted(false);
+        let now = self.scheduler.now();
+        let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
+        if slave.cpu.pipeline.cycles < now {
+            slave.cpu.pipeline.cycles = now;
+        }
+        slave.set_halted(false);
     }
 
     pub fn slave_is_halted(&self) -> bool {
@@ -192,6 +202,15 @@ impl Saturn {
             .entity_mut(self.master_id)
             .sh2_mut()
             .enable_pc_trace();
+    }
+
+    /// Debug-only: set the PC range `[lo, hi)` that freezes the master-PC trace
+    /// ring (M11/M12). The HLE direct boot uses the low BIOS-RAM idle region.
+    pub fn set_master_trace_freeze(&mut self, lo: u32, hi: u32) {
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_trace_freeze(lo, hi);
     }
 
     /// Debug-only: drain the recorded master-PC trace.
@@ -743,6 +762,12 @@ impl Saturn {
                 // longword triplets; the last entry has bit 31 of its source
                 // word set. Each triplet is its own transfer.
                 let mut index = req.dst;
+                // The indirect table is terminated by bit 31 of a triplet's
+                // source word. Cap the walk so a stray/zeroed table (no
+                // terminator) can't spin the host forever — a real list is far
+                // shorter than this.
+                const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
+                let mut walked = 0u32;
                 loop {
                     let (size, _) = self.bus.read32(index, AccessKind::Dma);
                     let (idst, _) = self.bus.read32(index.wrapping_add(4), AccessKind::Dma);
@@ -755,7 +780,8 @@ impl Saturn {
                         self.scu_transfer(isrc, idst, count, req.src_add, req.dst_add);
                     }
                     index = index.wrapping_add(0xC);
-                    if last {
+                    walked += 1;
+                    if last || walked >= MAX_INDIRECT_TRIPLETS {
                         break;
                     }
                 }

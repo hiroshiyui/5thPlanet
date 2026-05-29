@@ -127,6 +127,44 @@ impl SaturnBus {
     }
 }
 
+/// Debug write-watchpoint (M12 HLE-boot corruption hunt): when `SAT_WWATCH=0xADDR`
+/// is set, log any write whose byte span covers `ADDR`, with width, value, access
+/// kind and cycle. No-op (one cheap env check, cached) when unset.
+#[inline]
+fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64) {
+    use std::sync::OnceLock;
+    static W: OnceLock<Option<u32>> = OnceLock::new();
+    let w = *W.get_or_init(|| {
+        std::env::var("SAT_WWATCH")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+    });
+    if let Some(t) = w {
+        // High work RAM (1 MiB) mirrors across its 16 MiB window, so a write to
+        // any mirror of `t` hits the same byte. Compare folded offsets there.
+        let fold = |a: u32| {
+            if (HIGH_WRAM_BASE..=HIGH_WRAM_END).contains(&a) {
+                HIGH_WRAM_BASE + ((a - HIGH_WRAM_BASE) % 0x10_0000)
+            } else {
+                a
+            }
+        };
+        let (fa, ft) = (fold(addr), fold(t));
+        // Optional window (SAT_WWATCH_WIN bytes) so a memset-style clear loop
+        // near the target is visible, not just the exact word.
+        static WIN: OnceLock<u32> = OnceLock::new();
+        let win = *WIN.get_or_init(|| {
+            std::env::var("SAT_WWATCH_WIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        });
+        if fa.wrapping_add(size) > ft.saturating_sub(win) && fa < ft.wrapping_add(win.max(1)) {
+            eprintln!("WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle}", size * 8);
+        }
+    }
+}
+
 #[inline]
 fn waits_for(addr: u32) -> u32 {
     match addr {
@@ -223,6 +261,7 @@ impl Bus for SaturnBus {
     }
 
     fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
+        write_watch(addr, 1, val as u32, _k, self.cycle);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write8(addr - SMPC_BASE, val),
@@ -247,6 +286,7 @@ impl Bus for SaturnBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
+        write_watch(addr, 2, val as u32, _k, self.cycle);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write16(addr - SMPC_BASE, val),
@@ -271,6 +311,7 @@ impl Bus for SaturnBus {
     }
 
     fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
+        write_watch(addr, 4, val, _k, self.cycle);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write32(addr - SMPC_BASE, val),

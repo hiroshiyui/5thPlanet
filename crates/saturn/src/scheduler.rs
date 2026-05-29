@@ -162,6 +162,13 @@ pub struct Sh2Entity {
     /// save-state determinism; only set on the master via [`enable_pc_trace`].
     #[serde(skip)]
     pc_trace: Option<std::collections::VecDeque<u32>>,
+    /// Half-open PC range `[lo, hi)` that, once recorded, freezes the trace
+    /// ring (so the give-up tail isn't evicted by the destination's own loop).
+    /// Defaults to the work-RAM shell region (LLE give-up); the HLE direct boot
+    /// overrides it to the low BIOS-RAM idle, since there the shell range is
+    /// game code. `#[serde(skip)]` like the trace itself.
+    #[serde(skip)]
+    trace_freeze: (u32, u32),
     /// Debug-only full-speed breakpoint: when set and the master reaches this
     /// PC, [`bp_hit`] captures R0..R15 plus 96 bytes of code at the PC (so a
     /// transient work-RAM routine can be disassembled at the instant it runs).
@@ -183,6 +190,7 @@ impl Sh2Entity {
             cpu,
             halted: false,
             pc_trace: None,
+            trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
             hle_sys_active: false,
@@ -195,6 +203,7 @@ impl Sh2Entity {
             cpu,
             halted: true,
             pc_trace: None,
+            trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
             hle_sys_active: false,
@@ -209,6 +218,13 @@ impl Sh2Entity {
     /// Begin recording a full-speed PC trace (debug; see [`pc_trace`]).
     pub fn enable_pc_trace(&mut self) {
         self.pc_trace = Some(std::collections::VecDeque::new());
+    }
+
+    /// Override the PC range `[lo, hi)` that freezes the trace ring (see
+    /// [`trace_freeze`]). Used by the HLE direct boot to freeze on the low
+    /// BIOS-RAM idle instead of the default shell region.
+    pub fn set_trace_freeze(&mut self, lo: u32, hi: u32) {
+        self.trace_freeze = (lo, hi);
     }
 
     /// Drain the recorded PC trace (most-recent window), if enabled.
@@ -287,9 +303,8 @@ impl SchedEntity for Sh2Entity {
                 // region (0x0602_0000+): the boot give-up branch is the tail
                 // just before that entry, and the shell's own loop would
                 // otherwise flood the window and evict it.
-                let frozen = trace
-                    .back()
-                    .is_some_and(|&b| (0x0602_0000..0x0605_0000).contains(&b));
+                let (flo, fhi) = self.trace_freeze;
+                let frozen = trace.back().is_some_and(|&b| (flo..fhi).contains(&b));
                 if !idle && !frozen && trace.back() != Some(&pc) {
                     trace.push_back(pc);
                     if trace.len() > 32768 {

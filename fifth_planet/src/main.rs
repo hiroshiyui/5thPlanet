@@ -620,8 +620,12 @@ fn run(
         let bp = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
         saturn.set_master_bp(bp);
         let mut hit = None;
-        for _ in 0..headless_frames {
+        let mut hle_booted = false;
+        for f in 0..headless_frames {
             saturn.run_frame(&mut framebuffer);
+            if hle_boot && !hle_booted {
+                hle_booted = hle_boot_trigger(&mut saturn, f);
+            }
             if let Some(h) = saturn.take_master_bp_hit() {
                 hit = Some(h);
                 break;
@@ -653,13 +657,41 @@ fn run(
     // running until the master enters the work-RAM shell region (0x0602_0000+)
     // or SAT_FRAMES, then prints the tail of the trace — the boot give-up branch.
     if std::env::var_os("SAT_INLOOP").is_some() {
-        saturn.enable_master_pc_trace();
+        // Optional: fire the HLE boot (cold_hle_boot) the same way the main
+        // loop does, then trace the *game's* execution through the SYS hook
+        // (which only fires on the scheduler path, i.e. run_frame). Stop as
+        // soon as the master reaches the post-boot idle so the boot prefix is
+        // preserved rather than evicted by the idle loop flooding the ring.
+        let idle = std::env::var("SAT_INLOOP_STOP")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+        // For LLE, trace from the start (freeze on the shell give-up). For HLE,
+        // defer enabling the trace until the game has been injected — otherwise
+        // the freeze (low BIOS-RAM) trips during the BIOS's own boot, before the
+        // handoff, and the game is never traced.
+        if !hle_boot {
+            saturn.enable_master_pc_trace();
+        }
+        let mut hle_booted = false;
         let mut triggered = None;
         for f in 0..headless_frames {
             saturn.run_frame(&mut framebuffer);
+            if hle_boot && !hle_booted {
+                hle_booted = hle_boot_trigger(&mut saturn, f);
+                if hle_booted {
+                    // Game injected: start tracing now. Freeze only at the exact
+                    // stop PC (the hang) so interrupt handlers (the stubs at
+                    // 0x0600_08xx) and the game's own code are all recorded.
+                    saturn.enable_master_pc_trace();
+                    if let Some(stop) = idle {
+                        saturn.set_master_trace_freeze(stop, stop + 2);
+                    }
+                }
+            }
             let pc = saturn.master().regs.pc;
-            if (0x0602_0000..0x0605_0000).contains(&pc) {
-                triggered = Some(f);
+            let hit_shell = !hle_boot && (0x0602_0000..0x0605_0000).contains(&pc);
+            if hit_shell || Some(pc) == idle {
+                triggered = Some((f, pc));
                 break;
             }
         }
@@ -668,13 +700,20 @@ fn run(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(400);
-        let tail = trace.len().saturating_sub(n);
+        let head = std::env::var_os("SAT_INLOOP_HEAD").is_some();
         eprintln!(
-            "in-loop trace: {} PCs, shell-entered={triggered:?}",
+            "in-loop trace: {} PCs, stop={triggered:?}",
             trace.len()
         );
-        for pc in &trace[tail..] {
-            eprintln!("PC {pc:08X}");
+        if head {
+            for pc in trace.iter().take(n) {
+                eprintln!("PC {pc:08X}");
+            }
+        } else {
+            let tail = trace.len().saturating_sub(n);
+            for pc in &trace[tail..] {
+                eprintln!("PC {pc:08X}");
+            }
         }
         return ExitCode::SUCCESS;
     }
