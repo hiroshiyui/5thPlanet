@@ -857,9 +857,11 @@ fn run(
         let ist = saturn.bus.scu.ist;
         let mask348 = saturn.bus.read32(0x0600_0348, AccessKind::Data).0;
         let tvstat = saturn.bus.read16(0x0500_0004, AccessKind::Data).0;
+        let gbr = saturn.master().regs.gbr;
+        let tvmd = saturn.bus.read16(0x05F8_0000, AccessKind::Data).0;
         eprintln!(
             "IRQ: PC={pc:08X} SR.imask={imask} SCU.IMS={ims:08X} SCU.IST={ist:08X} \
-             [0x06000348]={mask348:08X} VDP2.TVSTAT={tvstat:04X}"
+             [0x06000348]={mask348:08X} VDP2.TVSTAT={tvstat:04X} GBR={gbr:08X} VDP2.TVMD={tvmd:04X}"
         );
     }
 
