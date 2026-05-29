@@ -126,10 +126,26 @@ fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
         bus.write32(SCU_MASK_VAR, m, AccessKind::Data);
         bus.write32(SCU_BASE + 0x00A0, m, AccessKind::Data); // IMS
     }
+    mask_trace("SetScuInterruptMask", cpu.regs.pr, m, 0, m, is_slave);
     if m & 0x8000 == 0 {
         bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
     }
 }
+
+/// Debug trace of the SCU interrupt-mask SYS calls (caller PR, R4, R5, resulting
+/// mask), under `SAT_SYS_TRACE` — used to find why a needed source stays masked.
+#[cfg(not(test))]
+fn mask_trace(name: &str, pr: u32, r4: u32, r5: u32, newmask: u32, is_slave: bool) {
+    if std::env::var_os("SAT_SYS_TRACE").is_some() {
+        eprintln!(
+            "MASK {name}{} caller_pr={pr:08X} R4={r4:08X} R5={r5:08X} -> IMS={newmask:08X} (VBlankOUT {})",
+            if is_slave { " [slave-skipped]" } else { "" },
+            if newmask & 0x02 == 0 { "UNMASKED" } else { "masked" },
+        );
+    }
+}
+#[cfg(test)]
+fn mask_trace(_: &str, _: u32, _: u32, _: u32, _: u32, _: bool) {}
 
 /// `ChangeScuInterruptMask` (slot 0x344): `mask = (stored & R4) | R5`, applied to
 /// the stored copy + IMS, and `R4` written to IST; A-bus-ack unless masked.
@@ -137,12 +153,13 @@ fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
 fn change_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
     let (r4, r5) = (cpu.regs.r[4], cpu.regs.r[5]);
     // Stored mask + IMS + IST are master-only (Yabause `!isslave`).
+    let newmask = (bus.read32(SCU_MASK_VAR, AccessKind::Data).0 & r4) | r5;
     if !is_slave {
-        let newmask = (bus.read32(SCU_MASK_VAR, AccessKind::Data).0 & r4) | r5;
         bus.write32(SCU_MASK_VAR, newmask, AccessKind::Data);
         bus.write32(SCU_BASE + 0x00A0, newmask, AccessKind::Data); // IMS
         bus.write32(SCU_BASE + 0x00A4, r4 as i16 as u32, AccessKind::Data); // IST
     }
+    mask_trace("ChangeScuInterruptMask", cpu.regs.pr, r4, r5, newmask, is_slave);
     if r4 & 0x8000 == 0 {
         bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
     }
