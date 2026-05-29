@@ -43,9 +43,15 @@ pub fn dispatch(cpu: &mut Cpu, bus: &mut SaturnBus) {
     let idx = (cpu.regs.pc.wrapping_sub(0x200)) >> 2;
     let mut implemented = true;
     match idx {
-        0x48 => change_system_clock(cpu, bus), // 0x0320
-        0x4C => get_semaphore(cpu, bus),       // 0x0330
-        0x4D => clear_semaphore(cpu, bus),     // 0x0334
+        0x40 => set_scu_interrupt(cpu, bus),         // 0x0300
+        0x41 => get_scu_interrupt(cpu, bus),         // 0x0304
+        0x44 => set_sh2_interrupt(cpu, bus),         // 0x0310
+        0x45 => get_sh2_interrupt(cpu, bus),         // 0x0314
+        0x48 => change_system_clock(cpu, bus),       // 0x0320
+        0x4C => get_semaphore(cpu, bus),             // 0x0330
+        0x4D => clear_semaphore(cpu, bus),           // 0x0334
+        0x50 => set_scu_interrupt_mask(cpu, bus),    // 0x0340
+        0x51 => change_scu_interrupt_mask(cpu, bus), // 0x0344
         _ => {
             // Not yet implemented: return harmlessly (R0 = 0) rather than
             // letting the game fall into the BIOS fatal handler.
@@ -58,6 +64,75 @@ pub fn dispatch(cpu: &mut Cpu, bus: &mut SaturnBus) {
     // The dispatch replaces a BIOS routine; charge a nominal cost so the
     // scheduler deadline advances (the entity must not stall).
     cpu.pipeline.advance(11);
+}
+
+/// The SCU interrupt-handler table the BIOS dispatch indexes by `vector << 2`
+/// (base `0x06000900`), and the BIOS default/"no handler" routine. Matches the
+/// real BIOS layout (verified against the running ROM) and Yabause `BiosInit`.
+const SCU_INT_TABLE: u32 = 0x0600_0900;
+const BIOS_DEFAULT_HANDLER: u32 = 0x0600_0610;
+/// The stored SCU interrupt mask the BIOS keeps in low work RAM.
+const SCU_MASK_VAR: u32 = 0x0600_0348;
+
+/// `SetScuInterrupt` (slot 0x300): install handler `R5` for SCU vector `R4` in
+/// the BIOS dispatch table (`R5 == 0` → the BIOS default). Yabause
+/// `BiosSetScuInterrupt`.
+fn set_scu_interrupt(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    let slot = SCU_INT_TABLE + (cpu.regs.r[4] << 2);
+    let handler = if cpu.regs.r[5] == 0 {
+        BIOS_DEFAULT_HANDLER
+    } else {
+        cpu.regs.r[5]
+    };
+    bus.write32(slot, handler, AccessKind::Data);
+}
+
+/// `GetScuInterrupt` (slot 0x304): R0 = the installed SCU-vector-`R4` handler.
+fn get_scu_interrupt(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    cpu.regs.r[0] = bus.read32(SCU_INT_TABLE + (cpu.regs.r[4] << 2), AccessKind::Data).0;
+}
+
+/// `SetSh2Interrupt` (slot 0x310): install handler `R5` directly in the SH-2
+/// exception vector table at `VBR + (R4 << 2)`. With `R5 == 0` Yabause restores
+/// a precomputed default; we leave the existing vector in place (games that use
+/// this pass a real handler).
+fn set_sh2_interrupt(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    if cpu.regs.r[5] != 0 {
+        let slot = cpu.regs.vbr.wrapping_add(cpu.regs.r[4] << 2);
+        bus.write32(slot, cpu.regs.r[5], AccessKind::Data);
+    }
+}
+
+/// `GetSh2Interrupt` (slot 0x314): R0 = the SH-2 vector at `VBR + (R4 << 2)`.
+fn get_sh2_interrupt(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    let slot = cpu.regs.vbr.wrapping_add(cpu.regs.r[4] << 2);
+    cpu.regs.r[0] = bus.read32(slot, AccessKind::Data).0;
+}
+
+/// `SetScuInterruptMask` (slot 0x340): set the SCU interrupt mask to `R4` (both
+/// the stored copy and the live IMS register), then A-bus-ack unless masked.
+/// Yabause `BiosSetScuInterruptMask`.
+fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    let m = cpu.regs.r[4];
+    bus.write32(SCU_MASK_VAR, m, AccessKind::Data);
+    bus.write32(SCU_BASE + 0x00A0, m, AccessKind::Data); // IMS
+    if m & 0x8000 == 0 {
+        bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
+    }
+}
+
+/// `ChangeScuInterruptMask` (slot 0x344): `mask = (stored & R4) | R5`, applied to
+/// the stored copy + IMS, and `R4` written to IST; A-bus-ack unless masked.
+/// Yabause `BiosChangeScuInterruptMask`.
+fn change_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus) {
+    let (r4, r5) = (cpu.regs.r[4], cpu.regs.r[5]);
+    let newmask = (bus.read32(SCU_MASK_VAR, AccessKind::Data).0 & r4) | r5;
+    bus.write32(SCU_MASK_VAR, newmask, AccessKind::Data);
+    bus.write32(SCU_BASE + 0x00A0, newmask, AccessKind::Data); // IMS
+    bus.write32(SCU_BASE + 0x00A4, r4 as i16 as u32, AccessKind::Data); // IST
+    if r4 & 0x8000 == 0 {
+        bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
+    }
 }
 
 /// `ChangeSystemClock` (slot 0x320): switch the 320/352-dot clock and reset the
@@ -158,5 +233,82 @@ fn sys_name(idx: u8) -> &'static str {
         0x56 => "BUPInit",
         0x60..=0x6B => "BUP*",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::SaturnBus;
+    use sh2::Cpu;
+
+    /// Land the master on SYS entry `addr` with the given args and dispatch it,
+    /// as the step hook does. Returns the post-call (cpu, bus).
+    fn run_sys(addr: u32, r4: u32, r5: u32) -> (Cpu, SaturnBus) {
+        let mut cpu = Cpu::new();
+        let mut bus = SaturnBus::with_blank_bios();
+        cpu.regs.pc = addr;
+        cpu.regs.pr = 0x0600_1000;
+        cpu.regs.r[4] = r4;
+        cpu.regs.r[5] = r5;
+        assert!(is_sys_addr(addr), "{addr:#06X} is a SYS entry");
+        dispatch(&mut cpu, &mut bus);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn set_scu_interrupt_installs_handler_and_returns() {
+        let (cpu, mut bus) = run_sys(0x0300, 0x40, 0x0601_2345);
+        // vector 0x40 → table slot 0x06000900 + 0x40*4 = 0x06000A00.
+        assert_eq!(bus.read32(SCU_INT_TABLE + 0x100, AccessKind::Data).0, 0x0601_2345);
+        assert_eq!(cpu.regs.pc, cpu.regs.pr, "SYS call returns via PR");
+    }
+
+    #[test]
+    fn set_scu_interrupt_zero_handler_uses_bios_default() {
+        let (_cpu, mut bus) = run_sys(0x0304 - 4, 0x41, 0); // 0x0300 = SetScuInterrupt
+        assert_eq!(
+            bus.read32(SCU_INT_TABLE + 0x41 * 4, AccessKind::Data).0,
+            BIOS_DEFAULT_HANDLER,
+        );
+    }
+
+    #[test]
+    fn get_scu_interrupt_reads_back_installed_handler() {
+        let mut cpu = Cpu::new();
+        let mut bus = SaturnBus::with_blank_bios();
+        bus.write32(SCU_INT_TABLE + 0x47 * 4, 0x0609_ABCD, AccessKind::Data);
+        cpu.regs.pc = 0x0304; // GetScuInterrupt
+        cpu.regs.pr = 0x0600_1000;
+        cpu.regs.r[4] = 0x47;
+        dispatch(&mut cpu, &mut bus);
+        assert_eq!(cpu.regs.r[0], 0x0609_ABCD);
+    }
+
+    #[test]
+    fn change_scu_interrupt_mask_applies_and_then_or() {
+        let mut cpu = Cpu::new();
+        let mut bus = SaturnBus::with_blank_bios();
+        bus.write32(SCU_MASK_VAR, 0xFFFF_FFFF, AccessKind::Data);
+        cpu.regs.pc = 0x0344; // ChangeScuInterruptMask
+        cpu.regs.pr = 0x0600_1000;
+        cpu.regs.r[4] = 0xFFFF_FFFE; // AND: clear VBlankIN mask bit
+        cpu.regs.r[5] = 0x0000_0004; // OR: set bit 2
+        dispatch(&mut cpu, &mut bus);
+        // (0xFFFFFFFF & 0xFFFFFFFE) | 0x4 = 0xFFFFFFFE
+        assert_eq!(bus.read32(SCU_MASK_VAR, AccessKind::Data).0, 0xFFFF_FFFE);
+    }
+
+    #[test]
+    fn set_sh2_interrupt_writes_vbr_vector() {
+        let mut cpu = Cpu::new();
+        let mut bus = SaturnBus::with_blank_bios();
+        cpu.regs.vbr = 0x0600_0000;
+        cpu.regs.pc = 0x0310; // SetSh2Interrupt
+        cpu.regs.pr = 0x0600_1000;
+        cpu.regs.r[4] = 0x4A;
+        cpu.regs.r[5] = 0x0604_2222;
+        dispatch(&mut cpu, &mut bus);
+        assert_eq!(bus.read32(0x0600_0000 + 0x4A * 4, AccessKind::Data).0, 0x0604_2222);
     }
 }
