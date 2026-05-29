@@ -124,7 +124,7 @@ fn hle_boot_trigger(saturn: &mut saturn::Saturn, frame: u32) -> bool {
         if frame < target {
             return false;
         }
-        match saturn.hle_boot() {
+        match saturn.cold_hle_boot() {
             Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
             None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
         }
@@ -136,7 +136,7 @@ fn hle_boot_trigger(saturn: &mut saturn::Saturn, frame: u32) -> bool {
     // give-up/shell state that broke the game's BIOS SYS calls (ADR-0010). A
     // frame fallback covers the no-disc / never-engaged case.
     if saturn.cd_host_engaged() || frame >= 360 {
-        match saturn.hle_boot() {
+        match saturn.cold_hle_boot() {
             Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
             None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
         }
@@ -756,13 +756,19 @@ fn run(
                     for a in (last_game.wrapping_sub(8)..=last_game.wrapping_add(8)).step_by(2) {
                         let (w, _) = saturn.bus.read16(a, AccessKind::Data);
                         let m = if a == last_game { "  <== here" } else { "" };
-                        eprintln!("  {a:08X}: {w:04X}  {}{m}", sh2::debug::disasm(sh2::decoder::decode(w)));
+                        eprintln!(
+                            "  {a:08X}: {w:04X}  {}{m}",
+                            sh2::debug::disasm(sh2::decoder::decode(w))
+                        );
                     }
                     eprintln!("  --- callee at {pc:08X} (SYS fn) ---");
                     for a in (pc.wrapping_sub(4)..=pc.wrapping_add(28)).step_by(2) {
                         let (w, _) = saturn.bus.read16(a, AccessKind::Data);
                         let m = if a == pc { "  <== entry" } else { "" };
-                        eprintln!("  {a:08X}: {w:04X}  {}{m}", sh2::debug::disasm(sh2::decoder::decode(w)));
+                        eprintln!(
+                            "  {a:08X}: {w:04X}  {}{m}",
+                            sh2::debug::disasm(sh2::decoder::decode(w))
+                        );
                     }
                     break;
                 }

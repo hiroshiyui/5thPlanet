@@ -58,3 +58,33 @@ fn hle_boot_loads_the_first_read_program() {
     let (w1, _) = sat.bus.read16(0x0600_4002, AccessKind::Data);
     assert_eq!(w1, 0xE0F0, "1st-read second word loaded into work RAM");
 }
+
+#[test]
+fn cold_hle_boot_installs_the_sys_call_table() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        eprintln!("no JP BIOS; skipped");
+        return;
+    };
+    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full.cue")) else {
+        eprintln!("no roms/vf2_full.cue fixture; skipped");
+        return;
+    };
+    let disc = saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    })
+    .expect("parse vf2_full.cue");
+
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.insert_disc(disc);
+    assert_eq!(sat.cold_hle_boot(), Some(0x0600_4000));
+
+    // The BIOS SYS call table is installed: each slot at 0x06000200+ holds the
+    // matching entry address that the dispatch hook intercepts. ChangeSystemClock
+    // (slot 0x320 = VF2's call) must point at 0x320, not a fatal/unimpl stub.
+    let (clk, _) = sat.bus.read32(0x0600_0320, AccessKind::Data);
+    assert_eq!(clk, 0x0000_0320, "ChangeSystemClock SYS slot installed");
+    let (sem, _) = sat.bus.read32(0x0600_0330, AccessKind::Data);
+    assert_eq!(sem, 0x0000_0330, "GetSemaphore SYS slot installed");
+}

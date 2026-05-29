@@ -690,6 +690,23 @@ impl Saturn {
         Some(load_addr)
     }
 
+    /// **Cold HLE direct boot** (ADR-0011): [`hle_boot`](Self::hle_boot) plus the
+    /// HLE BIOS system-call environment — install our SYS call table into work
+    /// RAM (overriding whatever the BIOS left there) and enable the master's
+    /// SYS-dispatch hook, so the game's BIOS system calls run our
+    /// [`bios_hle`](crate::bios_hle) implementations instead of the BIOS's
+    /// fatal/unimplemented stubs. Returns the 1st-read load address, or `None`
+    /// (no-op) if there's nothing bootable.
+    pub fn cold_hle_boot(&mut self) -> Option<u32> {
+        let addr = self.hle_boot()?;
+        crate::bios_hle::install_call_table(&mut self.bus);
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_hle_sys(true);
+        Some(addr)
+    }
+
     /// Plug a cartridge into the rear expansion slot (Extension RAM, backup
     /// RAM, or game ROM). The cart-ID byte at `0x04FF_FFFF` updates so the
     /// BIOS/game probes the right cart; the default slot is empty.

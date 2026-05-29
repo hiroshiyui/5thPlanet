@@ -35,8 +35,7 @@ pub trait SchedEntity {
     fn step(&mut self, ctx: &mut Self::Context);
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scheduler<E: SchedEntity> {
     entities: Vec<E>,
 }
@@ -141,8 +140,7 @@ impl<E: SchedEntity> Scheduler<E> {
 }
 
 /// Opaque handle into a [`Scheduler`] returned by [`Scheduler::add`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EntityId(pub(crate) usize);
 
 // ---- Concrete entity: SH-2 wrapped for the Saturn bus context. -----------
@@ -153,8 +151,7 @@ pub struct EntityId(pub(crate) usize);
 /// skips a halted CPU (it's "infinitely ahead") without any special-
 /// casing in the scheduler. The slave SH-2 lives in this halted state
 /// from power-on until SMPC's `SETSL` command releases it.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Sh2Entity {
     pub cpu: sh2::Cpu,
     halted: bool,
@@ -172,16 +169,41 @@ pub struct Sh2Entity {
     bp: Option<u32>,
     #[serde(skip)]
     bp_hit: Option<([u32; 16], Vec<u16>)>,
+    /// When set, the master's BIOS SYS-call entry addresses are intercepted and
+    /// run by [`crate::bios_hle`] instead of executing BIOS code (the cold HLE
+    /// direct boot, ADR-0011). `#[serde(skip)]` — save-state across an HLE boot
+    /// is out of scope, so a restored state resumes with LLE dispatch.
+    #[serde(skip)]
+    hle_sys_active: bool,
 }
 
 impl Sh2Entity {
     pub fn new(cpu: sh2::Cpu) -> Self {
-        Self { cpu, halted: false, pc_trace: None, bp: None, bp_hit: None }
+        Self {
+            cpu,
+            halted: false,
+            pc_trace: None,
+            bp: None,
+            bp_hit: None,
+            hle_sys_active: false,
+        }
     }
 
     /// Construct already-halted — what the slave starts as on power-on.
     pub fn new_halted(cpu: sh2::Cpu) -> Self {
-        Self { cpu, halted: true, pc_trace: None, bp: None, bp_hit: None }
+        Self {
+            cpu,
+            halted: true,
+            pc_trace: None,
+            bp: None,
+            bp_hit: None,
+            hle_sys_active: false,
+        }
+    }
+
+    /// Enable HLE BIOS SYS-call dispatch on this core (the cold HLE direct boot).
+    pub fn set_hle_sys(&mut self, on: bool) {
+        self.hle_sys_active = on;
     }
 
     /// Begin recording a full-speed PC trace (debug; see [`pc_trace`]).
@@ -230,6 +252,18 @@ impl SchedEntity for Sh2Entity {
 
     fn step(&mut self, ctx: &mut Self::Context) {
         if !self.halted {
+            // HLE BIOS SYS-call dispatch (cold HLE direct boot, ADR-0011):
+            // intercept a call landing on a SYS entry address and run the host
+            // implementation in place of BIOS code, then return to the caller.
+            // Checked before fetch so the BIOS routine never executes.
+            if self.hle_sys_active
+                && !self.cpu.next_is_delay_slot()
+                && crate::bios_hle::is_sys_addr(self.cpu.regs.pc)
+            {
+                ctx.cycle = self.cpu.pipeline.cycles;
+                crate::bios_hle::dispatch(&mut self.cpu, ctx);
+                return;
+            }
             // Publish the current global cycle to the bus so time-varying
             // peripheral reads (SMPC SF INTBACK completion) resolve at the
             // exact instruction that reads them.
@@ -282,8 +316,7 @@ impl SchedEntity for Sh2Entity {
 /// owns no CD state: it holds only its tick cadence and reaches the CD-block
 /// through the shared bus context. When the full CD-block arrives, a proper
 /// SH-1 core entity replaces this timer.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CdBlockEntity {
     /// Global cycle of the next tick.
     next: u64,
@@ -332,8 +365,7 @@ impl SchedEntity for CdBlockEntity {
 /// so boxing the SH-2 to equalise variant size would add an indirection on
 /// the hottest path to save a few KB. Not worth it; the lint is allowed.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SaturnEntity {
     Sh2(Sh2Entity),
     CdBlock(CdBlockEntity),

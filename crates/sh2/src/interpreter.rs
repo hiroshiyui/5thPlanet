@@ -103,6 +103,17 @@ impl Cpu {
         self.load_dest_pending = None;
     }
 
+    /// Return from a host-intercepted call: jump to `PR` (the saved return
+    /// address) and clear in-flight pipeline state. Used by HLE BIOS system
+    /// calls — the host runs the function in place of the BIOS routine, sets
+    /// `R0`, then calls this to hand control back to the caller (like `RTS`).
+    pub fn hle_return(&mut self) {
+        self.regs.pc = self.regs.pr;
+        self.pending_branch = None;
+        self.in_delay_slot = false;
+        self.load_dest_pending = None;
+    }
+
     /// True when the next [`step`] will execute a branch delay slot
     /// (a branch is pending). Used by trace tooling to match reference
     /// emulators that execute the delay slot inside the branch handler.
