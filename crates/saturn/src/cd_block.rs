@@ -427,6 +427,15 @@ impl CdBlock {
         self.disc.is_some()
     }
 
+    /// Whether the host has engaged the block (issued its first command). The
+    /// BIOS does this only after its hardware + SYS-table init completes and
+    /// just before it starts processing the disc — so the rising edge is a
+    /// clean "init done, disc not yet processed" point the HLE direct boot
+    /// hands off from (ADR-0010 / cold-state boot).
+    pub fn host_engaged(&self) -> bool {
+        self.host_initialized
+    }
+
     /// Eject the disc: the inverse of [`insert_disc`]. The drive returns to the
     /// empty-tray `NODISC` state with zeroed geometry, and a disc-change is
     /// flagged (`HIRQ.DCHG`) so the BIOS/game notices the media left.

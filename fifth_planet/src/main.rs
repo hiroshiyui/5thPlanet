@@ -130,9 +130,12 @@ fn hle_boot_trigger(saturn: &mut saturn::Saturn, frame: u32) -> bool {
         }
         return true;
     }
-    let pc = saturn.master().regs.pc;
-    let in_shell = (0x0602_0000..0x0605_0000).contains(&pc);
-    if in_shell || frame >= 360 {
+    // Hand off from a clean post-init state: the BIOS engages the CD-block
+    // (first command) only after its hardware + SYS-table init is done and
+    // before it processes the disc — so injecting on that edge avoids the
+    // give-up/shell state that broke the game's BIOS SYS calls (ADR-0010). A
+    // frame fallback covers the no-disc / never-engaged case.
+    if saturn.cd_host_engaged() || frame >= 360 {
         match saturn.hle_boot() {
             Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
             None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),

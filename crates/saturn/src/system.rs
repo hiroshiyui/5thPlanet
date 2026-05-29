@@ -624,6 +624,13 @@ impl Saturn {
         self.bus.cd_block.has_disc()
     }
 
+    /// Whether the BIOS has engaged the CD-block (issued its first command) —
+    /// the clean post-init handoff point for HLE direct boot (see
+    /// [`CdBlock::host_engaged`](crate::cd_block::CdBlock::host_engaged)).
+    pub fn cd_host_engaged(&self) -> bool {
+        self.bus.cd_block.host_engaged()
+    }
+
     /// **HLE direct boot** (ADR-0010): load the disc's 1st-read program into
     /// work RAM and jump the master SH-2 to it, bypassing the BIOS's CD boot
     /// loader. Returns the load address on success, or `None` (a no-op) if
