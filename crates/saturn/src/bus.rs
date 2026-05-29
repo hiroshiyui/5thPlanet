@@ -96,6 +96,11 @@ pub struct SaturnBus {
     /// exact instruction that reads them, rather than at a coarse drain
     /// boundary.
     pub cycle: u64,
+    /// PC of the CPU currently stepping, refreshed alongside `cycle`. Debug-only
+    /// (used by the `SAT_WWATCH` write-watchpoint to name the writing instruction);
+    /// `#[serde(skip)]` so it never affects save-state determinism.
+    #[serde(skip)]
+    pub step_pc: u32,
 }
 
 impl SaturnBus {
@@ -117,6 +122,7 @@ impl SaturnBus {
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
             cycle: 0,
+            step_pc: 0,
         }
     }
 
@@ -131,7 +137,7 @@ impl SaturnBus {
 /// is set, log any write whose byte span covers `ADDR`, with width, value, access
 /// kind and cycle. No-op (one cheap env check, cached) when unset.
 #[inline]
-fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64) {
+fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32) {
     use std::sync::OnceLock;
     static W: OnceLock<Option<u32>> = OnceLock::new();
     let w = *W.get_or_init(|| {
@@ -160,7 +166,7 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64) {
                 .unwrap_or(0)
         });
         if fa.wrapping_add(size) > ft.saturating_sub(win) && fa < ft.wrapping_add(win.max(1)) {
-            eprintln!("WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle}", size * 8);
+            eprintln!("WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}", size * 8);
         }
     }
 }
@@ -261,7 +267,7 @@ impl Bus for SaturnBus {
     }
 
     fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
-        write_watch(addr, 1, val as u32, _k, self.cycle);
+        write_watch(addr, 1, val as u32, _k, self.cycle, self.step_pc);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write8(addr - SMPC_BASE, val),
@@ -286,7 +292,7 @@ impl Bus for SaturnBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
-        write_watch(addr, 2, val as u32, _k, self.cycle);
+        write_watch(addr, 2, val as u32, _k, self.cycle, self.step_pc);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write16(addr - SMPC_BASE, val),
@@ -311,7 +317,7 @@ impl Bus for SaturnBus {
     }
 
     fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
-        write_watch(addr, 4, val, _k, self.cycle);
+        write_watch(addr, 4, val, _k, self.cycle, self.step_pc);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write32(addr - SMPC_BASE, val),

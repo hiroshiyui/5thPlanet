@@ -284,6 +284,7 @@ impl SchedEntity for Sh2Entity {
             // peripheral reads (SMPC SF INTBACK completion) resolve at the
             // exact instruction that reads them.
             ctx.cycle = self.cpu.pipeline.cycles;
+            ctx.step_pc = self.cpu.regs.pc;
             self.cpu.step(ctx);
             if let Some(bp) = self.bp
                 && self.cpu.regs.pc == bp
