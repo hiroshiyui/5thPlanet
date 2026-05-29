@@ -518,12 +518,41 @@ fn run(
     }
 
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..headless_frames {
+    // Optional master-PC trace for boot debugging: `SAT_PCTRACE=1` prints the
+    // master SH-2 PC once per frame (collapsing runs of the same value), so a
+    // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
+    // (0x0600_0000+), etc. — without per-instruction overhead.
+    let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
+    let mut last_pc = u32::MAX;
+    for f in 0..headless_frames {
         saturn.run_frame(&mut framebuffer);
+        if pctrace {
+            let pc = saturn.master().regs.pc;
+            if pc != last_pc {
+                eprintln!("frame {f:4} master PC=0x{pc:08X}");
+                last_pc = pc;
+            }
+        }
     }
 
     if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
         eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
+    }
+
+    // Optional disassembly window for boot debugging: `SAT_DISASM=0xADDR:N`
+    // decodes N SH-2 instructions from `addr` via the live bus (e.g. to inspect
+    // a work-RAM wait loop the boot stalls in).
+    if let Ok(spec) = std::env::var("SAT_DISASM") {
+        use sh2::bus::{AccessKind, Bus};
+        let (a, n) = spec.split_once(':').unwrap_or((spec.as_str(), "16"));
+        let base = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
+        let n: u32 = n.parse().unwrap_or(16);
+        for i in 0..n {
+            let addr = base + i * 2;
+            let (word, _) = saturn.bus.read16(addr, AccessKind::Data);
+            let op = sh2::decoder::decode(word);
+            eprintln!("  {addr:08X}: {word:04X}  {}", sh2::debug::disasm(op));
+        }
     }
 
     // Optional framebuffer snapshot for headless boot debugging: `SAT_DUMP=path`
