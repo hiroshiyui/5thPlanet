@@ -535,9 +535,9 @@ fn run(
             if saturn.master().regs.pc == bp {
                 let r = saturn.master().regs.r;
                 eprintln!("BP {bp:08X} hit. regs:");
-                for i in 0..16 {
-                    eprintln!("  R{i:<2}= {:08X}", r[i]);
-                }
+                for (i, v) in r.iter().enumerate() {
+                    eprintln!("  R{i:<2}= {v:08X}");
+            }
                 let (w3, _) = saturn.bus.read32(r[3], AccessKind::Data);
                 let (w4, _) = saturn.bus.read32(r[4], AccessKind::Data);
                 eprintln!("  [R3={:08X}]= {w3:08X}   [R4={:08X}]= {w4:08X}", r[3], r[4]);
@@ -547,6 +547,62 @@ fn run(
         }
         if !hit {
             eprintln!("BP {bp:08X} not hit");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Optional full-speed breakpoint capture: `SAT_FBP=0xADDR` arms a master
+    // breakpoint that snapshots R0..R15 + 96 bytes of code at the instant the
+    // PC is reached (works for transient work-RAM routines that single-step /
+    // post-frame dumps miss), runs until it fires, then prints regs + disasm.
+    if let Ok(s) = std::env::var("SAT_FBP") {
+        let bp = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        saturn.set_master_bp(bp);
+        let mut hit = None;
+        for _ in 0..headless_frames {
+            saturn.run_frame(&mut framebuffer);
+            if let Some(h) = saturn.take_master_bp_hit() {
+                hit = Some(h);
+                break;
+            }
+        }
+        match hit {
+            Some((r, code)) => {
+                eprintln!("FBP {bp:08X} hit. regs:");
+                for (i, v) in r.iter().enumerate() {
+                    eprintln!("  R{i:<2}= {v:08X}");
+            }
+                eprintln!("disasm:");
+                for (i, &w) in code.iter().enumerate() {
+                    let op = sh2::decoder::decode(w);
+                    eprintln!("  {:08X}: {w:04X}  {}", bp + (i as u32) * 2, sh2::debug::disasm(op));
+                }
+            }
+            None => eprintln!("FBP {bp:08X} not hit"),
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Optional full-speed in-loop master-PC trace: `SAT_INLOOP=1` records every
+    // master instruction's PC at run_frame speed (faithful interrupt timing),
+    // running until the master enters the work-RAM shell region (0x0602_0000+)
+    // or SAT_FRAMES, then prints the tail of the trace — the boot give-up branch.
+    if std::env::var_os("SAT_INLOOP").is_some() {
+        saturn.enable_master_pc_trace();
+        let mut triggered = None;
+        for f in 0..headless_frames {
+            saturn.run_frame(&mut framebuffer);
+            let pc = saturn.master().regs.pc;
+            if (0x0602_0000..0x0605_0000).contains(&pc) {
+                triggered = Some(f);
+                break;
+            }
+        }
+        let trace = saturn.take_master_pc_trace();
+        let tail = trace.len().saturating_sub(400);
+        eprintln!("in-loop trace: {} PCs, shell-entered={triggered:?}", trace.len());
+        for pc in &trace[tail..] {
+            eprintln!("PC {pc:08X}");
         }
         return ExitCode::SUCCESS;
     }

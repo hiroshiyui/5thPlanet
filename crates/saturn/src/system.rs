@@ -183,6 +183,30 @@ impl Saturn {
         &mut self.scheduler.entity_mut(self.slave_id).sh2_mut().cpu
     }
 
+    /// Debug-only: start a full-speed master-PC trace (M11 boot investigation).
+    /// Records every instruction's PC at `run_for`/`run_frame` speed — so the
+    /// VBlank-interrupt-driven boot flow is captured faithfully, unlike the
+    /// single-step `debug_step_master` path.
+    pub fn enable_master_pc_trace(&mut self) {
+        self.scheduler.entity_mut(self.master_id).sh2_mut().enable_pc_trace();
+    }
+
+    /// Debug-only: drain the recorded master-PC trace.
+    pub fn take_master_pc_trace(&mut self) -> Vec<u32> {
+        self.scheduler.entity_mut(self.master_id).sh2_mut().take_pc_trace()
+    }
+
+    /// Debug-only: arm a full-speed breakpoint capturing the master's regs +
+    /// code at `pc` (to inspect a transient work-RAM routine; M11).
+    pub fn set_master_bp(&mut self, pc: u32) {
+        self.scheduler.entity_mut(self.master_id).sh2_mut().set_bp(pc);
+    }
+
+    /// Debug-only: take a breakpoint hit's (R0..R15, code words), if it fired.
+    pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+        self.scheduler.entity_mut(self.master_id).sh2_mut().take_bp_hit()
+    }
+
     /// Debug-only: step the master SH-2 exactly one instruction, then
     /// drain SMPC/SCU side effects. Used by the reference-emulator PC
     /// trace diff (M4 task #5). Returns the cycles the instruction took.

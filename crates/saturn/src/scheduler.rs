@@ -158,16 +158,43 @@ pub struct EntityId(pub(crate) usize);
 pub struct Sh2Entity {
     pub cpu: sh2::Cpu,
     halted: bool,
+    /// Debug-only full-speed PC trace (M11 boot-give-up investigation). When
+    /// `Some`, every executed instruction's PC is appended (consecutive
+    /// duplicates and the BIOS idle poll `0x2B0..0x2B6` filtered) up to a cap,
+    /// keeping the most recent window. `#[serde(skip)]` so it never affects
+    /// save-state determinism; only set on the master via [`enable_pc_trace`].
+    #[serde(skip)]
+    pc_trace: Option<std::collections::VecDeque<u32>>,
+    /// Debug-only full-speed breakpoint: when set and the master reaches this
+    /// PC, [`bp_hit`] captures R0..R15 plus 96 bytes of code at the PC (so a
+    /// transient work-RAM routine can be disassembled at the instant it runs).
+    #[serde(skip)]
+    bp: Option<u32>,
+    #[serde(skip)]
+    bp_hit: Option<([u32; 16], Vec<u16>)>,
 }
 
 impl Sh2Entity {
     pub fn new(cpu: sh2::Cpu) -> Self {
-        Self { cpu, halted: false }
+        Self { cpu, halted: false, pc_trace: None, bp: None, bp_hit: None }
     }
 
     /// Construct already-halted — what the slave starts as on power-on.
     pub fn new_halted(cpu: sh2::Cpu) -> Self {
-        Self { cpu, halted: true }
+        Self { cpu, halted: true, pc_trace: None, bp: None, bp_hit: None }
+    }
+
+    /// Begin recording a full-speed PC trace (debug; see [`pc_trace`]).
+    pub fn enable_pc_trace(&mut self) {
+        self.pc_trace = Some(std::collections::VecDeque::new());
+    }
+
+    /// Drain the recorded PC trace (most-recent window), if enabled.
+    pub fn take_pc_trace(&mut self) -> Vec<u32> {
+        self.pc_trace
+            .as_mut()
+            .map(|d| d.drain(..).collect())
+            .unwrap_or_default()
     }
 
     pub fn is_halted(&self) -> bool {
@@ -176,6 +203,17 @@ impl Sh2Entity {
 
     pub fn set_halted(&mut self, halted: bool) {
         self.halted = halted;
+    }
+
+    /// Arm a full-speed breakpoint at `pc` (debug; see [`bp`]).
+    pub fn set_bp(&mut self, pc: u32) {
+        self.bp = Some(pc);
+        self.bp_hit = None;
+    }
+
+    /// Take the captured (registers, code-words) from a breakpoint hit, if any.
+    pub fn take_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+        self.bp_hit.take()
     }
 }
 
@@ -197,6 +235,34 @@ impl SchedEntity for Sh2Entity {
             // exact instruction that reads them.
             ctx.cycle = self.cpu.pipeline.cycles;
             self.cpu.step(ctx);
+            if let Some(bp) = self.bp
+                && self.cpu.regs.pc == bp
+                && self.bp_hit.is_none()
+            {
+                use sh2::bus::{AccessKind, Bus};
+                let mut code = Vec::with_capacity(48);
+                for i in 0..48u32 {
+                    code.push(ctx.read16(bp + i * 2, AccessKind::Data).0);
+                }
+                self.bp_hit = Some((self.cpu.regs.r, code));
+            }
+            if let Some(trace) = &mut self.pc_trace {
+                let pc = self.cpu.regs.pc;
+                let idle = (0x0000_02B0..=0x0000_02B6).contains(&pc);
+                // Freeze the buffer once execution reaches the work-RAM shell
+                // region (0x0602_0000+): the boot give-up branch is the tail
+                // just before that entry, and the shell's own loop would
+                // otherwise flood the window and evict it.
+                let frozen = trace
+                    .back()
+                    .is_some_and(|&b| (0x0602_0000..0x0605_0000).contains(&b));
+                if !idle && !frozen && trace.back() != Some(&pc) {
+                    trace.push_back(pc);
+                    if trace.len() > 32768 {
+                        trace.pop_front();
+                    }
+                }
+            }
         }
     }
 }
