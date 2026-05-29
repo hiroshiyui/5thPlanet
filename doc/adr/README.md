@@ -49,6 +49,7 @@ We use Michael Nygard's lightweight format — see
 | [0008](0008-frontend-osd-software-composite.md) | Hand-rolled, software-composited frontend OSD | Accepted |
 | [0009](0009-physdisc-libcdio-ffi-crate.md) | Live physical-disc reads via a feature-gated libcdio FFI crate | Accepted |
 | [0010](0010-hle-direct-boot.md) | Optional HLE direct boot (load the 1st-read program, bypass the BIOS CD loader) | Accepted |
+| [0011](0011-hle-bios-syscalls.md) | HLE the BIOS system-call library for cold direct boot | Accepted |
 
 ### Decisions worth recording (backlog)
 

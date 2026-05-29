@@ -24,6 +24,8 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
+| M11       | Boot a game to gameplay — CD-block fixes + HLE direct boot   | 🚧 active    |
+| M12       | HLE BIOS system-call library (cold-HLE boot)                 | 🚧 active    |
 
 Current test count: **523 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).

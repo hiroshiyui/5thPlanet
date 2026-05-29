@@ -575,7 +575,22 @@ optional HLE direct boot (ADR-0010).
 | 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture) / `SAT_MEMDUMP` / `SAT_DUMP`. Localized the LLE give-up to a ~200k-instruction work-RAM boot-loader blob. |
 | 3 | **HLE direct boot** (ADR-0010) 🚧 | Optional `--hle-boot` / `SAT_HLE_BOOT`: `Saturn::hle_boot` reads IP.BIN, loads the 1st-read file (`CdBlock::first_read_file`) into work RAM at the IP.BIN load address, and `Cpu::hle_jump`s the master to it. v1 hybrid (reuse the BIOS init, inject at the give-up). The game's own code now **runs** (~40k+ instructions past the CD player); it currently stalls in a BIOS SMPC poll during its loader (the hybrid give-up state isn't a true game-launch state). LLE boot stays the default; HLE off by default. |
 
+## Milestone 12 — HLE BIOS system-call library (finishes cold-HLE boot) 🚧
+
+The HLE-booted game runs ~40k instructions, then calls a BIOS **system call**
+(`JSR @[0x06000320]` = `ChangeSystemClock`) that, because our BIOS never reaches
+its game-launch state, points at the BIOS fatal handler. M11 proved this is
+inject-independent. Fix (ADR-0011): stop depending on the BIOS for the SYS
+environment — build the SYS call table ourselves and **HLE the SYS functions**,
+modelled on `yabref/yabause/src/bios.c`. A discovery milestone like M4.
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **Dispatch mechanism + first call** ⬜ | `crates/saturn/src/bios_hle.rs`: SYS entry-address set + a `dispatch(cpu, bus)` that reads R4–R7, mutates the bus, sets R0, returns `pc=pr`. Hook it in `Sh2Entity::step` (pre-`step`, gated by `hle_sys_active`). `Saturn::cold_hle_boot` writes the SYS table (`0x06000200..0x06000360`), enables the hook, loads the 1st-read, jumps — reusing the BIOS hardware/interrupt init. Implement `ChangeSystemClock`. Exit: VF2's `0x320` call returns (no `0x4C8` fatal). |
+| 2 | **Iterate to gameplay** ⬜ | Implement each subsequent SYS fn VF2 calls (semaphore, SCU interrupt set/get/mask, CD init, BUP, …) per `SAT_HLE_DIAG`, each cross-checked against `yabref bios.c`, until VF2 renders its title/intro. |
+| 3 | **Generalise + tests/docs** ⬜ | A second disc if available; gated `hle_boot` tests; finalize ADR-0011 result + this row. |
+
 ## Later milestones (queued)
 
-- **HLE boot follow-up** — set up a proper game-launch state (toward cold/no-BIOS HLE) or fix the stuck SYS path so the game's early init completes and renders.
+- **Full no-BIOS cold boot** — replicate the BIOS hardware + interrupt init too (M12 reuses it); MPEG SYS calls.
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
