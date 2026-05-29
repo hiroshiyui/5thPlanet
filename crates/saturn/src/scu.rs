@@ -552,6 +552,15 @@ impl Scu {
     /// `Some((source, level))` if any; clears the fresh-assertion bit
     /// for that source so we don't re-fire on the SH-2 on the next
     /// drain (re-firing only happens after a new `raise`).
+    ///
+    /// Acknowledging the interrupt **also clears its `IST` status bit**:
+    /// the Saturn SCU clears a pending interrupt's IST bit when the SH-2
+    /// takes the vector (the interrupt-acknowledge cycle), not only via
+    /// the software W1C path — game/BIOS handlers seldom W1C IST (VF2 and
+    /// the real BIOS each write IST only a couple of times across a whole
+    /// run), so without ack-clear the IST bits accumulate stale-set
+    /// forever and any handler that reads IST to decide masking sees the
+    /// wrong state.
     pub fn take_pending_interrupt(&mut self, sh2_imask: u8) -> Option<(Source, u8)> {
         let unmasked = self.fresh_assertions & !self.ims;
         for &source in ALL_SOURCES {
@@ -564,6 +573,7 @@ impl Scu {
                 continue;
             }
             self.fresh_assertions &= !bit;
+            self.ist &= !bit; // SCU clears IST on the SH-2 acknowledge cycle
             return Some((source, lvl));
         }
         None
@@ -775,17 +785,34 @@ mod tests {
     }
 
     #[test]
-    fn taking_an_interrupt_does_not_clear_ist_only_fresh_assertion() {
+    fn taking_an_interrupt_acknowledges_and_clears_its_ist_bit() {
         let mut s = Scu::new();
         s.raise(Source::DspEnd);
         let _ = s.take_pending_interrupt(0).unwrap();
-        // IST stays set until software W1Cs.
-        assert_ne!(s.ist & (1 << Source::DspEnd.bit()), 0);
+        // The SCU clears IST on the SH-2 acknowledge cycle (vector fetch);
+        // it does not linger stale-set waiting for a software W1C.
+        assert_eq!(s.ist & (1 << Source::DspEnd.bit()), 0);
         // Re-draining without a fresh raise returns nothing.
         assert!(s.take_pending_interrupt(0).is_none());
         // After a new raise, the same source fires again.
         s.raise(Source::DspEnd);
         assert!(s.take_pending_interrupt(0).is_some());
+    }
+
+    #[test]
+    fn a_masked_source_keeps_its_ist_bit_until_it_is_actually_taken() {
+        // Ack-clear only happens on delivery: a pending-but-masked source
+        // keeps its IST bit set (matching hardware — masking gates delivery,
+        // not the status latch).
+        let mut s = Scu::new();
+        s.ims = 1 << Source::VBlankOut.bit();
+        s.raise(Source::VBlankOut);
+        assert!(s.take_pending_interrupt(0).is_none(), "masked: not delivered");
+        assert_ne!(
+            s.ist & (1 << Source::VBlankOut.bit()),
+            0,
+            "masked source's IST bit stays set (not acknowledged)"
+        );
     }
 
     #[test]
