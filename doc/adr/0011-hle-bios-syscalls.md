@@ -32,11 +32,12 @@ approximate" is met by HLE rather than LLE.
 We will **high-level-emulate the BIOS SYS-call library** as part of the optional
 cold HLE direct boot, in a new `crates/saturn/src/bios_hle.rs`:
 
-- A **dispatch hook** in the master SH-2 step (`scheduler.rs`): when an
-  `hle_sys_active` flag is set and the master PC reaches a SYS entry address,
+- A **per-core dispatch hook** in the SH-2 step (`scheduler.rs`): when an
+  `hle_sys_active` flag is set and the core's PC reaches a SYS entry address,
   run the host implementation (read args R4–R7, mutate the bus, set R0, return
   via `pc = pr`) instead of executing BIOS code. Off by default — the LLE boot
-  path is untouched.
+  path is untouched. (Enabled on both the master and the slave, since the SYS
+  table is shared work RAM and the slave `JSR`s it too.)
 - `Saturn::cold_hle_boot` writes the SYS call table (`0x06000200..0x06000360`)
   with the SYS entry addresses, enables the hook, loads the 1st-read, and jumps —
   reusing the real BIOS's hardware + interrupt-dispatch init, replacing only the
@@ -56,6 +57,29 @@ cold HLE direct boot, in a new `crates/saturn/src/bios_hle.rs`:
   up front, like M4); some SYS functions may touch state beyond the bus. MPEG SYS
   calls and a full no-BIOS cold boot stay out of scope (we still reuse the BIOS's
   hardware init).
+
+## Result (updated 2026-05-30)
+
+The SYS library now covers what VF2's launch exercises: `ChangeSystemClock`,
+`Get/ClearSemaphore`, `Set/GetScuInterrupt`, `Set/GetSh2Interrupt`, and
+`Set/ChangeScuInterruptMask` (the mask calls **master-only**, per Yabause
+`!isslave`). Two further pieces, also RE'd from Yabause, were needed to get
+*both* CPUs alive:
+
+- **Slave start on `SSHON`** (`Saturn::release_slave`, Yabause
+  `YabauseStartSlave`): the slave jumps to the game-written entry at
+  `[0x06000250]` with `VBR = 0x06000400` and the slave stack, rather than
+  resuming its stale (mid-BIOS-init) PC — which had re-run the cold work-RAM
+  clear and wiped the loaded program.
+- **Inter-CPU FRT input-capture (FTI)**: a 16-bit write to
+  `0x0100_0000..0x017F_FFFF` (slave) / `0x0180_0000..` (master) pulses the
+  target core's FRT input capture (`FTCSR.ICF`) — the wake signal a game uses to
+  dispatch its slave.
+
+With these, VF2's program survives, the slave runs the game's slave routine and
+drains the master's work queue, and VBlank interrupts are delivered. It does not
+yet render — the master then waits on a frame-sync flag (`[GBR+19]`) that is the
+next handshake to resolve.
 
 ## Alternatives considered
 

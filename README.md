@@ -27,7 +27,7 @@ foundation stays solid.
 | M11       | Boot a game to gameplay — CD-block fixes + HLE direct boot   | 🚧 active    |
 | M12       | HLE BIOS system-call library (cold-HLE boot)                 | 🚧 active    |
 
-Current test count: **523 workspace-wide, 0 failures.** Task-by-task
+Current test count: **533 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel

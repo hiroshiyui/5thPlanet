@@ -1,18 +1,23 @@
 //! HLE of the SEGA Saturn BIOS **system-call library** (ADR-0011).
 //!
 //! Games reach BIOS services through a pointer table in low work RAM
-//! (`0x06000200..0x06000360`): a call is `JSR @[table slot]`, which lands the
-//! master SH-2 at a fixed BIOS entry address. For an HLE direct boot
+//! (`0x06000200..0x06000360`): a call is `JSR @[table slot]`, which lands an
+//! SH-2 at a fixed BIOS entry address. For an HLE direct boot
 //! ([`Saturn::cold_hle_boot`](crate::Saturn::cold_hle_boot)) we populate that
 //! table ourselves and intercept execution at those entry addresses — running a
 //! host implementation instead of BIOS code — so a game gets a working SYS
-//! environment without depending on our (failing) BIOS boot.
+//! environment without depending on our (failing) BIOS boot. The dispatch hook
+//! is enabled on **both** SH-2s (the table is shared work RAM and the slave
+//! `JSR`s it during its own init); [`dispatch`] takes `is_slave` because a few
+//! functions (the SCU interrupt-mask calls) are master-only.
 //!
 //! Modelled on Yabause `src/bios.c` (`BiosInit` / `BiosHandleFunc`). The entry
 //! addresses are the BIOS-ROM addresses the table points at; the dispatcher
 //! keys on `(pc - 0x200) >> 2` exactly as Yabause does. Functions read args in
 //! `R4..R7`, mutate machine state through the bus, set the result in `R0`, and
-//! return via [`Cpu::hle_return`](sh2::Cpu::hle_return).
+//! return via [`Cpu::hle_return`](sh2::Cpu::hle_return). The slave is *started*
+//! (on `SSHON`) at the game-written entry `[0x06000250]` — see
+//! [`Saturn::release_slave`](crate::Saturn::release_slave).
 
 use sh2::Cpu;
 use sh2::bus::{AccessKind, Bus};
