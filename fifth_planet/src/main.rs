@@ -518,6 +518,39 @@ fn run(
     }
 
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
+
+    // Optional instruction breakpoint: `SAT_BP=0xADDR` (opt `SAT_BP_FRAME=N`
+    // fast-forwards N frames first) single-steps the master until PC==ADDR,
+    // then dumps R0..R15 + the words at [R3]/[R4] (boot poll-loop debugging).
+    if let Ok(bps) = std::env::var("SAT_BP") {
+        use sh2::bus::{AccessKind, Bus};
+        let bp = u32::from_str_radix(bps.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let ff: u32 = std::env::var("SAT_BP_FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+        for _ in 0..ff {
+            saturn.run_frame(&mut framebuffer);
+        }
+        let mut hit = false;
+        for _ in 0..200_000_000u64 {
+            saturn.debug_step_master();
+            if saturn.master().regs.pc == bp {
+                let r = saturn.master().regs.r;
+                eprintln!("BP {bp:08X} hit. regs:");
+                for i in 0..16 {
+                    eprintln!("  R{i:<2}= {:08X}", r[i]);
+                }
+                let (w3, _) = saturn.bus.read32(r[3], AccessKind::Data);
+                let (w4, _) = saturn.bus.read32(r[4], AccessKind::Data);
+                eprintln!("  [R3={:08X}]= {w3:08X}   [R4={:08X}]= {w4:08X}", r[3], r[4]);
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            eprintln!("BP {bp:08X} not hit");
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Optional master-PC trace for boot debugging: `SAT_PCTRACE=1` prints the
     // master SH-2 PC once per frame (collapsing runs of the same value), so a
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
@@ -544,14 +577,17 @@ fn run(
     // a work-RAM wait loop the boot stalls in).
     if let Ok(spec) = std::env::var("SAT_DISASM") {
         use sh2::bus::{AccessKind, Bus};
-        let (a, n) = spec.split_once(':').unwrap_or((spec.as_str(), "16"));
-        let base = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
-        let n: u32 = n.parse().unwrap_or(16);
-        for i in 0..n {
-            let addr = base + i * 2;
-            let (word, _) = saturn.bus.read16(addr, AccessKind::Data);
-            let op = sh2::decoder::decode(word);
-            eprintln!("  {addr:08X}: {word:04X}  {}", sh2::debug::disasm(op));
+        for region in spec.split(',') {
+            let (a, n) = region.split_once(':').unwrap_or((region, "16"));
+            let base = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+            let n: u32 = n.parse().unwrap_or(16);
+            eprintln!("--- disasm {base:08X}..+{n} ---");
+            for i in 0..n {
+                let addr = base + i * 2;
+                let (word, _) = saturn.bus.read16(addr, AccessKind::Data);
+                let op = sh2::decoder::decode(word);
+                eprintln!("  {addr:08X}: {word:04X}  {}", sh2::debug::disasm(op));
+            }
         }
     }
 
