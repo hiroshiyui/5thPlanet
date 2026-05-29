@@ -599,7 +599,8 @@ fn run(
             }
         }
         let trace = saturn.take_master_pc_trace();
-        let tail = trace.len().saturating_sub(400);
+        let n: usize = std::env::var("SAT_INLOOP_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let tail = trace.len().saturating_sub(n);
         eprintln!("in-loop trace: {} PCs, shell-entered={triggered:?}", trace.len());
         for pc in &trace[tail..] {
             eprintln!("PC {pc:08X}");
@@ -659,6 +660,24 @@ fn run(
 
     if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
         eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
+    }
+
+    // Optional raw memory dump: `SAT_MEMDUMP=0xADDR:N` reads N bytes via the
+    // live bus and prints them as hex + ASCII (e.g. to verify IP.BIN landed in
+    // work-RAM intact vs the disc).
+    if let Ok(spec) = std::env::var("SAT_MEMDUMP") {
+        use sh2::bus::{AccessKind, Bus};
+        let (a, n) = spec.split_once(':').unwrap_or((spec.as_str(), "256"));
+        let base = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let n: u32 = n.parse().unwrap_or(256);
+        for row in 0..n.div_ceil(16) {
+            let addr = base + row * 16;
+            let bytes: Vec<u8> = (0..16).map(|i| saturn.bus.read8(addr + i, AccessKind::Data).0).collect();
+            let hex: String = bytes.iter().map(|b| format!("{b:02x} ")).collect();
+            let asc: String = bytes.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+            eprintln!("{addr:08X}  {hex} {asc}");
+        }
+        return ExitCode::SUCCESS;
     }
 
     // Optional disassembly window for boot debugging: `SAT_DISASM=0xADDR:N`
