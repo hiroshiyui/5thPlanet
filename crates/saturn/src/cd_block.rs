@@ -64,6 +64,7 @@ const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
 const STAT_SEEK: u8 = 0x04; // drive seeking
 const STAT_PLAY: u8 = 0x03; // read/playback in progress
+const STAT_STANDBY: u8 = 0x02; // drive stopped (MAME CD_STAT_STANDBY)
 
 // HIRQ playback-complete bit.
 const HIRQ_PEND: u16 = 0x0010; // CD playback / read range completed
@@ -1127,6 +1128,18 @@ impl CdBlock {
                 // `disk_changed` was never cleared) made the BIOS perceive a
                 // continuous disc swap and park in its CD control panel instead
                 // of auto-booting a recognised game disc.
+                //
+                // With a disc present (not NODISC), Init returns the drive to
+                // PAUSE at the start of track 1 and clears the play range — so
+                // a prior Seek that stopped the drive (STANDBY) is undone and
+                // the next probe pass finds a ready drive (MAME `cmd_init_cdsystem`).
+                if self.disc.is_some() {
+                    self.status = STAT_PAUSE;
+                    self.cd_curfad = FAD_OFFSET;
+                    self.fadstoplay = 0;
+                }
+                self.buf_full = false;
+                self.cd_speed = if self.cr1 & 0x10 != 0 { 1 } else { 2 };
                 self.cd_report();
                 let mut h = self.hirq & 0xFFE5;
                 if self.disk_changed {
@@ -1342,6 +1355,33 @@ impl CdBlock {
                     self.fadstoplay = d.lead_out_fad().saturating_sub(self.cd_curfad) as i64;
                 }
                 self.sectorstore = false;
+                self.cd_report();
+                self.hirq |= HIRQ_CMOK;
+            }
+            0x11 => {
+                // Disc seek (MAME `cmd_seek_disc`). CR1 bit 0x80 = FAD seek
+                // (0xFFFFFF = pause in place); otherwise a track seek where the
+                // track is CR2's high byte. A track-0 / invalid seek is the
+                // drive-stop idiom → STANDBY: the BIOS issues it to halt the
+                // drive between boot probe passes and waits for STANDBY before
+                // continuing, so leaving the status at PAUSE (the old default
+                // handler) stalled the boot loop and dropped to the CD shell.
+                if self.cr1 & 0x80 != 0 {
+                    let temp = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
+                    if temp == 0xFF_FFFF {
+                        self.status = STAT_PAUSE;
+                    } else {
+                        self.cd_curfad = ((self.cr1 as u32 & 0x7F) << 16) | self.cr2 as u32;
+                        self.status = STAT_PAUSE;
+                    }
+                } else if self.cr2 >> 8 != 0 {
+                    self.status = STAT_PAUSE;
+                    self.track = (self.cr2 >> 8) as u8;
+                } else {
+                    self.status = STAT_STANDBY;
+                    self.cd_curfad = 0xFFFF_FFFF;
+                    self.track = 0xFF;
+                }
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK;
             }
