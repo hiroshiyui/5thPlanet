@@ -414,6 +414,10 @@ impl Saturn {
         if !vblank && (prev & 0x0008) != 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankOut);
             self.bus.scu.trigger_dma_factor(1);
+            #[cfg(not(test))]
+            if std::env::var_os("SAT_INTC_TRACE").is_some() && now > 130_000_000 {
+                eprintln!("RAISE VBlankOut now={now} IMS={:08X}", self.bus.scu.ims);
+            }
         }
 
         // Complete any in-flight VDP1 plot whose draw duration has elapsed,
@@ -1001,6 +1005,14 @@ impl Saturn {
     fn drain_scu_intc(&mut self) {
         let imask = self.master().regs.sr.imask();
         if let Some((source, level)) = self.bus.scu.take_pending_interrupt(imask) {
+            #[cfg(not(test))]
+            if std::env::var_os("SAT_INTC_TRACE").is_some() && self.now() > 130_000_000 {
+                eprintln!(
+                    "INTC fwd {source:?} lvl={level} vec={:02X} master_imask={imask} now={}",
+                    source.vector(),
+                    self.now()
+                );
+            }
             // The SCU presents a fixed vector (0x40 + index) per source
             // during interrupt-acknowledge — not the SH-2 auto-vector
             // 64+level. Vectoring VBlank-IN to 64+15=0x4F would run the
