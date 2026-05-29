@@ -247,6 +247,19 @@ pub struct CdBlock {
     /// byte cursor. Phase 3 generalises this to sector data + the SCU-DMA port.
     xfer: Vec<u8>,
     xfer_pos: usize,
+    /// Running count of bytes the host has read from the data port since the
+    /// current transfer was staged (mirrors MAME `xferdnum`). Incremented by
+    /// both the 16-bit FIFO path (TOC/file-info) and the 32-bit sector path;
+    /// reset when a command stages a transfer; reported back, in words, by End
+    /// Data Transfer (`0x06`) so the BIOS can confirm how much it actually got.
+    xfer_done: usize,
+    /// Persistent data-transfer-request (TRANS, `0x4000`) status bit. Set when a
+    /// command stages host-readable data (Get TOC / Get Sector Data); cleared by
+    /// End Data Transfer (`0x06`). Mirrors MAME's `cd_stat & CD_STAT_TRANS`: the
+    /// BIOS polls status to know a transfer is pending and reads the transferred
+    /// word count back from End Data Transfer to confirm it — so the bit must
+    /// persist across status polls, not just appear in the staging command's CR1.
+    transfer_request: bool,
 
     /// Decoded CD-DA (Red Book) samples awaiting mix into the SCSP output —
     /// interleaved 16-bit stereo at 44.1 kHz. The read pump fills this while an
@@ -358,6 +371,8 @@ impl CdBlock {
             disc: None,
             xfer: Vec::new(),
             xfer_pos: 0,
+            xfer_done: 0,
+            transfer_request: false,
             cd_audio: VecDeque::new(),
             blocks: vec![Block::free(); MAX_BLOCKS],
             free_blocks: MAX_BLOCKS as i32,
@@ -389,8 +404,14 @@ impl CdBlock {
     }
 
     /// Insert (or replace) a disc. The drive returns to PAUSE at the start of
-    /// track 1 (FAD 150), the geometry the status reports now carry, and a
-    /// disc-change is flagged (`HIRQ.DCHG`) so the BIOS re-reads the TOC.
+    /// track 1 (FAD 150) with the geometry the status reports now carry.
+    ///
+    /// A disc-change (`HIRQ.DCHG`) is flagged **only for a runtime swap** — i.e.
+    /// once the host has engaged the block (`host_initialized`). At *cold boot*
+    /// the disc is simply present from the BIOS's point of view; raising DCHG
+    /// then makes the BIOS treat the boot disc as a hot-swap and drop into its
+    /// CD control panel ("Start Application") instead of auto-booting the game.
+    /// MAME's HLE likewise shows no DCHG in its cold-boot HIRQ trace.
     pub fn insert_disc<S: SectorSource + 'static>(&mut self, source: S) {
         self.ctrladdr = source
             .track_at_fad(FAD_OFFSET)
@@ -400,8 +421,10 @@ impl CdBlock {
         self.fad = FAD_OFFSET;
         self.status = STAT_PAUSE;
         self.disc = Some(Box::new(source));
-        self.disk_changed = true;
-        self.hirq |= HIRQ_DCHG;
+        self.disk_changed = self.host_initialized;
+        if self.host_initialized {
+            self.hirq |= HIRQ_DCHG;
+        }
     }
 
     /// Whether a disc is present.
@@ -562,7 +585,7 @@ impl CdBlock {
 
     /// Write a standard CD status report into CR1..CR4 (cs2.c `doCDReport`).
     fn cd_report(&mut self) {
-        self.cr1 = ((self.status as u16) << 8)
+        self.cr1 = self.cd_stat()
             | (((self.options & 0xF) as u16) << 4)
             | (self.repcnt & 0xF) as u16;
         self.cr2 = ((self.ctrladdr as u16) << 8) | self.track as u16;
@@ -572,7 +595,11 @@ impl CdBlock {
 
     /// The 16-bit status word (status code in the high byte) — MAME `cd_stat`.
     fn cd_stat(&self) -> u16 {
-        (self.status as u16) << 8
+        let mut s = (self.status as u16) << 8;
+        if self.transfer_request {
+            s |= STAT_TRANS;
+        }
+        s
     }
 
     /// Read one sector at `fad` into the working block and route it through the
@@ -695,8 +722,13 @@ impl CdBlock {
     /// to PLAY; in PLAY each tick reads one filtered sector until the range is
     /// exhausted, then pauses and raises `PEND`.
     fn play_data(&mut self) {
-        match self.status {
-            STAT_SEEK => self.status = STAT_PLAY,
+        // Match on the drive-state bits only: `STAT_PERI` (0x20) is OR'd into
+        // `status` by the unsolicited periodic report between commands, so an
+        // exact `match self.status` would miss the PLAY/SEEK arms whenever a
+        // periodic report has fired since the last CR1 write — stalling the read
+        // pump (the BIOS would wait forever for sector data after Play).
+        match self.status & !STAT_PERI {
+            STAT_SEEK => self.status = STAT_PLAY | (self.status & STAT_PERI),
             STAT_PLAY if self.fadstoplay > 0 => {
                 let fad = self.cd_curfad;
                 let is_audio = self
@@ -804,6 +836,7 @@ impl CdBlock {
                 xm.sect += 1;
             }
         }
+        self.xfer_done += 4;
         rv
     }
 
@@ -816,6 +849,7 @@ impl CdBlock {
         };
         if p < self.xfer.len() {
             self.xfer_pos = (p + 2).min(self.xfer.len());
+            self.xfer_done += 2;
         }
         word
     }
@@ -997,6 +1031,7 @@ impl CdBlock {
     /// which is what most CD-block commands return.
     fn execute(&mut self) {
         let command = (self.cr1 >> 8) as u8;
+        let cr_in = [self.cr1, self.cr2, self.cr3, self.cr4];
         // The host has engaged the block; unsolicited periodic reports may
         // now run (the signature no longer needs holding — see
         // `host_initialized`). The response that follows sits in CR1..CR4
@@ -1006,6 +1041,21 @@ impl CdBlock {
         // Clear CMOK while "processing" (cs2.c clears it at entry).
         self.hirq &= !HIRQ_CMOK;
 
+        self.dispatch(command, cr_in);
+        if std::env::var_os("CD_TRACE").is_some() {
+            eprintln!(
+                "CD {cmd:02X} in={i0:04X},{i1:04X},{i2:04X},{i3:04X} \
+                 out={o0:04X},{o1:04X},{o2:04X},{o3:04X} hirq={h:04X} stat={s:02X}",
+                cmd = command,
+                i0 = cr_in[0], i1 = cr_in[1], i2 = cr_in[2], i3 = cr_in[3],
+                o0 = self.cr1, o1 = self.cr2, o2 = self.cr3, o3 = self.cr4,
+                h = self.hirq, s = self.status,
+            );
+        }
+    }
+
+    /// Decode and run one host command. `cr_in` is the CR1..CR4 the host wrote.
+    fn dispatch(&mut self, command: u8, _cr_in: [u16; 4]) {
         match command {
             0x00 => {
                 // Get CD status.
@@ -1035,8 +1085,10 @@ impl CdBlock {
                 if let Some(d) = &self.disc {
                     self.xfer = d.toc().to_vec();
                     self.xfer_pos = 0;
+                    self.xfer_done = 0;
+                    self.transfer_request = true;
                 }
-                self.cr1 = STAT_TRANS | ((self.status as u16) << 8);
+                self.cr1 = self.cd_stat() | STAT_TRANS;
                 self.cr2 = 0x00CC;
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
@@ -1067,22 +1119,48 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK;
             }
             0x04 => {
-                // Initialize CD system: software/selector reset.
+                // Initialize CD system (MAME `cmd_init_cdsystem`): clears
+                // DRDY/BFUL/PEND from HIRQ (`& 0xFFE5`). The disc-change is a
+                // *one-shot*: the FIRST Init after an insert reports DCHG and
+                // acknowledges it (`disk_changed = false`); later Inits clear
+                // DCHG. Re-raising DCHG on every Init (the old behaviour, since
+                // `disk_changed` was never cleared) made the BIOS perceive a
+                // continuous disc swap and park in its CD control panel instead
+                // of auto-booting a recognised game disc.
                 self.cd_report();
                 let mut h = self.hirq & 0xFFE5;
                 if self.disk_changed {
                     h |= HIRQ_DCHG;
+                    self.disk_changed = false;
                 } else {
                     h &= !HIRQ_DCHG;
                 }
                 self.hirq = h | HIRQ_CMOK | HIRQ_ESEL;
             }
             0x06 => {
-                // End data transfer: no transfer pending → 0xFF count.
-                self.cr1 = ((self.status as u16) << 8) | 0x00FF;
-                self.cr2 = 0xFFFF;
+                // End data transfer (MAME `cmd_end_data_transfer`): clear the
+                // TRANS status bit and report the number of *bytes* the host
+                // read back, as a 24-bit count split across CR1 (MSB) / CR2
+                // (low 16 bits, in words). `xfer_pos` is the FIFO/DMA byte
+                // cursor advanced by the host's reads. When nothing was
+                // transferred, return the 0xFF / 0xFFFF "no xfer" sentinel.
+                // The BIOS reads this count to confirm a staged transfer (e.g.
+                // the TOC) actually completed before it proceeds with boot.
+                let xferd = self.xfer_done as u32;
+                self.transfer_request = false;
+                if xferd != 0 {
+                    self.cr1 = self.cd_stat() | ((xferd >> 17) & 0xFF) as u16;
+                    self.cr2 = ((xferd >> 1) & 0xFFFF) as u16;
+                } else {
+                    self.cr1 = self.cd_stat() | 0x00FF;
+                    self.cr2 = 0xFFFF;
+                }
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
+                self.xfer.clear();
+                self.xfer_pos = 0;
+                self.xfer_done = 0;
+                self.xfer32 = None;
                 self.hirq |= HIRQ_CMOK | HIRQ_EHST;
             }
             0x30 => {
@@ -1314,6 +1392,8 @@ impl CdBlock {
                         sect: 0,
                         offs: 0,
                     });
+                    self.xfer_done = 0;
+                    self.transfer_request = true;
                     self.cd_report();
                     self.cr1 |= STAT_TRANS;
                     self.hirq |= HIRQ_CMOK | HIRQ_EHST | HIRQ_DRDY;
@@ -1378,9 +1458,13 @@ impl CdBlock {
                         self.xfer = f;
                         self.xfer_pos = 0;
                     }
+                    self.xfer_done = 0;
+                    self.transfer_request = true;
                     self.cr1 = self.cd_stat() | STAT_TRANS;
                     self.cr2 = 6; // 6 words for a single file
                 } else {
+                    self.xfer_done = 0;
+                    self.transfer_request = true;
                     self.cr1 = self.cd_stat() | STAT_TRANS;
                     self.cr2 = 0x5F4; // all entries (whole-directory form)
                 }
@@ -1745,6 +1829,9 @@ mod tests {
     fn insert_disc_flags_change_and_reports_real_geometry() {
         let mut c = CdBlock::new();
         c.hirq = 0;
+        // A *runtime* swap (host already engaged) flags the disc change; at cold
+        // boot the disc is just present (no DCHG) so the BIOS auto-boots it.
+        c.host_initialized = true;
         c.insert_disc(iso_disc());
         assert!(c.has_disc());
         assert_eq!(c.hirq & HIRQ_DCHG, HIRQ_DCHG, "disc change flagged");
