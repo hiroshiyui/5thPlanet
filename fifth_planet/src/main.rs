@@ -551,6 +551,39 @@ fn run(
         return ExitCode::SUCCESS;
     }
 
+    // Optional fine BIOS-ROM trace: `SAT_BIOSTRACE=1` fast-forwards
+    // `SAT_BP_FRAME` frames, then single-steps logging every master-PC change
+    // (deduped) until PC enters the work-RAM shell region (0x0602_0000+) or the
+    // step cap, to capture the boot give-up branch path.
+    if std::env::var_os("SAT_BIOSTRACE").is_some() {
+        let ff: u32 = std::env::var("SAT_BP_FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(220);
+        for _ in 0..ff {
+            saturn.run_frame(&mut framebuffer);
+        }
+        let mut prev = u32::MAX;
+        let mut printed = 0u32;
+        for _ in 0..40_000_000u64 {
+            saturn.debug_step_master();
+            let pc = saturn.master().regs.pc;
+            // Skip the master idle poll (0x2B0..0x2B6) so the VBlank-handler
+            // bursts that actually run the boot state machine are visible.
+            let idle = (0x0000_02B0..=0x0000_02B6).contains(&pc);
+            if pc != prev && !idle {
+                eprintln!("PC {pc:08X}");
+                prev = pc;
+                printed += 1;
+                if printed > 4000 {
+                    break;
+                }
+                if (0x0602_0000..0x0605_0000).contains(&pc) {
+                    eprintln!("(entered shell region)");
+                    break;
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Optional master-PC trace for boot debugging: `SAT_PCTRACE=1` prints the
     // master SH-2 PC once per frame (collapsing runs of the same value), so a
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
