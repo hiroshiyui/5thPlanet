@@ -164,9 +164,20 @@ fn gen_vf2_pc_trace() {
     let mut w = std::io::BufWriter::new(f);
     let mut frame_cyc: u64 = 0;
     let mut vblank_raised = false;
+    // Loop-collapse to mirror MAME's `trace …,noloop`: suppress a PC already
+    // seen in the last 64 logged PCs (so idle/delay/poll spins log one pass,
+    // not their 10k+ iterations) — keeps the trace small and the resync_diff's
+    // WIN from being blown out by spin-count differences.
+    let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
     for _ in 0..n {
         let pc = sat.master().regs.pc;
-        writeln!(w, "{pc:08X}").unwrap();
+        if !recent.contains(&pc) {
+            writeln!(w, "{pc:08X}").unwrap();
+            if recent.len() == 64 {
+                recent.pop_front();
+            }
+            recent.push_back(pc);
+        }
         let c = sat.debug_step_master_nodrain() as u64;
         sat.debug_drain();
         // Mirror run_frame's VBlank cadence at instruction granularity.
