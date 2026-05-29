@@ -89,6 +89,20 @@ impl Cpu {
         self.regs.r[15] = sp;
     }
 
+    /// Redirect execution to `pc` with stack pointer `sp`, clearing in-flight
+    /// pipeline state (pending branch, delay-slot flag, pending load interlock)
+    /// so the jump takes effect on the next `step` rather than being overridden
+    /// by a half-retired branch. Unlike [`reset`](Self::reset) it preserves the
+    /// other registers (VBR/SR/GBR/…). Used by the host's HLE direct boot to
+    /// hand control to a freshly loaded program.
+    pub fn hle_jump(&mut self, pc: u32, sp: u32) {
+        self.regs.pc = pc;
+        self.regs.r[15] = sp;
+        self.pending_branch = None;
+        self.in_delay_slot = false;
+        self.load_dest_pending = None;
+    }
+
     /// True when the next [`step`] will execute a branch delay slot
     /// (a branch is pending). Used by trace tooling to match reference
     /// emulators that execute the delay slot inside the branch handler.

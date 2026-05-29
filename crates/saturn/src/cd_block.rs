@@ -83,8 +83,7 @@ const NO_FILTER: u8 = 0xFF;
 /// One buffered sector in the 200-block pool. `size < 0` marks the slot free;
 /// otherwise it holds `size` bytes of user data plus the sector's disc
 /// coordinates and subheader fields (used by filtering).
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Block {
     size: i32,
     fad: i32,
@@ -112,8 +111,7 @@ impl Block {
 
 /// A sector-selection filter (MAME `filterT`): FAD-range and subheader-condition
 /// matching, plus the true/false partition each matched sector routes to.
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Filter {
     mode: u8,
     chan: u8,
@@ -130,8 +128,7 @@ struct Filter {
 
 /// A partition (output buffer): an ordered list of pool-block indices. Unlike
 /// MAME's fixed array + null-defragment, we keep it compact in a `Vec`.
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Partition {
     blocks: Vec<usize>,
 }
@@ -139,8 +136,7 @@ struct Partition {
 /// In-flight 32-bit sector-data transfer (Get / Get-and-Delete Sector Data):
 /// streams `num` blocks of partition `part` starting at index `pos`, tracking
 /// the current block (`sect`) and byte offset within it (`offs`).
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Xfer32 {
     delete: bool,
     part: usize,
@@ -154,8 +150,7 @@ struct Xfer32 {
 const MASTER_HZ: u64 = 28_636_400;
 
 /// One ISO9660 directory record (MAME `direntryT`, fields we use).
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct DirEntry {
     firstfad: u32,
     length: u32,
@@ -191,8 +186,7 @@ const PERIODIC_CYCLES: u64 = 477_273;
 
 // Not `Clone`: holds a `Box<dyn SectorSource>` (image or live drive) that
 // isn't cloneable; nothing clones a CdBlock.
-#[derive(Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CdBlock {
     pub hirq: u16,
     pub hirq_mask: u16,
@@ -453,6 +447,22 @@ impl CdBlock {
         self.disc.as_deref()
     }
 
+    /// The disc's **1st-read file** — the first non-directory entry in the
+    /// ISO9660 root directory (e.g. `AAAVF2.BIN`), returned as `(start FAD,
+    /// length in bytes)`. This is the game's initial program that the BIOS
+    /// loads to the IP.BIN load address and jumps to; the HLE direct boot
+    /// (`Saturn::hle_boot`) loads it itself. Reuses the existing root-directory
+    /// parser; `None` if there's no disc or the filesystem can't be read.
+    pub fn first_read_file(&mut self) -> Option<(u32, u32)> {
+        self.disc.as_ref()?; // no disc → no 1st-read
+        self.read_new_dir(0xFF_FFFF); // parse the root directory into `curdir`
+        let e = self.curdir.get(self.firstfile as usize)?;
+        if e.firstfad == 0 || e.length == 0 {
+            return None;
+        }
+        Some((e.firstfad, e.length))
+    }
+
     /// Move the sector source out (leaving the drive disc-less). Used by
     /// `Saturn::load_state` to re-graft the live source onto a decoded state,
     /// which never carries the (skipped) media itself.
@@ -586,9 +596,8 @@ impl CdBlock {
 
     /// Write a standard CD status report into CR1..CR4 (cs2.c `doCDReport`).
     fn cd_report(&mut self) {
-        self.cr1 = self.cd_stat()
-            | (((self.options & 0xF) as u16) << 4)
-            | (self.repcnt & 0xF) as u16;
+        self.cr1 =
+            self.cd_stat() | (((self.options & 0xF) as u16) << 4) | (self.repcnt & 0xF) as u16;
         self.cr2 = ((self.ctrladdr as u16) << 8) | self.track as u16;
         self.cr3 = ((self.index as u16) << 8) | ((self.fad >> 16) & 0xFF) as u16;
         self.cr4 = self.fad as u16;
@@ -934,7 +943,10 @@ impl CdBlock {
                 file_unit_size: buf[pos + 26],
                 interleave_gap_size: buf[pos + 27],
                 flags: buf[pos + 25],
-                name: buf.get(pos + 33..pos + 33 + namelen).unwrap_or(&[]).to_vec(),
+                name: buf
+                    .get(pos + 33..pos + 33 + namelen)
+                    .unwrap_or(&[])
+                    .to_vec(),
             });
             pos += rec;
         }
@@ -1048,9 +1060,16 @@ impl CdBlock {
                 "CD {cmd:02X} in={i0:04X},{i1:04X},{i2:04X},{i3:04X} \
                  out={o0:04X},{o1:04X},{o2:04X},{o3:04X} hirq={h:04X} stat={s:02X}",
                 cmd = command,
-                i0 = cr_in[0], i1 = cr_in[1], i2 = cr_in[2], i3 = cr_in[3],
-                o0 = self.cr1, o1 = self.cr2, o2 = self.cr3, o3 = self.cr4,
-                h = self.hirq, s = self.status,
+                i0 = cr_in[0],
+                i1 = cr_in[1],
+                i2 = cr_in[2],
+                i3 = cr_in[3],
+                o0 = self.cr1,
+                o1 = self.cr2,
+                o2 = self.cr3,
+                o3 = self.cr4,
+                h = self.hirq,
+                s = self.status,
             );
         }
     }
@@ -1286,7 +1305,10 @@ impl CdBlock {
                 self.cr1 = self.cd_stat();
                 self.cr2 = 0;
                 self.cr3 = 0;
-                self.cr4 = self.partitions.get(buf).map_or(0, |p| p.blocks.len() as u16);
+                self.cr4 = self
+                    .partitions
+                    .get(buf)
+                    .map_or(0, |p| p.blocks.len() as u16);
                 self.hirq |= HIRQ_CMOK;
             }
             0x52 => {
@@ -1470,7 +1492,11 @@ impl CdBlock {
             0x71 => {
                 // Read directory: just (re)connect the filter for the read.
                 let f = (self.cr3 >> 8) as u8;
-                self.cd_device_filter = if (f as usize) < MAX_FILTERS { f } else { NO_FILTER };
+                self.cd_device_filter = if (f as usize) < MAX_FILTERS {
+                    f
+                } else {
+                    NO_FILTER
+                };
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
             }

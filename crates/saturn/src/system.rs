@@ -188,23 +188,35 @@ impl Saturn {
     /// VBlank-interrupt-driven boot flow is captured faithfully, unlike the
     /// single-step `debug_step_master` path.
     pub fn enable_master_pc_trace(&mut self) {
-        self.scheduler.entity_mut(self.master_id).sh2_mut().enable_pc_trace();
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .enable_pc_trace();
     }
 
     /// Debug-only: drain the recorded master-PC trace.
     pub fn take_master_pc_trace(&mut self) -> Vec<u32> {
-        self.scheduler.entity_mut(self.master_id).sh2_mut().take_pc_trace()
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .take_pc_trace()
     }
 
     /// Debug-only: arm a full-speed breakpoint capturing the master's regs +
     /// code at `pc` (to inspect a transient work-RAM routine; M11).
     pub fn set_master_bp(&mut self, pc: u32) {
-        self.scheduler.entity_mut(self.master_id).sh2_mut().set_bp(pc);
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_bp(pc);
     }
 
     /// Debug-only: take a breakpoint hit's (R0..R15, code words), if it fired.
     pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
-        self.scheduler.entity_mut(self.master_id).sh2_mut().take_bp_hit()
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .take_bp_hit()
     }
 
     /// Debug-only: step the master SH-2 exactly one instruction, then
@@ -610,6 +622,65 @@ impl Saturn {
     /// Whether a disc is currently inserted.
     pub fn has_disc(&self) -> bool {
         self.bus.cd_block.has_disc()
+    }
+
+    /// **HLE direct boot** (ADR-0010): load the disc's 1st-read program into
+    /// work RAM and jump the master SH-2 to it, bypassing the BIOS's CD boot
+    /// loader. Returns the load address on success, or `None` (a no-op) if
+    /// there's no disc / IP.BIN / filesystem to read, so the caller can fall
+    /// back to the running BIOS.
+    ///
+    /// This is the **hybrid** model: it assumes the BIOS has already
+    /// initialised the hardware and the `SYS_*` call table (call it once the
+    /// BIOS has recognised the disc and is about to drop to its CD player), so
+    /// only the final 1st-read load + handoff is high-level-emulated. The game
+    /// releases the slave SH-2 itself (via SMPC `SSHON`).
+    pub fn hle_boot(&mut self) -> Option<u32> {
+        use crate::bus::HIGH_WRAM_BASE;
+        use crate::disc::FAD_OFFSET;
+        const HWRAM_SIZE: u32 = 0x10_0000;
+
+        // 1st-read file (first root-directory entry): start FAD + byte length.
+        let (file_fad, file_len) = self.bus.cd_block.first_read_file()?;
+        let file_len = file_len.min(HWRAM_SIZE); // guard against a corrupt size
+
+        // IP.BIN header (FAD 150): 1st-read load address (+0xF0) and master
+        // stack (+0xE8; 0 → the conventional BIOS default 0x0600_2000).
+        let mut ip = [0u8; 2048];
+        if !self.bus.cd_block.disc()?.read_sector(FAD_OFFSET, &mut ip) {
+            return None;
+        }
+        let be = |o: usize| u32::from_be_bytes([ip[o], ip[o + 1], ip[o + 2], ip[o + 3]]);
+        let load_addr = be(0xF0);
+        if !(HIGH_WRAM_BASE..HIGH_WRAM_BASE + HWRAM_SIZE).contains(&load_addr) {
+            return None; // only high-work-RAM load addresses are supported
+        }
+        let stack = be(0xE8);
+        let sp = if stack != 0 { stack } else { 0x0600_2000 };
+
+        // Read the 1st-read file's sectors into an owned buffer (so the disc
+        // borrow is released before we write work RAM).
+        let nsec = (file_len as usize).div_ceil(2048);
+        let mut data = vec![0u8; nsec * 2048];
+        {
+            let disc = self.bus.cd_block.disc()?;
+            let mut sec = [0u8; 2048];
+            for i in 0..nsec {
+                if disc.read_sector(file_fad + i as u32, &mut sec) {
+                    data[i * 2048..(i + 1) * 2048].copy_from_slice(&sec);
+                }
+            }
+        }
+
+        // Copy into high work RAM at the load address.
+        let off = (load_addr - HIGH_WRAM_BASE) as usize;
+        let ram = self.bus.high_wram.as_mut_slice();
+        let end = (off + data.len()).min(ram.len());
+        ram[off..end].copy_from_slice(&data[..end - off]);
+
+        // Hand the master SH-2 control of the freshly loaded program.
+        self.master_mut().hle_jump(load_addr, sp);
+        Some(load_addr)
     }
 
     /// Plug a cartridge into the rear expansion slot (Extension RAM, backup
