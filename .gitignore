@@ -9,3 +9,9 @@ bios/*
 # CD-ROM disc images (CUE/BIN, CCD/IMG/SUB, ISO) live in roms/ and must
 # never be committed — they are copyrighted. Each developer supplies their own.
 roms/
+
+# MAME reference runtime artifacts (the ./mameref/ oracle writes these to the
+# repo root when run from here for boot-trace diffing). Never commit them.
+/cfg/
+/nvram/
+/error.log

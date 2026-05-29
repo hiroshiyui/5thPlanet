@@ -102,7 +102,34 @@ fn main() -> ExitCode {
     // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
     let save_base = std::path::PathBuf::from(&bios_path);
 
-    run(bios, disc_spec, cart, save_base)
+    let region = detect_region(&bios_path);
+    run(bios, disc_spec, cart, save_base, region)
+}
+
+/// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
+/// overrides; otherwise it's inferred from the BIOS filename (`(JAP)` → Japan,
+/// `(EUR)` → Europe-PAL, else North America). The region must be compatible
+/// with both the BIOS build and the disc's IP.BIN area string, or the BIOS
+/// rejects the disc with "Game disc unsuitable for this system" (until the
+/// M9 region/BIOS picker lands, this keeps a JP BIOS + JP disc booting).
+fn detect_region(bios_path: &str) -> u8 {
+    use saturn::smpc::region;
+    if let Ok(r) = std::env::var("SAT_REGION") {
+        return match r.trim().to_ascii_uppercase().as_str() {
+            "J" | "JP" | "JAPAN" => region::JAPAN,
+            "T" | "ASIA" => region::ASIA_NTSC,
+            "E" | "EU" | "EUR" | "EUROPE" | "PAL" => region::EUROPE_PAL,
+            _ => region::NORTH_AMERICA,
+        };
+    }
+    let up = bios_path.to_ascii_uppercase();
+    if up.contains("JAP") || up.contains("(JP") {
+        region::JAPAN
+    } else if up.contains("EUR") || up.contains("(EU") {
+        region::EUROPE_PAL
+    } else {
+        region::NORTH_AMERICA
+    }
 }
 
 /// Parse a `--cart=` spec into a [`Cartridge`]. Accepts `ram1m`/`ram4m`
@@ -176,6 +203,7 @@ fn run(
     disc_spec: Option<String>,
     cart: Cartridge,
     save_base: std::path::PathBuf,
+    region: u8,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -191,6 +219,7 @@ fn run(
 
     let mut saturn = Saturn::new(bios);
     saturn.reset();
+    saturn.set_region(region);
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
@@ -456,14 +485,21 @@ fn run(
     disc_spec: Option<String>,
     cart: Cartridge,
     save_base: std::path::PathBuf,
+    region: u8,
 ) -> ExitCode {
     use saturn::Saturn;
-    use saturn::vdp2::FRAMEBUFFER_BYTES;
+    use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
 
-    const HEADLESS_FRAMES: u32 = 180; // ~3 seconds of virtual time at 60 Hz
+    // ~3 s of virtual time at 60 Hz by default; `SAT_FRAMES` overrides it for
+    // longer headless runs (e.g. to reach the BIOS disc check / game boot).
+    let headless_frames: u32 = std::env::var("SAT_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(180);
 
     let mut saturn = Saturn::new(bios);
     saturn.reset();
+    saturn.set_region(region);
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
@@ -482,7 +518,7 @@ fn run(
     }
 
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..HEADLESS_FRAMES {
+    for _ in 0..headless_frames {
         saturn.run_frame(&mut framebuffer);
     }
 
@@ -490,10 +526,24 @@ fn run(
         eprintln!("failed to persist backup RAM to {}: {e}", battery_path.display());
     }
 
+    // Optional framebuffer snapshot for headless boot debugging: `SAT_DUMP=path`
+    // writes the final frame as a binary PPM (P6) — lets a boot run be inspected
+    // (CD-player vs splash vs game) without opening a window.
+    if let Ok(path) = std::env::var("SAT_DUMP") {
+        let mut ppm = format!("P6\n{FRAME_WIDTH} {FRAME_HEIGHT}\n255\n").into_bytes();
+        for px in framebuffer.chunks_exact(4) {
+            ppm.extend_from_slice(&px[..3]); // RGBA → RGB
+        }
+        match fs::write(&path, &ppm) {
+            Ok(()) => eprintln!("wrote framebuffer to {path}"),
+            Err(e) => eprintln!("failed to write framebuffer to {path}: {e}"),
+        }
+    }
+
     let master_pc = saturn.master().regs.pc;
     let cycles = saturn.master().pipeline.cycles;
     println!(
-        "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={HEADLESS_FRAMES}"
+        "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={headless_frames}"
     );
     ExitCode::SUCCESS
 }
