@@ -132,7 +132,9 @@ in depth and the conventions a contributor needs to follow. The
 Saturn-specific vocabulary used throughout the codebase and commits
 is collected in [`doc/glossary.md`](doc/glossary.md), and significant
 design decisions and their rationale are recorded as Architecture
-Decision Records in [`doc/adr/`](doc/adr/).
+Decision Records in [`doc/adr/`](doc/adr/). For how the Saturn hardware
+maps onto this project's crates and modules, see
+[`doc/system-architecture.md`](doc/system-architecture.md).
 
 ## Acknowledgements
 
