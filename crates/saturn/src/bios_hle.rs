@@ -39,19 +39,19 @@ pub fn is_sys_addr(pc: u32) -> bool {
 
 /// Run the HLE SYS function the master has reached, then return to the caller.
 /// `cpu.regs.pc` is the entry address (already checked by [`is_sys_addr`]).
-pub fn dispatch(cpu: &mut Cpu, bus: &mut SaturnBus) {
+pub fn dispatch(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
     let idx = (cpu.regs.pc.wrapping_sub(0x200)) >> 2;
     let mut implemented = true;
     match idx {
-        0x40 => set_scu_interrupt(cpu, bus),         // 0x0300
-        0x41 => get_scu_interrupt(cpu, bus),         // 0x0304
-        0x44 => set_sh2_interrupt(cpu, bus),         // 0x0310
-        0x45 => get_sh2_interrupt(cpu, bus),         // 0x0314
-        0x48 => change_system_clock(cpu, bus),       // 0x0320
-        0x4C => get_semaphore(cpu, bus),             // 0x0330
-        0x4D => clear_semaphore(cpu, bus),           // 0x0334
-        0x50 => set_scu_interrupt_mask(cpu, bus),    // 0x0340
-        0x51 => change_scu_interrupt_mask(cpu, bus), // 0x0344
+        0x40 => set_scu_interrupt(cpu, bus),                  // 0x0300
+        0x41 => get_scu_interrupt(cpu, bus),                  // 0x0304
+        0x44 => set_sh2_interrupt(cpu, bus),                  // 0x0310
+        0x45 => get_sh2_interrupt(cpu, bus),                  // 0x0314
+        0x48 => change_system_clock(cpu, bus),                // 0x0320
+        0x4C => get_semaphore(cpu, bus),                      // 0x0330
+        0x4D => clear_semaphore(cpu, bus),                    // 0x0334
+        0x50 => set_scu_interrupt_mask(cpu, bus, is_slave),   // 0x0340
+        0x51 => change_scu_interrupt_mask(cpu, bus, is_slave), // 0x0344
         _ => {
             // Not yet implemented: return harmlessly (R0 = 0) rather than
             // letting the game fall into the BIOS fatal handler.
@@ -112,10 +112,15 @@ fn get_sh2_interrupt(cpu: &mut Cpu, bus: &mut SaturnBus) {
 /// `SetScuInterruptMask` (slot 0x340): set the SCU interrupt mask to `R4` (both
 /// the stored copy and the live IMS register), then A-bus-ack unless masked.
 /// Yabause `BiosSetScuInterruptMask`.
-fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus) {
+fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
     let m = cpu.regs.r[4];
-    bus.write32(SCU_MASK_VAR, m, AccessKind::Data);
-    bus.write32(SCU_BASE + 0x00A0, m, AccessKind::Data); // IMS
+    // The stored mask + the live IMS are master-only (Yabause `!isslave`); a
+    // slave call must not clobber them, or it overwrites the master's setup
+    // (e.g. re-masking VBlank the game just unmasked).
+    if !is_slave {
+        bus.write32(SCU_MASK_VAR, m, AccessKind::Data);
+        bus.write32(SCU_BASE + 0x00A0, m, AccessKind::Data); // IMS
+    }
     if m & 0x8000 == 0 {
         bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
     }
@@ -124,12 +129,15 @@ fn set_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus) {
 /// `ChangeScuInterruptMask` (slot 0x344): `mask = (stored & R4) | R5`, applied to
 /// the stored copy + IMS, and `R4` written to IST; A-bus-ack unless masked.
 /// Yabause `BiosChangeScuInterruptMask`.
-fn change_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus) {
+fn change_scu_interrupt_mask(cpu: &mut Cpu, bus: &mut SaturnBus, is_slave: bool) {
     let (r4, r5) = (cpu.regs.r[4], cpu.regs.r[5]);
-    let newmask = (bus.read32(SCU_MASK_VAR, AccessKind::Data).0 & r4) | r5;
-    bus.write32(SCU_MASK_VAR, newmask, AccessKind::Data);
-    bus.write32(SCU_BASE + 0x00A0, newmask, AccessKind::Data); // IMS
-    bus.write32(SCU_BASE + 0x00A4, r4 as i16 as u32, AccessKind::Data); // IST
+    // Stored mask + IMS + IST are master-only (Yabause `!isslave`).
+    if !is_slave {
+        let newmask = (bus.read32(SCU_MASK_VAR, AccessKind::Data).0 & r4) | r5;
+        bus.write32(SCU_MASK_VAR, newmask, AccessKind::Data);
+        bus.write32(SCU_BASE + 0x00A0, newmask, AccessKind::Data); // IMS
+        bus.write32(SCU_BASE + 0x00A4, r4 as i16 as u32, AccessKind::Data); // IST
+    }
     if r4 & 0x8000 == 0 {
         bus.write32(SCU_BASE + 0x00A8, 1, AccessKind::Data); // A-bus interrupt ack
     }
@@ -252,7 +260,7 @@ mod tests {
         cpu.regs.r[4] = r4;
         cpu.regs.r[5] = r5;
         assert!(is_sys_addr(addr), "{addr:#06X} is a SYS entry");
-        dispatch(&mut cpu, &mut bus);
+        dispatch(&mut cpu, &mut bus, false);
         (cpu, bus)
     }
 
@@ -281,7 +289,7 @@ mod tests {
         cpu.regs.pc = 0x0304; // GetScuInterrupt
         cpu.regs.pr = 0x0600_1000;
         cpu.regs.r[4] = 0x47;
-        dispatch(&mut cpu, &mut bus);
+        dispatch(&mut cpu, &mut bus, false);
         assert_eq!(cpu.regs.r[0], 0x0609_ABCD);
     }
 
@@ -294,7 +302,7 @@ mod tests {
         cpu.regs.pr = 0x0600_1000;
         cpu.regs.r[4] = 0xFFFF_FFFE; // AND: clear VBlankIN mask bit
         cpu.regs.r[5] = 0x0000_0004; // OR: set bit 2
-        dispatch(&mut cpu, &mut bus);
+        dispatch(&mut cpu, &mut bus, false);
         // (0xFFFFFFFF & 0xFFFFFFFE) | 0x4 = 0xFFFFFFFE
         assert_eq!(bus.read32(SCU_MASK_VAR, AccessKind::Data).0, 0xFFFF_FFFE);
     }
@@ -308,7 +316,7 @@ mod tests {
         cpu.regs.pr = 0x0600_1000;
         cpu.regs.r[4] = 0x4A;
         cpu.regs.r[5] = 0x0604_2222;
-        dispatch(&mut cpu, &mut bus);
+        dispatch(&mut cpu, &mut bus, false);
         assert_eq!(bus.read32(0x0600_0000 + 0x4A * 4, AccessKind::Data).0, 0x0604_2222);
     }
 }

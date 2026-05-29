@@ -104,6 +104,7 @@ impl Saturn {
         // (its deadline equal to a CPU's) the CPU steps first.
         let master_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
         let slave_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
+        scheduler.entity_mut(slave_id).sh2_mut().set_is_slave(true);
         let cd_id = scheduler.add(SaturnEntity::CdBlock(CdBlockEntity::new(CD_TICK_CYCLES)));
         Self {
             bus,
@@ -164,15 +165,27 @@ impl Saturn {
     /// batch — time-travelling through stale code and corrupting memory.
     /// (This is what zeroed VF2's freshly-loaded program after its SSHON.)
     pub fn release_slave(&mut self) {
-        #[cfg(not(test))]
-        if std::env::var_os("SAT_SLAVE_TRACE").is_some() {
-            eprintln!(
-                "release_slave: master PC={:08X} now={}",
-                self.master().regs.pc,
-                self.scheduler.now()
-            );
-        }
         let now = self.scheduler.now();
+        // In cold HLE the slave must be *started* the way the BIOS would on
+        // SSH-ON (Yabause `YabauseStartSlave`): jump to the game-provided entry
+        // at `[0x06000250]`, with `VBR = 0x06000400` (the BIOS slave vector
+        // table) and the slave stack from `[0x060002AC]` (or the BIOS default
+        // `0x06001000`). Resuming the slave's stale PC instead made it re-run
+        // BIOS init and clobber the loaded game.
+        if self.scheduler.entity(self.slave_id).sh2().hle_sys() {
+            use sh2::bus::{AccessKind, Bus};
+            let entry = self.bus.read32(0x0600_0250, AccessKind::Data).0;
+            let alt_sp = self.bus.read32(0x0600_02AC, AccessKind::Data).0;
+            let sp = if alt_sp != 0 { alt_sp } else { 0x0600_1000 };
+            let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
+            slave.cpu.hle_jump(entry, sp);
+            slave.cpu.regs.vbr = 0x0600_0400;
+            if slave.cpu.pipeline.cycles < now {
+                slave.cpu.pipeline.cycles = now;
+            }
+            slave.set_halted(false);
+            return;
+        }
         let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
         if slave.cpu.pipeline.cycles < now {
             slave.cpu.pipeline.cycles = now;
@@ -759,8 +772,16 @@ impl Saturn {
     pub fn cold_hle_boot(&mut self) -> Option<u32> {
         let addr = self.hle_boot()?;
         crate::bios_hle::install_call_table(&mut self.bus);
+        // Enable the SYS-call hook on BOTH cores: the SYS table lives in shared
+        // work RAM, so the slave's BIOS init also `JSR`s our installed entry
+        // addresses. Without the hook on the slave it would run real BIOS ROM at
+        // those addresses (garbage) and fall into the fatal handler.
         self.scheduler
             .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_hle_sys(true);
+        self.scheduler
+            .entity_mut(self.slave_id)
             .sh2_mut()
             .set_hle_sys(true);
         Some(addr)

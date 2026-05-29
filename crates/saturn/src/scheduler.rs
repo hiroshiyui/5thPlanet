@@ -182,6 +182,11 @@ pub struct Sh2Entity {
     /// is out of scope, so a restored state resumes with LLE dispatch.
     #[serde(skip)]
     hle_sys_active: bool,
+    /// Whether this entity is the slave SH-2. Some HLE SYS functions are
+    /// master-only (e.g. writing the SCU interrupt mask), so the dispatcher
+    /// needs to know which core called it. `#[serde(skip)]`; re-set on load.
+    #[serde(skip)]
+    is_slave: bool,
 }
 
 impl Sh2Entity {
@@ -194,6 +199,7 @@ impl Sh2Entity {
             bp: None,
             bp_hit: None,
             hle_sys_active: false,
+            is_slave: false,
         }
     }
 
@@ -207,12 +213,23 @@ impl Sh2Entity {
             bp: None,
             bp_hit: None,
             hle_sys_active: false,
+            is_slave: false,
         }
     }
 
     /// Enable HLE BIOS SYS-call dispatch on this core (the cold HLE direct boot).
     pub fn set_hle_sys(&mut self, on: bool) {
         self.hle_sys_active = on;
+    }
+
+    /// Mark this entity as the slave SH-2 (for master-only HLE SYS functions).
+    pub fn set_is_slave(&mut self, is_slave: bool) {
+        self.is_slave = is_slave;
+    }
+
+    /// Whether HLE BIOS SYS-call dispatch is active on this core (cold HLE boot).
+    pub fn hle_sys(&self) -> bool {
+        self.hle_sys_active
     }
 
     /// Begin recording a full-speed PC trace (debug; see [`pc_trace`]).
@@ -277,7 +294,7 @@ impl SchedEntity for Sh2Entity {
                 && crate::bios_hle::is_sys_addr(self.cpu.regs.pc)
             {
                 ctx.cycle = self.cpu.pipeline.cycles;
-                crate::bios_hle::dispatch(&mut self.cpu, ctx);
+                crate::bios_hle::dispatch(&mut self.cpu, ctx, self.is_slave);
                 return;
             }
             // Publish the current global cycle to the bus so time-varying
