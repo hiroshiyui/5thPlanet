@@ -230,26 +230,34 @@ Rough completeness of each component **toward full Saturn fidelity within the
 project's scope** — a judgement call, not a measured metric (the
 authoritative, factual per-task status is [`roadmap.md`](roadmap.md)). "Done"
 here means accurate enough that no game/test has yet needed more; the listed
-gaps are the known remaining work.
+gaps are the known remaining work. The `Count` column gives the concrete
+implemented-vs-total figures the percentage is based on, where countable.
 
-| Component | Code | Progress | Done / remaining |
-|---|---|---|---|
-| SH-2 core (master + slave) | `crates/sh2/` | ~95% | M1: full ISA, 5-stage pipeline interlocks, write-through cache, exceptions, INTC/DMAC/DIVU/FRT/BSC. `WDT`/`SCI`/`UBC` are register stubs; deep cycle-timing edge cases refine as games surface them. |
-| MC68EC000 (SCSP CPU) | `crates/m68k/` | ~85% | M5: core runs hosted SCSP sound code. Rare opcodes / edge-case flag behaviour may remain. |
-| SCU-DSP | `crates/scu_dsp/` | ~90% | M3: standalone core, full ISA + DMA. |
-| SCSP (FM/PCM engine + SCSP-DSP) | `crates/saturn/src/scsp/` | ~80% | M6: 32-slot engine, DSP, hosted 68k, CDDA mix-in. SCSP CD-input level/pan fidelity and some envelope/effect corners are refinements. |
-| VDP1 (sprite/polygon) | `crates/saturn/src/vdp1/` | ~85% | M5: full command-list plotter (textured/scaled/distorted sprites, polygons, lines, gouraud, colour-calc). Some rare modes/edge cases. |
-| VDP2 (background/compositor) | `crates/saturn/src/vdp2/` | ~85% | M5: NBG0–3 + RBG0/1 rotation, priority, colour calc, windows, per-line scroll/zoom. Mosaic and some special modes refine as needed. |
-| SCU (DMA / INTC / timers) | `crates/saturn/src/scu.rs` | ~85% | M3: 3 DMA channels, interrupt aggregation, timers. Synchronous block DMA — cycle-stealing timing is a later refinement. |
-| SMPC | `crates/saturn/src/smpc.rs` | ~85% | M3–M4: register bank, `INTBACK` + digital pad, RTC, slave/sound on-off, region. Clock-change / `SYSRES` are no-ops. |
-| Bus + scheduler + memory | `bus.rs` `scheduler.rs` `memory.rs` | ~95% | M2: region dispatch, deterministic deadline scheduler, typed RAM/ROM/backup regions. |
-| CD-block (HLE) | `crates/saturn/src/cd_block.rs` | ~85% | M7+M10: host interface, block/filter/partition engine, read pump, data transfer, ISO9660 FS, auth, CDDA. **MPEG card + move/copy sector ops deferred.** |
-| Live optical drive | `crates/physdisc/` | ~80% | M10: libcdio `SectorSource` (TOC + raw sectors + CD-DA), feature-gated. Linux-verified; other OSes untested. |
-| Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | M7: Extension DRAM, battery RAM, ROM cart, cart-ID. |
-| Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
-| Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. |
-| LLE BIOS boot | (uses real BIOS) | ~70% | M4: boots to the SEGA splash, pixel-matching the reference. Booting a *game* via the real BIOS loader is not reached (the reason for the HLE path). |
-| HLE direct boot + SYS library | `bios_hle.rs` + `cold_hle_boot` | ~40% | M11/M12 active: opt-in (`--hle-boot`); VF2 loads + runs its own code on both SH-2s (slave dispatch, interrupts, work queue) but does **not yet render** — a frame-sync handshake remains. SYS coverage is per-game/iterative. |
+**By the numbers:** SH-2 **143/143** instruction encodings · SCU-DSP **7**
+instruction families + **13** ALU ops · MC68EC000 full 68000 set
+(inline-decoded) · CD-block **33 of ~50** host commands · SMPC **16** commands ·
+VDP1 **9** command types (full set) · VDP2 **101** named registers, 6 layers ·
+HLE BIOS **9 of 26** SYS slots · **533** tests workspace-wide (sh2 153, m68k 68,
+scu_dsp 21, saturn 279, frontend 12).
+
+| Component | Code | Progress | Count | Done / remaining |
+|---|---|---|---|---|
+| SH-2 core (master + slave) | `crates/sh2/` | ~95% | 143/143 encodings; 5/8 on-chip live | M1: full ISA decoded + executed (exhaustive `match`), 5-stage pipeline interlocks, write-through cache, exceptions. On-chip INTC/DMAC/DIVU/FRT/WDT functional; **BSC/SCI/UBC are register stubs**. Deep cycle-timing edges refine as games surface them. (153 tests) |
+| MC68EC000 (SCSP CPU) | `crates/m68k/` | ~85% | full 68000 set | M5: 68000 decoded inline (no flat table — addressing modes make one awkward); runs hosted SCSP sound code. Rare ops / edge-case flags may remain. (68 tests) |
+| SCU-DSP | `crates/scu_dsp/` | ~90% | 7 families + 13 ALU ops | M3: standalone core, full ISA + DSP-DMA. (21 tests) |
+| SCSP (FM/PCM engine + SCSP-DSP) | `crates/saturn/src/scsp/` | ~80% | 32 slots | M6: 32-slot FM/PCM engine, SCSP-DSP, hosted 68k, CDDA mix-in. SCSP CD-input level/pan fidelity and some envelope/effect corners are refinements. |
+| VDP1 (sprite/polygon) | `crates/saturn/src/vdp1/` | ~85% | 9/9 command types | M5: full command-list plotter — normal/scaled/distorted sprites, polygon, polyline, line, user-clip, system-clip, local-coordinate; gouraud + colour-calc. Some rare colour modes/edges. |
+| VDP2 (background/compositor) | `crates/saturn/src/vdp2/` | ~85% | 6 layers; 101 registers | M5: NBG0–3 + RBG0/1, rotation, priority, colour calc, windows, per-line scroll/zoom. Mosaic / some special modes refine as needed. |
+| SCU (DMA / INTC / timers) | `crates/saturn/src/scu.rs` | ~85% | 3 DMA channels | M3: 3 DMA channels, interrupt aggregation, timers. Synchronous block DMA — cycle-stealing timing is a later refinement. |
+| SMPC | `crates/saturn/src/smpc.rs` | ~85% | 16 commands | M3–M4: register bank, `INTBACK` + digital pad, RTC, slave/sound on-off, region. Clock-change / `SYSRES` are no-ops. |
+| Bus + scheduler + memory | `bus.rs` `scheduler.rs` `memory.rs` | ~95% | — | M2: region dispatch, deterministic deadline scheduler, typed RAM/ROM/backup regions. |
+| CD-block (HLE) | `crates/saturn/src/cd_block.rs` | ~85% | 33 of ~50 commands | M7+M10: host interface, block/filter/partition engine, read pump, data transfer, ISO9660 FS, auth, CDDA. **MPEG card + move/copy sector ops deferred.** |
+| Live optical drive | `crates/physdisc/` | ~80% | 1 backend (libcdio) | M10: libcdio `SectorSource` (TOC + raw sectors + CD-DA), feature-gated. Linux-verified; other OSes untested. |
+| Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
+| Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
+| Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
+| LLE BIOS boot | (uses real BIOS) | ~70% | splash | M4: boots to the SEGA splash, pixel-matching the reference. Booting a *game* via the real BIOS loader is not reached (the reason for the HLE path). |
+| HLE direct boot + SYS library | `bios_hle.rs` + `cold_hle_boot` | ~40% | 9 of 26 SYS slots | M11/M12 active, opt-in (`--hle-boot`): VF2 loads + runs its own code on both SH-2s (slave dispatch, interrupts, work queue) but does **not yet render** — a frame-sync handshake remains. SYS coverage is per-game/iterative. |
 
 ---
 
