@@ -464,6 +464,7 @@ impl Saturn {
             self.drain_vdp1();
             self.drain_scsp();
             self.drain_scu_intc();
+            self.drain_input_capture();
         }
     }
 
@@ -503,6 +504,7 @@ impl Saturn {
             self.drain_vdp1();
             self.drain_scsp();
             self.drain_scu_intc();
+            self.drain_input_capture();
         }
     }
 
@@ -1007,6 +1009,34 @@ impl Saturn {
                 .onchip
                 .intc
                 .raise_external(level, source.vector());
+        }
+    }
+
+    /// Apply pending inter-CPU FRT input-capture (FTI) triggers (`SaturnBus`
+    /// flags set by a 16-bit write to the slave/master FTI region): pulse the
+    /// target core's FRT input capture, setting `FTCSR.ICF`. This is how a
+    /// Saturn CPU wakes the other — e.g. VF2's master writes the slave FTI
+    /// region to release its slave's `ICF`-polling dispatch loop. The target
+    /// usually polls `ICF` with interrupts masked, so the input-capture
+    /// interrupt itself need not be delivered.
+    fn drain_input_capture(&mut self) {
+        if std::mem::take(&mut self.bus.slave_input_capture) {
+            self.scheduler
+                .entity_mut(self.slave_id)
+                .sh2_mut()
+                .cpu
+                .onchip
+                .frt
+                .input_capture();
+        }
+        if std::mem::take(&mut self.bus.master_input_capture) {
+            self.scheduler
+                .entity_mut(self.master_id)
+                .sh2_mut()
+                .cpu
+                .onchip
+                .frt
+                .input_capture();
         }
     }
 

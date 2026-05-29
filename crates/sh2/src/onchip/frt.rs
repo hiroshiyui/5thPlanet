@@ -70,6 +70,18 @@ impl Frt {
         }
     }
 
+    /// Trigger a free-running-timer input capture (FTI edge): latch FRC into
+    /// FICR and set the input-capture flag ICF (FTCSR bit 7). On the Saturn the
+    /// FTI of each SH-2 is driven by the *other* CPU writing a word to a fixed
+    /// region, so this is the inter-CPU "wake/dispatch" signal — see
+    /// `SaturnBus`/`Saturn::drain_input_capture`. Returns whether the input-
+    /// capture interrupt is enabled (TIER.ICIE, bit 7) so the caller can raise it.
+    pub fn input_capture(&mut self) -> bool {
+        self.ficr = self.frc;
+        self.ftcsr |= 0x80; // ICF
+        self.tier & 0x80 != 0
+    }
+
     pub fn read8(&self, offset: u32) -> u8 {
         match offset & 0x0F {
             0x00 => self.tier,
@@ -189,5 +201,20 @@ mod tests {
         f.ftcsr = 0x0E; // OCFA | OCFB | OVF set
         f.write8(0x01, 0x0F); // W1C all status, also set CCLRA
         assert_eq!(f.ftcsr, 0x01);
+    }
+
+    #[test]
+    fn input_capture_sets_icf_and_latches_frc() {
+        let mut f = Frt::new();
+        f.write16(0x04, 0xFFFF); // OCRA out of the way
+        f.tick(0x40); // advance FRC
+        assert_eq!(f.frc, 0x40);
+        let icie = f.input_capture();
+        assert_eq!(f.ftcsr & 0x80, 0x80, "ICF set");
+        assert_eq!(f.ficr, 0x40, "FRC latched into FICR");
+        assert!(!icie, "ICIE clear by default");
+        // ICIE (TIER bit 7) gates the interrupt return.
+        f.write8(0x00, 0x80); // TIER.ICIE
+        assert!(f.input_capture(), "ICIE set → interrupt requested");
     }
 }

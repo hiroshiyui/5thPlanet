@@ -167,3 +167,30 @@ fn releasing_slave_resyncs_its_cycle_no_time_travel() {
         now - slave_frozen,
     );
 }
+
+/// On the Saturn, a 16-bit write to a fixed region pulses the *other* SH-2's
+/// free-running-timer input-capture pin (FTI): 0x0100_0000..0x017F_FFFF wakes
+/// the slave, 0x0180_0000..0x01FF_FFFF the master. This is the inter-CPU
+/// "wake/dispatch" signal — VF2's master uses it to release its slave's
+/// ICF-polling dispatch loop. Verifies the bus flag + aggregate drain set the
+/// target FRT's ICF (FTCSR bit 7) and leave the other core untouched.
+#[test]
+fn word_write_to_fti_region_pulses_target_frt_input_capture() {
+    use sh2::bus::{AccessKind, Bus};
+
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    sat.reset();
+
+    sat.bus.write16(0x0100_0000, 0x1234, AccessKind::Data); // slave FTI
+    sat.run_for(512); // a batch boundary drains the pending input capture
+    assert_eq!(sat.slave().onchip.frt.ftcsr & 0x80, 0x80, "slave ICF set");
+    assert_eq!(
+        sat.master().onchip.frt.ftcsr & 0x80,
+        0,
+        "master ICF untouched by a slave-FTI write"
+    );
+
+    sat.bus.write16(0x0180_0000, 0x1234, AccessKind::Data); // master FTI
+    sat.run_for(512);
+    assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "master ICF set");
+}

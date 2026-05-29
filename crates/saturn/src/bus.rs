@@ -58,6 +58,13 @@ pub const SCSP_REGS_BASE: u32 = 0x05B0_0000;
 pub const SCSP_REGS_END: u32 = 0x05BF_FFFF;
 pub const ABUS_BBUS_BASE: u32 = 0x0500_0000;
 pub const ABUS_BBUS_END: u32 = 0x05FF_FFFF;
+/// Inter-CPU FRT input-capture (FTI) trigger regions: a 16-bit write to the
+/// first pulses the slave SH-2's FTI, the second the master's (Yabause
+/// `SSH2/MSH2InputCaptureWriteWord`; Saturn hardware wires the cores' FTI here).
+pub const SLAVE_FTI_BASE: u32 = 0x0100_0000;
+pub const SLAVE_FTI_END: u32 = 0x017F_FFFF;
+pub const MASTER_FTI_BASE: u32 = 0x0180_0000;
+pub const MASTER_FTI_END: u32 = 0x01FF_FFFF;
 pub const HIGH_WRAM_BASE: u32 = 0x0600_0000;
 pub const HIGH_WRAM_END: u32 = 0x06FF_FFFF;
 
@@ -101,6 +108,15 @@ pub struct SaturnBus {
     /// `#[serde(skip)]` so it never affects save-state determinism.
     #[serde(skip)]
     pub step_pc: u32,
+    /// Pending FRT input-capture (FTI) triggers from inter-CPU signalling: a
+    /// 16-bit write to `0x0100_0000..0x017F_FFFF` pulses the *slave*'s FTI,
+    /// `0x0180_0000..0x01FF_FFFF` the *master*'s. The bus can't reach the cores,
+    /// so it flags here and `Saturn::drain_input_capture` applies it (the
+    /// SMPC/SCU drain-at-aggregate pattern). `#[serde(skip)]` — transient signal.
+    #[serde(skip)]
+    pub slave_input_capture: bool,
+    #[serde(skip)]
+    pub master_input_capture: bool,
 }
 
 impl SaturnBus {
@@ -123,6 +139,8 @@ impl SaturnBus {
             high_wram: Ram::new(1024 * 1024),
             cycle: 0,
             step_pc: 0,
+            slave_input_capture: false,
+            master_input_capture: false,
         }
     }
 
@@ -311,6 +329,11 @@ impl Bus for SaturnBus {
             SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.ctrl.write16(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write16(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write16(addr - HIGH_WRAM_BASE, val),
+            // Inter-CPU FRT input-capture (FTI) trigger: a 16-bit write to this
+            // region pulses the *other* SH-2's free-running-timer input capture
+            // (the Saturn slave/master "wake" signal). Drained at the aggregate.
+            SLAVE_FTI_BASE..=SLAVE_FTI_END => self.slave_input_capture = true,
+            MASTER_FTI_BASE..=MASTER_FTI_END => self.master_input_capture = true,
             _ => {}
         }
         waits_for(addr)
