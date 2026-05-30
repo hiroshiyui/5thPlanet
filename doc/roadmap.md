@@ -575,7 +575,7 @@ see "Removed: the HLE-boot detour" below.
 |---|-------|-------|
 | 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
 | 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture; `SAT_SHELL_BASE` tunes the give-up detection) / `SAT_BIOSTRACE` / `SAT_WWATCH` / `SAT_IRQ_DUMP` / `SAT_INTC_TRACE` / `SAT_MEMDUMP` / `SAT_DUMP`. |
-| 3 | **LLE trace-diff vs Mednafen** 🚧 | Mednafen (LLE, instrumented `SS_PCTRACE`/`SS_WWATCH`) boots VF2; ours doesn't. Diffing localized the failure precisely: both run the **same BIOS CD-boot loader** copied to high work RAM (`0x0601`–`0x0603`); auth, region, IP.BIN read all pass; then **our loader rejects the disc and drops to the CD player (`0x06040xxx`) instead of loading the 1st-read**, while Mednafen jumps to the game (`0x06010000`). Narrowed to a single **data-driven branch near `0x0602E2CC`** on the **post-Play CD state** (HIRQ bits / periodic-report partition sector-count) our HLE presents differently than MAME/Mednafen after a Play completes. Next: the collapsed-PC-diff to that branch, then fix the post-Play state. |
+| 3 | **LLE trace-diff vs Mednafen** 🚧 | Mednafen (LLE, instrumented `SS_PCTRACE`/`SS_WWATCH`/`SS_CDTRACE`) boots VF2; ours doesn't. Both run the **same BIOS CD-boot loader** in high work RAM; auth, region, and the IP.BIN read all pass (transfer verified correct — 16 sectors, End-Xfer word-count `0x4000`); then **our loader rejects the disc and re-recognizes** (`GetToc`/`Init` → drops to the CD player `0x06040xxx`) where Mednafen reads the 1st-read file (`SetFilterRange`/`ReadFile` → `0x06010000` game). A **state-diff** pinned the give-up to a single error store: boot-status `[0x06020002]` ← error code 1 written at `0x060200A6`, tested by the branch at `0x06028106`. **Methodology note:** the instruction-stream PC-diff proved *unreliable* here — loop-collapse iteration-misalignment, a non-uniform fetch-PC offset, and an `SS_PCTRACE_LO` trace-filter artifact each manufactured false divergences (e.g. `0x25DC`, `0x4216`); **STATE/value diffing is the working method.** A dual-sided CD register-read diff (`CD_RWATCH` ↔ `SS_CDTRACE`+`sp_cdrd`) found and fixed one real divergence — the CR1 `is_cdrom` bit (now matches Mednafen) — but it is **not** the decider: the post-IP.BIN status report is now byte-identical to Mednafen yet the loader still re-recognizes. Next: chase the divergence *upstream* of the read decision (Mednafen consults the periodic report before choosing `ReadFile`; ours does not) plus the remaining HIRQ (MPED/CSCT) and Play-BUSY-model differences. |
 
 ### Spun out of M11 — kept general accuracy fixes
 
@@ -593,6 +593,22 @@ their own (independent of any boot path):
 - **SCU clears IST on the SH-2 acknowledge cycle** — `take_pending_interrupt`
   clears the acknowledged source's IST bit (matching hardware/Mednafen, which W1C
   IST only a couple of times a run) instead of leaving it stale-set.
+- **Event-edge-clamped scheduler batching** (Mednafen-alignment Phase 1) —
+  `Saturn::run_for` now clamps each scheduler batch to the next *scheduled event
+  edge* (VBlank-IN, VBlank-OUT, or a pending INTBACK completion) via a shared
+  `batch_size`/`cycles_to_next_event`, instead of fixed ≤256-cycle batches. This
+  mirrors Mednafen's `next_event_ts` model so interrupt assertion and the raster
+  registers settle at the cycle-exact point the reference produces them — keeping
+  the LLE↔Mednafen master-PC diff aligned (verified: the streams now correspond
+  PC-for-PC from boot). HBlank and SCU-DMA are deliberately excluded as clamp
+  edges. Also reconciled the INTBACK SF-busy time to Mednafen's 4 MHz SMPC-clock
+  model (`intback_busy_us`; a status INTBACK ≈ 261 µs, was ~16 µs). The scheduler
+  determinism contract is untouched.
+- **CD status report `is_cdrom` bit** — the CD-block status report's CR1 low byte
+  is now `(is_cdrom << 7) | (repcnt & 0x7F)` (matching Mednafen `cdb.cpp`), where
+  bit 7 marks the current head position as a CD-ROM (data) track; it was a
+  mismodeled `(options << 4) | repcnt` that left bit 7 clear. (A genuine fidelity
+  fix; not the VF2 boot decider — see M11 Phase 3.)
 
 ### Removed: the HLE-boot detour (ADR-0010/0011 Superseded)
 

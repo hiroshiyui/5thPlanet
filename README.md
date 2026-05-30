@@ -26,7 +26,7 @@ foundation stays solid.
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 | M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 active    |
 
-Current test count: **527 workspace-wide, 0 failures.** Task-by-task
+Current test count: **528 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
