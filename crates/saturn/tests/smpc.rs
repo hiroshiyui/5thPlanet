@@ -222,7 +222,11 @@ fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     // Status SR with no peripheral requested = 0x40 (MAME `0x40 | stage<<5`).
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
     assert_eq!(sr, 0x40);
-    // SCU's SMPC source is the path BIOS handlers wait on.
+    // SCU's SMPC source is the path BIOS handlers wait on. The SCU resets with
+    // every source masked (IMS=0xBFFF), as the BIOS expects; unmask here to
+    // confirm INTBACK actually raised the SMPC source (the BIOS does the same
+    // unmask before relying on the interrupt).
+    sat.bus.scu.ims = 0;
     let pending = sat.bus.scu.take_pending_interrupt(0);
     assert_eq!(pending.map(|(s, _)| s), Some(saturn::ScuSource::Smpc));
 }

@@ -240,6 +240,11 @@ impl Scu {
         for c in &mut s.channels {
             c.mode = 0x07;
         }
+        // Reset interrupt mask = 0xBFFF: every maskable SCU source is masked
+        // at power-on; the BIOS unmasks the ones it wants (matches the
+        // reference, `scu.inc` SCU_Reset). Resetting to 0 (all unmasked) made
+        // us deliver interrupts the real BIOS isn't ready for during early init.
+        s.ims = 0xBFFF;
         s
     }
 
@@ -279,7 +284,7 @@ impl Scu {
             0x90 => self.t0c = val,
             0x94 => self.t1s = val,
             0x98 => self.t1md = val,
-            0xA0 => self.ims = val,
+            0xA0 => self.ims = val & 0xBFFF, // IMS is 16-bit; bit 14 is unused (scu.inc)
             // IST is write-1-to-clear: software acknowledges interrupts
             // by writing the bit it wants to clear.
             0xA4 => self.ist &= !val,
@@ -663,12 +668,12 @@ mod tests {
         s.write32(0x90, 0x0000_1234); // T0C
         s.write32(0x94, 0x0000_5678); // T1S
         s.write32(0x98, 0x0000_0001); // T1MD
-        s.write32(0xA0, 0x0000_FF00); // IMS
+        s.write32(0xA0, 0x0000_FF00); // IMS — masked to 0xBFFF (bit 14 unused)
         assert_eq!(s.read32(0x90), 0x0000_1234);
         assert_eq!(s.read32(0x94), 0x0000_5678);
         assert_eq!(s.read32(0x98), 0x0000_0001);
-        assert_eq!(s.read32(0xA0), 0x0000_FF00, "IMS at 0xA0");
-        assert_eq!(s.ims, 0x0000_FF00, "0xA0 write reaches the mask field");
+        assert_eq!(s.read32(0xA0), 0x0000_BF00, "IMS at 0xA0 (bit 14 masked off)");
+        assert_eq!(s.ims, 0x0000_BF00, "0xA0 write reaches the mask field, masked to 0xBFFF");
     }
 
     #[test]
@@ -736,6 +741,7 @@ mod tests {
     #[test]
     fn finish_dma_raises_the_channel_specific_end_source() {
         let mut s = Scu::new();
+        s.ims = 0; // reset masks all sources; unmask to test delivery
         s.channels[1].transfer_count = 0x10;
         s.finish_dma(1, 0, 0);
         // IST bit set, fresh assertion ready, take_pending returns it.
@@ -748,6 +754,7 @@ mod tests {
     #[test]
     fn take_pending_interrupt_resolves_by_priority() {
         let mut s = Scu::new();
+        s.ims = 0; // reset masks all sources; unmask to test delivery
         s.raise(Source::SpriteDrawEnd); // prio 2
         s.raise(Source::VBlankIn); // prio 15
         s.raise(Source::DmaIllegal); // prio 3
@@ -763,6 +770,7 @@ mod tests {
     #[test]
     fn take_pending_interrupt_honours_sh2_imask() {
         let mut s = Scu::new();
+        s.ims = 0; // reset masks all sources; unmask to test SH-2 imask gating
         s.raise(Source::Smpc); // priority 8
         assert!(
             s.take_pending_interrupt(8).is_none(),
@@ -787,6 +795,7 @@ mod tests {
     #[test]
     fn taking_an_interrupt_acknowledges_and_clears_its_ist_bit() {
         let mut s = Scu::new();
+        s.ims = 0; // reset masks all sources; unmask to test acknowledge
         s.raise(Source::DspEnd);
         let _ = s.take_pending_interrupt(0).unwrap();
         // The SCU clears IST on the SH-2 acknowledge cycle (vector fetch);
