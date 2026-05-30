@@ -159,44 +159,45 @@ fn gen_vf2_pc_trace() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40_000_000);
+    let frames: u64 = std::env::var("PCTRACE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
     let out = std::env::var("PCTRACE_OUT").unwrap_or_else(|_| "/tmp/our_vf2_pc.log".into());
     let f = std::fs::File::create(&out).expect("create trace");
     let mut w = std::io::BufWriter::new(f);
-    let mut frame_cyc: u64 = 0;
-    let mut vblank_raised = false;
-    // Loop-collapse to mirror MAME's `trace …,noloop`: suppress a PC already
-    // seen in the last 64 logged PCs (so idle/delay/poll spins log one pass,
-    // not their 10k+ iterations) — keeps the trace small and the resync_diff's
-    // WIN from being blown out by spin-count differences.
+    // Trace through the REAL run path — `run_for_traced` drives the full
+    // scheduler (master + slave + CD-block) through the aligned `batch_size`
+    // (event-edge-clamped batching) and the complete peripheral drain set
+    // (incl. VBlank-OUT) — so the trace reflects the Mednafen-aligned interrupt
+    // timing, not the old hand-rolled single-step cadence. Per-frame chunked so
+    // the PC buffer stays bounded over a long boot. Loop-collapse to mirror
+    // Mednafen's SS_LogMasterPC: suppress a PC already seen in the last 64
+    // logged (so idle/delay/poll spins log one pass, not their 10k+ iterations).
+    // Set PCTRACE_DELAYSLOTS=1 for parity with Mednafen (it logs every Step,
+    // delay slots included). NB: Mednafen logs the fetch-PC = our exec-PC + 4.
     let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
-    for _ in 0..n {
-        let pc = sat.master().regs.pc;
-        if !recent.contains(&pc) {
-            writeln!(w, "{pc:08X}").unwrap();
-            if recent.len() == 64 {
-                recent.pop_front();
+    let mut logged: u64 = 0;
+    let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
+    'outer: for _ in 0..frames {
+        pcs.clear();
+        sat.run_for_traced(479_151, &mut pcs);
+        for &pc in &pcs {
+            if !recent.contains(&pc) {
+                writeln!(w, "{pc:08X}").unwrap();
+                if recent.len() == 64 {
+                    recent.pop_front();
+                }
+                recent.push_back(pc);
+                logged += 1;
+                if logged >= n {
+                    break 'outer;
+                }
             }
-            recent.push_back(pc);
-        }
-        let c = sat.debug_step_master_nodrain() as u64;
-        sat.debug_drain();
-        // Mirror run_frame's VBlank cadence at instruction granularity.
-        frame_cyc += c;
-        if !vblank_raised && frame_cyc >= 453_085 {
-            let t = sat.bus.vdp2.regs.read16(0x004);
-            sat.bus.vdp2.regs.write16(0x004, t | 0x0008);
-            sat.bus.scu.raise(saturn::ScuSource::VBlankIn);
-            vblank_raised = true;
-        }
-        if frame_cyc >= 476_932 {
-            let t = sat.bus.vdp2.regs.read16(0x004);
-            sat.bus.vdp2.regs.write16(0x004, t & !0x0008);
-            frame_cyc -= 476_932;
-            vblank_raised = false;
         }
     }
     w.flush().unwrap();
-    println!("wrote {n} VF2-boot master PCs to {out}");
+    println!("wrote {logged} VF2-boot master PCs (run_for_traced path) to {out}");
 }
 
 #[test]
