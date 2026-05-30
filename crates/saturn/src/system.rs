@@ -152,25 +152,32 @@ impl Saturn {
     }
 
     /// Release the slave SH-2 from halt. Triggered by SMPC `SSHON`.
-    /// The slave resumes from whatever PC/SP it was last left at — on
-    /// real hardware this is the BIOS reset vector, which is also what
-    /// our [`reset`] sets up.
+    /// Release the slave SH-2 (SMPC `SSHON`). On real hardware `SetActive(true)`
+    /// **power-on-resets** the slave — VBR=0, SR.imask=0xF, PC/SP re-fetched
+    /// from the reset vector — it does *not* resume whatever PC/SP it held when
+    /// last halted (matches Mednafen `sh7095.inc` `SetActive`→`Reset`). For the
+    /// first release this is equivalent to our power-on [`reset`] (the slave was
+    /// reset then held), but for an `SSHOFF`→`SSHON` re-release it correctly
+    /// re-vectors to the BIOS rather than resuming stale mid-execution state.
     ///
-    /// Resyncs the slave's cycle counter to the current global cycle first:
-    /// while halted its `next_deadline` is `u64::MAX` so the scheduler skips
-    /// it and its `pipeline.cycles` freezes at the cycle it was halted at. If
-    /// it were released without resyncing, the scheduler would see it as far
-    /// "behind" the master and run it millions of catch-up cycles in one
-    /// batch — time-travelling through stale code and corrupting memory.
-    /// (This is what zeroed VF2's freshly-loaded program after its SSHON.)
+    /// Then resync the slave's cycle to the current global cycle: while halted
+    /// its `next_deadline` is `u64::MAX`, so the scheduler skips it and its
+    /// `pipeline.cycles` freezes; releasing without the bump would make the
+    /// scheduler see it as millions of cycles "behind" and run that many
+    /// catch-up steps in one batch ("time travel"). Regression:
+    /// `dual_sh2::releasing_slave_resyncs_its_cycle_no_time_travel`.
     pub fn release_slave(&mut self) {
-        let now = self.scheduler.now();
-        // Un-halting must resync the slave's frozen cycle up to the global
-        // clock first: while halted its `pipeline.cycles` froze (the scheduler
-        // skips a halted entity), so releasing it without the bump would make
-        // the scheduler see it as millions of cycles "behind" and run that many
-        // catch-up steps of stale code in one batch ("time travel").
-        let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
+        // Destructure for disjoint borrows (cpu.reset needs &mut bus; the
+        // entity comes from the scheduler) — same pattern as `reset`.
+        let Self {
+            bus,
+            scheduler,
+            slave_id,
+            ..
+        } = self;
+        let now = scheduler.now();
+        let slave = scheduler.entity_mut(*slave_id).sh2_mut();
+        slave.cpu.reset(bus);
         if slave.cpu.pipeline.cycles < now {
             slave.cpu.pipeline.cycles = now;
         }
