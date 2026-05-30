@@ -30,20 +30,26 @@ fn us_to_cycles(us: u64) -> u64 {
 
 /// INTBACK SF-busy time in microseconds, computed from the request.
 ///
-/// REVIEW(magic): these timings are reference-derived (MAME `smpc.cpp`), NOT
-/// from the SMPC datasheet — base 8 µs, +8 if status requested (`IREG0 != 0`),
-/// +700 if peripheral requested (`IREG1 & 8`). MAME's own source marks the
-/// 700 µs "TODO: is timing correct?", so it's a guess. The BIOS only needs SF
-/// to stay busy long enough that its poll loop sees "busy" at least once; the
-/// exact duration is unverified against hardware. (Was a fixed ~250 µs,
-/// Yabause-style.)
+/// Reconciled against Mednafen (the LLE reference), which models INTBACK as a
+/// 4 MHz SMPC-clock state machine (`mednaref/src/ss/smpc.cpp` `SMPC_Update` /
+/// `SMPC_EAT_CLOCKS`): every command eats **92** SMPC clocks of dispatch
+/// overhead, the **status** phase (taken when `IREG0 & 0xF`) eats **+952**, and
+/// the **peripheral** phase (`IREG1 & 8`) runs a data-dependent per-port /
+/// per-byte scan (`JR_EAT`). Converting SMPC clocks → µs (÷4 at 4 MHz):
+/// dispatch 92 → 23 µs, status +952 → +238 µs (so a status INTBACK is ~261 µs).
+/// The old values (8 / +8 / +700, MAME-derived) made status ~16 µs — ~16× too
+/// short, which cleared SF far earlier than the reference and skewed the boot
+/// trace. The peripheral phase is still a lump approximation (the full JR scan
+/// is unmodeled); replace it with the per-peripheral scan when peripheral
+/// INTBACK fidelity is needed.
 fn intback_busy_us(ireg0: u8, ireg1: u8) -> u64 {
-    let mut us = 8;
-    if ireg0 != 0 {
-        us += 8;
+    let mut clocks = 92; // common command dispatch
+    if ireg0 & 0x0F != 0 {
+        clocks += 952; // status phase
     }
+    let mut us = clocks / 4; // 4 MHz SMPC clock → µs
     if ireg1 & 0x08 != 0 {
-        us += 700;
+        us += 700; // peripheral phase (approximation; see above)
     }
     us
 }
@@ -435,6 +441,55 @@ impl Saturn {
         }
     }
 
+    /// Cycles from `now` until the next VBLANK→active edge (the frame
+    /// boundary, start of the next frame's active display) — where VBlank-OUT
+    /// is raised. The BIOS's VBlank-OUT callback (SCU vector 0x41) advances its
+    /// frame counter, so the batch must stop on this edge for the interrupt to
+    /// land cycle-exactly rather than up to a batch late. One edge per frame.
+    fn cycles_to_next_vblank_out(now: u64) -> u64 {
+        CYCLES_PER_FRAME - (now % CYCLES_PER_FRAME)
+    }
+
+    /// Cycles from `now` until the next scheduled peripheral side-effect edge.
+    /// This is the local analogue of Mednafen's `next_event_ts` (`ss.cpp`): the
+    /// batch is clamped to it so interrupt assertion and the raster registers
+    /// settle at the cycle-exact point the reference produces them, rather than
+    /// up to a [`SMPC_POLL_QUANTUM`]-cycle batch late.
+    ///
+    /// Included edges: VBlank-IN, VBlank-OUT, and a pending INTBACK completion
+    /// (`smpc.intback_complete_at`). **Deliberately excluded** — do NOT add
+    /// without the noted prerequisites:
+    /// - **HBlank**: `TVSTAT.HBLANK` here is an invented "last 20% of the
+    ///   scanline" approximation (see `update_video_timing`), not the real
+    ///   H-blank dot count — clamping to it would lock in a *precise* divergence
+    ///   from the reference and add ~526 stops/frame for no diff benefit. Add
+    ///   only once the dot count is corrected and a divergence points at HBLANK.
+    /// - **SCU DMA**: synchronous/instant in our model (`drain_scu_dma` finishes
+    ///   the whole transfer at the boundary) — there is no future completion
+    ///   timestamp to clamp to. Making it a timed event is a later model change.
+    fn cycles_to_next_event(&self, now: u64) -> u64 {
+        let mut next = Self::cycles_to_next_vblank_in(now).min(Self::cycles_to_next_vblank_out(now));
+        if let Some(t) = self.bus.smpc.intback_complete_at
+            && t > now
+        {
+            next = next.min(t - now);
+        }
+        next
+    }
+
+    /// Size of the next scheduler batch: the smallest of the requested
+    /// `remaining` horizon, the [`SMPC_POLL_QUANTUM`] safety ceiling, and the
+    /// next scheduled event edge ([`cycles_to_next_event`]). The `.max(1)` keeps
+    /// a batch from ever being zero (which would spin `run_for` forever when
+    /// `now` sits exactly on an edge). Shared by [`run_for`](Self::run_for) and
+    /// [`run_for_traced`](Self::run_for_traced) so the trace tool and the real
+    /// run can never compute different batch boundaries.
+    fn batch_size(&self, now: u64, remaining: u64) -> u64 {
+        remaining
+            .min(SMPC_POLL_QUANTUM)
+            .min(self.cycles_to_next_event(now).max(1))
+    }
+
     /// Advance global time by at least `cycles` cycles, interleaving
     /// the two CPUs by deadline order and polling SMPC + SCU between
     /// scheduler batches.
@@ -443,12 +498,10 @@ impl Saturn {
         while self.now() < target {
             let now = self.now();
             let remaining = target - now;
-            // Clamp the batch to the next VBlank-IN edge so the interrupt is
-            // raised cycle-exactly (`.max(1)` so a batch is never zero when
-            // sitting exactly on the edge).
-            let batch = remaining
-                .min(SMPC_POLL_QUANTUM)
-                .min(Self::cycles_to_next_vblank_in(now).max(1));
+            // Clamp the batch to the next scheduled event edge so peripheral
+            // side-effects (VBlank-IN/OUT, INTBACK completion) settle
+            // cycle-exactly rather than up to a batch late — see `batch_size`.
+            let batch = self.batch_size(now, remaining);
             self.scheduler.run_for(batch, &mut self.bus);
             self.bus.scsp.run(batch);
             self.update_video_timing();
@@ -478,9 +531,7 @@ impl Saturn {
         while self.now() < target {
             let now = self.now();
             let remaining = target - now;
-            let batch = remaining
-                .min(SMPC_POLL_QUANTUM)
-                .min(Self::cycles_to_next_vblank_in(now).max(1));
+            let batch = self.batch_size(now, remaining);
             self.scheduler
                 .run_for_traced(batch, &mut self.bus, |entity, id| {
                     if id == master_id {
