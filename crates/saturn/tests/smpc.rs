@@ -219,9 +219,10 @@ fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     assert_eq!(sat.bus.smpc.oreg[9], 0x04);
     assert_eq!(sat.bus.smpc.oreg[10], 0x34);
     assert_eq!(sat.bus.smpc.oreg[31], 0x10);
-    // Status SR with no peripheral requested = 0x40 (MAME `0x40 | stage<<5`).
+    // Status SR with no peripheral requested = 0x0F (Mednafen `(SR&~0x80&~NPE)
+    // | 0x0F`; NPE/0x20 only set when peripheral data is also requested).
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
-    assert_eq!(sr, 0x40);
+    assert_eq!(sr, 0x0F);
     // SCU's SMPC source is the path BIOS handlers wait on. The SCU resets with
     // every source masked (IMS=0xBFFF), as the BIOS expects; unmask here to
     // confirm INTBACK actually raised the SMPC source (the BIOS does the same
@@ -241,9 +242,9 @@ fn intback_peripheral_continuation_reports_the_digital_pad() {
     sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
     sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
     sat.run_for(40_000);
-    // Status phase done: SR = 0x40 | (1<<5) = 0x60 (peripheral pending).
+    // Status phase done: SR = 0x0F | NPE(0x20) = 0x2F (peripheral pending).
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
-    assert_eq!(sr, 0x60, "status SR signals peripheral data pending");
+    assert_eq!(sr, 0x2F, "status SR signals peripheral data pending");
     // Host requests CONTINUE (IREG0 bit 0x80) → peripheral phase.
     sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data);
     sat.run_for(40_000);

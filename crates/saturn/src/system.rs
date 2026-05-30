@@ -529,22 +529,27 @@ impl Saturn {
                         .raise(sh2::InterruptSource::Nmi);
                 }
                 SmpcCommand::IntBack => {
-                    // INTBACK status phase (MAME `resolve_intback`). Fill the
-                    // status OREG and arm the staged-peripheral protocol:
+                    // INTBACK status phase (Mednafen `resolve_intback`). Fill
+                    // the status OREG and arm the staged-peripheral protocol:
                     // `intback_stage = (IREG1 & 8) >> 3` (1 if peripheral data
-                    // was requested), `pmode = IREG0 >> 4`, `SR = 0x40 |
-                    // (stage << 5)`. Raise the SMPC interrupt now so the
-                    // response is ready the moment SF drops, and keep SF busy
-                    // for the request-dependent execution time
-                    // (`intback_busy_us`); `settle_intback` clears it on the
-                    // exact instruction that reads SMPC past completion.
+                    // was requested), `pmode = IREG0 >> 4`. The status-phase SR
+                    // is `(SR & ~0x80 & ~NPE) | 0x0F`, with NPE (0x20) set iff
+                    // peripheral data was also requested — *not* the old
+                    // `0x40 | stage<<5` (bit 6 set, low nibble 0), which the
+                    // BIOS's INTBACK state machine reads. Raise the SMPC
+                    // interrupt now so the response is ready the moment SF
+                    // drops, and keep SF busy for the request-dependent
+                    // execution time (`intback_busy_us`); `settle_intback`
+                    // clears it on the exact instruction that reads SMPC past
+                    // completion.
                     let ireg0 = self.bus.smpc.ireg[0];
                     let ireg1 = self.bus.smpc.ireg[1];
                     self.respond_to_intback_status();
                     let stage = (ireg1 & 0x08) >> 3;
                     self.bus.smpc.intback_stage = stage;
                     self.bus.smpc.pmode = ireg0 >> 4;
-                    self.bus.smpc.sr = 0x40 | (stage << 5);
+                    let npe = if stage != 0 { 0x20 } else { 0x00 }; // SR_NPE: peripheral data follows
+                    self.bus.smpc.sr = (self.bus.smpc.sr & !0xA0) | 0x0F | npe;
                     let busy = us_to_cycles(intback_busy_us(ireg0, ireg1));
                     self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
                     self.bus.scu.raise(crate::scu::Source::Smpc);
