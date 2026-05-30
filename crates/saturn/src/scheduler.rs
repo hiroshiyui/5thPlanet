@@ -169,12 +169,13 @@ pub struct Sh2Entity {
     #[serde(skip)]
     trace_freeze: (u32, u32),
     /// Debug-only full-speed breakpoint: when set and the master reaches this
-    /// PC, [`bp_hit`] captures R0..R15 plus 96 bytes of code at the PC (so a
-    /// transient work-RAM routine can be disassembled at the instant it runs).
+    /// PC, [`bp_hit`] captures R0..R15 + PR + GBR plus 96 bytes of code at the
+    /// PC (so a transient work-RAM routine can be disassembled — and its caller
+    /// found via PR — at the instant it runs).
     #[serde(skip)]
     bp: Option<u32>,
     #[serde(skip)]
-    bp_hit: Option<([u32; 16], Vec<u16>)>,
+    bp_hit: Option<([u32; 16], u32, u32, Vec<u16>)>,
 }
 
 impl Sh2Entity {
@@ -235,7 +236,7 @@ impl Sh2Entity {
     }
 
     /// Take the captured (registers, code-words) from a breakpoint hit, if any.
-    pub fn take_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+    pub fn take_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
         self.bp_hit.take()
     }
 }
@@ -268,7 +269,7 @@ impl SchedEntity for Sh2Entity {
                 for i in 0..48u32 {
                     code.push(ctx.read16(bp + i * 2, AccessKind::Data).0);
                 }
-                self.bp_hit = Some((self.cpu.regs.r, code));
+                self.bp_hit = Some((self.cpu.regs.r, self.cpu.regs.pr, self.cpu.regs.gbr, code));
             }
             if let Some(trace) = &mut self.pc_trace {
                 let pc = self.cpu.regs.pc;

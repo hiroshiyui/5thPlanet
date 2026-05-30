@@ -604,8 +604,8 @@ fn run(
             }
         }
         match hit {
-            Some((r, code)) => {
-                eprintln!("FBP {bp:08X} hit. regs:");
+            Some((r, pr, gbr, code)) => {
+                eprintln!("FBP {bp:08X} hit. PR={pr:08X} GBR={gbr:08X} regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");
                 }
@@ -636,7 +636,6 @@ fn run(
         let idle = std::env::var("SAT_INLOOP_STOP")
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
-        saturn.enable_master_pc_trace();
         // `SAT_SHELL_BASE` overrides the give-up detection base (default
         // 0x0602_0000). The CD-boot *loader* legitimately runs in
         // 0x0602_xxxx/0x0603_xxxx, so set it to 0x0604_0000 to trace *through*
@@ -645,6 +644,11 @@ fn run(
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(0x0602_0000);
+        saturn.enable_master_pc_trace();
+        // Freeze the ring at the give-up region (not the default 0x0602_0000,
+        // which would freeze the moment the loader itself enters work RAM), so
+        // the ring tail is the loader code right before the give-up.
+        saturn.set_master_trace_freeze(shell_base, 0x0605_0000);
         let mut triggered = None;
         for f in 0..headless_frames {
             saturn.run_frame(&mut framebuffer);

@@ -250,16 +250,15 @@ impl Saturn {
             .set_bp(pc);
     }
 
-    /// Debug-only: take a breakpoint hit's (R0..R15, code words), if it fired.
-    pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+    /// Debug-only: take a breakpoint hit's (R0..R15, PR, GBR, code words), if it fired.
+    pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
         self.scheduler
             .entity_mut(self.master_id)
             .sh2_mut()
             .take_bp_hit()
     }
 
-    /// Debug-only: arm a full-speed breakpoint on the *slave* SH-2 (M12 — to
-    /// catch the slave running a memory-fill over the HLE-booted program).
+    /// Debug-only: arm a full-speed breakpoint on the *slave* SH-2.
     pub fn set_slave_bp(&mut self, pc: u32) {
         self.scheduler
             .entity_mut(self.slave_id)
@@ -267,8 +266,8 @@ impl Saturn {
             .set_bp(pc);
     }
 
-    /// Debug-only: take the slave breakpoint hit's (R0..R15, code words).
-    pub fn take_slave_bp_hit(&mut self) -> Option<([u32; 16], Vec<u16>)> {
+    /// Debug-only: take the slave breakpoint hit's (R0..R15, PR, GBR, code words).
+    pub fn take_slave_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
         self.scheduler
             .entity_mut(self.slave_id)
             .sh2_mut()
