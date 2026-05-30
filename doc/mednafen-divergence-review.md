@@ -54,6 +54,17 @@ Each fix re-verifies the `bios_boot` splash golden and re-checks the VF2 LLE
 boot trace before moving on. #5 (the SCU interrupt rework) is the deepest and
 riskiest; do it on its own with the golden as guard.
 
+**Status (2026-05-30):** #1 landed (`3e43928`), #2 landed (`5ce37d4`) — both
+correct, golden-safe, full suite green. VF2 still gives up to the CD player,
+which is expected: the post-IP.BIN rejection is a *convergence*, and the
+single most likely unblock is the deep **#5 (SCU IST = live pending set +
+level re-assertion)**. #5 conflicts with the earlier interim IST-ack-clear
+(`7739673`) and reworks the interrupt core (`raise`/`take_pending`/IST read +
+the system drain + a vector-fetch ack hook), so it warrants a focused pass with
+the splash golden as guard rather than a quick edit. #3/#4/#6/#7/#8 are smaller
+consolidation fixes that improve fidelity but are individually less likely to
+flip the boot decision.
+
 ---
 
 ## Findings by subsystem
