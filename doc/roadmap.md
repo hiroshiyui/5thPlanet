@@ -566,31 +566,44 @@ original disc from a host drive (see ADR-0009). The security ring is a non-issue
 ## Milestone 11 — Boot a game to gameplay 🚧
 
 A discovery milestone (like M4): get a commercial game (*Virtua Fighter 2*, JP
-`GS-9079`) past the BIOS CD player. Two tracks — the LLE/trace-diff path and an
-optional HLE direct boot (ADR-0010).
+`GS-9079`) past the BIOS CD player. Pursued purely on the **real-BIOS LLE path**,
+trace-diffed against Mednafen (itself LLE — the only mode in which a master-SH-2
+PC-trace-diff is valid). An opt-in HLE direct boot was tried and **removed** —
+see "Removed: the HLE-boot detour" below.
 
 | # | Phase | Notes |
 |---|-------|-------|
 | 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
-| 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture) / `SAT_MEMDUMP` / `SAT_DUMP`. Localized the LLE give-up to a ~200k-instruction work-RAM boot-loader blob. |
-| 3 | **HLE direct boot** (ADR-0010) 🚧 | Optional `--hle-boot` / `SAT_HLE_BOOT`: `Saturn::hle_boot` reads IP.BIN, loads the 1st-read file (`CdBlock::first_read_file`) into work RAM at the IP.BIN load address, and `Cpu::hle_jump`s the master to it. v1 hybrid (reuse the BIOS init, inject at the give-up). The game's own code now **runs** (~40k+ instructions past the CD player); it currently stalls in a BIOS SMPC poll during its loader (the hybrid give-up state isn't a true game-launch state). LLE boot stays the default; HLE off by default. |
+| 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture; `SAT_SHELL_BASE` tunes the give-up detection) / `SAT_BIOSTRACE` / `SAT_WWATCH` / `SAT_IRQ_DUMP` / `SAT_INTC_TRACE` / `SAT_MEMDUMP` / `SAT_DUMP`. |
+| 3 | **LLE trace-diff vs Mednafen** 🚧 | Mednafen (LLE, instrumented `SS_PCTRACE`/`SS_WWATCH`) boots VF2; ours doesn't. Diffing localized the failure precisely: both run the **same BIOS CD-boot loader** copied to high work RAM (`0x0601`–`0x0603`); auth, region, IP.BIN read all pass; then **our loader rejects the disc and drops to the CD player (`0x06040xxx`) instead of loading the 1st-read**, while Mednafen jumps to the game (`0x06010000`). Narrowed to a single **data-driven branch near `0x0602E2CC`** on the **post-Play CD state** (HIRQ bits / periodic-report partition sector-count) our HLE presents differently than MAME/Mednafen after a Play completes. Next: the collapsed-PC-diff to that branch, then fix the post-Play state. |
 
-## Milestone 12 — HLE BIOS system-call library (finishes cold-HLE boot) 🚧
+### Spun out of M11 — kept general accuracy fixes
 
-The HLE-booted game runs ~40k instructions, then calls a BIOS **system call**
-(`JSR @[0x06000320]` = `ChangeSystemClock`) that, because our BIOS never reaches
-its game-launch state, points at the BIOS fatal handler. M11 proved this is
-inject-independent. Fix (ADR-0011): stop depending on the BIOS for the SYS
-environment — build the SYS call table ourselves and **HLE the SYS functions**,
-modelled on `yabref/yabause/src/bios.c`. A discovery milestone like M4.
+Real hardware-fidelity fixes that came out of the boot investigation and stand on
+their own (independent of any boot path):
 
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **Dispatch mechanism + first call** ✅ | `crates/saturn/src/bios_hle.rs`: SYS entry-address set + a `dispatch(cpu, bus)` that reads R4–R7, mutates the bus, sets R0, returns `pc=pr`. Hooked in `Sh2Entity::step` (pre-`step`, gated by `hle_sys_active`). `Saturn::cold_hle_boot` writes the SYS table (`0x06000200..0x06000360`), enables the hook, loads the 1st-read, jumps — reusing the BIOS hardware/interrupt init. `ChangeSystemClock`, `GetSemaphore`, `ClearSemaphore` implemented. |
-| 2 | **Iterate to gameplay** 🚧 | (a) **Fixed a scheduler `time-travel` bug** (the actual blocker): `release_slave` (SSHON) didn't resync the slave's cycle counter, so when VF2 released the slave the scheduler ran it ~54M catch-up cycles of stale code that **zeroed VF2's freshly-loaded program** — manifesting as a jump into zeroed RAM → illegal-instr → BIOS fatal hang. `Saturn::release_slave` now resyncs the slave to the global cycle (regression test `dual_sh2::releasing_slave_resyncs_its_cycle_no_time_travel`). (b) Implemented the SYS fns VF2 calls during init: `SetScuInterrupt`/`GetScuInterrupt` (0x40/0x41), `SetSh2Interrupt`/`GetSh2Interrupt` (0x44/0x45), `SetScuInterruptMask`/`ChangeScuInterruptMask` (0x50/0x51), each per `yabref bios.c` (unit-tested). (c) **Slave-SH2 dispatch (the big one), RE'd from Yabause `YabauseStartSlave`/`BiosInit`:** SSHON now *starts* the slave at the game-written entry `[0x06000250]` (`VBR=0x06000400`, slave stack), not a resume of stale BIOS code that re-ran the cold work-RAM clear and wiped the game. The inter-CPU wakeup is the FRT input-capture pin: a 16-bit write to `0x0100_0000..0x017F_FFFF` pulses the slave's `FTCSR.ICF` (`0x0180_..` the master's) — `sh2 Frt::input_capture` + bus FTI regions + `Saturn::drain_input_capture`. Made `Set/ChangeScuInterruptMask` master-only (`is_slave`) so the slave stops clobbering the SCU mask. **Result:** the game survives, the slave runs VF2's slave routine + drains the master's work queue, VBlank interrupts deliver, and the master advances past its first post-init wait into its frame loop. **Current blocker (still black):** master polls a frame-sync flag `[GBR+19]` bit7 (0x0604CE8A) that isn't being set — the next handshake link. |
-| 3 | **Generalise + tests/docs** ⬜ | A second disc if available; gated `hle_boot` tests; finalize ADR-0011 result + this row. |
+- **Scheduler cycle-resync on un-halt** — `Saturn::release_slave` (SMPC `SSHON`)
+  bumps the slave's frozen `pipeline.cycles` up to the global clock before
+  un-halting, so the scheduler can't "time-travel" through millions of stale
+  catch-up cycles. Regression: `dual_sh2::releasing_slave_resyncs_its_cycle_no_time_travel`.
+- **Inter-CPU FRT input-capture (FTI)** — a 16-bit write to
+  `0x0100_0000..0x017F_FFFF` pulses the slave's `FTCSR.ICF`, `0x0180_..` the
+  master's (`sh2 Frt::input_capture` + bus FTI regions + `Saturn::drain_input_capture`).
+  Regression: `dual_sh2::word_write_to_fti_region_pulses_target_frt_input_capture`.
+- **SCU clears IST on the SH-2 acknowledge cycle** — `take_pending_interrupt`
+  clears the acknowledged source's IST bit (matching hardware/Mednafen, which W1C
+  IST only a couple of times a run) instead of leaving it stale-set.
+
+### Removed: the HLE-boot detour (ADR-0010/0011 Superseded)
+
+An opt-in HLE direct boot (`--hle-boot`: load the 1st-read + jump) plus an HLE
+BIOS SYS-call library (`bios_hle`, `cold_hle_boot`) got VF2's own code running on
+both SH-2s but never rendered, and — being a different program from the real-BIOS
+boot — broke the PC-trace-diff methodology. Since the reference oracle (Mednafen)
+is LLE, the path was **removed** to keep the codebase clean and the diff valid.
+The general fixes above were salvaged from it.
 
 ## Later milestones (queued)
 
-- **Full no-BIOS cold boot** — replicate the BIOS hardware + interrupt init too (M12 reuses it); MPEG SYS calls.
+- **MPEG card** + CD move/copy sector ops (deferred from M7).
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).

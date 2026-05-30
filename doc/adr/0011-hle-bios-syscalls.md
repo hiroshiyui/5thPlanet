@@ -1,6 +1,8 @@
 # 0011. HLE the BIOS system-call library for cold direct boot
 
-- **Status:** Accepted
+- **Status:** Superseded (2026-05-30) — removed together with ADR-0010's
+  HLE-boot path. `crates/saturn/src/bios_hle.rs` and `cold_hle_boot` no longer
+  exist; the project boots only the real BIOS (LLE). Kept for the record.
 - **Date:** 2026-05-29
 
 ## Context

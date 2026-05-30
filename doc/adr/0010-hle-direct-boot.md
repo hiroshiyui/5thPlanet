@@ -1,6 +1,9 @@
 # 0010. Optional HLE direct boot
 
-- **Status:** Accepted
+- **Status:** Superseded (2026-05-30) — the HLE-boot path was removed in favour
+  of fixing the real LLE BIOS boot (cross-checked against Mednafen, which is
+  itself LLE). The code (`Saturn::hle_boot`/`cold_hle_boot`, `--hle-boot`) no
+  longer exists; this record is kept for the rationale and lessons learned.
 - **Date:** 2026-05-29
 
 ## Context

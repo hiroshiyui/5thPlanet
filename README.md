@@ -24,10 +24,9 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay — CD-block fixes + HLE direct boot   | 🚧 active    |
-| M12       | HLE BIOS system-call library (cold-HLE boot)                 | 🚧 active    |
+| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 active    |
 
-Current test count: **533 workspace-wide, 0 failures.** Task-by-task
+Current test count: **527 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -149,9 +148,9 @@ instruction:
   **accuracy reference for game-level behavior**. Its Saturn module has
   the highest game compatibility of the open-source emulators (it runs
   the commercial library, including the dual-SH-2 / SCU-DSP / VDP1 3D
-  titles), so it is the oracle for the game-boot work (M11/M12): a local
+  titles), so it is the oracle for the game-boot work (M11): a local
   instrumented build emits VF2's master-SH-2 trace to diff against ours
-  from the 1st-read entry to the first divergence.
+  (both running the real BIOS) from the boot loader to the first divergence.
 - [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
   reference. Its Saturn driver models the chips closely (down to a
   low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
@@ -160,10 +159,10 @@ instruction:
   showed a stuck boot was a wrong-path symptom, then that a periodic
   report was clobbering the CD-block signature the BIOS checks.
 - [Yabause](https://github.com/Yabause/yabause) — the **secondary**
-  reference; the primary during early development (M1–M3), the blueprint
-  for the HLE BIOS SYS library (its `src/bios.c`), and still a useful
-  second opinion. A patched, headless build emits the master PC stream
-  for diffing.
+  reference; the primary during early development (M1–M3) and still a
+  useful second opinion (its `src/bios.c` was the blueprint for a
+  since-removed HLE BIOS experiment). A patched, headless build emits the
+  master PC stream for diffing.
 
 Each is set up as a local, **never-committed** build (gitignored
 `mednaref/`, `mameref/`, `yabref/`). **No emulator code is included in or

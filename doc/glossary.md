@@ -240,16 +240,6 @@ the write and `Saturn::drain_input_capture` pulsing the target FRT.
 
 ## H
 
-**HLE BIOS SYS-call library** — High-level emulation of the SEGA Saturn
-BIOS's system-call services (`crates/saturn/src/bios_hle.rs`, ADR-0011), used
-by the *opt-in* HLE direct boot (`--hle-boot`, ADR-0010). Games call BIOS
-services through a pointer table in low work RAM (`0x06000200..0x06000360`);
-`Saturn::cold_hle_boot` populates it and intercepts the `JSR` targets, running
-host implementations (`ChangeSystemClock`, semaphores, SCU/SH-2 interrupt
-set/get/mask, …) modeled on Yabause `bios.c` instead of BIOS code. The real-
-BIOS LLE boot remains the default and reference. See also [FTI inter-CPU
-signalling] for how the HLE boot starts the [slave].
-
 **HBlank** — Horizontal blanking interval. VDP fires an interrupt at
 each line transition; the [SCU] aggregates it into the SH-2 INTC.
 Reflected in [TVSTAT] bit 2 by `Saturn::update_video_timing`.
@@ -481,11 +471,8 @@ delivers a standalone `scu_dsp` crate parallel to `sh2`.
 from its power-on halt. Tracked by `Sh2Entity::halted` in the
 scheduler; releasing also resyncs the slave's cycle counter to the
 global clock (a halted entity's counter freezes — otherwise it would
-"time-travel" through millions of catch-up cycles). Under the [HLE BIOS
-SYS-call library] boot, `SSHON` *starts* the slave the BIOS way (Yabause
-`YabauseStartSlave`): jump to the game-written entry at `0x06000250`,
-`VBR = 0x06000400`, slave stack from `0x060002AC` (or the default
-`0x06001000`) — not a resume of the slave's stale PC.
+"time-travel" through millions of catch-up cycles of stale code). The
+slave then runs from wherever the BIOS left its PC/vectors.
 
 **SETSM / SSHOFF** — SMPC command 0x03. Halts the slave.
 

@@ -11,8 +11,9 @@ The guiding axis is **accuracy over performance** (ADR-0002): real chips are
 low-level-emulated (LLE) cycle-by-cycle; no JIT, dynarec, or "approximate
 cycle". The one deliberate exception is the **CD-block, which is HLE** — its
 SH-1 firmware is undumped and half its job is an analog servo with no digital
-ground truth, so there is nothing to be cycle-accurate against (ADR-0010 also
-covers an *opt-in* HLE direct game boot; the LLE BIOS path stays the default).
+ground truth, so there is nothing to be cycle-accurate against. The BIOS itself
+is run for real (LLE); an opt-in HLE direct boot was tried and removed
+(ADR-0010/0011 Superseded).
 
 ---
 
@@ -188,16 +189,12 @@ reading sectors through a `disc::SectorSource` (an in-memory image, or a live
 optical drive via the feature-gated `crates/physdisc/` libcdio crate, ADR-0009,
 the project's only `unsafe`).
 
-**Boot — two paths:**
-- **LLE (default, reference):** run the real BIOS ROM; it initialises the
-  hardware and either boots a disc or drops to its CD player. This is the path
-  the `bios_boot` golden test pins.
-- **HLE direct boot (opt-in, `--hle-boot`, ADR-0010/0011):**
-  `Saturn::cold_hle_boot` loads the disc's 1st-read program, installs an HLE BIOS
-  **SYS-call library** (`bios_hle.rs`) over the work-RAM call table
-  (`0x0600_0200..0x0600_0360`), enables a per-core dispatch hook, and hands off
-  both SH-2s (the slave is started on `SSHON` at the game-written entry
-  `[0x06000250]`, `VBR = 0x06000400`). This is the active M11/M12 work.
+**Boot — LLE only:** run the real BIOS ROM; it initialises the hardware and
+either boots a disc or drops to its CD player. This is the path the `bios_boot`
+golden test pins, and the one M11 (boot a game) is being driven down via a
+trace-diff against Mednafen. (An opt-in HLE direct boot + HLE BIOS SYS-call
+library was tried and removed — ADR-0010/0011 Superseded — because the reference
+oracle is itself LLE, so a valid PC-trace-diff needs LLE↔LLE.)
 
 **Save states** (`savestate.rs`, M8): a `bincode` snapshot of the whole machine;
 external media (BIOS/disc/ROM-cart bytes) is referenced not embedded, re-grafted
@@ -213,7 +210,7 @@ host file.
 | `crates/sh2/` | SH7604 core (`no_std + alloc`), on-chip peripherals |
 | `crates/m68k/` | MC68EC000 core (SCSP sound CPU) |
 | `crates/scu_dsp/` | SCU's embedded 32-bit DSP (ADR-0006) |
-| `crates/saturn/` | System glue: bus, scheduler, SMPC, SCU, VDP1, VDP2, SCSP, CD-block, cartridge, save states, `bios_hle` |
+| `crates/saturn/` | System glue: bus, scheduler, SMPC, SCU, VDP1, VDP2, SCSP, CD-block, cartridge, save states |
 | `crates/physdisc/` | Live optical-drive `SectorSource` via libcdio; the sole FFI/`unsafe` crate (ADR-0009) |
 | `fifth_planet/` | SDL2 frontend (window + audio) or headless; the `osd/` in-window menu (ADR-0008) |
 | `doc/` | This file, [`roadmap.md`](roadmap.md), [`glossary.md`](glossary.md), [`adr/`](adr/) |
@@ -237,8 +234,8 @@ implemented-vs-total figures the percentage is based on, where countable.
 instruction families + **13** ALU ops · MC68EC000 full 68000 set
 (inline-decoded) · CD-block **33 of ~50** host commands · SMPC **16** commands ·
 VDP1 **9** command types (full set) · VDP2 **101** named registers, 6 layers ·
-HLE BIOS **9 of 26** SYS slots · **533** tests workspace-wide (sh2 153, m68k 68,
-scu_dsp 21, saturn 279, frontend 12).
+**527** tests workspace-wide (sh2 153, m68k 68, scu_dsp 21, saturn 273,
+frontend 12).
 
 | Component | Code | Progress | Count | Done / remaining |
 |---|---|---|---|---|
@@ -256,8 +253,7 @@ scu_dsp 21, saturn 279, frontend 12).
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
 | Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
 | Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
-| LLE BIOS boot | (uses real BIOS) | ~70% | splash | M4: boots to the SEGA splash, pixel-matching the reference. Booting a *game* via the real BIOS loader is not reached (the reason for the HLE path). |
-| HLE direct boot + SYS library | `bios_hle.rs` + `cold_hle_boot` | ~40% | 9 of 26 SYS slots | M11/M12 active, opt-in (`--hle-boot`): VF2 loads + runs its own code on both SH-2s (slave dispatch, interrupts, work queue) but does **not yet render** — a frame-sync handshake remains. SYS coverage is per-game/iterative. |
+| LLE BIOS boot / game boot | (uses real BIOS) | ~70% | splash | M4: boots to the SEGA splash, pixel-matching the reference. **M11 (active):** booting a *game* via the real BIOS loader — VF2 authenticates + region-checks + reads IP.BIN, but the work-RAM CD-boot loader then rejects the disc; localized (trace-diff vs Mednafen) to one data-driven branch on the post-Play CD state. |
 
 ---
 
