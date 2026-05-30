@@ -580,11 +580,21 @@ impl CdBlock {
 
     /// Write a standard CD status report into CR1..CR4 (cs2.c `doCDReport`).
     fn cd_report(&mut self) {
+        // The reported FAD is the drive's *current* head position, which the
+        // read pump advances (`cd_curfad`) — not the static `fad` set only at
+        // insert/eject. Reporting the stale `fad` left the BIOS boot loader
+        // seeing the head never move past the IP.BIN start (150) after a read,
+        // so it rejected the disc; cs2.c reports the live `cd_curfad`.
+        let fad = if self.disc.is_some() {
+            self.cd_curfad
+        } else {
+            self.fad
+        };
         self.cr1 =
             self.cd_stat() | (((self.options & 0xF) as u16) << 4) | (self.repcnt & 0xF) as u16;
         self.cr2 = ((self.ctrladdr as u16) << 8) | self.track as u16;
-        self.cr3 = ((self.index as u16) << 8) | ((self.fad >> 16) & 0xFF) as u16;
-        self.cr4 = self.fad as u16;
+        self.cr3 = ((self.index as u16) << 8) | ((fad >> 16) & 0xFF) as u16;
+        self.cr4 = fad as u16;
     }
 
     /// The 16-bit status word (status code in the high byte) — MAME `cd_stat`.
