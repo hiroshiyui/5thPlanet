@@ -68,11 +68,32 @@ impl Vdp2 {
         )
     }
 
+    /// `TVSTAT.VBLANK` (bit 3) reads 1 whenever the display is disabled
+    /// (`TVMD.DISP=0`), not only during the raster vblank period — matching the
+    /// reference (Mednafen `InternalVB = !DisplayOn`, true at power-on). The
+    /// bit *stored* by [`Saturn::update_video_timing`] is the pure raster
+    /// vblank (so the VBlank-IN/OUT interrupt edges are unaffected); this
+    /// display-off term is OR'd in only on the **bus-facing** read. Without it,
+    /// the BIOS — which polls TVSTAT.VBLANK while the display is still off,
+    /// before enabling it — would spin forever during boot.
+    #[inline]
+    fn tvstat_vblank_off(&self) -> bool {
+        !self.regs.display_enabled()
+    }
+
     pub fn read8(&self, addr: u32) -> u8 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.read8(addr - VRAM_BASE),
             CRAM_BASE..=CRAM_END => self.cram.read8(addr - CRAM_BASE),
-            REGS_BASE..=REGS_END => self.regs.read8(addr - REGS_BASE),
+            REGS_BASE..=REGS_END => {
+                let v = self.regs.read8(addr - REGS_BASE);
+                // TVSTAT low byte (offset 0x005) holds VBLANK (bit 3).
+                if addr - REGS_BASE == 0x005 && self.tvstat_vblank_off() {
+                    v | 0x08
+                } else {
+                    v
+                }
+            }
             _ => 0,
         }
     }
@@ -80,7 +101,14 @@ impl Vdp2 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.read16(addr - VRAM_BASE),
             CRAM_BASE..=CRAM_END => self.cram.read16(addr - CRAM_BASE),
-            REGS_BASE..=REGS_END => self.regs.read16(addr - REGS_BASE),
+            REGS_BASE..=REGS_END => {
+                let v = self.regs.read16(addr - REGS_BASE);
+                if addr - REGS_BASE == 0x004 && self.tvstat_vblank_off() {
+                    v | 0x0008
+                } else {
+                    v
+                }
+            }
             _ => 0,
         }
     }
@@ -88,7 +116,16 @@ impl Vdp2 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.read32(addr - VRAM_BASE),
             CRAM_BASE..=CRAM_END => self.cram.read32(addr - CRAM_BASE),
-            REGS_BASE..=REGS_END => self.regs.read32(addr - REGS_BASE),
+            REGS_BASE..=REGS_END => {
+                let v = self.regs.read32(addr - REGS_BASE);
+                // A 32-bit read at 0x004 puts TVSTAT in the upper half-word
+                // (big-endian), so VBLANK is bit 19.
+                if addr - REGS_BASE == 0x004 && self.tvstat_vblank_off() {
+                    v | 0x0008_0000
+                } else {
+                    v
+                }
+            }
             _ => 0,
         }
     }
@@ -130,6 +167,20 @@ mod tests {
         assert!(Vdp2::owns(REGS_BASE));
         assert!(!Vdp2::owns(VRAM_BASE - 1));
         assert!(!Vdp2::owns(0x0500_0000)); // A-bus area, not VDP2
+    }
+
+    #[test]
+    fn tvstat_vblank_reads_set_while_display_off() {
+        let mut v = Vdp2::new();
+        // Display off (TVMD.DISP=0): TVSTAT.VBLANK (bit 3) reads 1 on the bus
+        // regardless of the stored raster bit — matches the reference.
+        v.write16(REGS_BASE, 0x0000); // DISP = 0
+        assert_eq!(v.read16(REGS_BASE + 0x004) & 0x0008, 0x0008);
+        assert_eq!(v.read8(REGS_BASE + 0x005) & 0x08, 0x08);
+        assert_eq!(v.read32(REGS_BASE + 0x004) & 0x0008_0000, 0x0008_0000);
+        // Display on: VBLANK reflects only the stored raster bit (0 here).
+        v.write16(REGS_BASE, 0x8000); // DISP = 1
+        assert_eq!(v.read16(REGS_BASE + 0x004) & 0x0008, 0x0000);
     }
 
     #[test]
