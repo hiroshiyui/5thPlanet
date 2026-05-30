@@ -198,7 +198,6 @@ pub struct CdBlock {
     // CD status report fields (see `cd_report`). With no disc inserted
     // these stay at their power-on "nothing" values.
     status: u8,
-    options: u8,
     repcnt: u8,
     ctrladdr: u8,
     track: u8,
@@ -356,7 +355,6 @@ impl CdBlock {
             // both the USA v1.00 and JP v1.01 BIOS; the splash boot path is
             // unaffected by PAUSE-vs-NODISC, but the host-visible status is.)
             status: STAT_NODISC,
-            options: 0x00,
             repcnt: 0x00,
             ctrladdr: 0x00,
             track: 0x00,
@@ -484,15 +482,45 @@ impl CdBlock {
                 // left CMOK/DCHG bits set that derailed the BIOS — see the
                 // MAME reference diff at BIOS 0x4216.)
                 self.hirq &= !(HIRQ_DCHG | HIRQ_BFUL | HIRQ_CSCT);
+                // Debug: env-gated HIRQ read-watch (logs each *changed* value
+                // the host reads), to see which HIRQ state the BIOS CD-boot
+                // loader branches on at the post-IP.BIN read-file-vs-re-recognize
+                // decision. Deduped so the constant status-poll doesn't flood.
+                #[cfg(not(test))]
+                if std::env::var_os("CD_RWATCH").is_some() {
+                    use std::sync::atomic::{AtomicU16, Ordering};
+                    static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
+                    if LAST.swap(self.hirq, Ordering::Relaxed) != self.hirq {
+                        eprintln!("HIRQrd {:04X}", self.hirq);
+                    }
+                }
                 self.hirq
             }
             0x000C => self.hirq_mask,
-            0x0018 => self.cr1,
+            0x0018 => {
+                #[cfg(not(test))]
+                if std::env::var_os("CD_RWATCH").is_some() {
+                    use std::sync::atomic::{AtomicU16, Ordering};
+                    static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
+                    if LAST.swap(self.cr1, Ordering::Relaxed) != self.cr1 {
+                        eprintln!("CR1rd {:04X}", self.cr1);
+                    }
+                }
+                self.cr1
+            }
             0x001C => self.cr2,
             0x0020 => self.cr3,
             0x0024 => {
                 // Reading CR4 consumes a command response; periodic
                 // reports may resume (cs2.c clears `_command` here).
+                #[cfg(not(test))]
+                if std::env::var_os("CD_RWATCH").is_some() {
+                    use std::sync::atomic::{AtomicU16, Ordering};
+                    static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
+                    if LAST.swap(self.cr4, Ordering::Relaxed) != self.cr4 {
+                        eprintln!("CR4rd {:04X}", self.cr4);
+                    }
+                }
                 self.command_pending = false;
                 self.cr4
             }
@@ -590,8 +618,20 @@ impl CdBlock {
         } else {
             self.fad
         };
-        self.cr1 =
-            self.cd_stat() | (((self.options & 0xF) as u16) << 4) | (self.repcnt & 0xF) as u16;
+        // CR1 low byte (MAME / Mednafen `Results[0]`, cdb.cpp: `(is_cdrom << 7)
+        // | (repcount & 0x7F)`): bit 7 = "the current head position is on a
+        // CD-ROM (data) track" (`is_cdrom`), bits 6-0 = the periodic repeat
+        // count. The BIOS CD-boot loader checks this is-cdrom bit in the status
+        // report after reading IP.BIN to confirm it is positioned on a data
+        // track before reading the 1st-read file; without it the loader rejects
+        // the disc and re-recognizes (dropping to the CD player). (Was a
+        // mismodeled `(options << 4) | repcnt` low byte that left bit 7 clear.)
+        let is_cdrom = self
+            .disc
+            .as_ref()
+            .and_then(|d| d.track_at_fad(fad))
+            .is_some_and(|t| !t.is_audio);
+        self.cr1 = self.cd_stat() | ((is_cdrom as u16) << 7) | (self.repcnt & 0x7F) as u16;
         self.cr2 = ((self.ctrladdr as u16) << 8) | self.track as u16;
         self.cr3 = ((self.index as u16) << 8) | ((fad >> 16) & 0xFF) as u16;
         self.cr4 = fad as u16;
@@ -1900,7 +1940,9 @@ mod tests {
         c.write16(0x001C, 0x0000);
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000);
-        assert_eq!(c.read16(0x0018), 0x0100, "PAUSE status");
+        // CR1 = PAUSE status (0x01) in the high byte | the `is_cdrom` bit
+        // (0x80) in the low byte, since FAD 150 is on a data (CD-ROM) track.
+        assert_eq!(c.read16(0x0018), 0x0180, "PAUSE status + is_cdrom");
         assert_eq!(c.read16(0x001C), 0x4101, "ctrl/adr 0x41, track 1");
         assert_eq!(c.read16(0x0020), 0x0100, "index 1, FAD hi 0");
         assert_eq!(c.read16(0x0024), 0x0096, "FAD 150");
