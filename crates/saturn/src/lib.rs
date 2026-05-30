@@ -44,7 +44,6 @@
 //!
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 
-pub mod bios_hle;
 pub mod bus;
 pub mod cartridge;
 pub mod cd_block;

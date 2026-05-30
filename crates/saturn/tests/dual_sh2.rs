@@ -140,8 +140,7 @@ fn reset_loads_pc_and_sp_from_bios_vector() {
 /// `pipeline.cycles` freezes; if `release_slave` left that stale value in place,
 /// the scheduler would see the slave as millions of cycles "behind" the master
 /// and run it that many catch-up steps in a single batch — "time travelling"
-/// through stale code. (This zeroed VF2's freshly HLE-loaded program right after
-/// its SSHON.) Regression for `Saturn::release_slave`.
+/// through stale code. Regression for `Saturn::release_slave`.
 #[test]
 fn releasing_slave_resyncs_its_cycle_no_time_travel() {
     let mut sat = Saturn::new(vec![0u8; 512 * 1024]);

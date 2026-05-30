@@ -427,15 +427,6 @@ impl CdBlock {
         self.disc.is_some()
     }
 
-    /// Whether the host has engaged the block (issued its first command). The
-    /// BIOS does this only after its hardware + SYS-table init completes and
-    /// just before it starts processing the disc — so the rising edge is a
-    /// clean "init done, disc not yet processed" point the HLE direct boot
-    /// hands off from (ADR-0010 / cold-state boot).
-    pub fn host_engaged(&self) -> bool {
-        self.host_initialized
-    }
-
     /// Eject the disc: the inverse of [`insert_disc`]. The drive returns to the
     /// empty-tray `NODISC` state with zeroed geometry, and a disc-change is
     /// flagged (`HIRQ.DCHG`) so the BIOS/game notices the media left.
@@ -454,22 +445,6 @@ impl CdBlock {
     /// media for save-state validation (the source is `#[serde(skip)]`'d).
     pub fn disc(&self) -> Option<&dyn SectorSource> {
         self.disc.as_deref()
-    }
-
-    /// The disc's **1st-read file** — the first non-directory entry in the
-    /// ISO9660 root directory (e.g. `AAAVF2.BIN`), returned as `(start FAD,
-    /// length in bytes)`. This is the game's initial program that the BIOS
-    /// loads to the IP.BIN load address and jumps to; the HLE direct boot
-    /// (`Saturn::hle_boot`) loads it itself. Reuses the existing root-directory
-    /// parser; `None` if there's no disc or the filesystem can't be read.
-    pub fn first_read_file(&mut self) -> Option<(u32, u32)> {
-        self.disc.as_ref()?; // no disc → no 1st-read
-        self.read_new_dir(0xFF_FFFF); // parse the root directory into `curdir`
-        let e = self.curdir.get(self.firstfile as usize)?;
-        if e.firstfad == 0 || e.length == 0 {
-            return None;
-        }
-        Some((e.firstfad, e.length))
     }
 
     /// Move the sector source out (leaving the drive disc-less). Used by

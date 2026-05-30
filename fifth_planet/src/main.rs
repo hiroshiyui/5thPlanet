@@ -35,17 +35,12 @@ fn host_unix_secs() -> u64 {
 }
 
 fn main() -> ExitCode {
-    // Split flags (`--cart=…`, `--hle-boot`) from positional args (BIOS, disc).
+    // Split flags (`--cart=…`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
-    // HLE direct boot (ADR-0010): skip the BIOS's CD boot loader and jump
-    // straight to the game's 1st-read program. Opt-in via flag or env.
-    let mut hle_boot = std::env::var_os("SAT_HLE_BOOT").is_some();
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
-        } else if arg == "--hle-boot" {
-            hle_boot = true;
         } else {
             positionals.push(arg);
         }
@@ -108,42 +103,7 @@ fn main() -> ExitCode {
     let save_base = std::path::PathBuf::from(&bios_path);
 
     let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region, hle_boot)
-}
-
-/// Run the BIOS until it has recognised the disc and is about to drop into its
-/// CD player (the master executing in the work-RAM shell region), or a frame
-/// fallback, then perform an HLE direct boot. Returns whether the boot fired.
-/// The shell-region range is tuned for the JP v1.01 BIOS (ADR-0010).
-#[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
-fn hle_boot_trigger(saturn: &mut saturn::Saturn, frame: u32) -> bool {
-    // Debug override: `SAT_HLE_FRAME=N` fires the HLE boot at exactly frame N
-    // (to probe the cleanest pre-shell handoff point).
-    if let Ok(n) = std::env::var("SAT_HLE_FRAME") {
-        let target: u32 = n.parse().unwrap_or(0);
-        if frame < target {
-            return false;
-        }
-        match saturn.cold_hle_boot() {
-            Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
-            None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
-        }
-        return true;
-    }
-    // Hand off from a clean post-init state: the BIOS engages the CD-block
-    // (first command) only after its hardware + SYS-table init is done and
-    // before it processes the disc — so injecting on that edge avoids the
-    // give-up/shell state that broke the game's BIOS SYS calls (ADR-0010). A
-    // frame fallback covers the no-disc / never-engaged case.
-    if saturn.cd_host_engaged() || frame >= 360 {
-        match saturn.cold_hle_boot() {
-            Some(addr) => eprintln!("HLE boot: jumped to 0x{addr:08X} at frame {frame}"),
-            None => eprintln!("HLE boot: no bootable 1st-read program found on the disc"),
-        }
-        true
-    } else {
-        false
-    }
+    run(bios, disc_spec, cart, save_base, region)
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
@@ -246,7 +206,6 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    hle_boot: bool,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -338,10 +297,6 @@ fn run(
     // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
     // the slot-less `<bios>.state`).
     let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
-
-    // HLE direct-boot state: a frame counter + a fired flag for the trigger.
-    let mut frame: u32 = 0;
-    let mut hle_booted = false;
 
     'main: loop {
         // The host SDL2 library on a modern Linux desktop emits event
@@ -448,10 +403,6 @@ fn run(
             saturn.set_pad1(held);
 
             saturn.run_frame(&mut framebuffer);
-            if hle_boot && !hle_booted {
-                hle_booted = hle_boot_trigger(&mut saturn, frame);
-            }
-            frame = frame.wrapping_add(1);
 
             // Queue this frame's SCSP audio, unless we're already buffered well
             // ahead (keeps latency bounded if the host runs faster than realtime).
@@ -540,7 +491,6 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    hle_boot: bool,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -632,12 +582,8 @@ fn run(
         let rlo = std::env::var("SAT_FBP_RLO").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
         let rhi = std::env::var("SAT_FBP_RHI").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u32::MAX);
         let mut hit = None;
-        let mut hle_booted = false;
-        for f in 0..headless_frames {
+        for _ in 0..headless_frames {
             saturn.run_frame(&mut framebuffer);
-            if hle_boot && !hle_booted {
-                hle_booted = hle_boot_trigger(&mut saturn, f);
-            }
             let h = if on_slave {
                 saturn.take_slave_bp_hit()
             } else {
@@ -683,47 +629,27 @@ fn run(
     // running until the master enters the work-RAM shell region (0x0602_0000+)
     // or SAT_FRAMES, then prints the tail of the trace — the boot give-up branch.
     if std::env::var_os("SAT_INLOOP").is_some() {
-        // Optional: fire the HLE boot (cold_hle_boot) the same way the main
-        // loop does, then trace the *game's* execution through the SYS hook
-        // (which only fires on the scheduler path, i.e. run_frame). Stop as
-        // soon as the master reaches the post-boot idle so the boot prefix is
-        // preserved rather than evicted by the idle loop flooding the ring.
+        // Stop when the master reaches the work-RAM region the BIOS gives up
+        // into, or an explicit `SAT_INLOOP_STOP=0xPC`, so the give-up branch is
+        // the tail of the ring rather than being evicted by the destination's
+        // own loop flooding it.
         let idle = std::env::var("SAT_INLOOP_STOP")
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
-        // For LLE, trace from the start (freeze on the shell give-up). For HLE,
-        // defer enabling the trace until the game has been injected — otherwise
-        // the freeze (low BIOS-RAM) trips during the BIOS's own boot, before the
-        // handoff, and the game is never traced.
-        if !hle_boot {
-            saturn.enable_master_pc_trace();
-        }
+        saturn.enable_master_pc_trace();
         // `SAT_SHELL_BASE` overrides the give-up detection base (default
-        // 0x0602_0000). Now that the CD-boot *loader* legitimately runs in
-        // 0x0602_xxxx/0x0603_xxxx, set it to 0x0604_0000 to trace *through* the
-        // loader and stop only at the CD-player give-up loop.
+        // 0x0602_0000). The CD-boot *loader* legitimately runs in
+        // 0x0602_xxxx/0x0603_xxxx, so set it to 0x0604_0000 to trace *through*
+        // the loader and stop only at the CD-player give-up loop.
         let shell_base = std::env::var("SAT_SHELL_BASE")
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(0x0602_0000);
-        let mut hle_booted = false;
         let mut triggered = None;
         for f in 0..headless_frames {
             saturn.run_frame(&mut framebuffer);
-            if hle_boot && !hle_booted {
-                hle_booted = hle_boot_trigger(&mut saturn, f);
-                if hle_booted {
-                    // Game injected: start tracing now. Freeze only at the exact
-                    // stop PC (the hang) so interrupt handlers (the stubs at
-                    // 0x0600_08xx) and the game's own code are all recorded.
-                    saturn.enable_master_pc_trace();
-                    if let Some(stop) = idle {
-                        saturn.set_master_trace_freeze(stop, stop + 2);
-                    }
-                }
-            }
             let pc = saturn.master().regs.pc;
-            let hit_shell = !hle_boot && (shell_base..0x0605_0000).contains(&pc);
+            let hit_shell = (shell_base..0x0605_0000).contains(&pc);
             if hit_shell || Some(pc) == idle {
                 triggered = Some((f, pc));
                 break;
@@ -794,60 +720,8 @@ fn run(
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
     let mut last_pc = u32::MAX;
-    let mut hle_booted = false;
     for f in 0..headless_frames {
         saturn.run_frame(&mut framebuffer);
-        if hle_boot && !hle_booted {
-            hle_booted = hle_boot_trigger(&mut saturn, f);
-            // SAT_HLE_DIAG: after the handoff, single-step the game logging PC
-            // changes until it leaves work RAM (i.e. faults to a BIOS handler),
-            // to find the faulting instruction.
-            if hle_booted && std::env::var_os("SAT_HLE_DIAG").is_some() {
-                use sh2::bus::{AccessKind, Bus};
-                // Single-step the game until it leaves its code region (>=
-                // 0x06004000) — i.e. takes an exception that vectors into a
-                // BIOS handler — then dump the faulting instruction + state.
-                let mut last_game = 0x0600_4000u32;
-                for _ in 0..4_000_000u64 {
-                    let pc = saturn.master().regs.pc;
-                    if pc >= 0x0600_4000 {
-                        last_game = pc;
-                        saturn.debug_step_master();
-                        continue;
-                    }
-                    let r = saturn.master().regs.r;
-                    eprintln!(
-                        "DIAG fault: vectored to {pc:08X}; last game PC={last_game:08X} \
-                         VBR={:08X} PR={:08X}",
-                        saturn.master().regs.vbr,
-                        saturn.master().regs.pr,
-                    );
-                    for (i, v) in r.iter().enumerate() {
-                        eprintln!("  R{i:<2}={v:08X}");
-                    }
-                    eprintln!("  --- caller (last game PC) ---");
-                    for a in (last_game.wrapping_sub(8)..=last_game.wrapping_add(8)).step_by(2) {
-                        let (w, _) = saturn.bus.read16(a, AccessKind::Data);
-                        let m = if a == last_game { "  <== here" } else { "" };
-                        eprintln!(
-                            "  {a:08X}: {w:04X}  {}{m}",
-                            sh2::debug::disasm(sh2::decoder::decode(w))
-                        );
-                    }
-                    eprintln!("  --- callee at {pc:08X} (SYS fn) ---");
-                    for a in (pc.wrapping_sub(4)..=pc.wrapping_add(28)).step_by(2) {
-                        let (w, _) = saturn.bus.read16(a, AccessKind::Data);
-                        let m = if a == pc { "  <== entry" } else { "" };
-                        eprintln!(
-                            "  {a:08X}: {w:04X}  {}{m}",
-                            sh2::debug::disasm(sh2::decoder::decode(w))
-                        );
-                    }
-                    break;
-                }
-                return ExitCode::SUCCESS;
-            }
-        }
         if pctrace {
             let pc = saturn.master().regs.pc;
             if pc != last_pc {

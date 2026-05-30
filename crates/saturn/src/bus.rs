@@ -151,7 +151,7 @@ impl SaturnBus {
     }
 }
 
-/// Debug write-watchpoint (M12 HLE-boot corruption hunt): when `SAT_WWATCH=0xADDR`
+/// Debug write-watchpoint (boot-divergence investigation): when `SAT_WWATCH=0xADDR`
 /// is set, log any write whose byte span covers `ADDR`, with width, value, access
 /// kind and cycle. No-op (one cheap env check, cached) when unset.
 #[inline]

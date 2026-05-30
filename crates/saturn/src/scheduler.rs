@@ -164,9 +164,8 @@ pub struct Sh2Entity {
     pc_trace: Option<std::collections::VecDeque<u32>>,
     /// Half-open PC range `[lo, hi)` that, once recorded, freezes the trace
     /// ring (so the give-up tail isn't evicted by the destination's own loop).
-    /// Defaults to the work-RAM shell region (LLE give-up); the HLE direct boot
-    /// overrides it to the low BIOS-RAM idle, since there the shell range is
-    /// game code. `#[serde(skip)]` like the trace itself.
+    /// Defaults to the work-RAM region the BIOS gives up into; override via
+    /// [`set_trace_freeze`]. `#[serde(skip)]` like the trace itself.
     #[serde(skip)]
     trace_freeze: (u32, u32),
     /// Debug-only full-speed breakpoint: when set and the master reaches this
@@ -176,17 +175,6 @@ pub struct Sh2Entity {
     bp: Option<u32>,
     #[serde(skip)]
     bp_hit: Option<([u32; 16], Vec<u16>)>,
-    /// When set, the master's BIOS SYS-call entry addresses are intercepted and
-    /// run by [`crate::bios_hle`] instead of executing BIOS code (the cold HLE
-    /// direct boot, ADR-0011). `#[serde(skip)]` — save-state across an HLE boot
-    /// is out of scope, so a restored state resumes with LLE dispatch.
-    #[serde(skip)]
-    hle_sys_active: bool,
-    /// Whether this entity is the slave SH-2. Some HLE SYS functions are
-    /// master-only (e.g. writing the SCU interrupt mask), so the dispatcher
-    /// needs to know which core called it. `#[serde(skip)]`; re-set on load.
-    #[serde(skip)]
-    is_slave: bool,
 }
 
 impl Sh2Entity {
@@ -198,8 +186,6 @@ impl Sh2Entity {
             trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
-            hle_sys_active: false,
-            is_slave: false,
         }
     }
 
@@ -212,24 +198,7 @@ impl Sh2Entity {
             trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
-            hle_sys_active: false,
-            is_slave: false,
         }
-    }
-
-    /// Enable HLE BIOS SYS-call dispatch on this core (the cold HLE direct boot).
-    pub fn set_hle_sys(&mut self, on: bool) {
-        self.hle_sys_active = on;
-    }
-
-    /// Mark this entity as the slave SH-2 (for master-only HLE SYS functions).
-    pub fn set_is_slave(&mut self, is_slave: bool) {
-        self.is_slave = is_slave;
-    }
-
-    /// Whether HLE BIOS SYS-call dispatch is active on this core (cold HLE boot).
-    pub fn hle_sys(&self) -> bool {
-        self.hle_sys_active
     }
 
     /// Begin recording a full-speed PC trace (debug; see [`pc_trace`]).
@@ -238,8 +207,7 @@ impl Sh2Entity {
     }
 
     /// Override the PC range `[lo, hi)` that freezes the trace ring (see
-    /// [`trace_freeze`]). Used by the HLE direct boot to freeze on the low
-    /// BIOS-RAM idle instead of the default shell region.
+    /// [`trace_freeze`]).
     pub fn set_trace_freeze(&mut self, lo: u32, hi: u32) {
         self.trace_freeze = (lo, hi);
     }
@@ -285,18 +253,6 @@ impl SchedEntity for Sh2Entity {
 
     fn step(&mut self, ctx: &mut Self::Context) {
         if !self.halted {
-            // HLE BIOS SYS-call dispatch (cold HLE direct boot, ADR-0011):
-            // intercept a call landing on a SYS entry address and run the host
-            // implementation in place of BIOS code, then return to the caller.
-            // Checked before fetch so the BIOS routine never executes.
-            if self.hle_sys_active
-                && !self.cpu.next_is_delay_slot()
-                && crate::bios_hle::is_sys_addr(self.cpu.regs.pc)
-            {
-                ctx.cycle = self.cpu.pipeline.cycles;
-                crate::bios_hle::dispatch(&mut self.cpu, ctx, self.is_slave);
-                return;
-            }
             // Publish the current global cycle to the bus so time-varying
             // peripheral reads (SMPC SF INTBACK completion) resolve at the
             // exact instruction that reads them.

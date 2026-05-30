@@ -104,7 +104,6 @@ impl Saturn {
         // (its deadline equal to a CPU's) the CPU steps first.
         let master_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
         let slave_id = scheduler.add(SaturnEntity::Sh2(Sh2Entity::new(Cpu::new())));
-        scheduler.entity_mut(slave_id).sh2_mut().set_is_slave(true);
         let cd_id = scheduler.add(SaturnEntity::CdBlock(CdBlockEntity::new(CD_TICK_CYCLES)));
         Self {
             bus,
@@ -166,26 +165,11 @@ impl Saturn {
     /// (This is what zeroed VF2's freshly-loaded program after its SSHON.)
     pub fn release_slave(&mut self) {
         let now = self.scheduler.now();
-        // In cold HLE the slave must be *started* the way the BIOS would on
-        // SSH-ON (Yabause `YabauseStartSlave`): jump to the game-provided entry
-        // at `[0x06000250]`, with `VBR = 0x06000400` (the BIOS slave vector
-        // table) and the slave stack from `[0x060002AC]` (or the BIOS default
-        // `0x06001000`). Resuming the slave's stale PC instead made it re-run
-        // BIOS init and clobber the loaded game.
-        if self.scheduler.entity(self.slave_id).sh2().hle_sys() {
-            use sh2::bus::{AccessKind, Bus};
-            let entry = self.bus.read32(0x0600_0250, AccessKind::Data).0;
-            let alt_sp = self.bus.read32(0x0600_02AC, AccessKind::Data).0;
-            let sp = if alt_sp != 0 { alt_sp } else { 0x0600_1000 };
-            let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
-            slave.cpu.hle_jump(entry, sp);
-            slave.cpu.regs.vbr = 0x0600_0400;
-            if slave.cpu.pipeline.cycles < now {
-                slave.cpu.pipeline.cycles = now;
-            }
-            slave.set_halted(false);
-            return;
-        }
+        // Un-halting must resync the slave's frozen cycle up to the global
+        // clock first: while halted its `pipeline.cycles` froze (the scheduler
+        // skips a halted entity), so releasing it without the bump would make
+        // the scheduler see it as millions of cycles "behind" and run that many
+        // catch-up steps of stale code in one batch ("time travel").
         let slave = self.scheduler.entity_mut(self.slave_id).sh2_mut();
         if slave.cpu.pipeline.cycles < now {
             slave.cpu.pipeline.cycles = now;
@@ -700,97 +684,6 @@ impl Saturn {
     /// Whether a disc is currently inserted.
     pub fn has_disc(&self) -> bool {
         self.bus.cd_block.has_disc()
-    }
-
-    /// Whether the BIOS has engaged the CD-block (issued its first command) —
-    /// the clean post-init handoff point for HLE direct boot (see
-    /// [`CdBlock::host_engaged`](crate::cd_block::CdBlock::host_engaged)).
-    pub fn cd_host_engaged(&self) -> bool {
-        self.bus.cd_block.host_engaged()
-    }
-
-    /// **HLE direct boot** (ADR-0010): load the disc's 1st-read program into
-    /// work RAM and jump the master SH-2 to it, bypassing the BIOS's CD boot
-    /// loader. Returns the load address on success, or `None` (a no-op) if
-    /// there's no disc / IP.BIN / filesystem to read, so the caller can fall
-    /// back to the running BIOS.
-    ///
-    /// This is the **hybrid** model: it assumes the BIOS has already
-    /// initialised the hardware and the `SYS_*` call table (call it once the
-    /// BIOS has recognised the disc and is about to drop to its CD player), so
-    /// only the final 1st-read load + handoff is high-level-emulated. The game
-    /// releases the slave SH-2 itself (via SMPC `SSHON`).
-    pub fn hle_boot(&mut self) -> Option<u32> {
-        use crate::bus::HIGH_WRAM_BASE;
-        use crate::disc::FAD_OFFSET;
-        const HWRAM_SIZE: u32 = 0x10_0000;
-
-        // 1st-read file (first root-directory entry): start FAD + byte length.
-        let (file_fad, file_len) = self.bus.cd_block.first_read_file()?;
-        let file_len = file_len.min(HWRAM_SIZE); // guard against a corrupt size
-
-        // IP.BIN header (FAD 150): 1st-read load address (+0xF0) and master
-        // stack (+0xE8; 0 → the conventional BIOS default 0x0600_2000).
-        let mut ip = [0u8; 2048];
-        if !self.bus.cd_block.disc()?.read_sector(FAD_OFFSET, &mut ip) {
-            return None;
-        }
-        let be = |o: usize| u32::from_be_bytes([ip[o], ip[o + 1], ip[o + 2], ip[o + 3]]);
-        let load_addr = be(0xF0);
-        if !(HIGH_WRAM_BASE..HIGH_WRAM_BASE + HWRAM_SIZE).contains(&load_addr) {
-            return None; // only high-work-RAM load addresses are supported
-        }
-        let stack = be(0xE8);
-        let sp = if stack != 0 { stack } else { 0x0600_2000 };
-
-        // Read the 1st-read file's sectors into an owned buffer (so the disc
-        // borrow is released before we write work RAM).
-        let nsec = (file_len as usize).div_ceil(2048);
-        let mut data = vec![0u8; nsec * 2048];
-        {
-            let disc = self.bus.cd_block.disc()?;
-            let mut sec = [0u8; 2048];
-            for i in 0..nsec {
-                if disc.read_sector(file_fad + i as u32, &mut sec) {
-                    data[i * 2048..(i + 1) * 2048].copy_from_slice(&sec);
-                }
-            }
-        }
-
-        // Copy into high work RAM at the load address.
-        let off = (load_addr - HIGH_WRAM_BASE) as usize;
-        let ram = self.bus.high_wram.as_mut_slice();
-        let end = (off + data.len()).min(ram.len());
-        ram[off..end].copy_from_slice(&data[..end - off]);
-
-        // Hand the master SH-2 control of the freshly loaded program.
-        self.master_mut().hle_jump(load_addr, sp);
-        Some(load_addr)
-    }
-
-    /// **Cold HLE direct boot** (ADR-0011): [`hle_boot`](Self::hle_boot) plus the
-    /// HLE BIOS system-call environment — install our SYS call table into work
-    /// RAM (overriding whatever the BIOS left there) and enable the master's
-    /// SYS-dispatch hook, so the game's BIOS system calls run our
-    /// [`bios_hle`](crate::bios_hle) implementations instead of the BIOS's
-    /// fatal/unimplemented stubs. Returns the 1st-read load address, or `None`
-    /// (no-op) if there's nothing bootable.
-    pub fn cold_hle_boot(&mut self) -> Option<u32> {
-        let addr = self.hle_boot()?;
-        crate::bios_hle::install_call_table(&mut self.bus);
-        // Enable the SYS-call hook on BOTH cores: the SYS table lives in shared
-        // work RAM, so the slave's BIOS init also `JSR`s our installed entry
-        // addresses. Without the hook on the slave it would run real BIOS ROM at
-        // those addresses (garbage) and fall into the fatal handler.
-        self.scheduler
-            .entity_mut(self.master_id)
-            .sh2_mut()
-            .set_hle_sys(true);
-        self.scheduler
-            .entity_mut(self.slave_id)
-            .sh2_mut()
-            .set_hle_sys(true);
-        Some(addr)
     }
 
     /// Plug a cartridge into the rear expansion slot (Extension RAM, backup
