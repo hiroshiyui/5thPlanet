@@ -54,16 +54,31 @@ Each fix re-verifies the `bios_boot` splash golden and re-checks the VF2 LLE
 boot trace before moving on. #5 (the SCU interrupt rework) is the deepest and
 riskiest; do it on its own with the golden as guard.
 
-**Status (2026-05-30):** #1 landed (`3e43928`), #2 landed (`5ce37d4`) — both
-correct, golden-safe, full suite green. VF2 still gives up to the CD player,
-which is expected: the post-IP.BIN rejection is a *convergence*, and the
-single most likely unblock is the deep **#5 (SCU IST = live pending set +
-level re-assertion)**. #5 conflicts with the earlier interim IST-ack-clear
-(`7739673`) and reworks the interrupt core (`raise`/`take_pending`/IST read +
-the system drain + a vector-fetch ack hook), so it warrants a focused pass with
-the splash golden as guard rather than a quick edit. #3/#4/#6/#7/#8 are smaller
-consolidation fixes that improve fidelity but are individually less likely to
-flip the boot decision.
+**Status (2026-05-30):** four boot-critical consolidation fixes landed — #1
+`3e43928`, #2 `5ce37d4`, #6 `879bba7` (slave power-on-reset on SSHON), #8-SR
+`534a7ba` (INTBACK status SR = `(SR&~0x80&~NPE)|0x0F`). All correct, golden-safe
+(splash hash unchanged), full suite + clippy green. **VF2 still gives up** —
+expected: the post-IP.BIN rejection is a *convergence* and none of these is the
+single unblock.
+
+**Reassessment of the remaining queue:**
+- **#5 (SCU IST live-pending / level re-assert)** — on closer scoping this is
+  *unlikely* the VF2 unblock: the boot loader barely touches the SCU IST (~3
+  register writes the whole run; it reads the CD HIRQ instead), and the
+  boot-path interrupt sources (VBlank-IN/OUT, HBlank) are edges, not held
+  levels, so the level-re-assertion substance is moot for boot. It's a real
+  Mednafen-consolidation fix but high-risk (golden) + low boot payoff. Deferred.
+- **#3 (VBlank-OUT edge)** — a 1-line phase shift; marginal, golden risk. Deferred.
+- **#7 (CKCHG subsystem-reset + master NMI)** — involved and *not* low-risk
+  (injecting a master NMI mid-boot is a large behavior change), and it isn't
+  blocking us (we proceed past display init). Warrants its own focused pass.
+- **#8-OREG / #4 timers** — minor / BIOS-ignored fidelity.
+
+**The actual VF2 unblock is still the unpinned, overlay-obscured value the
+loader reads when it rejects the disc post-IP.BIN** — that needs a focused deep
+trace (master read-watch / step-trace through the loader's validation), not more
+interrupt-model edits. The consolidation pass above has materially de-tangled
+the boot-path interrupt/timing model against Mednafen, which was the goal.
 
 ---
 
