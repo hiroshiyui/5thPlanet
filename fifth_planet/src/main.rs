@@ -698,6 +698,14 @@ fn run(
         if !hle_boot {
             saturn.enable_master_pc_trace();
         }
+        // `SAT_SHELL_BASE` overrides the give-up detection base (default
+        // 0x0602_0000). Now that the CD-boot *loader* legitimately runs in
+        // 0x0602_xxxx/0x0603_xxxx, set it to 0x0604_0000 to trace *through* the
+        // loader and stop only at the CD-player give-up loop.
+        let shell_base = std::env::var("SAT_SHELL_BASE")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x0602_0000);
         let mut hle_booted = false;
         let mut triggered = None;
         for f in 0..headless_frames {
@@ -715,7 +723,7 @@ fn run(
                 }
             }
             let pc = saturn.master().regs.pc;
-            let hit_shell = !hle_boot && (0x0602_0000..0x0605_0000).contains(&pc);
+            let hit_shell = !hle_boot && (shell_base..0x0605_0000).contains(&pc);
             if hit_shell || Some(pc) == idle {
                 triggered = Some((f, pc));
                 break;
