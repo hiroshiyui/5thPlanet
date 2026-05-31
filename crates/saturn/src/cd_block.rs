@@ -1223,6 +1223,21 @@ impl CdBlock {
                 }
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
+                // A Get-and-Delete transfer (0x63) frees the sectors it covered
+                // when the transfer ends (MAME `cmd_end_data_transfer`,
+                // `XFERTYPE32_GETDELETESECTOR`): the host reads exactly the
+                // requested sector count via the data port and never over-reads,
+                // so the lazy free in `read_data_port32` — which only fires on a
+                // read *past* the end — does not run. Free them here instead.
+                // Without this the transferred sectors (e.g. the 16 IP.BIN
+                // sectors) linger in the partition and are prepended to the next
+                // file read, shifting the loaded 1st-read program that many
+                // sectors so the BIOS jumps into stale IP.BIN data and crashes.
+                if let Some(x) = self.xfer32.take()
+                    && x.delete
+                {
+                    self.delete_partition_sectors(x.part, x.pos, x.num);
+                }
                 self.xfer.clear();
                 self.xfer_pos = 0;
                 self.xfer_done = 0;
@@ -2126,6 +2141,29 @@ mod tests {
         }
         let _ = c.read32(0x8000); // past end → frees the blocks
         assert!(c.partitions[0].blocks.is_empty(), "partition emptied");
+        assert_eq!(c.free_blocks, free_before + 1, "block returned to the pool");
+    }
+
+    #[test]
+    fn end_data_transfer_frees_a_get_and_delete_that_was_not_over_read() {
+        // Regression: the host reads exactly the sector count and never over-
+        // reads the data port, so the lazy free in `read_data_port32` doesn't
+        // fire — `0x06 EndDataTransfer` must free the Get-and-Delete blocks.
+        // Without it the sectors linger and are prepended to the next read,
+        // shifting a loaded 1st-read program (the VF2 boot crash).
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 1);
+        c.tick(MASTER_HZ / (75 * 2) + 100);
+        assert_eq!(c.partitions[0].blocks.len(), 1);
+        let free_before = c.free_blocks;
+        cmd(&mut c, 0x6300, 0x0000, 0x0000, 0x0001); // get-and-delete 1 sector
+        for _ in 0..512 {
+            let _ = c.read32(0x8000); // drain exactly one sector, no over-read
+        }
+        assert_eq!(c.partitions[0].blocks.len(), 1, "still buffered before EndXfer");
+        cmd(&mut c, 0x0600, 0x0000, 0x0000, 0x0000); // End data transfer
+        assert!(c.partitions[0].blocks.is_empty(), "EndXfer freed the block");
         assert_eq!(c.free_blocks, free_before + 1, "block returned to the pool");
     }
 
