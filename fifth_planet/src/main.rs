@@ -773,9 +773,17 @@ fn run(
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
+    // Debug: `SAT_CACHE_PURGE=1` purges both SH-2 I-caches each frame, to test
+    // whether a stale-cache fetch is the blocker (if a game runs past a spurious
+    // illegal-instruction fault only with this on, the cache is incoherent).
+    let cache_purge = std::env::var_os("SAT_CACHE_PURGE").is_some();
     let mut last_pc = u32::MAX;
     for f in 0..headless_frames {
         apply_scripted_pad(&mut saturn, f);
+        if cache_purge {
+            saturn.master_mut().cache.purge();
+            saturn.slave_mut().cache.purge();
+        }
         saturn.run_frame(&mut framebuffer);
         if pctrace {
             let pc = saturn.master().regs.pc;
