@@ -266,8 +266,14 @@ fn dump_giveup_state() {
     sat.set_master_bp(giveup);
 
     // Run headless (no render) in 1-frame chunks until the give-up fires.
+    // FRAMES caps the run (default 400; keep ≤~700 so a single test run fits the
+    // harness ~8s budget).
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let mut hit = None;
-    for f in 0..400u32 {
+    for f in 0..frames {
         sat.run_for(479_151);
         if let Some(h) = sat.take_master_bp_hit() {
             println!("give-up 0x{giveup:08X} hit at frame {f}");
@@ -344,7 +350,7 @@ fn dump_giveup_state() {
 
     let Some((r, pr, gbr, code)) = hit else {
         println!(
-            "give-up 0x{giveup:08X} NOT hit in 400 frames (pc=0x{:08X})",
+            "give-up 0x{giveup:08X} NOT hit in {frames} frames (pc=0x{:08X})",
             sat.master().regs.pc
         );
         return;
