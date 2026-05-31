@@ -620,8 +620,25 @@ impl Saturn {
                     let ireg = self.bus.smpc.ireg;
                     self.bus.smpc.smem.copy_from_slice(&ireg[0..4]);
                 }
-                // Remaining commands (clock-change, reset-enable/disable, …)
-                // are recognised but have no emulator-side effect yet.
+                // CKCHG352/CKCHG320 — system-clock change. On hardware the SMPC
+                // does a partial system reset (sound CPU off; SCSP/VDP1/VDP2/SCU
+                // soft-reset), switches the dot-clock divisor (28 MHz / 26 MHz),
+                // then asserts a master-SH-2 NMI after a few VBlanks (Mednafen
+                // `smpc.cpp` CMD_CKCHG). The BIOS `ChangeSystemClock` SYS call
+                // issues this and *waits for that NMI*; without it the BIOS times
+                // out into its fatal handler (this is exactly what VF2's startup
+                // hits — SYS slot 0x320). We don't model the 26/28 MHz divisor
+                // switch, but we reproduce the observable handshake: halt the
+                // slave and NMI the master so the SYS call returns.
+                SmpcCommand::CkChg352 | SmpcCommand::CkChg320 => {
+                    self.halt_slave();
+                    self.master_mut()
+                        .onchip
+                        .intc
+                        .raise(sh2::InterruptSource::Nmi);
+                }
+                // Remaining commands (reset-enable/disable, …) are recognised
+                // but have no emulator-side effect yet.
                 _ => {}
             }
             self.bus.smpc.mark_command_done();
