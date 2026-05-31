@@ -878,5 +878,19 @@ fn run(
     println!(
         "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={headless_frames}; slave PC=0x{slave_pc:08X} halted={slave_halted}"
     );
+    // SCU interrupt-vector table dump for boot debugging: print VBR and the
+    // master's exception-vector entries the SCU sources use (0x40 VBlank-IN ..
+    // 0x4D Sprite-Draw-End), so an unhandled-interrupt park can be traced to
+    // which vector the BIOS left pointing at its default handler.
+    if std::env::var_os("SAT_VEC_DUMP").is_some() {
+        use sh2::bus::{AccessKind, Bus};
+        let vbr = saturn.master().regs.vbr;
+        eprint!("VBR={vbr:08X}");
+        for v in 0x40u32..=0x4D {
+            let (h, _) = saturn.bus.read32(vbr.wrapping_add(v * 4), AccessKind::Data);
+            eprint!(" [{v:02X}]={h:08X}");
+        }
+        eprintln!();
+    }
     ExitCode::SUCCESS
 }
