@@ -1547,9 +1547,19 @@ impl CdBlock {
                     self.status = STAT_PAUSE;
                     self.track = (self.cr2 >> 8) as u8;
                 } else {
+                    // Stop (Seek target 0): the drive halts. Match Mednafen's
+                    // STOP geometry (cdb.cpp:2846) — every position field goes
+                    // to the "no position" sentinel (0xFF / FAD 0xFFFFFF) and
+                    // the repeat count to 0x7F — so the BIOS's post-stop
+                    // GetStatus poll sees the expected stopped geometry
+                    // (CR2=0xFFFF, CR3=0xFFFF, CR4=0xFFFF) and proceeds, rather
+                    // than reading stale track/ctrl-adr fields and looping.
                     self.status = STAT_STANDBY;
                     self.cd_curfad = 0xFFFF_FFFF;
                     self.track = 0xFF;
+                    self.ctrladdr = 0xFF;
+                    self.index = 0xFF;
+                    self.repcnt = 0x7F;
                 }
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK;
