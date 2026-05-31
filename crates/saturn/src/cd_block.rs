@@ -451,7 +451,12 @@ impl CdBlock {
         // the read pump actually reads a data sector (Mednafen semantics).
         self.is_cdrom = false;
         self.disc = Some(Box::new(source));
-        self.disk_changed = self.host_initialized;
+        // A disc appearing is always a disc-change: the FIRST Init (cold boot
+        // *or* a runtime swap) reports DCHG one-shot, matching Mednafen, which
+        // treats a power-on disc as a change (its recognition HIRQ carries
+        // DCHG). For a runtime swap (host already engaged) also assert DCHG now,
+        // since the BIOS/game isn't about to issue an Init.
+        self.disk_changed = true;
         if self.host_initialized {
             self.hirq |= HIRQ_DCHG;
         }
@@ -510,22 +515,21 @@ impl CdBlock {
         }
         match Self::slot(offset & 0xFFFF) {
             0x0008 => {
-                // Recompute the buffer/disc-state flags on read and latch
-                // them, matching MAME's `hirq_r`: DCHG ("disc change / tray
-                // open") is **always cleared** on read. (This replaces the
-                // earlier Yabause-derived DCHG *re-assert*, which is the
-                // opposite and left CMOK/DCHG bits set that derailed the BIOS
-                // — see the MAME reference diff at BIOS 0x4216.)
+                // DCHG ("disc change / tray open") is **W1C, NOT auto-cleared
+                // on read** — Mednafen keeps it set in the HIRQ until the host
+                // acknowledges by writing HIRQ (its disc-recognition loop reads
+                // HIRQ many times and the stored value retains DCHG=0x20; the
+                // value the BIOS branches on is e.g. 0x0FE1, with DCHG). MAME's
+                // `hirq_r` clears DCHG on read, but that left our recognition
+                // HIRQ shadow ([0x060003A4]) at 0x0EC1 — missing DCHG — and the
+                // BIOS took its give-up (AbortFile-loop) path instead of
+                // proceeding to GetToc → auth → Play. (Same W1C reasoning as
+                // CSCT below.)
                 //
-                // CSCT ("1 sector read complete") is **W1C, NOT auto-cleared on
-                // read** — it stays set after the read pump raises it until the
-                // host acknowledges by writing HIRQ (Mednafen keeps it set; its
-                // loader reads CSCT after the IP.BIN transfer to confirm the
-                // read completed before reading the 1st-read file). Clearing it
-                // here made our loader never see "read complete" → it
-                // re-recognized the disc (0x02 GetToc) and dropped to the CD
-                // player instead of reading the 1st-read (0x70/0x74).
-                self.hirq &= !(HIRQ_DCHG | HIRQ_BFUL);
+                // CSCT ("1 sector read complete") is likewise W1C — it stays set
+                // after the read pump raises it until the host writes HIRQ.
+                // Clearing it on read made our loader never see "read complete".
+                self.hirq &= !HIRQ_BFUL;
                 // Debug: env-gated HIRQ read-watch (logs each *changed* value
                 // the host reads), to see which HIRQ state the BIOS CD-boot
                 // loader branches on at the post-IP.BIN read-file-vs-re-recognize
