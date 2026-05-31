@@ -78,8 +78,7 @@ const STUB_WAITS: u32 = 0;
 
 // Not `Clone`: the CD-block holds a `Box<dyn SectorSource>` (an image or a
 // live drive) that isn't cloneable, and nothing clones the bus anyway.
-#[derive(Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SaturnBus {
     pub bios: BiosRom,
     pub smpc: Smpc,
@@ -163,6 +162,23 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u3
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
     });
+    // Value-match mode (SAT_WVAL=0xVALUE): log any write of that 32-bit value,
+    // regardless of address — finds *where* a known datum lands (e.g. the
+    // IP.BIN "SEGA" word 0x53454741 to locate the IP.BIN's WRAM destination).
+    static WV: OnceLock<Option<u32>> = OnceLock::new();
+    let wv = *WV.get_or_init(|| {
+        std::env::var("SAT_WVAL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+    });
+    if let Some(tv) = wv
+        && val == tv
+    {
+        eprintln!(
+            "WVAL {tv:08X}: w{}@{addr:08X} {k:?} cyc={cycle} pc={pc:08X}",
+            size * 8
+        );
+    }
     if let Some(t) = w {
         // High work RAM (1 MiB) mirrors across its 16 MiB window, so a write to
         // any mirror of `t` hits the same byte. Compare folded offsets there.
@@ -184,7 +200,10 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u3
                 .unwrap_or(0)
         });
         if fa.wrapping_add(size) > ft.saturating_sub(win) && fa < ft.wrapping_add(win.max(1)) {
-            eprintln!("WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}", size * 8);
+            eprintln!(
+                "WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}",
+                size * 8
+            );
         }
     }
 }

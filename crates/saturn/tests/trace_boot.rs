@@ -436,6 +436,46 @@ fn dump_giveup_state() {
         );
     }
 
+    // Scan low + high WRAM for a byte string — MEMSCAN="SEGA SEGASATURN"
+    // confirms the transferred IP.BIN landed in work RAM intact. IP.BIN reaches
+    // WRAM via GetThenDelete → the 32-bit data port (0x05818000) → SCU-DMA, a
+    // path distinct from the auth command's direct CD-block read, so a correct
+    // auth doesn't prove a correct transfer. Runs regardless of the BP, so a
+    // never-hit GIVEUP_PC + a chosen FRAMES scans at an arbitrary frame.
+    if let Ok(needle) = std::env::var("MEMSCAN") {
+        let pat = needle.as_bytes();
+        println!("\n=== MEMSCAN {needle:?} (low + high WRAM) ===");
+        let mut found = 0;
+        for (lo, hi) in [(0x0020_0000u32, 0x0030_0000u32), (0x0600_0000, 0x0610_0000)] {
+            let mut a = lo;
+            while a < hi && found < 24 {
+                if sat.bus.read8(a, AccessKind::Data).0 == pat[0]
+                    && pat
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &pb)| sat.bus.read8(a + k as u32, AccessKind::Data).0 == pb)
+                {
+                    let ctx: String = (0..48)
+                        .map(|k| {
+                            let bb = sat.bus.read8(a + k, AccessKind::Data).0;
+                            if (0x20..0x7F).contains(&bb) {
+                                bb as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    println!("  match @0x{a:08X}: {ctx}");
+                    found += 1;
+                }
+                a += 1;
+            }
+        }
+        if found == 0 {
+            println!("  (no match in low/high WRAM)");
+        }
+    }
+
     let Some((r, pr, gbr, code)) = hit else {
         println!(
             "give-up 0x{giveup:08X} NOT hit in {frames} frames (pc=0x{:08X})",
