@@ -475,13 +475,20 @@ impl CdBlock {
             0x0008 => {
                 // Recompute the buffer/disc-state flags on read and latch
                 // them, matching MAME's `hirq_r`: DCHG ("disc change / tray
-                // open") is **always cleared**, and BFUL/CSCT are set from
-                // the buffer state — both clear in our no-disc model (no data
-                // buffered, no sector stored). (This replaces the earlier
-                // Yabause-derived DCHG *re-assert*, which is the opposite and
-                // left CMOK/DCHG bits set that derailed the BIOS — see the
-                // MAME reference diff at BIOS 0x4216.)
-                self.hirq &= !(HIRQ_DCHG | HIRQ_BFUL | HIRQ_CSCT);
+                // open") is **always cleared** on read. (This replaces the
+                // earlier Yabause-derived DCHG *re-assert*, which is the
+                // opposite and left CMOK/DCHG bits set that derailed the BIOS
+                // — see the MAME reference diff at BIOS 0x4216.)
+                //
+                // CSCT ("1 sector read complete") is **W1C, NOT auto-cleared on
+                // read** — it stays set after the read pump raises it until the
+                // host acknowledges by writing HIRQ (Mednafen keeps it set; its
+                // loader reads CSCT after the IP.BIN transfer to confirm the
+                // read completed before reading the 1st-read file). Clearing it
+                // here made our loader never see "read complete" → it
+                // re-recognized the disc (0x02 GetToc) and dropped to the CD
+                // player instead of reading the 1st-read (0x70/0x74).
+                self.hirq &= !(HIRQ_DCHG | HIRQ_BFUL);
                 // Debug: env-gated HIRQ read-watch (logs each *changed* value
                 // the host reads), to see which HIRQ state the BIOS CD-boot
                 // loader branches on at the post-IP.BIN read-file-vs-re-recognize
