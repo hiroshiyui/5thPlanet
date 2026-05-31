@@ -51,6 +51,11 @@ const HIRQ_DCHG: u16 = 0x0020; // disc change / tray open
 const HIRQ_ESEL: u16 = 0x0040; // soft-reset / selector settings done
 const HIRQ_EHST: u16 = 0x0080; // host I/O done
 const HIRQ_SCDQ: u16 = 0x0400; // subcode Q decode done
+// MPEG decode-end / "no MPEG card" bit. The real CD-block sets it at power-on
+// and holds it (Mednafen `cdb.cpp` sets it from reset and it appears in every
+// HIRQ the BIOS reads). We have no MPEG card, so it stays set permanently —
+// kept across host HIRQ writes (the host never clears it without an MPEG card).
+const HIRQ_MPED: u16 = 0x0800;
 
 // CD status codes — high byte of CR1 (cs2.c / MAME `CD_STAT_*`).
 const STAT_PAUSE: u8 = 0x01; // drive ready, disc present, not playing
@@ -337,7 +342,7 @@ impl CdBlock {
             // rest are set only by events (commands, periodics). The BIOS
             // ORs HIRQ into a WRAM accumulator and tests CMOK (bit 0) early
             // in boot — a spuriously-set CMOK derails it.
-            hirq: 0x0000,
+            hirq: HIRQ_MPED, // no MPEG card → MPED set from power-on, held
             hirq_mask: 0xFFFF,
             // Power-on identity string "CDBLOCK" — the BIOS reads CR1..CR4
             // to confirm the CD subsystem is present.
@@ -542,7 +547,9 @@ impl CdBlock {
         match Self::slot(offset & 0xFFFF) {
             // HIRQ is write-AND-to-clear: a written 0 bit clears the flag,
             // a written 1 bit leaves it untouched (cs2.c: `HIRQ &= val`).
-            0x0008 => self.hirq &= val,
+            // MPED is held set regardless (no MPEG card — it's never cleared
+            // without one), matching Mednafen where MPED persists from reset.
+            0x0008 => self.hirq = (self.hirq & val) | HIRQ_MPED,
             0x000C => self.hirq_mask = val,
             0x0018 => {
                 // Writing CR1 begins a command and ends any periodic
@@ -1634,7 +1641,7 @@ impl CdBlock {
                 }
                 if !mpeg && self.disc.is_some() {
                     self.sectorstore = true;
-                    self.hirq = 0x07C5;
+                    self.hirq = 0x07C5 | HIRQ_MPED; // 0x0FC5 (MPED held, no MPEG card)
                 } else {
                     self.hirq |= HIRQ_CMOK;
                 }
@@ -1753,13 +1760,16 @@ mod tests {
     #[test]
     fn hirq_is_write_and_to_clear() {
         let mut c = CdBlock::new();
-        c.hirq = HIRQ_CMOK | HIRQ_DRDY | HIRQ_DCHG;
+        c.hirq = HIRQ_CMOK | HIRQ_DRDY | HIRQ_DCHG | HIRQ_MPED;
         // Clear CMOK by writing a word with CMOK = 0, others = 1.
         c.write16(0x0008, !HIRQ_CMOK);
-        assert_eq!(c.hirq, HIRQ_DRDY | HIRQ_DCHG);
+        assert_eq!(c.hirq, HIRQ_DRDY | HIRQ_DCHG | HIRQ_MPED);
         // Writing all-ones clears nothing.
         c.write16(0x0008, 0xFFFF);
-        assert_eq!(c.hirq, HIRQ_DRDY | HIRQ_DCHG);
+        assert_eq!(c.hirq, HIRQ_DRDY | HIRQ_DCHG | HIRQ_MPED);
+        // MPED is held even if the host writes a 0 to it (no MPEG card).
+        c.write16(0x0008, !HIRQ_MPED);
+        assert_eq!(c.hirq & HIRQ_MPED, HIRQ_MPED, "MPED stays set (no MPEG)");
     }
 
     #[test]
@@ -2265,7 +2275,7 @@ mod tests {
         c.insert_disc(iso_disc());
         // Check copy protection (0xE0): the auth HIRQ pattern incl. ECPY (0x100).
         cmd(&mut c, 0xE000, 0x0000, 0, 0);
-        assert_eq!(c.hirq, 0x07C5, "authentication HIRQ pattern");
+        assert_eq!(c.hirq, 0x0FC5, "authentication HIRQ pattern (0x07C5 | MPED)");
         assert_ne!(c.hirq & 0x0100, 0, "ECPY (authentication done)");
         // Get disc region (0xE1): 4 = Saturn data disc.
         cmd(&mut c, 0xE100, 0x0000, 0, 0);

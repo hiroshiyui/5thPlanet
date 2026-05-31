@@ -20,10 +20,11 @@ const CR4: u32 = CD_BLOCK_BASE + 0x24;
 fn power_on_hirq_and_cdblock_signature_via_the_bus() {
     let mut sat = Saturn::with_blank_bios();
     let (hirq, _) = sat.bus.read16(HIRQ, AccessKind::Data);
-    // Power-on HIRQ is all-clear (MAME's `hirqreg = 0`): no bits are set
-    // until an event (command / periodic) sets them. The read recompute
-    // clears DCHG/BFUL/CSCT, which are already 0 here.
-    assert_eq!(hirq, 0x0000, "power-on HIRQ is all-clear");
+    // Power-on HIRQ has only MPED (0x0800) set — the "no MPEG card" bit the
+    // real CD-block (and Mednafen) holds from reset. No other bits are set
+    // until an event (command / periodic). MAME instead starts at 0; we follow
+    // Mednafen here since the BIOS reads MPED in every HIRQ during boot.
+    assert_eq!(hirq, 0x0800, "power-on HIRQ = MPED only");
     // The BIOS reads CR1..CR4 for the ASCII "CDBLOCK" identity string.
     let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
     let (cr2, _) = sat.bus.read16(CR2, AccessKind::Data);
