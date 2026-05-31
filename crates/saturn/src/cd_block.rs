@@ -1131,17 +1131,18 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK;
             }
             0x01 => {
-                // Get hardware info: status, CD/MPEG version, drive rev
-                // (MAME `cmd_get_hw_info`). MAME does *not* touch the
-                // disc-changed state here, so we don't either.
-                // REVIEW(magic): CR2/CR4 (0x0201, 0x0400) are MAME's literal
-                // hardware-info bytes (CD-block version / drive revision),
-                // not from a datasheet. The BIOS doesn't gate boot on them
-                // (it just reads them); revisit if a game checks the revision.
+                // Get hardware info: status + CD-block hardware flags/version,
+                // MPEG version, drive info (Mednafen `cdb.cpp` GET_HWINFO:
+                // CR2=0x0002, CR3=0x0000, CR4=0x0600). MAME uses different
+                // literal bytes (0x0201/0x0400) whose CR2 high byte (0x02) the
+                // BIOS reads as "MPEG card present" — that sent our boot down
+                // the MPEG-auth-probe path (E0/E1/E2 with CR2=1) and made it
+                // loop disc recognition ~4× instead of proceeding once. With
+                // no MPEG card we must report 0x0002/0x0600 like the reference.
                 self.cr1 = (self.status as u16) << 8;
-                self.cr2 = 0x0201; // MPEG card present / CD version
-                self.cr3 = 0x0000; // MPEG not authenticated
-                self.cr4 = 0x0400; // drive info / revision
+                self.cr2 = 0x0002; // hardware flags (no MPEG) / version
+                self.cr3 = 0x0000; // MPEG version (none)
+                self.cr4 = 0x0600; // drive info / revision
                 self.hirq |= HIRQ_CMOK;
             }
             0x02 => {
@@ -1893,8 +1894,8 @@ mod tests {
         c.write16(0x001C, 0x0000);
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000); // CR4 completes the set → trigger
-        assert_eq!(c.read16(0x001C), 0x0201);
-        assert_eq!(c.read16(0x0024), 0x0400);
+        assert_eq!(c.read16(0x001C), 0x0002); // CR2: hw flags (no MPEG) / version
+        assert_eq!(c.read16(0x0024), 0x0600); // CR4: drive info (Mednafen value)
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
     }
 
