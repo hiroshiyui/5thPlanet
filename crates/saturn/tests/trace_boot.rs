@@ -178,11 +178,23 @@ fn gen_vf2_pc_trace() {
     // delay slots included). NB: Mednafen logs the fetch-PC = our exec-PC + 4.
     let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
     let mut logged: u64 = 0;
+    // PCTRACE_LO: only log PCs >= this, applied BEFORE the loop-collapse window
+    // (matching Mednafen's SS_PCTRACE_LO, which returns before its recent-64
+    // check). Set PCTRACE_LO=06000000 to keep only work-RAM execution and skip
+    // the BIOS-ROM init noise, so the give-up divergence in the CD-boot loader
+    // stands out.
+    let lo: u32 = std::env::var("PCTRACE_LO")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
     let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
     'outer: for _ in 0..frames {
         pcs.clear();
         sat.run_for_traced(479_151, &mut pcs);
         for &pc in &pcs {
+            if pc < lo {
+                continue;
+            }
             if !recent.contains(&pc) {
                 writeln!(w, "{pc:08X}").unwrap();
                 if recent.len() == 64 {
@@ -198,6 +210,224 @@ fn gen_vf2_pc_trace() {
     }
     w.flush().unwrap();
     println!("wrote {logged} VF2-boot master PCs (run_for_traced path) to {out}");
+}
+
+/// M11: stop AT the VF2 CD-boot give-up branch and dump the live loader code +
+/// the work-RAM state words it branches on, so we can compare the *decision*
+/// against Mednafen (whose full PC trace crashes headless here, but whose
+/// SS_WWATCH on the same work-RAM word works). Uses the no-render `run_for` +
+/// a master breakpoint (fast — fits the harness runtime budget), unlike SAT_FBP
+/// which renders every frame.
+///
+/// ```sh
+/// GIVEUP_PC=0x06028106 cargo test -p saturn --test trace_boot -- \
+///   --ignored --nocapture dump_giveup_state
+/// ```
+#[test]
+#[ignore = "manual: dump the VF2 CD-boot give-up branch + loader state (M11)"]
+fn dump_giveup_state() {
+    use sh2::bus::{AccessKind, Bus};
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_path = root.join("roms/vf2_full.cue");
+    let Ok(cue) = std::fs::read_to_string(&cue_path) else {
+        println!("no vf2_full.cue; skipped");
+        return;
+    };
+    let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cue parse failed: {e}");
+            return;
+        }
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    // Record the CD command stream (off in normal runs) so we can dump the
+    // post-Play sequence the loader's drive-status check depends on.
+    sat.bus.cd_block.cmd_log_on = true;
+
+    let giveup: u32 = std::env::var("GIVEUP_PC")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x0602_8106);
+    sat.set_master_bp(giveup);
+
+    // Run headless (no render) in 1-frame chunks until the give-up fires.
+    let mut hit = None;
+    for f in 0..400u32 {
+        sat.run_for(479_151);
+        if let Some(h) = sat.take_master_bp_hit() {
+            println!("give-up 0x{giveup:08X} hit at frame {f}");
+            hit = Some(h);
+            break;
+        }
+    }
+    // CD command stream up to here (post-Play window is the tail). Decode the
+    // command name, the input CR1 (carries the command + top FAD byte) and the
+    // reported status (CR1-out high byte) so we can see PLAY→…→ the drive state
+    // the loader reads. CMD_LOG_TAIL limits how many trailing entries to show.
+    let tail: usize = std::env::var("CMD_LOG_TAIL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let name = |c: u8| -> &'static str {
+        match c {
+            0x00 => "GetStatus",
+            0x01 => "GetHwInfo",
+            0x02 => "GetToc",
+            0x03 => "GetSession",
+            0x04 => "Init",
+            0x06 => "EndDataXfer",
+            0x10 => "Play",
+            0x11 => "Seek",
+            0x12 => "Scan",
+            0x20 => "GetSubcodeQ",
+            0x30 => "SetDevConn",
+            0x31 => "GetDevConn",
+            0x40 => "SetFilterRange",
+            0x42 => "SetFilterSubhdr",
+            0x44 => "SetFilterMode",
+            0x46 => "SetFilterConn",
+            0x48 => "ResetSelector",
+            0x50 => "GetBufSize",
+            0x51 => "GetBufStat",
+            0x52 => "CalcActualSize",
+            0x60 => "SetSectorLen",
+            0x61 => "GetSectorData",
+            0x62 => "GetThenDelSector",
+            0x63 => "GetSectorInfo",
+            0x67 => "GetCopyError",
+            0x70 => "ChangeDir",
+            0x71 => "ReadDir",
+            0x72 => "GetFileScope",
+            0x73 => "GetFileInfo",
+            0x74 => "ReadFile",
+            0x75 => "AbortFile",
+            0xE0 => "Auth",
+            0xE1 => "GetDiscRegion",
+            _ => "?",
+        }
+    };
+    let log = std::mem::take(&mut sat.bus.cd_block.cmd_log);
+    println!(
+        "\n=== CD command stream (last {tail} of {}) — [idx] cmd  CR_in -> CR_out  HIRQ st ===",
+        log.len()
+    );
+    let start = log.len().saturating_sub(tail);
+    for (i, (c, cin, cout, hirq, st)) in log.iter().enumerate().skip(start) {
+        println!(
+            "  [{i:>3}] {c:02X} {:<15} in={:04X},{:04X},{:04X},{:04X} -> out={:04X},{:04X},{:04X},{:04X}  HIRQ={hirq:04X} st={st:02X}",
+            name(*c),
+            cin[0],
+            cin[1],
+            cin[2],
+            cin[3],
+            cout[0],
+            cout[1],
+            cout[2],
+            cout[3],
+        );
+    }
+
+    let Some((r, pr, gbr, code)) = hit else {
+        println!(
+            "give-up 0x{giveup:08X} NOT hit in 400 frames (pc=0x{:08X})",
+            sat.master().regs.pc
+        );
+        return;
+    };
+    println!("PR=0x{pr:08X} GBR=0x{gbr:08X}");
+    for row in 0..4 {
+        let b = row * 4;
+        println!(
+            "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+            b,
+            r[b],
+            b + 1,
+            r[b + 1],
+            b + 2,
+            r[b + 2],
+            b + 3,
+            r[b + 3],
+        );
+    }
+    println!("\n=== live give-up branch code @0x{giveup:08X} ===");
+    for (i, &w) in code.iter().enumerate() {
+        let op = sh2::decoder::decode(w);
+        println!(
+            "  0x{:08X}: {w:04X}  {}",
+            giveup + (i as u32) * 2,
+            sh2::debug::disasm(op)
+        );
+    }
+    // The loader state words around GBR (0x06020000) the branch reads + the
+    // error-code cell at 0x0601FFF0 (set on the failing path).
+    println!("\n=== loader state words ===");
+    for a in [
+        0x0601_FFF0u32,
+        0x0601_FFF4,
+        0x0602_0000,
+        0x0602_0004,
+        0x0602_0008,
+        0x0602_000C,
+    ] {
+        let (v, _) = sat.bus.read32(a, AccessKind::Data);
+        println!("  [0x{a:08X}] = 0x{v:08X}");
+    }
+    // The low-WRAM BIOS CD-status block the error handler reads ([0x0600022C]
+    // the loader maps: 0x22/2 -> error 8; else -> error 1). Dump a window so we
+    // can see which CD field the BIOS mirrors there.
+    println!("\n=== low-WRAM CD status block (0x06000220..0x06000260) ===");
+    for a in (0x0600_0220u32..0x0600_0260).step_by(4) {
+        let (v, _) = sat.bus.read32(a, AccessKind::Data);
+        println!("  [0x{a:08X}] = 0x{v:08X}");
+    }
+    // The live CD-block host registers (HIRQ/CR1..CR4) right now.
+    let (hirq, _) = sat.bus.read16(0x0589_0008, AccessKind::Data);
+    let (cr1, _) = sat.bus.read16(0x0589_0018, AccessKind::Data);
+    let (cr2, _) = sat.bus.read16(0x0589_001C, AccessKind::Data);
+    let (cr3, _) = sat.bus.read16(0x0589_0020, AccessKind::Data);
+    let (cr4, _) = sat.bus.read16(0x0589_0024, AccessKind::Data);
+    println!("\n  CD now: HIRQ={hirq:04X} CR1={cr1:04X} CR2={cr2:04X} CR3={cr3:04X} CR4={cr4:04X}");
+    // Any register pointing into low/high WRAM — deref it (the branch variable
+    // is usually [Rn] for some Rn).
+    println!("\n=== register-pointed WRAM ===");
+    for (i, &a) in r.iter().enumerate() {
+        if (0x0600_0000..0x0608_0000).contains(&(a & 0x07FF_FFFF)) {
+            let (v, _) = sat.bus.read32(a & !3, AccessKind::Data);
+            let (h, _) = sat.bus.read16(a & !1, AccessKind::Data);
+            println!("  R{i:<2}=0x{a:08X}  [.&!3]=0x{v:08X}  [.&!1](16)=0x{h:04X}");
+        }
+    }
+    // Optional: disassemble an arbitrary LIVE work-RAM range while stopped here
+    // (DISASM_FROM / DISASM_LEN), to read the relocated loader's decision code.
+    if let Ok(s) = std::env::var("DISASM_FROM") {
+        let from = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let len: u32 = std::env::var("DISASM_LEN")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x80);
+        println!("\n=== live disasm @0x{from:08X}..0x{:08X} ===", from + len);
+        for off in (0..len).step_by(2) {
+            let a = from + off;
+            let (w, _) = sat.bus.read16(a, AccessKind::Fetch);
+            let op = sh2::decoder::decode(w);
+            println!("  0x{a:08X}: {w:04X}  {}", sh2::debug::disasm(op));
+        }
+    }
 }
 
 #[test]
@@ -596,8 +826,17 @@ fn analyze_park() {
         sat.run_frame(&mut fb);
     }
     let pc = sat.master().regs.pc & 0x07FF_FFFF;
-    println!("after 150 frames: pc=0x{pc:07X} imask={}", sat.master().regs.sr.imask());
-    disasm_range(&mut sat, "park loop (live WRAM)", 0x0601_08A0, 0x40, pc | 0x0600_0000);
+    println!(
+        "after 150 frames: pc=0x{pc:07X} imask={}",
+        sat.master().regs.sr.imask()
+    );
+    disasm_range(
+        &mut sat,
+        "park loop (live WRAM)",
+        0x0601_08A0,
+        0x40,
+        pc | 0x0600_0000,
+    );
 
     // Count VBlank-IN interrupt deliveries over the next 5 frames by watching
     // the master enter the VBlank handler vector, and watch the polled counter.
@@ -646,13 +885,21 @@ fn disasm_vblank_handler() {
     for _ in 0..150u32 {
         sat.run_frame(&mut fb);
     }
-    disasm_range(&mut sat, "VBlank-IN handler (live WRAM)", 0x0600_0800, 0x140, 0x0600_0840);
+    disasm_range(
+        &mut sat,
+        "VBlank-IN handler (live WRAM)",
+        0x0600_0800,
+        0x140,
+        0x0600_0840,
+    );
     // The interrupt vector table: which handler does the master's INTC vector
     // to for VBlank-IN? VBR + vector*4. Read VBR + a few likely SCU vectors.
     let vbr = sat.master().regs.vbr;
     println!("\nVBR=0x{vbr:08X}");
     for vec in 0x40u32..0x48 {
-        let (h, _) = sat.bus.read32(vbr.wrapping_add(vec * 4), sh2::bus::AccessKind::Data);
+        let (h, _) = sat
+            .bus
+            .read32(vbr.wrapping_add(vec * 4), sh2::bus::AccessKind::Data);
         println!("  vector 0x{vec:02X} -> 0x{h:08X}");
     }
 }
@@ -691,8 +938,15 @@ fn watch_callback_install() {
         vec_off >> 2
     );
     let slot = base.wrapping_add(0x40 << 2); // VBlank-IN = vector 0x40
-    let rd = |sat: &mut Saturn, a: u32| sat.bus.read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data).0;
-    println!("VBlank-IN slot = 0x{slot:08X}, current = 0x{:08X}", rd(&mut sat, slot));
+    let rd = |sat: &mut Saturn, a: u32| {
+        sat.bus
+            .read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data)
+            .0
+    };
+    println!(
+        "VBlank-IN slot = 0x{slot:08X}, current = 0x{:08X}",
+        rd(&mut sat, slot)
+    );
 
     // 2) Run frame-by-frame for a long time; report the first frame the slot
     //    leaves the do-nothing stub (= install reached) or that it never does.
@@ -730,7 +984,11 @@ fn dump_callback_table() {
     for _ in 0..150u32 {
         sat.run_frame(&mut fb);
     }
-    let rd = |sat: &mut Saturn, a: u32| sat.bus.read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data).0;
+    let rd = |sat: &mut Saturn, a: u32| {
+        sat.bus
+            .read32(a & 0x07FF_FFFF, sh2::bus::AccessKind::Data)
+            .0
+    };
     let srmask_base = rd(&mut sat, 0x0600_0960);
     let cb_base = rd(&mut sat, 0x0600_0998);
     println!("SR-mask table base = 0x{srmask_base:08X}; callback table base = 0x{cb_base:08X}");
@@ -738,7 +996,11 @@ fn dump_callback_table() {
     // installed callback + whether it's the do-nothing stub 0x0600083C.
     for vec in 0x40u32..0x50 {
         let cb = rd(&mut sat, cb_base.wrapping_add(vec * 4));
-        let stub = if (cb & 0x07FF_FFFF) == 0x0600_083C { " (do-nothing stub)" } else { "" };
+        let stub = if (cb & 0x07FF_FFFF) == 0x0600_083C {
+            " (do-nothing stub)"
+        } else {
+            ""
+        };
         println!("  vec 0x{vec:02X}: callback=0x{cb:08X}{stub}");
     }
 }
@@ -758,15 +1020,31 @@ fn analyze_park2() {
     }
     let pc = sat.master().regs.pc & 0x07FF_FFFF;
     let m = sat.master();
-    println!("after 780 frames: pc=0x{pc:07X} imask={}", m.regs.sr.imask());
+    println!(
+        "after 780 frames: pc=0x{pc:07X} imask={}",
+        m.regs.sr.imask()
+    );
     for row in 0..4 {
         let b = row * 4;
         println!(
             "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
-            b, m.regs.r[b], b + 1, m.regs.r[b + 1], b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+            b,
+            m.regs.r[b],
+            b + 1,
+            m.regs.r[b + 1],
+            b + 2,
+            m.regs.r[b + 2],
+            b + 3,
+            m.regs.r[b + 3],
         );
     }
-    disasm_range(&mut sat, "post-splash park (live WRAM)", 0x0602_8F60, 0x60, pc | 0x0600_0000);
+    disasm_range(
+        &mut sat,
+        "post-splash park (live WRAM)",
+        0x0602_8F60,
+        0x60,
+        pc | 0x0600_0000,
+    );
     println!("\n  WRAM at register-pointed addresses:");
     for r in 0..16 {
         let a = sat.master().regs.r[r];
@@ -800,7 +1078,10 @@ fn splash_timeline() {
         sat.run_frame(&mut fb);
         if f % 20 == 0 || f <= 5 {
             let h = fnv(&fb);
-            let nb = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+            let nb = fb
+                .chunks_exact(4)
+                .filter(|p| p[0] | p[1] | p[2] != 0)
+                .count();
             let mark = if h == prev { " (stable)" } else { "" };
             println!("frame {f:>3}: hash=0x{h:016X} nonblack={nb}{mark}");
             prev = h;
@@ -835,7 +1116,10 @@ fn dump_framebuffer() {
             out.write_all(&px[0..3]).unwrap();
         }
         out.flush().unwrap();
-        let nonblack = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+        let nonblack = fb
+            .chunks_exact(4)
+            .filter(|p| p[0] | p[1] | p[2] != 0)
+            .count();
         println!("frame {snap}: wrote {path} ({nonblack} non-black px)");
     }
 }
@@ -856,9 +1140,15 @@ fn check_splash_state() {
     // VDP2 TVMD (0x05F8_0000): bit15 DISP = display enable; bits[2:0] HRESO.
     let (tvmd, _) = sat.bus.read16(0x05F8_0000, sh2::bus::AccessKind::Data);
     let (bgon, _) = sat.bus.read16(0x05F8_0020, sh2::bus::AccessKind::Data); // BGON
-    println!("TVMD=0x{tvmd:04X} (DISP={}), BGON=0x{bgon:04X}", (tvmd >> 15) & 1);
+    println!(
+        "TVMD=0x{tvmd:04X} (DISP={}), BGON=0x{bgon:04X}",
+        (tvmd >> 15) & 1
+    );
     // Framebuffer non-black pixel count.
-    let nonblack = fb.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| p[0] | p[1] | p[2] != 0)
+        .count();
     println!("framebuffer: {nonblack}/{} pixels non-black", fb.len() / 4);
     // Histogram of the top distinct RGBA colors.
     use std::collections::HashMap;
@@ -874,7 +1164,9 @@ fn check_splash_state() {
     // The watched address the park polls: R3 = *(0x06010970) (PC-rel @0x060108BC).
     for a in [0x0601_0970u32, 0x0601_0974, 0x0601_0978] {
         let (ptr, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
-        let (val, _) = sat.bus.read32(ptr & 0x07FF_FFFF, sh2::bus::AccessKind::Data);
+        let (val, _) = sat
+            .bus
+            .read32(ptr & 0x07FF_FFFF, sh2::bus::AccessKind::Data);
         println!("  [{a:08X}]=0x{ptr:08X}  *that=0x{val:08X}");
     }
 }
@@ -926,8 +1218,20 @@ fn disasm_bios_park_loops() {
     };
     let mut sat = Saturn::new(bios);
     // BIOS is ROM — no boot needed to read the code.
-    disasm_range(&mut sat, "OUR hang (0x00001D3C tight spin)", 0x0000_1D10, 0x60, 0x0000_1D3C);
-    disasm_range(&mut sat, "MAME loop (0x00003200 region)", 0x0000_31E0, 0x80, 0x0000_3200);
+    disasm_range(
+        &mut sat,
+        "OUR hang (0x00001D3C tight spin)",
+        0x0000_1D10,
+        0x60,
+        0x0000_1D3C,
+    );
+    disasm_range(
+        &mut sat,
+        "MAME loop (0x00003200 region)",
+        0x0000_31E0,
+        0x80,
+        0x0000_3200,
+    );
 }
 
 #[test]
@@ -952,16 +1256,30 @@ fn catch_divergence_1168() {
         steps += 1;
     }
     if sat.master().regs.pc != TARGET {
-        println!("never reached 0x{TARGET:08X} (pc=0x{:08X})", sat.master().regs.pc);
+        println!(
+            "never reached 0x{TARGET:08X} (pc=0x{:08X})",
+            sat.master().regs.pc
+        );
         return;
     }
     let m = sat.master();
-    println!("at 0x{TARGET:08X} (after {steps} steps): sr.t={} imask={}", m.regs.sr.t(), m.regs.sr.imask());
+    println!(
+        "at 0x{TARGET:08X} (after {steps} steps): sr.t={} imask={}",
+        m.regs.sr.t(),
+        m.regs.sr.imask()
+    );
     for row in 0..4 {
         let b = row * 4;
         println!(
             "  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
-            b, m.regs.r[b], b + 1, m.regs.r[b + 1], b + 2, m.regs.r[b + 2], b + 3, m.regs.r[b + 3],
+            b,
+            m.regs.r[b],
+            b + 1,
+            m.regs.r[b + 1],
+            b + 2,
+            m.regs.r[b + 2],
+            b + 3,
+            m.regs.r[b + 3],
         );
     }
     disasm_range(&mut sat, "divergent loop", 0x0600_1140, 0x50, TARGET);
@@ -1037,9 +1355,7 @@ fn trace_vblank_handler() {
         }
     }
     let ctr_after = read32(&mut sat, ctr_addr);
-    println!(
-        "  counter [0x{ctr_addr:08X}]: before=0x{ctr_before:08X} after=0x{ctr_after:08X}"
-    );
+    println!("  counter [0x{ctr_addr:08X}]: before=0x{ctr_before:08X} after=0x{ctr_after:08X}");
     if !callback_pcs.is_empty() {
         println!("  callback PC path (first {}):", callback_pcs.len());
         for pc in &callback_pcs {
@@ -1325,14 +1641,30 @@ fn disasm_range(sat: &mut Saturn, label: &str, start: u32, len: u32, mark: u32) 
 #[test]
 #[ignore = "manual: dump SCSP timer/interrupt regs + SCU sound-request state at the park"]
 fn scsp_state_at_park() {
-    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS");
+        return;
+    };
     let mut sat = Saturn::new(bios);
     sat.reset();
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..780u32 { sat.run_frame(&mut fb); }
-    let rd16 = |sat: &mut Saturn, o: u32| sat.bus.read16(0x05B0_0000 + o, sh2::bus::AccessKind::Data).0;
-    for (name, o) in [("TIMA", 0x418u32), ("TIMB", 0x41A), ("TIMC", 0x41C),
-                      ("SCIEB", 0x41E), ("SCIPD", 0x420), ("MCIEB", 0x42A), ("MCIPD", 0x42C)] {
+    for _ in 0..780u32 {
+        sat.run_frame(&mut fb);
+    }
+    let rd16 = |sat: &mut Saturn, o: u32| {
+        sat.bus
+            .read16(0x05B0_0000 + o, sh2::bus::AccessKind::Data)
+            .0
+    };
+    for (name, o) in [
+        ("TIMA", 0x418u32),
+        ("TIMB", 0x41A),
+        ("TIMC", 0x41C),
+        ("SCIEB", 0x41E),
+        ("SCIPD", 0x420),
+        ("MCIEB", 0x42A),
+        ("MCIPD", 0x42C),
+    ] {
         println!("  {name}(0x{o:03X}) = 0x{:04X}", rd16(&mut sat, o));
     }
 }
@@ -1340,17 +1672,26 @@ fn scsp_state_at_park() {
 #[test]
 #[ignore = "manual: SCU IMS/IST + SMPC state at the post-splash park (is vec 0x47 masked?)"]
 fn scu_state_at_park2() {
-    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS");
+        return;
+    };
     let mut sat = Saturn::new(bios);
     sat.reset();
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..780u32 { sat.run_frame(&mut fb); }
+    for _ in 0..780u32 {
+        sat.run_frame(&mut fb);
+    }
     let base = 0x25FE_0000u32;
     let rd = |sat: &mut Saturn, o: u32| sat.bus.read32(base + o, sh2::bus::AccessKind::Data).0;
     let ims = rd(&mut sat, 0xB0);
     let ist = rd(&mut sat, 0xB4);
-    println!("at park: IMS=0x{ims:08X} IST=0x{ist:08X}", );
-    println!("  Smpc(bit7) masked={} pending={}", (ims>>7)&1, (ist>>7)&1);
+    println!("at park: IMS=0x{ims:08X} IST=0x{ist:08X}",);
+    println!(
+        "  Smpc(bit7) masked={} pending={}",
+        (ims >> 7) & 1,
+        (ist >> 7) & 1
+    );
     println!("  imask(master)={}", sat.master().regs.sr.imask());
     // Step ~3 frames; count Smpc raises (IST bit7 transitions) + INTBACK COMREG writes.
     let mut smpc_seen = 0u64;
@@ -1360,7 +1701,9 @@ fn scu_state_at_park2() {
         sat.debug_step_master();
         sat.debug_drain();
         let i = (sat.bus.read32(base + 0xB4, sh2::bus::AccessKind::Data).0 >> 7) & 1;
-        if i == 1 && prev_ist7 == 0 { smpc_seen += 1; }
+        if i == 1 && prev_ist7 == 0 {
+            smpc_seen += 1;
+        }
         prev_ist7 = i;
         steps += 1;
     }
@@ -1370,15 +1713,24 @@ fn scu_state_at_park2() {
 #[test]
 #[ignore = "manual: is the BIOS issuing SMPC commands (INTBACK) post-splash?"]
 fn smpc_activity_at_park() {
-    let Some((bios, _)) = load_bios() else { println!("no BIOS"); return; };
+    let Some((bios, _)) = load_bios() else {
+        println!("no BIOS");
+        return;
+    };
     let mut sat = Saturn::new(bios);
     sat.reset();
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..780u32 { sat.run_frame(&mut fb); }
+    for _ in 0..780u32 {
+        sat.run_frame(&mut fb);
+    }
     // SMPC SF at 0x0010_0063 (bit0 busy); COMREG at 0x0010_001F.
     let sf = |sat: &mut Saturn| sat.bus.read8(0x0010_0063, sh2::bus::AccessKind::Data).0;
     let comreg = |sat: &mut Saturn| sat.bus.read8(0x0010_001F, sh2::bus::AccessKind::Data).0;
-    println!("at park: SF=0x{:02X} COMREG=0x{:02X}", sf(&mut sat), comreg(&mut sat));
+    println!(
+        "at park: SF=0x{:02X} COMREG=0x{:02X}",
+        sf(&mut sat),
+        comreg(&mut sat)
+    );
     let mut sf_busy_edges = 0u64;
     let mut prev = sf(&mut sat) & 1;
     let mut steps = 0u64;
@@ -1386,9 +1738,13 @@ fn smpc_activity_at_park() {
         sat.debug_step_master();
         sat.debug_drain();
         let b = sf(&mut sat) & 1;
-        if b == 1 && prev == 0 { sf_busy_edges += 1; }
+        if b == 1 && prev == 0 {
+            sf_busy_edges += 1;
+        }
         prev = b;
         steps += 1;
     }
-    println!("over ~5 frames: SMPC SF busy rising edges = {sf_busy_edges} (each = a command issued)");
+    println!(
+        "over ~5 frames: SMPC SF busy rising edges = {sf_busy_edges} (each = a command issued)"
+    );
 }

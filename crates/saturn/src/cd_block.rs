@@ -337,7 +337,23 @@ pub struct CdBlock {
     /// Yabause-derived "periodic from power-on" behaviour, which is what
     /// broke the signature check — see the MAME reference diff.)
     host_initialized: bool,
+
+    /// Debug-only command-history ring (M11 boot trace): when `cmd_log_on` is
+    /// set, [`dispatch`](Self::dispatch) appends `(cmd, cr_in, [cr1..4 out],
+    /// hirq, status)` per command (bounded to the last 512). Not part of the
+    /// machine state — `#[serde(skip)]` so the save-state determinism contract
+    /// is untouched — and recording is off by default so normal runs pay
+    /// nothing. Read in `tests/trace_boot.rs` to diff our recognition CD command
+    /// stream against Mednafen's `cdb.cpp`.
+    #[serde(skip)]
+    pub cmd_log: Vec<CmdTrace>,
+    #[serde(skip)]
+    pub cmd_log_on: bool,
 }
+
+/// One [`CdBlock::cmd_log`] entry: `(command, CR1..4 in, CR1..4 out, HIRQ,
+/// status)` — debug-only (M11 boot trace).
+pub type CmdTrace = (u8, [u16; 4], [u16; 4], u16, u8);
 
 impl Default for CdBlock {
     fn default() -> Self {
@@ -409,6 +425,8 @@ impl CdBlock {
             cr_written: 0,
             periodic_accum: 0,
             host_initialized: false,
+            cmd_log: Vec::new(),
+            cmd_log_on: false,
         }
     }
 
@@ -1142,7 +1160,24 @@ impl CdBlock {
     }
 
     /// Decode and run one host command. `cr_in` is the CR1..CR4 the host wrote.
-    fn dispatch(&mut self, command: u8, _cr_in: [u16; 4]) {
+    fn dispatch(&mut self, command: u8, cr_in: [u16; 4]) {
+        self.dispatch_inner(command, cr_in);
+        // M11 boot-trace ring (off by default; see `cmd_log`).
+        if self.cmd_log_on {
+            if self.cmd_log.len() >= 512 {
+                self.cmd_log.remove(0);
+            }
+            self.cmd_log.push((
+                command,
+                cr_in,
+                [self.cr1, self.cr2, self.cr3, self.cr4],
+                self.hirq,
+                self.status,
+            ));
+        }
+    }
+
+    fn dispatch_inner(&mut self, command: u8, _cr_in: [u16; 4]) {
         match command {
             0x00 => {
                 // Get CD status.
