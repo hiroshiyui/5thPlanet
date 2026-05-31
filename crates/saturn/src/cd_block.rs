@@ -209,6 +209,16 @@ pub struct CdBlock {
     index: u8,
     fad: u32,
     disk_changed: bool,
+    /// "Current head position is on a CD-ROM (data) track" status bit (CR1 low
+    /// byte bit 7). **Read-based, like Mednafen** (`CurPosInfo.is_cdrom`,
+    /// cdb.cpp:2312/2324): set true only when the read pump actually reads a
+    /// *data* sector during PLAY, cleared for audio and at Init/insert. It is
+    /// NOT a position lookup — during recognition (before any PLAY) the real
+    /// drive reports `is_cdrom = 0`, and the BIOS recognition state machine
+    /// branches on that: a premature `1` (our old `track_at_fad`-based value)
+    /// made the loader restart its cleanup loop (AbortFile) and give up to the
+    /// CD player instead of proceeding to GetToc → auth → Play → ReadFile.
+    is_cdrom: bool,
 
     /// A command's response sits in CR1..CR4 awaiting a host read; periodic
     /// reports are suppressed until then so they don't clobber it. Set when
@@ -366,6 +376,7 @@ impl CdBlock {
             index: 0x00,
             fad: 0,
             disk_changed: true,
+            is_cdrom: false,
             disc: None,
             xfer: Vec::new(),
             xfer_pos: 0,
@@ -418,6 +429,9 @@ impl CdBlock {
         self.index = 1;
         self.fad = FAD_OFFSET;
         self.status = STAT_PAUSE;
+        // A freshly-loaded disc has not been read yet → `is_cdrom` clears until
+        // the read pump actually reads a data sector (Mednafen semantics).
+        self.is_cdrom = false;
         self.disc = Some(Box::new(source));
         self.disk_changed = self.host_initialized;
         if self.host_initialized {
@@ -637,15 +651,12 @@ impl CdBlock {
         // CD-ROM (data) track" (`is_cdrom`), bits 6-0 = the periodic repeat
         // count. The BIOS CD-boot loader checks this is-cdrom bit in the status
         // report after reading IP.BIN to confirm it is positioned on a data
-        // track before reading the 1st-read file; without it the loader rejects
-        // the disc and re-recognizes (dropping to the CD player). (Was a
-        // mismodeled `(options << 4) | repcnt` low byte that left bit 7 clear.)
-        let is_cdrom = self
-            .disc
-            .as_ref()
-            .and_then(|d| d.track_at_fad(fad))
-            .is_some_and(|t| !t.is_audio);
-        self.cr1 = self.cd_stat() | ((is_cdrom as u16) << 7) | (self.repcnt & 0x7F) as u16;
+        // track before reading the 1st-read file. **Read-based** (`self.is_cdrom`,
+        // set by the read pump on a data-sector read) — NOT a `track_at_fad`
+        // position lookup, which reported `1` during recognition (before any
+        // PLAY) where the real drive / Mednafen report `0`, derailing the BIOS
+        // recognition into the give-up loop.
+        self.cr1 = self.cd_stat() | ((self.is_cdrom as u16) << 7) | (self.repcnt & 0x7F) as u16;
         self.cr2 = ((self.ctrladdr as u16) << 8) | self.track as u16;
         self.cr3 = ((self.index as u16) << 8) | ((fad >> 16) & 0xFF) as u16;
         self.cr4 = fad as u16;
@@ -797,6 +808,8 @@ impl CdBlock {
                 if is_audio {
                     // CDDA: stream the sector to the audio mixer, don't buffer it
                     // as data (no CSCT / sector store — the host isn't reading).
+                    // An audio sector clears `is_cdrom` (Mednafen cdb.cpp:2312).
+                    self.is_cdrom = false;
                     if self.read_cd_audio_sector(fad) {
                         self.cd_curfad += 1;
                         self.fadstoplay -= 1;
@@ -805,14 +818,20 @@ impl CdBlock {
                             self.hirq |= HIRQ_PEND;
                         }
                     }
-                } else if self.read_filtered_sector(fad) {
-                    self.cd_curfad += 1;
-                    self.fadstoplay -= 1;
-                    self.hirq |= HIRQ_CSCT;
-                    self.sectorstore = true;
-                    if self.fadstoplay == 0 {
-                        self.status = STAT_PAUSE;
-                        self.hirq |= HIRQ_PEND;
+                } else {
+                    // Reading a data sector sets `is_cdrom` (Mednafen
+                    // cdb.cpp:2324) — the head is confirmed on a CD-ROM track,
+                    // whether or not a filter buffers the sector.
+                    self.is_cdrom = true;
+                    if self.read_filtered_sector(fad) {
+                        self.cd_curfad += 1;
+                        self.fadstoplay -= 1;
+                        self.hirq |= HIRQ_CSCT;
+                        self.sectorstore = true;
+                        if self.fadstoplay == 0 {
+                            self.status = STAT_PAUSE;
+                            self.hirq |= HIRQ_PEND;
+                        }
                     }
                 }
             }
@@ -1205,6 +1224,10 @@ impl CdBlock {
                     self.status = STAT_PAUSE;
                     self.cd_curfad = FAD_OFFSET;
                     self.fadstoplay = 0;
+                    // Init re-seats the head at track 1 with nothing read yet →
+                    // `is_cdrom` clears (Mednafen cdb.cpp:4051) until the next
+                    // PLAY actually reads a data sector.
+                    self.is_cdrom = false;
                 }
                 self.buf_full = false;
                 self.cd_speed = if self.cr1 & 0x10 != 0 { 1 } else { 2 };
@@ -1986,12 +2009,36 @@ mod tests {
         c.write16(0x001C, 0x0000);
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000);
-        // CR1 = PAUSE status (0x01) in the high byte | the `is_cdrom` bit
-        // (0x80) in the low byte, since FAD 150 is on a data (CD-ROM) track.
-        assert_eq!(c.read16(0x0018), 0x0180, "PAUSE status + is_cdrom");
+        // CR1 = PAUSE status (0x01) in the high byte. The `is_cdrom` bit (0x80,
+        // low byte) is **read-based** (Mednafen `CurPosInfo.is_cdrom`): a
+        // freshly-inserted disc has read no data sector yet, so it is 0 here —
+        // the real drive / Mednafen report `is_cdrom = 0` during recognition,
+        // before any PLAY. (A `track_at_fad` position lookup wrongly reported 1,
+        // derailing the BIOS recognition into its give-up loop.)
+        assert_eq!(
+            c.read16(0x0018),
+            0x0100,
+            "PAUSE status, is_cdrom=0 (no read yet)"
+        );
         assert_eq!(c.read16(0x001C), 0x4101, "ctrl/adr 0x41, track 1");
         assert_eq!(c.read16(0x0020), 0x0100, "index 1, FAD hi 0");
         assert_eq!(c.read16(0x0024), 0x0096, "FAD 150");
+        // Once the read pump reads a data sector, `is_cdrom` latches to 1 and a
+        // subsequent status report carries the bit (low byte 0x80).
+        c.cd_curfad = FAD_OFFSET;
+        c.fadstoplay = 1;
+        c.status = STAT_PLAY;
+        c.play_data();
+        assert!(c.is_cdrom, "is_cdrom set after reading a data sector");
+        c.write16(0x0018, 0x0000);
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000);
+        assert_eq!(
+            c.read16(0x0018) & 0x0080,
+            0x0080,
+            "is_cdrom bit now reported"
+        );
     }
 
     #[test]
@@ -2192,7 +2239,11 @@ mod tests {
         for _ in 0..512 {
             let _ = c.read32(0x8000); // drain exactly one sector, no over-read
         }
-        assert_eq!(c.partitions[0].blocks.len(), 1, "still buffered before EndXfer");
+        assert_eq!(
+            c.partitions[0].blocks.len(),
+            1,
+            "still buffered before EndXfer"
+        );
         cmd(&mut c, 0x0600, 0x0000, 0x0000, 0x0000); // End data transfer
         assert!(c.partitions[0].blocks.is_empty(), "EndXfer freed the block");
         assert_eq!(c.free_blocks, free_before + 1, "block returned to the pool");
@@ -2289,7 +2340,10 @@ mod tests {
         c.insert_disc(iso_disc());
         // Check copy protection (0xE0): the auth HIRQ pattern incl. ECPY (0x100).
         cmd(&mut c, 0xE000, 0x0000, 0, 0);
-        assert_eq!(c.hirq, 0x0FC5, "authentication HIRQ pattern (0x07C5 | MPED)");
+        assert_eq!(
+            c.hirq, 0x0FC5,
+            "authentication HIRQ pattern (0x07C5 | MPED)"
+        );
         assert_ne!(c.hirq & 0x0100, 0, "ECPY (authentication done)");
         // Get disc region (0xE1): 4 = Saturn data disc.
         cmd(&mut c, 0xE100, 0x0000, 0, 0);
