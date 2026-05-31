@@ -1664,6 +1664,19 @@ impl CdBlock {
                 self.cr4 = 0;
                 self.hirq |= HIRQ_CMOK;
             }
+            0x67 => {
+                // Get copy/move error: report "no error" — CR1 = status,
+                // CR2=CR3=CR4=0 (Mednafen `cdb.cpp` returns 0x0100,0,0,0). The
+                // default status report's non-zero geometry (CR2-4 = ctrl/track
+                // /index/FAD) was read by the BIOS recognition code as a copy
+                // error, making it loop recognition (re-Init / GetCopyError ~6×)
+                // instead of proceeding once.
+                self.cr1 = self.cd_stat();
+                self.cr2 = 0;
+                self.cr3 = 0;
+                self.cr4 = 0;
+                self.hirq |= HIRQ_CMOK;
+            }
             _ => {
                 // Default: most commands answer with a status report.
                 self.cd_report();
