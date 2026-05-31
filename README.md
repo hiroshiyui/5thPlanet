@@ -93,6 +93,40 @@ cargo test -p sh2 -- decoder::tests::decodes_branches
 cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
 ```
 
+## Controls
+
+The SDL2 frontend maps the host keyboard to **port&nbsp;1** (a standard Saturn
+digital control pad) plus a few emulator hotkeys. (Controller rebinding and
+gamepad support are planned M9 phases.)
+
+### Saturn control pad — port 1
+
+| Saturn button | Keyboard |
+| ------------- | -------- |
+| D-pad ↑ ↓ ← → | Arrow keys |
+| A / B / C     | Z / X / C |
+| X / Y / Z     | A / S / D |
+| L / R         | Q / W |
+| Start         | Enter |
+
+### Emulator hotkeys
+
+| Action                            | Key |
+| --------------------------------- | --- |
+| Open / close the on-screen menu   | Esc |
+| Quick save (to the quick slot)    | F5 |
+| Quick load (from the quick slot)  | F9 |
+| Quit                              | Close the window, or Esc → **Quit** |
+
+### On-screen menu (while it is open)
+
+| Action                              | Key |
+| ----------------------------------- | --- |
+| Move selection                      | ↑ / ↓ |
+| Select                              | Enter or Z |
+| Back (closes the menu at top level) | Backspace or X |
+| Close menu                          | Esc |
+
 ## Workspace
 
 - [`crates/sh2`](crates/sh2) — cycle-accurate SH-2 (SH7604) CPU core.
