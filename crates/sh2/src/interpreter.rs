@@ -55,6 +55,16 @@ pub struct Cpu {
     /// very next instruction that reads it pays a 1-cycle stall, then
     /// this is cleared regardless.
     pub(crate) load_dest_pending: Option<u8>,
+    /// Debug only: the last CPU *exception* taken as `(vector, faulting PC)` —
+    /// illegal (4) / slot-illegal (6) / address-error (9/10) / TRAPA, but not
+    /// hardware interrupts. Used to diagnose spurious faults; not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub last_fault: Option<(u8, u32)>,
+    /// Debug only: the raw 16-bit word the fetch returned for the most recent
+    /// *general-illegal* (vector 4) instruction. Lets a spurious illegal be
+    /// compared against the external-memory word (a mismatch = stale I-cache).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub last_illegal_word: Option<u16>,
 }
 
 impl Default for Cpu {
@@ -73,6 +83,8 @@ impl Cpu {
             pending_branch: None,
             in_delay_slot: false,
             load_dest_pending: None,
+            last_fault: None,
+            last_illegal_word: None,
         }
     }
 
@@ -164,6 +176,7 @@ impl Cpu {
 
         // ---- General illegal instruction ----
         if matches!(op, Op::Illegal(_)) {
+            self.last_illegal_word = Some(word);
             self.regs.pc = instr_pc; // RTE returns to the offending op
             let cost = self.take_exception(4, None, bus);
             self.pipeline.advance(interlock_stall + fetch_stall + cost);
@@ -196,6 +209,10 @@ impl Cpu {
     /// 5-cycle exception overhead. If `set_imask` is `Some(lvl)` the SR
     /// interrupt mask is raised to it after the push (interrupt entry).
     fn take_exception(&mut self, vector: u8, set_imask: Option<u8>, bus: &mut impl Bus) -> u32 {
+        // Debug: record CPU exceptions (set_imask None) — not interrupts.
+        if set_imask.is_none() {
+            self.last_fault = Some((vector, self.regs.pc));
+        }
         let mut sp = self.regs.r[15];
         sp = sp.wrapping_sub(4);
         let s1 = self.mem_write32(sp, self.regs.sr.0, AccessKind::Data, bus);
