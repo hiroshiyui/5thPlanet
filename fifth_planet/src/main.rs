@@ -524,6 +524,32 @@ fn run(
 
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
 
+    // Optional: load a save state captured in the SDL frontend (F5), so the
+    // trace hooks below operate on *that* machine rather than a fresh boot —
+    // e.g. to diagnose where a game halts after a manual launch the headless
+    // path can't reach. The BIOS + disc inserted above are re-grafted into the
+    // loaded state by `load_state`. Prints where both SH-2s are parked.
+    if let Ok(path) = std::env::var("SAT_LOADSTATE") {
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("read save state {path} failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(e) = saturn.load_state(&bytes) {
+            eprintln!("load save state {path} failed: {e:?}");
+            return ExitCode::from(1);
+        }
+        let m = saturn.master();
+        let s = saturn.slave();
+        eprintln!(
+            "loaded save state {path}\n  master: PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}\n  slave : PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}",
+            m.regs.pc, m.regs.pr, m.regs.sr.0, m.regs.gbr, m.regs.r[15], saturn.master_is_halted(),
+            s.regs.pc, s.regs.pr, s.regs.sr.0, s.regs.gbr, s.regs.r[15], saturn.slave_is_halted(),
+        );
+    }
+
     // Optional instruction breakpoint: `SAT_BP=0xADDR` (opt `SAT_BP_FRAME=N`
     // fast-forwards N frames first) single-steps the master until PC==ADDR,
     // then dumps R0..R15 + the words at [R3]/[R4] (boot poll-loop debugging).
@@ -723,8 +749,28 @@ fn run(
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
+    // Optional scripted port-1 pad input: `SAT_PAD=0xBITS` (saturn::smpc::pad
+    // mask) held from frame `SAT_PAD_FROM` (default 0) onward — lets a headless
+    // run drive the BIOS menu (e.g. press Start at the multiplayer screen to
+    // launch the highlighted disc) so the manual-launch path can be traced.
+    let scripted_pad: Option<u16> = std::env::var("SAT_PAD")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+    let pad_from: u32 = std::env::var("SAT_PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Release the scripted pad at `SAT_PAD_TO` (default: held to the end) so a
+    // button can be a brief tap rather than a permanent hold.
+    let pad_to: u32 = std::env::var("SAT_PAD_TO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
     let mut last_pc = u32::MAX;
     for f in 0..headless_frames {
+        if let Some(bits) = scripted_pad {
+            saturn.set_pad1(if (pad_from..pad_to).contains(&f) { bits } else { 0 });
+        }
         saturn.run_frame(&mut framebuffer);
         if pctrace {
             let pc = saturn.master().regs.pc;
@@ -822,8 +868,10 @@ fn run(
 
     let master_pc = saturn.master().regs.pc;
     let cycles = saturn.master().pipeline.cycles;
+    let slave_pc = saturn.slave().regs.pc;
+    let slave_halted = saturn.slave_is_halted();
     println!(
-        "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={headless_frames}"
+        "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={headless_frames}; slave PC=0x{slave_pc:08X} halted={slave_halted}"
     );
     ExitCode::SUCCESS
 }
