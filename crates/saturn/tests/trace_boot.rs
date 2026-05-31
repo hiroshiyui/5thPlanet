@@ -275,12 +275,22 @@ fn gen_vf2_pc_trace() {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(0);
+    // PCTRACE_HI: only log PCs <= this (matching Mednafen's SS_PCTRACE_HI). With
+    // LO this is a *range* filter — set LO=06020000 HI=0602FFFF to keep only the
+    // work-RAM CD-boot loader (0x0602xxxx) and drop the recognition-poll bulk
+    // (0x0601xxxx) and the cache-through BIOS (0x20xxxxxx Mednafen logs but we
+    // don't), so the post-Play give-up divergence stands out and the entry cap
+    // isn't spent on noise.
+    let hi: u32 = std::env::var("PCTRACE_HI")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(u32::MAX);
     let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
     'outer: for _ in 0..frames {
         pcs.clear();
         sat.run_for_traced(479_151, &mut pcs);
         for &pc in &pcs {
-            if pc < lo {
+            if pc < lo || pc > hi {
                 continue;
             }
             if !recent.contains(&pc) {
