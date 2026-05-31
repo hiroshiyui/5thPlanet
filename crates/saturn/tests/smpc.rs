@@ -249,11 +249,11 @@ fn intback_peripheral_continuation_reports_the_digital_pad() {
     sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data);
     sat.run_for(40_000);
     // Port 1: a directly-connected standard digital pad (0xF1, ID 0x02),
-    // active-low data with Start (bit 4) and Left (bit 1) of byte 1 held.
+    // active-low data with Start (bit 3) and Left (bit 6) of byte 1 held.
     assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: 1 device, direct");
     assert_eq!(sat.bus.smpc.oreg[1], 0x02, "standard digital pad");
     assert_eq!(
-        sat.bus.smpc.oreg[2], !0x12,
+        sat.bus.smpc.oreg[2], !0x48,
         "Start + Left held (active low)"
     );
     assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "no second-byte buttons held");

@@ -161,20 +161,26 @@ pub struct Smpc {
 /// Standard digital-pad button bits for [`Smpc::pad1`] (1 = pressed). The high
 /// byte is the SMPC's first data byte, the low byte the second (active-low on
 /// the wire — the report inverts this mask).
+///
+/// Bit positions match the standard Saturn digital control pad as it appears on
+/// the wire / in SGL's `PER_DGT_*` table: first data byte (high) is
+/// Right/Left/Down/Up/Start/A/C/B from MSB→LSB, second data byte (low) is
+/// R/X/Y/Z/L in bits 7..3 (bits 2..0 reserved, held high). Getting this order
+/// reversed makes the BIOS read a D-pad press as a face button — e.g. Left as C.
 pub mod pad {
-    pub const B: u16 = 1 << 15;
-    pub const C: u16 = 1 << 14;
-    pub const A: u16 = 1 << 13;
-    pub const START: u16 = 1 << 12;
-    pub const UP: u16 = 1 << 11;
-    pub const DOWN: u16 = 1 << 10;
-    pub const LEFT: u16 = 1 << 9;
-    pub const RIGHT: u16 = 1 << 8;
-    pub const L: u16 = 1 << 7;
-    pub const Z: u16 = 1 << 6;
+    pub const RIGHT: u16 = 1 << 15;
+    pub const LEFT: u16 = 1 << 14;
+    pub const DOWN: u16 = 1 << 13;
+    pub const UP: u16 = 1 << 12;
+    pub const START: u16 = 1 << 11;
+    pub const A: u16 = 1 << 10;
+    pub const C: u16 = 1 << 9;
+    pub const B: u16 = 1 << 8;
+    pub const R: u16 = 1 << 7;
+    pub const X: u16 = 1 << 6;
     pub const Y: u16 = 1 << 5;
-    pub const X: u16 = 1 << 4;
-    pub const R: u16 = 1 << 3;
+    pub const Z: u16 = 1 << 4;
+    pub const L: u16 = 1 << 3;
 }
 
 /// Region code for INTBACK OREG9 (SMPC manual area-code table).
