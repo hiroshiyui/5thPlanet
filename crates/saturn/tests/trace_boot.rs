@@ -119,6 +119,94 @@ fn gen_master_pc_trace() {
 /// divergence): `mameref/saturn saturnjp -bios 101 -rompath mameref/roms \
 ///   -cdrom roms/vf2_full.cue -debug`, console `trace vf2.tr,maincpu` then `go`,
 /// stop after ~10 s, and diff the PC columns to the first sustained divergence.
+/// M11 perf probe: time each `run_frame` of the VF2 boot to find frames that
+/// overrun the 16.6 ms vsync budget (which the SDL frontend shows as an
+/// unstable framerate), and report the master PC on the slowest frames so the
+/// heavy work can be identified. `run_frame` here renders the VDP2 frame just
+/// like the frontend, so the timing reflects what the user sees.
+///
+/// ```sh
+/// FRAMES=280 cargo test -p saturn --test trace_boot -- \
+///   --ignored --nocapture --exact frame_timing
+/// ```
+#[test]
+#[ignore = "manual: per-frame run_frame timing for the VF2 boot (M11 perf)"]
+fn frame_timing() {
+    use saturn::vdp2::FRAMEBUFFER_BYTES;
+    use std::time::Instant;
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_path = root.join("roms/vf2_full.cue");
+    let Ok(cue) = std::fs::read_to_string(&cue_path) else {
+        println!("no vf2_full.cue; skipped");
+        return;
+    };
+    let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cue parse failed: {e}");
+            return;
+        }
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(280);
+    // RENDER=0 times emulation only (run_for, no VDP2 composite) to isolate the
+    // render cost from the emulation cost.
+    let render = std::env::var("RENDER").map(|s| s != "0").unwrap_or(true);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let budget_ms = 1000.0 / 60.0; // 16.67 ms
+    let mut total_ms = 0.0f64;
+    let mut max_ms = 0.0f64;
+    let mut overruns = 0u32;
+    // Slowest frames: (ms, frame, master pc).
+    let mut slow: Vec<(f64, u32, u32)> = Vec::new();
+    for f in 0..frames {
+        let t = Instant::now();
+        if render {
+            sat.run_frame(&mut fb);
+        } else {
+            sat.run_for(479_151);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let pc = sat.master().regs.pc;
+        total_ms += ms;
+        if ms > max_ms {
+            max_ms = ms;
+        }
+        if ms > budget_ms {
+            overruns += 1;
+        }
+        slow.push((ms, f, pc));
+    }
+    slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!(
+        "frames={frames} avg={:.2}ms ({:.0} fps) max={max_ms:.2}ms overruns(>{budget_ms:.1}ms)={overruns}",
+        total_ms / frames as f64,
+        1000.0 / (total_ms / frames as f64),
+    );
+    println!("slowest 15 frames (ms, frame#, master PC):");
+    for (ms, f, pc) in slow.iter().take(15) {
+        println!("  {ms:7.2}ms  frame {f:>4}  pc=0x{pc:08X}");
+    }
+}
+
 #[test]
 #[ignore = "manual: VF2-boot master PC trace for the MAME reference diff (M11)"]
 fn gen_vf2_pc_trace() {
