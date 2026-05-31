@@ -878,6 +878,21 @@ fn run(
     println!(
         "headless run complete: master PC=0x{master_pc:08X}, cycles={cycles}, frames={headless_frames}; slave PC=0x{slave_pc:08X} halted={slave_halted}"
     );
+    if let Some((vec, pc)) = saturn.master().last_fault {
+        use sh2::bus::{AccessKind, Bus};
+        print!("  master last CPU exception: vector={vec} (0x{vec:02X}) at PC=0x{pc:08X}");
+        if let Some(w) = saturn.master().last_illegal_word {
+            let (bus_w, _) = saturn.bus.read16(pc, AccessKind::Data);
+            print!(" — fetched word=0x{w:04X}, external-memory word=0x{bus_w:04X}");
+            if w != bus_w {
+                print!("  *** MISMATCH (stale I-cache) ***");
+            }
+        }
+        println!();
+    }
+    if let Some((vec, pc)) = saturn.slave().last_fault {
+        println!("  slave  last CPU exception: vector={vec} (0x{vec:02X}) at PC=0x{pc:08X}");
+    }
     // SCU interrupt-vector table dump for boot debugging: print VBR and the
     // master's exception-vector entries the SCU sources use (0x40 VBlank-IN ..
     // 0x4D Sprite-Draw-End), so an unhandled-interrupt park can be traced to
