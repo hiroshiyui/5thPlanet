@@ -4,8 +4,9 @@ How the SEGA Saturn hardware maps onto this project's code. This is the
 orientation map: for each real chip, bus, and memory region it points at the
 crate/module/file that models it. For Saturn-specific vocabulary see
 [`glossary.md`](glossary.md); for task-by-task status see
-[`roadmap.md`](roadmap.md); for *why* a structural choice was made see the ADRs
-in [`adr/`](adr/).
+[`roadmap.md`](roadmap.md); for how the BIOS brings the machine up from reset to
+the splash and then boots a game see [`bootstrapping.md`](bootstrapping.md); for
+*why* a structural choice was made see the ADRs in [`adr/`](adr/).
 
 The guiding axis is **accuracy over performance** (ADR-0002): real chips are
 low-level-emulated (LLE) cycle-by-cycle; no JIT, dynarec, or "approximate
