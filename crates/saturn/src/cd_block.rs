@@ -458,9 +458,21 @@ impl CdBlock {
         // DCHG). For a runtime swap (host already engaged) also assert DCHG now,
         // since the BIOS/game isn't about to issue an Init.
         self.disk_changed = true;
-        if self.host_initialized {
-            self.hirq |= HIRQ_DCHG;
-        }
+        // Mednafen's CD block reset-completes with the full reset HIRQ
+        // (cdb.cpp:4075, CMOK|DCHG|ESEL|EHST|MPED|ECPY|EFLS = 0x0BE1) when a
+        // disc is present — that's the value the BIOS reads before its first
+        // disc-recognition command, so it goes straight to GetHwInfo. With only
+        // MPED set, the BIOS saw a "not ready" block, issued an extra
+        // Init(SW-reset)+GetStatus, and the recognition state machine desynced:
+        // it then looped AbortFile and gave up to the CD player. Setting the
+        // full reset HIRQ on a disc-present boot makes recognition proceed
+        // (GetToc → auth → GetDiscRegion → ChangeDir), matching Mednafen.
+        //
+        // Gated on disc presence (insert_disc): the no-disc splash keeps the
+        // MPED-only power-on HIRQ, so the bios_boot golden is unaffected —
+        // setting this HIRQ at cold *power-on* (no disc) breaks the splash.
+        self.hirq =
+            HIRQ_CMOK | HIRQ_DCHG | HIRQ_ESEL | HIRQ_EHST | HIRQ_MPED | HIRQ_ECPY | HIRQ_EFLS;
     }
 
     /// Whether a disc is present.
