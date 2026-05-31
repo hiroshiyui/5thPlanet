@@ -550,6 +550,28 @@ fn run(
         );
     }
 
+    // Optional scripted port-1 pad input: `SAT_PAD=0xBITS` (saturn::smpc::pad
+    // mask) held over the frame window [`SAT_PAD_FROM`, `SAT_PAD_TO`) — lets a
+    // headless run drive the BIOS menu (e.g. tap Start at the multiplayer screen
+    // to launch the highlighted disc) so the manual-launch path can be traced.
+    // Applied in every per-frame loop below via `apply_scripted_pad`.
+    let scripted_pad: Option<u16> = std::env::var("SAT_PAD")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+    let pad_from: u32 = std::env::var("SAT_PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let pad_to: u32 = std::env::var("SAT_PAD_TO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    let apply_scripted_pad = |saturn: &mut saturn::Saturn, f: u32| {
+        if let Some(bits) = scripted_pad {
+            saturn.set_pad1(if (pad_from..pad_to).contains(&f) { bits } else { 0 });
+        }
+    };
+
     // Optional instruction breakpoint: `SAT_BP=0xADDR` (opt `SAT_BP_FRAME=N`
     // fast-forwards N frames first) single-steps the master until PC==ADDR,
     // then dumps R0..R15 + the words at [R3]/[R4] (boot poll-loop debugging).
@@ -608,7 +630,8 @@ fn run(
         let rlo = std::env::var("SAT_FBP_RLO").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
         let rhi = std::env::var("SAT_FBP_RHI").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u32::MAX);
         let mut hit = None;
-        for _ in 0..headless_frames {
+        for f in 0..headless_frames {
+            apply_scripted_pad(&mut saturn, f);
             saturn.run_frame(&mut framebuffer);
             let h = if on_slave {
                 saturn.take_slave_bp_hit()
@@ -677,6 +700,7 @@ fn run(
         saturn.set_master_trace_freeze(shell_base, 0x0605_0000);
         let mut triggered = None;
         for f in 0..headless_frames {
+            apply_scripted_pad(&mut saturn, f);
             saturn.run_frame(&mut framebuffer);
             let pc = saturn.master().regs.pc;
             let hit_shell = (shell_base..0x0605_0000).contains(&pc);
@@ -749,28 +773,9 @@ fn run(
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
-    // Optional scripted port-1 pad input: `SAT_PAD=0xBITS` (saturn::smpc::pad
-    // mask) held from frame `SAT_PAD_FROM` (default 0) onward — lets a headless
-    // run drive the BIOS menu (e.g. press Start at the multiplayer screen to
-    // launch the highlighted disc) so the manual-launch path can be traced.
-    let scripted_pad: Option<u16> = std::env::var("SAT_PAD")
-        .ok()
-        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
-    let pad_from: u32 = std::env::var("SAT_PAD_FROM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    // Release the scripted pad at `SAT_PAD_TO` (default: held to the end) so a
-    // button can be a brief tap rather than a permanent hold.
-    let pad_to: u32 = std::env::var("SAT_PAD_TO")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(u32::MAX);
     let mut last_pc = u32::MAX;
     for f in 0..headless_frames {
-        if let Some(bits) = scripted_pad {
-            saturn.set_pad1(if (pad_from..pad_to).contains(&f) { bits } else { 0 });
-        }
+        apply_scripted_pad(&mut saturn, f);
         saturn.run_frame(&mut framebuffer);
         if pctrace {
             let pc = saturn.master().regs.pc;
