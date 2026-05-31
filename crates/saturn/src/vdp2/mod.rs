@@ -129,11 +129,28 @@ impl Vdp2 {
             _ => 0,
         }
     }
+    /// Whether a register byte offset is a **read-only status register** the
+    /// bus must not write: TVSTAT (0x004–0x005), HCNT (0x008–0x009), VCNT
+    /// (0x00A–0x00B). On hardware these reflect the live raster and ignore CPU
+    /// writes; `update_video_timing` maintains TVSTAT/VCNT/HCNT via `regs`
+    /// directly. Without this guard a game's bulk VDP2 register init writes 0
+    /// into TVSTAT, wiping the VBLANK edge-state stored there — which re-fired
+    /// the VBlank-IN edge every scheduler batch and flooded the master with
+    /// interrupts (VF2 hung its startup interrupt handler on that flood).
+    const fn reg_readonly(off: u32) -> bool {
+        // `off` is already 0..=0x1FF (REGS_BASE..=REGS_END window).
+        matches!(off, 0x004 | 0x005 | 0x008 | 0x009 | 0x00A | 0x00B)
+    }
+    fn write_reg8(&mut self, off: u32, val: u8) {
+        if !Self::reg_readonly(off) {
+            self.regs.write8(off, val);
+        }
+    }
     pub fn write8(&mut self, addr: u32, val: u8) {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write8(addr - VRAM_BASE, val),
             CRAM_BASE..=CRAM_END => self.cram.write8(addr - CRAM_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write8(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => self.write_reg8(addr - REGS_BASE, val),
             _ => {}
         }
     }
@@ -141,7 +158,12 @@ impl Vdp2 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write16(addr - VRAM_BASE, val),
             CRAM_BASE..=CRAM_END => self.cram.write16(addr - CRAM_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write16(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => {
+                let off = addr - REGS_BASE;
+                let b = val.to_be_bytes();
+                self.write_reg8(off, b[0]);
+                self.write_reg8(off.wrapping_add(1), b[1]);
+            }
             _ => {}
         }
     }
@@ -149,7 +171,12 @@ impl Vdp2 {
         match addr {
             VRAM_BASE..=VRAM_END => self.vram.write32(addr - VRAM_BASE, val),
             CRAM_BASE..=CRAM_END => self.cram.write32(addr - CRAM_BASE, val),
-            REGS_BASE..=REGS_END => self.regs.write32(addr - REGS_BASE, val),
+            REGS_BASE..=REGS_END => {
+                let off = addr - REGS_BASE;
+                for (k, &byte) in val.to_be_bytes().iter().enumerate() {
+                    self.write_reg8(off.wrapping_add(k as u32), byte);
+                }
+            }
             _ => {}
         }
     }
@@ -181,6 +208,27 @@ mod tests {
         // Display on: VBLANK reflects only the stored raster bit (0 here).
         v.write16(REGS_BASE, 0x8000); // DISP = 1
         assert_eq!(v.read16(REGS_BASE + 0x004) & 0x0008, 0x0000);
+    }
+
+    #[test]
+    fn bus_writes_to_readonly_status_registers_are_ignored() {
+        let mut v = Vdp2::new();
+        v.write16(REGS_BASE, 0x8000); // display on (so TVSTAT has no override)
+        // Seed the status registers the way `update_video_timing` would.
+        v.regs.write16(0x004, 0x0008); // TVSTAT.VBLANK
+        v.regs.write16(0x008, 0x1234); // HCNT
+        v.regs.write16(0x00A, 0x0056); // VCNT
+        // A game's bulk register init writing 0 must NOT clobber them.
+        v.write16(REGS_BASE + 0x004, 0x0000);
+        v.write16(REGS_BASE + 0x008, 0x0000);
+        v.write16(REGS_BASE + 0x00A, 0x0000);
+        v.write32(REGS_BASE + 0x004, 0x0000_0000); // also covers 0x006 VRSIZE (RW)
+        assert_eq!(v.regs.read16(0x004), 0x0008, "TVSTAT preserved");
+        assert_eq!(v.regs.read16(0x008), 0x1234, "HCNT preserved");
+        assert_eq!(v.regs.read16(0x00A), 0x0056, "VCNT preserved");
+        // A writable register (TVMD, 0x000) still takes bus writes.
+        v.write16(REGS_BASE, 0x81C3);
+        assert_eq!(v.regs.read16(0x000), 0x81C3, "TVMD writable");
     }
 
     #[test]
