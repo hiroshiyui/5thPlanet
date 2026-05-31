@@ -77,6 +77,7 @@ const HIRQ_PEND: u16 = 0x0010; // CD playback / read range completed
 // HIRQ bits used by the buffer/filter/partition + filesystem engine.
 #[allow(dead_code)] // M7 phase 4 (filesystem)
 const HIRQ_EFLS: u16 = 0x0200; // file-system processing complete
+const HIRQ_ECPY: u16 = 0x0100; // end of copy/move (also set at CD-block reset)
 
 // Buffer/filter/partition engine sizes (MAME `saturn_cd_hle`): a shared pool of
 // 200 sector blocks, and 24 filter/partition selectors.
@@ -1278,7 +1279,15 @@ impl CdBlock {
                 } else {
                     h &= !HIRQ_DCHG;
                 }
-                self.hirq = h | HIRQ_CMOK | HIRQ_ESEL;
+                // Mednafen's CD-block reset raises the full "end of <op>" set —
+                // CMOK|DCHG|ESEL|EHST|MPED|ECPY|EFLS = 0x0BE1 (cdb.cpp:4075) —
+                // and the BIOS disc-recognition loop polls HIRQ into its shadow
+                // [0x060003A4] and waits for that mask. We previously raised only
+                // CMOK|ESEL (+DCHG), so the shadow topped out at 0x0EE1 (missing
+                // **ECPY 0x100**, which ours otherwise sets only on auth) — the
+                // wait never completed and recognition looped/gave up. Raise the
+                // same set Mednafen's reset does so recognition can proceed.
+                self.hirq = h | HIRQ_CMOK | HIRQ_ESEL | HIRQ_EHST | HIRQ_ECPY | HIRQ_EFLS;
             }
             0x06 => {
                 // End data transfer (MAME `cmd_end_data_transfer`): clear the
