@@ -231,6 +231,37 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u3
     }
 }
 
+/// Debug read-watchpoint (handshake/poll investigation): when `SAT_RWATCH=0xADDR`
+/// is set, log any read whose byte span covers `[ADDR, ADDR+SAT_RWATCH_WIN)`,
+/// with width, value, access kind, cycle and PC. Mirrors [`write_watch`] but for
+/// reads — finds where the master polls a status word a peripheral/68k writes
+/// (e.g. a sound-driver ready signature in sound RAM). No-op when unset. Note the
+/// SCSP 68k reads via its own bus, so this isolates *main-CPU* (+ SCU-DMA) reads.
+#[inline]
+fn read_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32) {
+    use std::sync::OnceLock;
+    static R: OnceLock<Option<u32>> = OnceLock::new();
+    let r = *R.get_or_init(|| {
+        std::env::var("SAT_RWATCH")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+    });
+    let Some(t) = r else { return };
+    static WIN: OnceLock<u32> = OnceLock::new();
+    let win = *WIN.get_or_init(|| {
+        std::env::var("SAT_RWATCH_WIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4)
+    });
+    if addr.wrapping_add(size) > t && addr < t.wrapping_add(win.max(1)) {
+        eprintln!(
+            "RWATCH {t:08X}: r{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}",
+            size * 8
+        );
+    }
+}
+
 #[inline]
 fn waits_for(addr: u32) -> u32 {
     match addr {
@@ -267,6 +298,7 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read8(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
+        read_watch(addr, 1, v as u32, _k, self.cycle, self.step_pc);
         (v, waits_for(addr))
     }
 
@@ -294,6 +326,7 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read16(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
+        read_watch(addr, 2, v as u32, _k, self.cycle, self.step_pc);
         (v, waits_for(addr))
     }
 
@@ -323,6 +356,7 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read32(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
+        read_watch(addr, 4, v, _k, self.cycle, self.step_pc);
         (v, waits_for(addr))
     }
 

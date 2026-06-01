@@ -293,6 +293,14 @@ impl ScspCtrl {
         ((self.read16(o) as u32) << 16) | self.read16(o + 2) as u32
     }
 
+    /// Debug: the current 68k IRQ state — `(asserted_level, SCIEB, SCIPD)`.
+    /// Lets a debugger see whether the sound driver enabled a timer interrupt
+    /// (SCIEB) and whether one is pending (SCIPD) — i.e. whether the 68k should
+    /// be woken from its idle spin to service sound commands.
+    pub fn irq_state(&self) -> (u8, u16, u16) {
+        (self.asserted_level, self.read16(SCIEB), self.read16(SCIPD))
+    }
+
     /// Store a 16-bit register without running write side effects.
     fn store16(&mut self, o: u32, v: u16) {
         let b = v.to_be_bytes();

@@ -612,6 +612,11 @@ impl Dbg {
                     "  68k pc={:06X} stopped={} a7={:08X}  d0={:08X} d1={:08X} a0={:08X} a1={:08X}",
                     c.regs.pc, c.stopped, c.regs.a[7], c.regs.d[0], c.regs.d[1], c.regs.a[0], c.regs.a[1]
                 );
+                let (lvl, scieb, scipd) = s.ctrl.irq_state();
+                println!(
+                    "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
+                    c.regs.sr.imask, c.regs.sr.supervisor
+                );
             }
             "w" => match a1.and_then(parse_num) {
                 Some(addr) => {
