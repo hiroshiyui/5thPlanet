@@ -145,9 +145,10 @@ gamepad support are planned M9 phases.)
   via libcdio, feature-gated (`libcdio`); the only crate that uses `unsafe`
   (FFI). Default build is a stub.
 - [`crates/debugger`](crates/debugger) — interactive headless Saturn debugger
-  (bin `sdbg`): a gdb-style REPL over the core with breakpoints, single-step,
-  register/memory/disassembly inspection, CD-block state + command history, and
-  save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
+  (bin `sdbg`): a gdb-style REPL over the core with breakpoints (incl.
+  register-guarded), single-step, SH-2 **and** SCSP-68k disassembly + PC-trace,
+  read/write watchpoints, memory search, CD-block + SCSP/68k state, command
+  history, and save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
