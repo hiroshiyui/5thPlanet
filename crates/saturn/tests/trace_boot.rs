@@ -1928,3 +1928,70 @@ fn smpc_activity_at_park() {
         "over ~5 frames: SMPC SF busy rising edges = {sf_busy_edges} (each = a command issued)"
     );
 }
+
+/// M11 render check: boot a game and, every 300 frames, report whether it is
+/// actually *running and drawing* — master/slave PC (is the game executing? is
+/// the slave released?), VDP2 display-enable, VDP1 draw state, and the
+/// framebuffer's non-black pixel count (anything on screen?). Diagnoses the
+/// "boots to game code but the screen stays black" symptom.
+///
+/// ```sh
+/// FRAMES=1800 CUE=vf2_full.cue cargo test -p saturn --test trace_boot -- \
+///   --ignored --nocapture vf2_render_state
+/// ```
+#[test]
+#[ignore = "manual: post-boot run/render state for a game disc"]
+fn vf2_render_state() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let disc =
+        match saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+        {
+            Ok(d) => d,
+            Err(e) => {
+                println!("cue parse failed: {e}");
+                return;
+            }
+        };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+    let mut fb = vec![0u8; 320 * 224 * 4];
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        if (f + 1) % 300 == 0 || f + 1 == frames {
+            let nonblack = fb
+                .chunks_exact(4)
+                .filter(|p| (p[0] | p[1] | p[2]) != 0)
+                .count();
+            println!(
+                "frame {:>4}: master=0x{:08X} slave=0x{:08X} VDP2.disp={} VDP1.drawing={} fb_nonblack={}/{}",
+                f + 1,
+                sat.master().regs.pc,
+                sat.slave().regs.pc,
+                sat.bus.vdp2.regs.display_enabled(),
+                sat.bus.vdp1.is_drawing(),
+                nonblack,
+                320 * 224,
+            );
+        }
+    }
+}
