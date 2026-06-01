@@ -161,6 +161,12 @@ pub struct Sh2Entity {
     bp: Option<u32>,
     #[serde(skip)]
     bp_hit: Option<([u32; 16], u32, u32, Vec<u16>)>,
+    /// Optional register guard on [`bp`]: when `Some((idx, val))` the breakpoint
+    /// fires only if `regs.r[idx] == val` at the PC. Lets a debugger stop at a
+    /// shared routine (e.g. the generic CD-command writer) on the *one* call
+    /// that carries a specific argument, instead of the first call. `#[serde(skip)]`.
+    #[serde(skip)]
+    bp_cond: Option<(usize, u32)>,
 }
 
 impl Sh2Entity {
@@ -172,6 +178,7 @@ impl Sh2Entity {
             trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
+            bp_cond: None,
         }
     }
 
@@ -184,6 +191,7 @@ impl Sh2Entity {
             trace_freeze: (0x0602_0000, 0x0605_0000),
             bp: None,
             bp_hit: None,
+            bp_cond: None,
         }
     }
 
@@ -214,10 +222,20 @@ impl Sh2Entity {
         self.halted = halted;
     }
 
-    /// Arm a full-speed breakpoint at `pc` (debug; see [`bp`]).
+    /// Arm a full-speed breakpoint at `pc` (debug; see [`bp`]). Clears any
+    /// register guard previously set via [`set_bp_cond`].
     pub fn set_bp(&mut self, pc: u32) {
         self.bp = Some(pc);
         self.bp_hit = None;
+        self.bp_cond = None;
+    }
+
+    /// Arm a register-guarded breakpoint: fires at `pc` only when
+    /// `regs.r[idx] == val` (see [`bp_cond`]).
+    pub fn set_bp_cond(&mut self, pc: u32, idx: usize, val: u32) {
+        self.bp = Some(pc);
+        self.bp_hit = None;
+        self.bp_cond = Some((idx, val));
     }
 
     /// Take the captured (registers, code-words) from a breakpoint hit, if any.
@@ -248,6 +266,9 @@ impl SchedEntity for Sh2Entity {
             if let Some(bp) = self.bp
                 && self.cpu.regs.pc == bp
                 && self.bp_hit.is_none()
+                && self
+                    .bp_cond
+                    .is_none_or(|(idx, val)| self.cpu.regs.r[idx] == val)
             {
                 use sh2::bus::{AccessKind, Bus};
                 let mut code = Vec::with_capacity(48);

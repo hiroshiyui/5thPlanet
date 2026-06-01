@@ -273,6 +273,16 @@ impl Saturn {
             .set_bp(pc);
     }
 
+    /// Debug-only: arm a register-guarded master breakpoint — fires at `pc`
+    /// only when `R[idx] == val`. Used to stop at a shared routine (the generic
+    /// CD-command writer) on the one call carrying a specific argument.
+    pub fn set_master_bp_cond(&mut self, pc: u32, idx: usize, val: u32) {
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_bp_cond(pc, idx, val);
+    }
+
     /// Debug-only: take a breakpoint hit's (R0..R15, PR, GBR, code words), if it fired.
     pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
         self.scheduler

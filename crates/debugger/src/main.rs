@@ -36,6 +36,9 @@ struct Dbg {
     sat: Saturn,
     fb: Vec<u8>,
     master_bp: Option<u32>,
+    /// Optional register guard on `master_bp`: `(reg-index, value)` — the bp
+    /// fires only when `R[idx] == val`. Set via `b <addr> <regidx> <val>`.
+    master_bp_cond: Option<(usize, u32)>,
     slave_bp: Option<u32>,
     /// Poll watchpoints checked during `c`: (addr, size-in-bytes).
     watches: Vec<(u32, u8)>,
@@ -394,7 +397,10 @@ impl Dbg {
     /// to `max_frames`, stopping when the armed master breakpoint snapshots.
     fn frame_cont(&mut self, max_frames: u64) {
         if let Some(pc) = self.master_bp {
-            self.sat.set_master_bp(pc);
+            match self.master_bp_cond {
+                Some((idx, val)) => self.sat.set_master_bp_cond(pc, idx, val),
+                None => self.sat.set_master_bp(pc),
+            }
         }
         if let Some(pc) = self.slave_bp {
             self.sat.set_slave_bp(pc);
@@ -418,6 +424,24 @@ impl Dbg {
                     "  pr={pr:08X} gbr={gbr:08X} code={:04X?}",
                     &code[..code.len().min(8)]
                 );
+                // Heuristic call-chain: scan the stack (R15..+0x100) for words
+                // that look like return addresses into game/BIOS code — the
+                // saved PRs of the enclosing calls. No frame pointers on SH-2,
+                // so this is best-effort but reliably surfaces the callers.
+                let sp = r[15];
+                let mut chain: Vec<(u32, u32)> = Vec::new();
+                for off in (0..0x100u32).step_by(4) {
+                    let w = self.read_mem(sp.wrapping_add(off), 4);
+                    let in_code = (0x0600_0000..0x0610_0000).contains(&w)
+                        || (0x0000_0000..0x0008_0000).contains(&w);
+                    if in_code && w & 1 == 0 {
+                        chain.push((sp.wrapping_add(off), w));
+                    }
+                }
+                println!("  stack call-chain (sp={sp:08X}, likely return addrs):");
+                for (at, w) in chain.iter().take(16) {
+                    println!("    [{at:08X}] = {w:08X}");
+                }
                 return;
             }
             if let Some((r, ..)) = self.sat.take_slave_bp_hit() {
@@ -533,10 +557,21 @@ impl Dbg {
             "b" => match a1.and_then(parse_num) {
                 Some(pc) => {
                     self.master_bp = Some(pc);
-                    println!("master bp @ {pc:08X}");
+                    // Optional register guard: `b <addr> <regidx> <val>`.
+                    self.master_bp_cond = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
+                        (Some(idx), Some(val)) if idx < 16 => Some((idx as usize, val)),
+                        _ => None,
+                    };
+                    match self.master_bp_cond {
+                        Some((idx, val)) => {
+                            println!("master bp @ {pc:08X} when R{idx}=={val:08X}")
+                        }
+                        None => println!("master bp @ {pc:08X}"),
+                    }
                 }
                 None => {
                     self.master_bp = None;
+                    self.master_bp_cond = None;
                     println!("master bp cleared");
                 }
             },
@@ -722,6 +757,7 @@ fn main() {
         sat,
         fb: vec![0u8; 320 * 224 * 4],
         master_bp: None,
+        master_bp_cond: None,
         slave_bp: None,
         watches: Vec::new(),
     };
