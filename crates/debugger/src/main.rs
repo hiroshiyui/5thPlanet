@@ -572,6 +572,11 @@ impl Dbg {
                     "SCSP running(SNDON)={}  active slots={}/32",
                     s.running, active
                 );
+                let c = &s.cpu;
+                println!(
+                    "  68k pc={:06X} stopped={} a7={:08X}  d0={:08X} d1={:08X} a0={:08X} a1={:08X}",
+                    c.regs.pc, c.stopped, c.regs.a[7], c.regs.d[0], c.regs.d[1], c.regs.a[0], c.regs.a[1]
+                );
             }
             "w" => match a1.and_then(parse_num) {
                 Some(addr) => {
