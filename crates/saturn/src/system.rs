@@ -143,6 +143,16 @@ impl Saturn {
         } = self;
         scheduler.entity_mut(*master_id).sh2_mut().cpu.reset(bus);
         scheduler.entity_mut(*slave_id).sh2_mut().cpu.reset(bus);
+        // The slave SH-2 reads BCR1 bit 15 (SH7604 master/slave bit) = 1, so the
+        // BIOS cold-start takes the slave path and does NOT re-initialize work
+        // RAM. Without this, an SSHON-released slave re-runs the WRAM init and
+        // clobbers the running game (the M11 first-screen blocker). A
+        // hardware/pin property that survives reset, so set it here once.
+        scheduler
+            .entity_mut(*slave_id)
+            .sh2_mut()
+            .cpu
+            .set_bsc_slave(true);
         // Real Saturn power-on: slave is held in reset until the BIOS
         // sends SMPC SETSL. Mirror that here.
         scheduler.entity_mut(*slave_id).sh2_mut().set_halted(true);
@@ -468,7 +478,8 @@ impl Saturn {
     ///   the whole transfer at the boundary) — there is no future completion
     ///   timestamp to clamp to. Making it a timed event is a later model change.
     fn cycles_to_next_event(&self, now: u64) -> u64 {
-        let mut next = Self::cycles_to_next_vblank_in(now).min(Self::cycles_to_next_vblank_out(now));
+        let mut next =
+            Self::cycles_to_next_vblank_in(now).min(Self::cycles_to_next_vblank_out(now));
         if let Some(t) = self.bus.smpc.intback_complete_at
             && t > now
         {

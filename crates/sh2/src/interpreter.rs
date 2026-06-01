@@ -101,6 +101,15 @@ impl Cpu {
         self.regs.r[15] = sp;
     }
 
+    /// Mark this core as the **slave** SH-2: `BCR1` bit 15 (the SH7604
+    /// master/slave bit) then reads 1, so the Saturn BIOS cold-start takes the
+    /// slave path and does **not** re-initialize work RAM (which would clobber
+    /// the running game when the slave is `SSHON`-released). A hardware/pin
+    /// property — it survives [`reset`], so the host sets it once.
+    pub fn set_bsc_slave(&mut self, is_slave: bool) {
+        self.onchip.bsc.is_slave = is_slave;
+    }
+
     /// True when the next [`step`] will execute a branch delay slot
     /// (a branch is pending). Used by trace tooling to match reference
     /// emulators that execute the delay slot inside the branch handler.
