@@ -723,6 +723,10 @@ pub struct Scsp {
     /// Generated 44.1 kHz output, interleaved L,R. The frontend drains it each
     /// frame; capped so headless runs (which never drain) don't grow unbounded.
     out: Vec<i16>,
+    /// Debug-only ring of recent 68k PCs (consecutive duplicates collapsed), for
+    /// the `sdbg` `t68` sound-driver trace. `#[serde(skip)]` — not machine state.
+    #[serde(skip)]
+    pc_trace: Option<std::collections::VecDeque<u32>>,
 }
 
 /// Cap on the buffered audio (interleaved samples ≈ 46 ms) — overrun guard.
@@ -744,6 +748,20 @@ impl Scsp {
             frac: 0,
             sample_frac: 0,
             out: Vec::new(),
+            pc_trace: None,
+        }
+    }
+
+    /// Begin recording a ring of recent 68k PCs (debug; see [`pc_trace`]).
+    pub fn enable_68k_trace(&mut self) {
+        self.pc_trace = Some(std::collections::VecDeque::new());
+    }
+
+    /// Drain the recorded 68k PC ring (oldest→newest), if enabled.
+    pub fn take_68k_trace(&mut self) -> Vec<u32> {
+        match &mut self.pc_trace {
+            Some(t) => t.iter().copied().collect(),
+            None => Vec::new(),
         }
     }
 
@@ -827,8 +845,18 @@ impl Scsp {
         let mut budget = (self.frac / SH2_CLOCK_HZ) as i64;
         self.frac %= SH2_CLOCK_HZ;
 
-        let Scsp { ram, ctrl, cpu, .. } = &mut *self;
+        let Scsp { ram, ctrl, cpu, pc_trace, .. } = &mut *self;
         while budget > 0 {
+            // Debug PC ring (collapses consecutive duplicates so a tight spin
+            // doesn't flood it): records the 68k's execution path.
+            if let Some(t) = pc_trace.as_mut()
+                && t.back() != Some(&cpu.regs.pc)
+            {
+                t.push_back(cpu.regs.pc);
+                if t.len() > 16384 {
+                    t.pop_front();
+                }
+            }
             // Present the level-triggered SCSP IRQ line at each boundary.
             cpu.pending_irq = ctrl.asserted_level;
             let mut bus = M68kView {

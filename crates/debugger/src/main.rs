@@ -23,6 +23,8 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+mod m68k_disasm;
+
 use saturn::Saturn;
 use saturn::disc::Disc;
 use sh2::bus::{AccessKind, Bus};
@@ -281,6 +283,58 @@ impl Dbg {
             println!(" {ascii}");
             a += 16;
         }
+    }
+
+    /// Read `words` 16-bit words of the SCSP 68k's address space (sound RAM at
+    /// main-bus 0x05A0_0000) starting at 68k address `base68`, into a buffer.
+    fn read_sound_words(&mut self, base68: u32, words: u32) -> Vec<u16> {
+        (0..words)
+            .map(|i| self.read_mem(0x05A0_0000 + ((base68 + i * 2) & 0x7_FFFF), 2) as u16)
+            .collect()
+    }
+
+    /// Disassemble `n` 68k instructions at 68k address `addr` (the SCSP sound
+    /// driver). Reads sound RAM via the main bus; targets shown in 68k space.
+    fn disasm68(&mut self, addr: u32, n: usize) {
+        let base68 = addr & 0x7_FFFF;
+        let buf = self.read_sound_words(base68, n as u32 * 6 + 8);
+        let read = |a: u32| -> u16 {
+            buf.get(((a.wrapping_sub(base68)) / 2) as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut pc = base68;
+        for _ in 0..n {
+            let insn = m68k_disasm::disasm(&read, pc);
+            let raw: String = (0..insn.len / 2)
+                .map(|j| format!("{:04X} ", read(pc + j * 2)))
+                .collect();
+            println!("  {pc:06X}: {:<22}{}", raw.trim_end(), insn.text);
+            pc = pc.wrapping_add(insn.len.max(2));
+        }
+    }
+
+    /// Dump the last `n` entries of the 68k PC ring (consecutive-collapsed),
+    /// each disassembled. The ring is enabled at startup; advance with `fc`.
+    fn trace68(&mut self, n: usize) {
+        let trace = self.sat.bus.scsp.take_68k_trace();
+        if trace.is_empty() {
+            println!("(68k trace empty — run the system with `fc` first; SNDON must have fired)");
+            return;
+        }
+        let start = trace.len().saturating_sub(n);
+        for &pc in &trace[start..] {
+            let base68 = pc & 0x7_FFFF;
+            let buf = self.read_sound_words(base68, 6);
+            let read = |a: u32| -> u16 {
+                buf.get(((a.wrapping_sub(base68)) / 2) as usize)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let insn = m68k_disasm::disasm(&read, base68);
+            println!("  {pc:06X}: {}", insn.text);
+        }
+        println!("({} PCs in ring; showed last {})", trace.len(), n.min(trace.len()));
     }
 
     fn dump_disasm(&mut self, addr: u32, n: u32) {
@@ -593,6 +647,13 @@ impl Dbg {
                 let addr = a1.and_then(parse_num).unwrap_or(self.sat.master().regs.pc);
                 self.dump_disasm(addr, a2.and_then(parse_num).unwrap_or(16));
             }
+            "d68" => match a1.and_then(parse_num) {
+                Some(addr) => {
+                    self.disasm68(addr, a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(16))
+                }
+                None => println!("usage: d68 <68k-addr> [n]  (SCSP sound 68k)"),
+            },
+            "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
             "cd" => self.cd_state(),
             "cdlog" => self.cdlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(20)),
             "vdp" => println!(
@@ -674,7 +735,7 @@ sdbg commands:
                   (hex; optional CR_in[3] match), preserving setup in cdlog
   frame [n]       run n full frames (slave+VDP+CD advance)         [alias f]
   run <cyc>       run_for <cyc> master cycles (full system)
-  b [pc]          set/clear master breakpoint (hex)
+  b [pc] [ri v]   set/clear master bp (hex); optional guard: fire only when R[ri]==v
   bs [pc]         set/clear slave breakpoint
   w <addr> [sz]   add a poll watchpoint (size 1/2/4, default 2), checked in `c`
   dw              clear watchpoints
@@ -683,6 +744,8 @@ sdbg commands:
   regs            dump master + slave registers (r0-r15 each)       [alias r]
   m <addr> [len]  hex-dump memory                                  [alias x]
   d [addr] [n]    disassemble n insns from addr (default: master pc) [alias dis]
+  d68 <addr> [n]  disassemble n SCSP 68k insns at 68k addr (sound RAM)
+  t68 [n]         dump last n 68k PCs (disassembled) from the trace ring
   cd              CD-block state (status/hirq/curfad/partitions)
   cdlog [n]       last n CD host commands
   vdp             VDP display state
@@ -757,6 +820,8 @@ fn main() {
     }
     // CD command history on by default — the debugger's most-used view.
     sat.bus.cd_block.cmd_log_on = true;
+    // SCSP 68k PC ring on by default (for `t68` sound-driver tracing).
+    sat.bus.scsp.enable_68k_trace();
 
     let mut dbg = Dbg {
         sat,
