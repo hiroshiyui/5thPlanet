@@ -565,6 +565,14 @@ impl Dbg {
                 self.sat.bus.vdp2.regs.display_enabled(),
                 self.sat.bus.vdp1.is_drawing(),
             ),
+            "scsp" => {
+                let s = &self.sat.bus.scsp;
+                let active = (0..32).filter(|&i| s.slot_active(i)).count();
+                println!(
+                    "SCSP running(SNDON)={}  active slots={}/32",
+                    s.running, active
+                );
+            }
             "w" => match a1.and_then(parse_num) {
                 Some(addr) => {
                     let sz = a2.and_then(parse_num).unwrap_or(2) as u8;
@@ -633,6 +641,7 @@ sdbg commands:
   cd              CD-block state (status/hirq/curfad/partitions)
   cdlog [n]       last n CD host commands
   vdp             VDP display state
+  scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)
   load <file>     restore a save state (rewind; re-enables cdlog)
   help            this help                                        [alias h ?]
