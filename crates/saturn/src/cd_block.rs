@@ -2153,6 +2153,44 @@ mod tests {
         c.write16(0x0024, cr4);
     }
 
+    /// Parse the real VF2 disc's ISO9660 root directory and dump it, so we can
+    /// confirm the FS parser finds the 1st-read file the CD-boot loader expects.
+    #[test]
+    #[ignore = "manual: dump the real VF2 disc's ISO9660 root directory"]
+    fn vf2_iso9660_root_dir_dump() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full.cue")) else {
+            println!("no roms/vf2_full.cue; skipped");
+            return;
+        };
+        let disc = match Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("cue parse failed: {e}");
+                return;
+            }
+        };
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir -> root
+        println!(
+            "curroot: firstfad=0x{:X} length={} flags=0x{:02X}",
+            c.curroot.firstfad, c.curroot.length, c.curroot.flags
+        );
+        println!("numfiles={} firstfile={}", c.numfiles, c.firstfile);
+        for (i, e) in c.curdir.iter().enumerate() {
+            println!(
+                "  [{i:>2}] name={:<16?} firstfad=0x{:06X} len={:>8} flags=0x{:02X}",
+                String::from_utf8_lossy(&e.name),
+                e.firstfad,
+                e.length,
+                e.flags
+            );
+        }
+    }
+
     #[test]
     fn set_and_get_filter_range_round_trips() {
         let mut c = CdBlock::new();
