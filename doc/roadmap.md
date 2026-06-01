@@ -573,18 +573,31 @@ trace-diffed against Mednafen (itself LLE — the only mode in which a master-SH
 PC-trace-diff is valid). An opt-in HLE direct boot was tried and **removed** —
 see "Removed: the HLE-boot detour" below.
 
-**Status: the real BIOS now boots VF2 and Doukyuusei ~if~ to their own game
-code** (it loads the 1st-read program and jumps to it — VF2 reaches load address
-`0x06004000` and executes there). The root blocker was the CD-block re-raising
-`DCHG` (Disc Changed) on the first `Init` after recognition; fixed by clearing
-the `disk_changed` latch when the host acknowledges `DCHG` (Phase 3 below). The
-only remaining M11 step is confirming the first game screen renders visually.
+**Status: VF2 boots the real BIOS, runs game code on both SH-2s, and streams its
+CD asset load correctly — but stalls partway through loading (display stays off),
+and the remaining blocker is now proven to be scheduler/interrupt-timing
+accuracy, not the CD-block.** After the boot breakthrough (Phase 3) a chain of
+post-boot fixes (Phase 4) carried VF2 from "reaches its load address" to "runs +
+loads assets": the **BCR1 master/slave bit** (so an `SSHON`-released slave takes
+the BIOS slave path and doesn't re-init work RAM over the running game), and
+**`run_frame` no longer splitting the frame into two `run_for` calls** (the split
+re-anchored the batch grid and diverged the master's execution from the headless
+path). A **Mednafen dev-build CD trace-diff** then proved the CD command/response
+stream is **byte-identical to Mednafen** through the divergence and the data
+transfer is correct by construction — so the next-file decision the game makes
+mid-load diverges on **timing** (the stall point oscillates with every timing
+change). Phase 2 of the Mednafen scheduler alignment landed (**2A** master-leads-
+slave interleave, **2B** per-instruction SCU interrupt sampling) but isn't
+sufficient alone; closing the gap needs the deeper Phase-3 timing model. An
+interactive debugger (`crates/debugger`/`sdbg`) was built to drive this work.
+**Remaining: bit-accurate timing (Phase-3) to reach the first game screen.**
 
 | # | Phase | Notes |
 |---|-------|-------|
 | 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
 | 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture; `SAT_SHELL_BASE` tunes the give-up detection) / `SAT_BIOSTRACE` / `SAT_WWATCH` / `SAT_IRQ_DUMP` / `SAT_INTC_TRACE` / `SAT_MEMDUMP` / `SAT_DUMP`. |
-| 3 | **LLE trace-diff vs Mednafen** ✅ done — VF2 + Doukyuusei ~if~ boot to game code | Both run the **same BIOS CD-boot loader**; auth, region, and the IP.BIN read all pass. Our loader rejected the disc and re-recognized (`GetToc`/`Init` → CD player) where Mednafen reads the 1st-read (`ChangeDir`→`GetFileScope`→`ReadFile` → game). **Root: the CD-block re-raised `DCHG` (Disc Changed, HIRQ `0x20`) on the first `Init` after recognition** — the internal `disk_changed` latch was cleared only *inside* the Init handler, so that Init reported a fresh disc swap and the BIOS looped recognition forever. **Fix: clear `disk_changed` when the host write-1-to-clear-acknowledges `DCHG`** (matching Mednafen, which clears it once during recognition and never re-raises it at Init). **The method that cracked it:** the BIOS code is identical on both LLE sides, so the root had to be a differing CD-block response → a **command-level CD trace-diff** (detailed `cmd_log`: caller PC + CR1–4 in→out + HIRQ in→out, poll bursts collapsed) showed the streams match exactly through the 19th command (2nd `GetSession`), then the *only* state difference was the HIRQ — ours' Init left `DCHG` set (`0FC4→0FE5`) where Mednafen left it clear (`0F84`). With the fix, ours' command stream matches Mednafen and the master reaches VF2's load address `0x06004000` and executes game code (frame 653); Doukyuusei ~if~ likewise reaches `ReadFile`. `bios_boot` golden unchanged, full saturn suite green. (Earlier notes — state-diff beats the unreliable PC-diff; the CR1 `is_cdrom` fix — stand but weren't the decider; the *general recipe* is: find the first differing **input**, not the first differing behavior.) **Remaining: confirm the first game screen renders.** |
+| 3 | **LLE trace-diff vs Mednafen** ✅ done — VF2 + Doukyuusei ~if~ boot to game code | Both run the **same BIOS CD-boot loader**; auth, region, and the IP.BIN read all pass. Our loader rejected the disc and re-recognized (`GetToc`/`Init` → CD player) where Mednafen reads the 1st-read (`ChangeDir`→`GetFileScope`→`ReadFile` → game). **Root: the CD-block re-raised `DCHG` (Disc Changed, HIRQ `0x20`) on the first `Init` after recognition** — the internal `disk_changed` latch was cleared only *inside* the Init handler, so that Init reported a fresh disc swap and the BIOS looped recognition forever. **Fix: clear `disk_changed` when the host write-1-to-clear-acknowledges `DCHG`** (matching Mednafen, which clears it once during recognition and never re-raises it at Init). **The method that cracked it:** the BIOS code is identical on both LLE sides, so the root had to be a differing CD-block response → a **command-level CD trace-diff** (detailed `cmd_log`: caller PC + CR1–4 in→out + HIRQ in→out, poll bursts collapsed) showed the streams match exactly through the 19th command (2nd `GetSession`), then the *only* state difference was the HIRQ — ours' Init left `DCHG` set (`0FC4→0FE5`) where Mednafen left it clear (`0F84`). With the fix, ours' command stream matches Mednafen and the master reaches VF2's load address `0x06004000` and executes game code (frame 653); Doukyuusei ~if~ likewise reaches `ReadFile`. `bios_boot` golden unchanged, full saturn suite green. (Earlier notes — state-diff beats the unreliable PC-diff; the CR1 `is_cdrom` fix — stand but weren't the decider; the *general recipe* is: find the first differing **input**, not the first differing behavior.) |
+| 4 | **Post-boot run + timing diagnosis** 🚧 blocked on timing accuracy | After Phase 3 the game runs but stalls mid asset-load (display off). Fixes: **BCR1 bit-15 master/slave** (`1f584d6`) — an `SSHON`-released slave takes the BIOS slave path instead of re-initialising work RAM over the running game (it was clobbering the loaded code → master fault); **`run_frame` = one `run_for(CYCLES_PER_FRAME)`** (`0b78733`) — the old active/VBLANK split re-anchored `run_for`'s batch grid and diverged the master's execution from the headless path. A **Mednafen dev-build** (`--enable-dev-build`, `-ss.dbg_mask cdb`) **CD trace-diff** then proved the CD command/response stream is **byte-identical to Mednafen** through the divergence and the data transfer is correct by construction; the game's next-file decision diverges on **timing** (stall point oscillates FAD 2596 ↔ 7772 with each timing change). **Mednafen scheduler alignment Phase 2** landed — **2A** master-leads-slave interleave (`b583cc4`), **2B** per-instruction SCU interrupt sampling (`70f4049`) — correct accuracy gains, `bios_boot` golden unchanged, but not sufficient alone. **Tooling: `sdbg`** interactive debugger (`crates/debugger`). **Blocked on bit-accurate Phase-3 timing** (SCSP per-edge, SCU-DMA cycle-stealing, sub-instruction memory timestamps). |
 
 ### Spun out of M11 — kept general accuracy fixes
 
@@ -618,6 +631,23 @@ their own (independent of any boot path):
   bit 7 marks the current head position as a CD-ROM (data) track; it was a
   mismodeled `(options << 4) | repcnt` that left bit 7 clear. (A genuine fidelity
   fix; not the VF2 boot decider — see M11 Phase 3.)
+- **Master-leads-slave CPU interleave** (Mednafen-alignment Phase 2A) —
+  `Saturn::step_cpus` steps the master one instruction then runs the slave until
+  it catches up to the master's timestamp (Mednafen `ss.cpp`: `CPU[0].Step` +
+  `RunSlaveUntil`), replacing the scheduler's most-behind-first rule for the
+  SH-2 pair (which could let the slave lead the master). `run_for` and
+  `run_for_traced` both route through it; the generic `Scheduler::run_for` is
+  kept for the CD timer + the determinism unit test. Golden unchanged;
+  determinism + savestate round-trip green.
+- **Per-instruction SCU interrupt sampling** (Phase 2B) — the SCU IRL is sampled
+  before every master instruction (`step_cpus` / `debug_step_master`) instead of
+  once per scheduler batch, so an interrupt is delivered at the exact instruction
+  `SR.imask` drops below its level (matching Mednafen's per-instruction IRL
+  sampling) rather than up to a batch late. `drain_scu_intc` retired.
+- **`sdbg` interactive debugger** (`crates/debugger`) — a headless gdb-style REPL
+  over the core: breakpoints, single-step, register/memory/disassembly, CD-block
+  state + command history, a `cb` CD-command breakpoint, and save-state rewind.
+  Built to drive the boot/CD/timing investigation without rebuild cycles.
 
 ### Removed: the HLE-boot detour (ADR-0010/0011 Superseded)
 
