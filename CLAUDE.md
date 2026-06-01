@@ -48,6 +48,11 @@ crates/saturn/     — M2+ deliverable: Saturn system glue (bus, scheduler,
 crates/physdisc/   — M10: live optical-drive `SectorSource` via libcdio,
                      feature-gated (`libcdio`); the sole `unsafe`/FFI crate
                      (ADR-0009). Default build is a stub.
+crates/debugger/   — interactive headless Saturn debugger (bin `sdbg`): a
+                     gdb-style REPL over `saturn::Saturn` (breakpoints,
+                     single-step, regs/mem/disasm, CD-block state + command
+                     history, save-state rewind). Depends only on `saturn` +
+                     `sh2`; an observer/driver that adds no core behaviour.
 fifth_planet/      — SDL2 frontend binary (window + framebuffer upload +
                      audio, or headless), behind the default-on
                      `sdl2-frontend` feature. The `osd` module (in-window

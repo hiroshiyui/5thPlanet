@@ -144,6 +144,10 @@ gamepad support are planned M9 phases.)
 - [`crates/physdisc`](crates/physdisc) — live optical-drive `SectorSource`
   via libcdio, feature-gated (`libcdio`); the only crate that uses `unsafe`
   (FFI). Default build is a stub.
+- [`crates/debugger`](crates/debugger) — interactive headless Saturn debugger
+  (bin `sdbg`): a gdb-style REPL over the core with breakpoints, single-step,
+  register/memory/disassembly inspection, CD-block state + command history, and
+  save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
 - [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
