@@ -1994,4 +1994,79 @@ fn vf2_render_state() {
             );
         }
     }
+    // Classify the post-boot hang: imask 15 = all interrupts masked (a
+    // fatal/masked park — nothing can break the `bf $`); imask < the VBlank
+    // level = an interrupt-driven event-wait (a handler is meant to set the
+    // stacked T). T==0 means the spin is still waiting.
+    use sh2::bus::{AccessKind, Bus};
+    let (mpc, mimask, mt, mpr, mr15) = {
+        let m = sat.master();
+        (
+            m.regs.pc,
+            m.regs.sr.imask(),
+            m.regs.sr.t(),
+            m.regs.pr,
+            m.regs.r[15],
+        )
+    };
+    let (spc, simask, st, spr) = {
+        let s = sat.slave();
+        (s.regs.pc, s.regs.sr.imask(), s.regs.sr.t(), s.regs.pr)
+    };
+    println!(
+        "\nMASTER pc=0x{mpc:08X} imask={mimask} T={} PR=0x{mpr:08X} R15=0x{mr15:08X}",
+        mt as u8
+    );
+    println!(
+        "SLAVE  pc=0x{spc:08X} imask={simask} T={} PR=0x{spr:08X}",
+        st as u8
+    );
+    let base = (mpc & !1).wrapping_sub(0x12);
+    println!("=== spin disasm @0x{base:08X} ===");
+    for off in (0..0x18u32).step_by(2) {
+        let a = base + off;
+        let (w, _) = sat.bus.read16(a, AccessKind::Fetch);
+        println!(
+            "  0x{a:08X}: {w:04X}  {}",
+            sh2::debug::disasm(sh2::decoder::decode(w))
+        );
+    }
+    // Verify the 1st-read (AAAVF2.BIN) loaded into WRAM byte-for-byte against the
+    // disc file — a gap (zeros where the file has data) means the ReadFile
+    // streaming dropped sectors, which would crash the game into uninitialized
+    // memory. FAD/len/load-addr from the vf2_iso9660 dump + the IP.BIN entry.
+    if let Ok(d2) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    {
+        const FILE_FAD: u32 = 0xAE;
+        const FILE_LEN: usize = 670640;
+        const LOAD: u32 = 0x0600_4000;
+        let sectors = FILE_LEN.div_ceil(2048);
+        let mut mism = 0usize;
+        let mut first = None;
+        for s in 0..sectors {
+            let Some(data) = d2.read_sector(FILE_FAD + s as u32) else {
+                break;
+            };
+            let n = (FILE_LEN - s * 2048).min(data.len());
+            for b in 0..n {
+                let mem = sat
+                    .bus
+                    .read8(LOAD + (s * 2048 + b) as u32, AccessKind::Data)
+                    .0;
+                if mem != data[b] {
+                    mism += 1;
+                    if first.is_none() {
+                        first = Some((LOAD + (s * 2048 + b) as u32, data[b], mem));
+                    }
+                }
+            }
+        }
+        match first {
+            None => println!("\nAAAVF2.BIN load: MATCHES disc across {sectors} sectors — load OK"),
+            Some((a, disc, mem)) => println!(
+                "\nAAAVF2.BIN load: {mism} mismatches; first @0x{a:08X} disc=0x{disc:02X} mem=0x{mem:02X}"
+            ),
+        }
+    }
 }
