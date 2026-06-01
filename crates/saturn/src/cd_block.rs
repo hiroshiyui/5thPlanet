@@ -190,6 +190,21 @@ fn le32(b: &[u8], o: usize) -> u32 {
 /// corrected to 479_151 — don't re-tie it to the frame length.
 const PERIODIC_CYCLES: u64 = 477_273;
 
+/// The CD-block's internal clock: 44.1 kHz × 256 — the unit Mednafen counts its
+/// drive and periodic timers in (`cdb.cpp`).
+const CD_CLOCK_HZ: u64 = 44_100 * 256;
+
+/// SH-2 master cycles between periodic reports **while the drive is actively
+/// reading** (PLAY). Mednafen reloads its periodic counter to `17712` of the
+/// [`CD_CLOCK_HZ`] clock on every sector tick in PLAY/PAUSE (`cdb.cpp` ~2373),
+/// so the periodic fires roughly **once per sector** (≈75–150 Hz) during a read
+/// rather than the idle ~60 Hz ([`PERIODIC_CYCLES`]). Found via a Mednafen
+/// dev-build CD trace-diff (M11 timing alignment): ours fired the flat idle
+/// cadence regardless of drive state, so during a game's CD-heavy load our
+/// periodic/`SCDQ` reports were far sparser than the reference's. `17712 /
+/// (44100×256) × 28.6364 MHz ≈ 44_927` master cycles.
+const ACTIVE_PERIODIC_CYCLES: u64 = 17_712 * MASTER_HZ / CD_CLOCK_HZ;
+
 // Not `Clone`: holds a `Box<dyn SectorSource>` (image or live drive) that
 // isn't cloneable; nothing clones a CdBlock.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -897,6 +912,11 @@ impl CdBlock {
                     if self.read_cd_audio_sector(fad) {
                         self.cd_curfad += 1;
                         self.fadstoplay -= 1;
+                        // PLAY active periodic cadence: a sector read schedules
+                        // the next periodic ~one sector hence (Mednafen's
+                        // per-sector reset; see ACTIVE_PERIODIC_CYCLES).
+                        self.periodic_accum =
+                            PERIODIC_CYCLES.saturating_sub(ACTIVE_PERIODIC_CYCLES);
                         if self.fadstoplay == 0 {
                             self.status = STAT_PAUSE;
                             self.hirq |= HIRQ_PEND;
@@ -910,6 +930,9 @@ impl CdBlock {
                     if self.read_filtered_sector(fad) {
                         self.cd_curfad += 1;
                         self.fadstoplay -= 1;
+                        // PLAY active periodic cadence (see audio branch above).
+                        self.periodic_accum =
+                            PERIODIC_CYCLES.saturating_sub(ACTIVE_PERIODIC_CYCLES);
                         self.hirq |= HIRQ_CSCT;
                         self.sectorstore = true;
                         if self.fadstoplay == 0 {
