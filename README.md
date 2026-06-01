@@ -20,7 +20,7 @@ foundation stays solid.
 | M4        | BIOS splash on screen                                       | ✅ complete  |
 | M5        | Chip-coverage build-out — VDP1, MC68EC000, full VDP2        | ✅ complete  |
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
-| M7        | CD-block (HLE) + game boot + cartridge slot                 | ✅ complete  |
+| M7        | CD-block (HLE) + disc recognition + cartridge slot          | ✅ complete  |
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |

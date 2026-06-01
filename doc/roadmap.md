@@ -481,10 +481,12 @@ ladder). Key-off enters the release phase. The mixer (task #4) multiplies
 - **#7 Input:** the INTBACK peripheral phase reports a standard digital pad
   (`smpc::pad`), driven by the frontend's keyboard mapping.
 
-## Milestone 7 — CD-block (HLE) + games 🚧 active
+## Milestone 7 — CD-block (HLE) + cartridge slot ✅ done
 
-The CD-block is the last subsystem and the blocker for booting commercial
-games. **Approach: HLE** (the established model in every Saturn emulator —
+The CD-block is the last core subsystem and the prerequisite for booting
+commercial games — the disc-recognition + filesystem + authentication surface
+the BIOS drives. (The actual boot-to-gameplay, loading a game's 1st-read program
+via the real BIOS, is **M11**.) **Approach: HLE** (the established model in every Saturn emulator —
 MAME, Yabause, Mednafen). The SH-1's CD-ROM firmware is undumped (on-die mask
 ROM) and half its job is an analog servo with no digital ground truth, so
 there is nothing to low-level-emulate *against*. We instead model the host
@@ -505,7 +507,7 @@ M7 grows it into the full engine, in independently-testable phases:
 | 2 | **Buffer/filter/partition core** ✅ done | 200 blocks, 24 filters (FAD-range / file-id / channel / submode / coding-info), partitions. Reset Selector / Set Filter\* / Get Buffer\* (`0x40`–`0x54`). Pure-logic tests. |
 | 3 | **Sector pump + data transfer** ✅ done | 75/150 Hz read pump (extends `CdBlockEntity`) disc→filter→partition; Get/Get-and-Delete Sector Data (`0x60`–`0x63`) streaming the data port + the SCU-DMA path. **Address-map fix:** the data-transfer port is at `0x2581_8000` (the SCU DMA already special-cases `0x0581_8000`) — outside the current `0x0589_xxxx` window, so the bus needs that region. |
 | 4 | **CD-ROM filesystem** ✅ done | ISO9660 directory parse (PVD at FAD 166, `direntryT` records). Change Dir / Get File Scope / Get File Info / Read File (`0x70`–`0x75`). |
-| 5 | **Authentication + game boot** ✅ done | disc-validity (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check; get a real game's IP.BIN / first program running. |
+| 5 | **Authentication + region** ✅ done | disc-validity / region report (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check, so the BIOS accepts the disc and reads its IP.BIN. (Actually *booting* a game — loading the 1st-read program and reaching its game code — is **M11**, done via the real BIOS; M7 delivers the CD-block surface that boot drives.) |
 | 6 | **Cartridge slot** ✅ done | `cartridge.rs`: Extension DRAM (1 MB / 4 MB, two mirrored banks), battery backup-RAM (Saturn odd-byte packing + "BackUpRam Format" tag), and game ROM carts, at `0x0200_0000..0x04FF_FFFF` with the cart-ID byte at `0x04FF_FFFF` (empty slot floats high to `0xFF`). `Saturn::insert_cartridge` + frontend `--cart=ram1m|ram4m|bram[4|8|16|32]|rom:<path>`. 5 tests. |
 
 **Deferred within M7 → done in M10:** CDDA audio playback into the SCSP, and
