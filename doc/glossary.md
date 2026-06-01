@@ -50,10 +50,19 @@ palette code 0 a solid colour instead of transparent.
 (mirrored to `0x0010_0000`). Copyrighted by SEGA — see `bios/README.md`
 for the don't-commit policy.
 
+**BCR1** — Bus Control Register 1 of the [BSC], at `0xFFFFFFE0`. **Bit 15
+is the SH7604 MASTER/slave bit** (read-only, a hardware/pin property): the
+master SH-2 reads it as 0, the slave as 1. The Saturn BIOS cold-start reads
+it to branch — the slave path skips the work-RAM init the master does — so an
+`SSHON`-released slave that misreads it re-initialises WRAM over a running
+game. Modelled by `Bsc::is_slave` (set via `Cpu::set_bsc_slave`); the rest of
+[BSC] is still register-storage only.
+
 **BSC** — Bus State Controller. SH7604 on-chip peripheral at
-`0xFFFFFF40+` that configures wait states for each external chip
-select. Stub in M3 (`sh2::onchip::bsc::Bsc`); real wait-state math
-deferred until a target game shows it matters.
+`0xFFFFFF40+` (and [BCR1] at `0xFFFFFFE0`) that configures wait states for
+each external chip select. Mostly register-storage in M3 plus the [BCR1]
+master/slave bit (`sh2::onchip::bsc::Bsc`); real wait-state math deferred
+until a target game shows it matters.
 
 ---
 
@@ -276,9 +285,11 @@ sequence disc recognition and the game boot.
 
 **IMS / IST** — SCU Interrupt Mask / Status registers. Each bit is a
 specific source; IMS=1 suppresses, IST records pending (write-1-to-
-clear). Wired into the SH-2 master INTC via `Saturn::drain_scu_intc`,
-which forwards the highest-priority unmasked source whose level exceeds
-the master's `SR.imask`.
+clear). The master SH-2 samples this as a level **every instruction** (in
+`Saturn::step_cpus`, via `take_pending_interrupt`): the highest-priority
+pending source (`IST & !IMS`) whose level exceeds the master's `SR.imask`
+is delivered to the master [INTC] at the exact instruction it becomes
+unmasked (Phase 2B — was a once-per-batch drain).
 
 **IP.BIN** — Initial Program. A Saturn disc's boot header at the start of
 the first data track (FAD 150), beginning with the "SEGA SEGASATURN"

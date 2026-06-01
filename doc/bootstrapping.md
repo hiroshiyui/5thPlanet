@@ -47,19 +47,24 @@ steps of stale code in one batch ("time travel"). Regression:
 
 ### A.2 The scheduler loop
 
-`Saturn::run_for(cycles)` is the headless heartbeat (`run_frame` wraps it for
-the SDL frontend). It runs the scheduler in **batches clamped to the next
-scheduled peripheral-event edge** (`batch_size` → `cycles_to_next_event`: the
-next VBlank-IN, VBlank-OUT, or pending INTBACK-completion, capped by
-`SMPC_POLL_QUANTUM = 256`). Between batches it:
+`Saturn::run_for(cycles)` is the headless heartbeat (`run_frame` wraps it, in a
+**single** `run_for(CYCLES_PER_FRAME)` + render — never split into active+VBLANK
+calls, which would diverge the master's execution). Each **batch is clamped to
+the next scheduled peripheral-event edge** (`batch_size` → `cycles_to_next_event`:
+the next VBlank-IN, VBlank-OUT, or pending INTBACK-completion, capped by
+`SMPC_POLL_QUANTUM = 256`) and steps the SH-2 pair **master-leads-slave**
+(`step_cpus`: master one instruction, then slave catches up to its timestamp),
+sampling the SCU interrupt line per master instruction. Between batches it:
 
 1. `update_video_timing()` — derives `VCNT`/`TVSTAT` from the global cycle and
    raises **VBlank-IN / VBlank-OUT** on the raster edges.
 2. `drain_smpc()` — runs queued SMPC commands, completes INTBACK, etc.
 3. `drain_scu_dma()` / `drain_scu_dsp()` — synchronous DMA / DSP runs.
-4. `drain_scu_intc()` — forwards the highest-priority unmasked SCU source to the
-   master INTC.
-5. `drain_input_capture()` — applies inter-CPU FRT input-capture (FTI) pulses.
+4. `drain_input_capture()` — applies inter-CPU FRT input-capture (FTI) pulses.
+
+(SCU interrupts are *not* a between-batch drain — they're sampled per master
+instruction inside `step_cpus`; the former `drain_scu_intc` was removed in
+Mednafen-alignment Phase 2B.)
 
 The edge-clamp mirrors Mednafen's `next_event_ts` model (`ss.cpp`), so interrupt
 assertion and the raster registers settle at the cycle-exact point the reference
@@ -302,6 +307,12 @@ booting. Fix: **clear `disk_changed` when the host write-1-to-clear-acknowledges
 never re-raises it at Init). It was found by a command-level CD trace-diff: the
 BIOS code is identical on both LLE sides, so the root had to be a differing CD
 response — and the only divergence was ours' Init leaving `DCHG` set (`0FC4 →
-0FE5`) where Mednafen left it clear (`0F84`). The remaining M11 step is
-confirming the first game screen renders. See [`roadmap.md`](roadmap.md) M11 and
-the memory log for the trace-by-trace history.
+0FE5`) where Mednafen left it clear (`0F84`). Post-boot, two more fixes (the
+BCR1 master/slave bit, so an `SSHON`-released slave doesn't re-init WRAM over the
+running game; and `run_frame` running the whole frame in one `run_for`) let VF2
+run and stream its CD asset load. It then stalls mid-load: a Mednafen dev-build
+CD trace-diff proved the CD layer byte-identical to Mednafen, so the remaining
+blocker is **scheduler/interrupt-timing accuracy** (Mednafen-alignment Phase 2
+landed — master-leads interleave + per-instruction SCU sampling — Phase 3
+remains). See [`roadmap.md`](roadmap.md) M11 and the memory log for the
+trace-by-trace history.

@@ -134,17 +134,26 @@ the surface the frontend holds.
   global cycle) and the most-behind entity steps; ties break by insertion order
   (master, slave, CD-block). A halted entity reports `u64::MAX` so it is skipped
   — and un-halting **resyncs its cycle** to `now()` so it can't "time-travel".
-- **`run_for(cycles)`** is the headless loop: it runs the scheduler in
-  `SMPC_POLL_QUANTUM = 256`-cycle batches (clamped to the next VBlank-IN edge),
-  then between batches drains the queued side effects. **`run_frame(out)`** runs
-  one NTSC frame (`CYCLES_PER_FRAME = 479_151`, `LINES_PER_FRAME = 263`,
-  `ACTIVE_LINES = 224`) and snapshots the framebuffer at the active→VBLANK edge.
+  The **live SH-2 pair, though, is stepped master-leads-slave** by
+  `Saturn::step_cpus` (Mednafen's `CPU[0].Step` + `RunSlaveUntil` order; Phase
+  2A), not by this most-behind rule — which is kept for the CD-block timer and
+  the determinism unit test.
+- **`run_for(cycles)`** is the headless loop: each batch (clamped to the next
+  scheduled event edge — VBlank-IN/-OUT or INTBACK, `SMPC_POLL_QUANTUM = 256`
+  ceiling) steps the SH-2 pair master-leads-slave, sampling the SCU IRL per
+  master instruction; between batches it drains the queued side effects.
+  **`run_frame(out)`** runs one NTSC frame (`CYCLES_PER_FRAME = 479_151`,
+  `LINES_PER_FRAME = 263`, `ACTIVE_LINES = 224`) in a **single
+  `run_for(CYCLES_PER_FRAME)`** then renders — it must not split the frame into
+  active+VBLANK calls (the split re-anchors the batch grid and diverges the
+  master's execution from the headless path).
 - **Queue-and-drain** (ADR-0005): peripherals can't reach the CPUs across the
   bus borrow, so they flag a side effect and `Saturn` drains it at the batch
   boundary: `update_video_timing` (raster regs + VBlank-IN), `drain_smpc`,
-  `drain_scu_dma`, `drain_scu_dsp`, `drain_vdp1`, `drain_scsp`, `drain_scu_intc`
-  (forwards the top unmasked SCU source to the master INTC), and
-  `drain_input_capture` (the inter-CPU FRT pulse, §6).
+  `drain_scu_dma`, `drain_scu_dsp`, `drain_vdp1`, `drain_scsp`, and
+  `drain_input_capture` (the inter-CPU FRT pulse, §6). SCU interrupts are *not*
+  a between-batch drain — they're sampled per master instruction in `step_cpus`
+  (Phase 2B; the former `drain_scu_intc` was removed).
 
 The **SMPC** (`smpc.rs`) is the low-speed controller: reset/clock, the RTC, pad
 input via `INTBACK`, and slave/sound on-off (`SSHON`/`SSHOFF`, `SNDON`). The
@@ -254,7 +263,7 @@ frontend 12).
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
 | Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
 | Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
-| LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The root blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Remaining: confirm the first game screen renders. |
+| LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The boot blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Post-boot, VF2 runs on both SH-2s and streams its CD asset load (after the BCR1 master/slave + `run_frame`-no-split fixes), then stalls mid-load: a dev-build CD trace-diff proved the CD layer byte-identical to Mednafen, so the remaining blocker is scheduler/interrupt-timing accuracy (Mednafen-alignment Phase 2 landed — master-leads interleave + per-instruction SCU sampling — Phase 3 remains). |
 
 ---
 

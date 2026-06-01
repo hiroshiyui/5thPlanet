@@ -24,7 +24,7 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 boots to game code |
+| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 boots + runs; timing-accuracy blocker |
 
 Current test count: **530 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
@@ -192,7 +192,10 @@ instruction:
   pinned the M11 root — a spurious `DCHG` (Disc Changed) our CD-block
   re-raised at `Init`, which made the BIOS loop recognition — and with it
   fixed, VF2 and Doukyuusei ~if~ now load their 1st-read program and reach
-  their own game code (VF2 at `0x06004000`).
+  their own game code (VF2 at `0x06004000`). Post-boot, a dev-build CD-command
+  trace-diff proved our CD layer byte-identical to Mednafen through VF2's asset
+  load, localizing the remaining blocker to scheduler/interrupt-timing accuracy
+  (Mednafen-alignment Phase 2+) rather than the CD-block.
 - [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
   reference. Its Saturn driver models the chips closely (down to a
   low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
