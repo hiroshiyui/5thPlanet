@@ -287,11 +287,21 @@ Hard-won, each with a regression or golden behind it:
 
 ## Status (M11, as of this writing)
 
-The disc-recognition give-up that blocked VF2 is **resolved**: ours now matches
-Mednafen's recognition command stream byte-for-byte (GetHwInfo → … → GetToc →
-GetSession → **Auth → GetDiscRegion → ChangeDir**), authenticates, and runs the
-**work-RAM CD-boot loader** (master in `0x0602xxxx`) — well past the old give-up
-at `0x06028106`. The remaining blocker is **later**: the loader polls
-`GetStatus` (drive STANDBY) and has not yet issued the `Play`/`ReadFile` that
-loads the 1st-read. See [`roadmap.md`](roadmap.md) M11 for the live status and
+**VF2 and Doukyuusei ~if~ now boot to their own game code.** Ours matches
+Mednafen's command stream through recognition (GetHwInfo → … → Auth →
+GetDiscRegion → ChangeDir) and on into the boot — **Play (IP.BIN) → ChangeDir
+(`00ffffff`) → GetFileScope → ReadFile** — streaming the 1st-read program; the
+master reaches VF2's load address `0x06004000` and executes there.
+
+The final blocker was a CD-block one: the host interface re-raised **`DCHG`
+(Disc Changed) on the first `Init` after recognition**, because the internal
+`disk_changed` latch was cleared only inside the Init handler — so that Init
+reported a fresh disc swap and the BIOS looped recognition forever instead of
+booting. Fix: **clear `disk_changed` when the host write-1-to-clear-acknowledges
+`DCHG`** (matching Mednafen, which clears `DCHG` once during recognition and
+never re-raises it at Init). It was found by a command-level CD trace-diff: the
+BIOS code is identical on both LLE sides, so the root had to be a differing CD
+response — and the only divergence was ours' Init leaving `DCHG` set (`0FC4 →
+0FE5`) where Mednafen left it clear (`0F84`). The remaining M11 step is
+confirming the first game screen renders. See [`roadmap.md`](roadmap.md) M11 and
 the memory log for the trace-by-trace history.

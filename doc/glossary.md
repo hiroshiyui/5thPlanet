@@ -173,6 +173,15 @@ the divide; result lands in DVDNTL (quotient) + DVDNTH (remainder).
 DVCR.OVF set on /0, `INT_MIN / -1`, or 64-bit overflow. See
 `crates/sh2/src/onchip/divu.rs`.
 
+**DCHG** — Disc Changed. [HIRQ] bit `0x20` in the [CD-block], set when a
+disc is inserted/changed (tray close). The BIOS reads it during disc
+recognition and clears it write-1-to-clear to acknowledge the new disc; once
+cleared it must stay clear (no further swap) or the BIOS perceives a fresh
+disc and loops recognition instead of booting. Our CD-block latches an
+internal `disk_changed` flag alongside the bit and clears that latch on the
+W1C acknowledgment, so a later `Init` does not re-raise `DCHG` — the fix that
+unblocked the M11 game boot (matches Mednafen `cdb.cpp`).
+
 **DMA** — Direct Memory Access. Saturn has DMA in the [SH-2] on-chip
 DMAC (2 channels) and in the [SCU] (3 channels). The SCU's three
 channels are the heavy-lift transfers; on-chip DMAC is for SH-2-
@@ -252,6 +261,15 @@ global cycle alongside [VCNT] / [TVSTAT].
 [Low Work RAM] (1-cycle vs 3-cycle wait states). Saturn programs
 typically run code from here.
 
+**HIRQ** — Host Interrupt Request flags, the [CD-block]'s 16-bit status
+register at `0x0589_8008`. Each bit signals an event the host polls: `CMOK`
+(command complete, `0x01`), `DRDY` (data ready), `CSCT` (sector read), `PEND`
+(play end), [DCHG] (disc changed, `0x20`), `ESEL`/`EHST` (selector/host-command
+end), `EFLS` (filesystem), `SCDQ` (subcode-Q), `MPED` (MPEG — held set since
+there is no MPEG card). Write-1-to-clear: the host writes a word and a written
+`0` clears that flag (`HIRQ &= val`). The BIOS polls HIRQ between CD commands to
+sequence disc recognition and the game boot.
+
 ---
 
 ## I
@@ -265,7 +283,9 @@ the master's `SR.imask`.
 **IP.BIN** — Initial Program. A Saturn disc's boot header at the start of
 the first data track (FAD 150), beginning with the "SEGA SEGASATURN"
 signature. After the [CD-block] authenticates the disc (`0xE0`/`0xE1`), the
-BIOS reads IP.BIN and jumps to the game's entry point.
+BIOS reads IP.BIN, then loads the **1st-read** program (the first file in the
+[ISO9660] root directory — e.g. VF2's `AAAVF2.BIN`) to the work-RAM address
+IP.BIN names and jumps to it. Reaching that game code is the M11 boot goal.
 
 **ISO9660** — The CD-ROM filesystem. The [CD-block] (M7 phase 4) parses the
 primary volume descriptor (FAD 166) and directory records to serve the file

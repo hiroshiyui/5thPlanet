@@ -2,6 +2,21 @@
 
 **Date:** 2026-05-30 · **Reference:** Mednafen / Beetle Saturn (`mednaref/src/ss/`)
 
+> **Update (2026-06-01) — VF2 now boots; the root was in the CD-block after
+> all.** This review's headline ("eliminated the CD-block as the cause… the
+> likely culprits cluster in the interrupt/raster timing model") was premature.
+> The actual M11 boot blocker was a **CD-block** bug: the host interface
+> re-raised `DCHG` (Disc Changed) on the first `Init` after recognition (the
+> internal `disk_changed` latch was cleared only inside the Init handler), so
+> the BIOS perceived a fresh disc swap and looped recognition. Clearing
+> `disk_changed` on the host's `DCHG` write-1-to-clear (matching Mednafen) fixed
+> it — VF2 and Doukyuusei ~if~ now load their 1st-read and reach game code. The
+> "changing CD outputs doesn't change the loader's decision" finding missed it
+> because the divergence was a *HIRQ acknowledgment latch*, surfaced only by a
+> command-level CR/HIRQ trace-diff (not the response-value diffs tried here).
+> The general fidelity observations below (SCU/timing model, etc.) still stand
+> as accuracy notes, but were not the boot decider.
+
 ## Why
 
 5thPlanet's Saturn layer was built up one chip at a time, walking several

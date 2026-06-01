@@ -24,9 +24,9 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 active    |
+| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 boots to game code |
 
-Current test count: **528 workspace-wide, 0 failures.** Task-by-task
+Current test count: **530 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -183,8 +183,12 @@ instruction:
   the highest game compatibility of the open-source emulators (it runs
   the commercial library, including the dual-SH-2 / SCU-DSP / VDP1 3D
   titles), so it is the oracle for the game-boot work (M11): a local
-  instrumented build emits VF2's master-SH-2 trace to diff against ours
-  (both running the real BIOS) from the boot loader to the first divergence.
+  instrumented build emits VF2's master-SH-2 trace and CD command/HIRQ
+  stream to diff against ours (both running the real BIOS). That diff
+  pinned the M11 root — a spurious `DCHG` (Disc Changed) our CD-block
+  re-raised at `Init`, which made the BIOS loop recognition — and with it
+  fixed, VF2 and Doukyuusei ~if~ now load their 1st-read program and reach
+  their own game code (VF2 at `0x06004000`).
 - [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
   reference. Its Saturn driver models the chips closely (down to a
   low-level CD-block SH-1) and is the authority for CPU/bus/peripheral

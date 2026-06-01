@@ -254,7 +254,7 @@ frontend 12).
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
 | Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
 | Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
-| LLE BIOS boot / game boot | (uses real BIOS) | ~70% | splash | M4: boots to the SEGA splash, pixel-matching the reference. **M11 (active):** booting a *game* via the real BIOS loader — VF2 authenticates + region-checks + reads IP.BIN, but the work-RAM CD-boot loader then rejects the disc; localized (trace-diff vs Mednafen) to one data-driven branch on the post-Play CD state. |
+| LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The root blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Remaining: confirm the first game screen renders. |
 
 ---
 
