@@ -350,11 +350,28 @@ pub struct CdBlock {
     pub cmd_log: Vec<CmdTrace>,
     #[serde(skip)]
     pub cmd_log_on: bool,
+    /// Master PC that issued the in-flight command, set by the bus from its
+    /// `step_pc` just before a CD register write so [`execute`](Self::execute)
+    /// can record the caller in [`cmd_log`](Self::cmd_log). Debug-only.
+    #[serde(skip)]
+    pub caller_pc: u32,
 }
 
-/// One [`CdBlock::cmd_log`] entry: `(command, CR1..4 in, CR1..4 out, HIRQ,
-/// status)` — debug-only (M11 boot trace).
-pub type CmdTrace = (u8, [u16; 4], [u16; 4], u16, u8);
+/// One [`CdBlock::cmd_log`] entry — a detailed CD host-command record for the
+/// M11 boot trace: the master-SH-2 PC that issued the command, the command
+/// byte, the CR1..4 the host wrote and the CR1..4 the block returned, the HIRQ
+/// before→after the command, and the resulting drive status. Debug-only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CmdTrace {
+    /// Master PC that wrote the command trigger (CR4), via the bus `step_pc`.
+    pub caller_pc: u32,
+    pub cmd: u8,
+    pub cr_in: [u16; 4],
+    pub cr_out: [u16; 4],
+    pub hirq_in: u16,
+    pub hirq_out: u16,
+    pub status: u8,
+}
 
 impl Default for CdBlock {
     fn default() -> Self {
@@ -428,6 +445,7 @@ impl CdBlock {
             host_initialized: false,
             cmd_log: Vec::new(),
             cmd_log_on: false,
+            caller_pc: 0,
         }
     }
 
@@ -598,7 +616,21 @@ impl CdBlock {
             // a written 1 bit leaves it untouched (cs2.c: `HIRQ &= val`).
             // MPED is held set regardless (no MPEG card — it's never cleared
             // without one), matching Mednafen where MPED persists from reset.
-            0x0008 => self.hirq = (self.hirq & val) | HIRQ_MPED,
+            0x0008 => {
+                // When the host clears DCHG it has *acknowledged* the disc
+                // change, so drop the internal `disk_changed` latch too.
+                // Otherwise the next Init re-raises DCHG (see the 0x04 handler)
+                // and the BIOS perceives a fresh disc swap — it then loops
+                // recognition instead of booting the disc it already read.
+                // Mednafen clears DCHG once during recognition and never
+                // re-raises it at Init; this matches that (verified by the CD
+                // command/HIRQ trace-diff: ours' Init was the only command
+                // leaving DCHG set where Mednafen's left it clear).
+                if self.hirq & HIRQ_DCHG != 0 && val & HIRQ_DCHG == 0 {
+                    self.disk_changed = false;
+                }
+                self.hirq = (self.hirq & val) | HIRQ_MPED;
+            }
             0x000C => self.hirq_mask = val,
             0x0018 => {
                 // Writing CR1 begins a command and ends any periodic
@@ -1153,10 +1185,11 @@ impl CdBlock {
         // until the host reads CR4, so guard it from periodic clobbering.
         self.host_initialized = true;
         self.command_pending = true;
+        let hirq_in = self.hirq; // HIRQ the host saw before issuing this command
         // Clear CMOK while "processing" (cs2.c clears it at entry).
         self.hirq &= !HIRQ_CMOK;
 
-        self.dispatch(command, cr_in);
+        self.dispatch(command, cr_in, hirq_in);
         if std::env::var_os("CD_TRACE").is_some() {
             eprintln!(
                 "CD {cmd:02X} in={i0:04X},{i1:04X},{i2:04X},{i3:04X} \
@@ -1176,21 +1209,34 @@ impl CdBlock {
         }
     }
 
-    /// Decode and run one host command. `cr_in` is the CR1..CR4 the host wrote.
-    fn dispatch(&mut self, command: u8, cr_in: [u16; 4]) {
+    /// Decode and run one host command. `cr_in` is the CR1..CR4 the host wrote;
+    /// `hirq_in` is the HIRQ the host saw just before issuing it.
+    fn dispatch(&mut self, command: u8, cr_in: [u16; 4], hirq_in: u16) {
         self.dispatch_inner(command, cr_in);
-        // M11 boot-trace ring (off by default; see `cmd_log`).
+        // M11 boot-trace ring (off by default; see `cmd_log`). Collapse a run of
+        // consecutive GetStatus(0x00) polls from the same caller into a single
+        // entry (the stall spins on it) so the ring keeps the meaningful command
+        // sequence instead of flooding with identical polls.
         if self.cmd_log_on {
-            if self.cmd_log.len() >= 512 {
-                self.cmd_log.remove(0);
+            let collapse = command == 0x00
+                && self
+                    .cmd_log
+                    .last()
+                    .is_some_and(|e| e.cmd == 0x00 && e.caller_pc == self.caller_pc);
+            if !collapse {
+                if self.cmd_log.len() >= 1024 {
+                    self.cmd_log.remove(0);
+                }
+                self.cmd_log.push(CmdTrace {
+                    caller_pc: self.caller_pc,
+                    cmd: command,
+                    cr_in,
+                    cr_out: [self.cr1, self.cr2, self.cr3, self.cr4],
+                    hirq_in,
+                    hirq_out: self.hirq,
+                    status: self.status,
+                });
             }
-            self.cmd_log.push((
-                command,
-                cr_in,
-                [self.cr1, self.cr2, self.cr3, self.cr4],
-                self.hirq,
-                self.status,
-            ));
         }
     }
 

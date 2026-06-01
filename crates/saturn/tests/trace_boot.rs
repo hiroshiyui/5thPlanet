@@ -427,22 +427,27 @@ fn dump_giveup_state() {
     };
     let log = std::mem::take(&mut sat.bus.cd_block.cmd_log);
     println!(
-        "\n=== CD command stream (last {tail} of {}) — [idx] cmd  CR_in -> CR_out  HIRQ st ===",
+        "\n=== CD command stream (last {tail} of {}) — [idx] caller cmd  CR_in -> CR_out  HIRQ_in->out st ===",
         log.len()
     );
     let start = log.len().saturating_sub(tail);
-    for (i, (c, cin, cout, hirq, st)) in log.iter().enumerate().skip(start) {
+    for (i, e) in log.iter().enumerate().skip(start) {
         println!(
-            "  [{i:>3}] {c:02X} {:<15} in={:04X},{:04X},{:04X},{:04X} -> out={:04X},{:04X},{:04X},{:04X}  HIRQ={hirq:04X} st={st:02X}",
-            name(*c),
-            cin[0],
-            cin[1],
-            cin[2],
-            cin[3],
-            cout[0],
-            cout[1],
-            cout[2],
-            cout[3],
+            "  [{i:>3}] @{:08X} {:02X} {:<15} in={:04X},{:04X},{:04X},{:04X} -> out={:04X},{:04X},{:04X},{:04X}  HIRQ {:04X}->{:04X} st={:02X}",
+            e.caller_pc,
+            e.cmd,
+            name(e.cmd),
+            e.cr_in[0],
+            e.cr_in[1],
+            e.cr_in[2],
+            e.cr_in[3],
+            e.cr_out[0],
+            e.cr_out[1],
+            e.cr_out[2],
+            e.cr_out[3],
+            e.hirq_in,
+            e.hirq_out,
+            e.status,
         );
     }
 
@@ -570,6 +575,31 @@ fn dump_giveup_state() {
             let (w, _) = sat.bus.read16(a, AccessKind::Fetch);
             let op = sh2::decoder::decode(w);
             println!("  0x{a:08X}: {w:04X}  {}", sh2::debug::disasm(op));
+        }
+    }
+    // Optional: hex-dump a LIVE work-RAM range as u32 words (DUMP_FROM/DUMP_LEN)
+    // — e.g. the stack (R15) to read the call-chain return addresses, or a data
+    // table the loader walks.
+    if let Ok(s) = std::env::var("DUMP_FROM") {
+        let from = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let len: u32 = std::env::var("DUMP_LEN")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x40);
+        println!(
+            "\n=== live dump @0x{from:08X}..0x{:08X} (u32) ===",
+            from + len
+        );
+        for off in (0..len).step_by(16) {
+            let a = from + off;
+            let mut row = format!("  0x{a:08X}:");
+            for w in 0..4u32 {
+                if off + w * 4 < len {
+                    let (v, _) = sat.bus.read32(a + w * 4, AccessKind::Data);
+                    row.push_str(&format!(" {v:08X}"));
+                }
+            }
+            println!("{row}");
         }
     }
 }

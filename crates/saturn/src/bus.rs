@@ -337,7 +337,12 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.write16(addr - LOW_WRAM_BASE, val),
             SOUND_BASE..=SOUND_END => self.sound.write16(addr - SOUND_BASE, val),
             a if Cartridge::owns(a) => self.cartridge.write16(a, val),
-            CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.write16(addr - CD_BLOCK_BASE, val),
+            CD_BLOCK_BASE..=CD_BLOCK_END => {
+                // Record the issuing master PC so the CD command trace can name
+                // the loader code that drove each command (debug-only).
+                self.cd_block.caller_pc = self.step_pc;
+                self.cd_block.write16(addr - CD_BLOCK_BASE, val)
+            }
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
                 self.vdp1.write16(a, val)
