@@ -1050,12 +1050,29 @@ impl Saturn {
     /// Writes into `out`, which must be exactly
     /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes (RGBA8888 320×224).
     pub fn run_frame(&mut self, out: &mut [u8]) {
-        const ACTIVE_CYCLES: u64 = ACTIVE_LINES * CYCLES_PER_LINE;
-        const VBLANK_CYCLES: u64 = CYCLES_PER_FRAME - ACTIVE_CYCLES;
-
-        self.run_for(ACTIVE_CYCLES);
+        // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
+        // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short
+        // (per-line integer truncation — the very drift `VBLANK_IN_CYCLE`'s
+        // doc-comment warns about), so it forces a drain at a point that is
+        // NOT an event-clamp edge, forwarding SCU interrupts ~194 cycles early
+        // and diverging master-SH-2 execution from `run_for(CYCLES_PER_FRAME)`.
+        // That divergence sent VF2 down a different CD-read path that stalled.
+        // Splitting at the VBlank-IN edge (which `run_for` clamps to anyway)
+        // makes `run_frame` == `run_for(full frame)` + a read-only render at
+        // the active→VBLANK boundary.
+        // Advance the WHOLE frame in one `run_for`, then render. Do NOT split
+        // into run_for(active)+run_for(vblank): `run_for`'s `SMPC_POLL_QUANTUM`
+        // batch grid (hence its drain/interrupt-forwarding points) is anchored
+        // to each call's *start*, so a split re-anchors the grid and forwards
+        // SCU interrupts at different cycles than one continuous `run_for` —
+        // diverging master-SH-2 execution. That divergence sent VF2 down a
+        // different CD-read path that dead-ended (GetSectorData over-request →
+        // no DRDY). A single `run_for(CYCLES_PER_FRAME)` makes `run_frame`
+        // bit-identical to the headless `run_for` path (verified via sdbg).
+        // The framebuffer is snapshotted at the frame boundary; the VDP state
+        // a game commits at VBlank is what it intends to display.
+        self.run_for(CYCLES_PER_FRAME);
         crate::vdp2::render_frame(&self.bus.vdp2, Some(self.bus.vdp1.display_fb()), out);
-        self.run_for(VBLANK_CYCLES);
     }
 
     /// Take the SCSP's generated audio for this period (interleaved L,R at
