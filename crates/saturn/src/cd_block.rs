@@ -701,6 +701,23 @@ impl CdBlock {
         self.write16(offset + 2, val as u16);
     }
 
+    /// Debug: the drive head's current FAD (the read-pump position).
+    pub fn curfad(&self) -> u32 {
+        self.cd_curfad
+    }
+
+    /// Debug: a snapshot of CD-block state for the interactive debugger —
+    /// `(status, cur_fad, fad_to_play, free_blocks, per-partition block counts)`.
+    pub fn debug_state(&self) -> (u8, u32, i64, i32, Vec<usize>) {
+        (
+            self.status,
+            self.cd_curfad,
+            self.fadstoplay,
+            self.free_blocks,
+            self.partitions.iter().map(|p| p.blocks.len()).collect(),
+        )
+    }
+
     /// Write a standard CD status report into CR1..CR4 (cs2.c `doCDReport`).
     fn cd_report(&mut self) {
         // The reported FAD is the drive's *current* head position, which the

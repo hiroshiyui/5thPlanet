@@ -1,0 +1,17 @@
+[package]
+name = "sdbg"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sdbg"
+path = "src/main.rs"
+
+[dependencies]
+saturn = { path = "../saturn" }
+sh2 = { path = "../sh2" }
+
+[lints]
+workspace = true

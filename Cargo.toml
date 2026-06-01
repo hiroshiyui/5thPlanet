@@ -6,6 +6,7 @@ members = [
     "crates/scu_dsp",
     "crates/m68k",
     "crates/physdisc",
+    "crates/debugger",
     "fifth_planet",
 ]
 
