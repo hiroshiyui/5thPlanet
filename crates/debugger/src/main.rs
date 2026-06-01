@@ -319,11 +319,36 @@ impl Dbg {
         );
     }
 
+    /// Full-system run until the CD-block first logs a host command matching
+    /// `cmd` (and `cr4` in CR_in[3], if given). Stops on the first occurrence,
+    /// preserving the preceding setup commands in the (1024-entry) `cmd_log`.
+    fn cd_break(&mut self, cmd: u8, cr4: Option<u16>, max_frames: u64) {
+        for f in 0..max_frames {
+            self.sat.run_for(CYCLES_PER_FRAME);
+            let log = &self.sat.bus.cd_block.cmd_log;
+            let hit = log
+                .iter()
+                .rev()
+                .take(256)
+                .any(|e| e.cmd == cmd && cr4.is_none_or(|v| e.cr_in[3] == v));
+            if hit {
+                println!(
+                    "CD command {cmd:02X}{} first seen at frame {f}; master @ {:08X}",
+                    cr4.map(|v| format!(" cr4={v:04X}")).unwrap_or_default(),
+                    self.sat.master().regs.pc,
+                );
+                return;
+            }
+        }
+        println!("CD command {cmd:02X} not seen in {max_frames} frames");
+    }
+
     fn exec(&mut self, line: &str) -> bool {
         let mut it = line.split_whitespace();
         let Some(cmd) = it.next() else { return true };
         let a1 = it.next();
         let a2 = it.next();
+        let a3 = it.next();
         match cmd {
             "q" | "quit" | "exit" => return false,
             "h" | "help" | "?" => print_help(),
@@ -331,6 +356,14 @@ impl Dbg {
             "si" | "s" => self.step(a1.and_then(parse_dec).unwrap_or(1)),
             "c" | "cont" => self.cont(a1.and_then(parse_dec).unwrap_or(5_000_000)),
             "fc" => self.frame_cont(a1.and_then(parse_dec).unwrap_or(600)),
+            "cb" => match a1.and_then(parse_num) {
+                Some(cmdbyte) => self.cd_break(
+                    cmdbyte as u8,
+                    a2.and_then(parse_num).map(|v| v as u16),
+                    a3.and_then(parse_dec).unwrap_or(6000),
+                ),
+                None => println!("usage: cb <cmd-hex> [cr4-hex] [max-frames]"),
+            },
             "frame" | "f" => {
                 let n = a1.and_then(parse_dec).unwrap_or(1);
                 for _ in 0..n {
@@ -431,6 +464,8 @@ sdbg commands:
   si [n]          step master n instructions (slave frozen)        [alias s]
   c [n]           continue master single-step until bp/watch/max-n insns
   fc [n]          full-system continue up to n frames, stop at master bp
+  cb <cmd> [cr4] [maxf]  full-system run until the CD logs host command <cmd>
+                  (hex; optional CR_in[3] match), preserving setup in cdlog
   frame [n]       run n full frames (slave+VDP+CD advance)         [alias f]
   run <cyc>       run_for <cyc> master cycles (full system)
   b [pc]          set/clear master breakpoint (hex)
