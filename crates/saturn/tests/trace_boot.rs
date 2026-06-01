@@ -2021,6 +2021,20 @@ fn vf2_render_state() {
         "SLAVE  pc=0x{spc:08X} imask={simask} T={} PR=0x{spr:08X}",
         st as u8
     );
+    // The SH-2 records the last CPU *fault* (vector, faulting PC) — illegal(4) /
+    // slot-illegal(6) / address-error(9/10) / TRAPA, not interrupts — and the
+    // raw word for a general-illegal. This is the reliable crash site (the stack
+    // frame is clobbered by the BIOS reset that follows the fault).
+    println!(
+        "MASTER last_fault={:08X?} illegal_word={:04X?}",
+        sat.master().last_fault,
+        sat.master().last_illegal_word
+    );
+    println!(
+        "SLAVE  last_fault={:08X?} illegal_word={:04X?}",
+        sat.slave().last_fault,
+        sat.slave().last_illegal_word
+    );
     let base = (mpc & !1).wrapping_sub(0x12);
     println!("=== spin disasm @0x{base:08X} ===");
     for off in (0..0x18u32).step_by(2) {
