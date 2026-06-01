@@ -54,6 +54,22 @@ fn parse_dec(s: &str) -> Option<u64> {
     s.trim().parse().ok()
 }
 
+/// Parse a hex byte string (`"060B17D0"`, optional `0x`) into bytes for `find`.
+fn parse_hex_bytes(s: &str) -> Vec<u8> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    if t.is_empty() || !t.len().is_multiple_of(2) || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Vec::new();
+    }
+    (0..t.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&t[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Short mnemonic for a CD-block host command (subset; falls back to hex).
 fn cd_name(cmd: u8) -> &'static str {
     match cmd {
@@ -130,16 +146,117 @@ impl Dbg {
         }
         let s = self.sat.slave();
         println!(
-            "SLAVE  pc={:08X} pr={:08X} sr=(T{} I{:X}){}",
+            "SLAVE  pc={:08X} pr={:08X} sr=(T{} I{:X}) gbr={:08X} vbr={:08X}{}",
             s.regs.pc,
             s.regs.pr,
             s.regs.sr.t() as u8,
             s.regs.sr.imask(),
+            s.regs.gbr,
+            s.regs.vbr,
             if self.sat.slave_is_halted() {
                 " [HALTED]"
             } else {
                 ""
             },
+        );
+        for row in 0..4 {
+            print!("  ");
+            for col in 0..4 {
+                let i = row * 4 + col;
+                print!("r{i:<2}={:08X} ", s.regs.r[i]);
+            }
+            println!();
+        }
+    }
+
+    /// Step the slave one instruction (master frozen) and show its new PC.
+    fn step_slave(&mut self, n: u64) {
+        for _ in 0..n {
+            self.sat.debug_step_slave();
+        }
+        let pc = self.sat.slave().regs.pc;
+        let w = self.read_mem(pc, 2) as u16;
+        println!("slave @ {pc:08X}: {w:04X}  {}", disasm(decode(w)));
+    }
+
+    /// Trace `n` master instructions, printing each PC + disasm (to `file` if
+    /// given, else stdout). A windowed trace from a save state is the basis for
+    /// a per-instruction diff against Mednafen's `SS_PCTRACE`.
+    fn trace(&mut self, n: u64, file: Option<&str>) {
+        let mut buf = String::new();
+        for _ in 0..n {
+            let pc = self.sat.master().regs.pc;
+            let w = self.read_mem(pc, 2) as u16;
+            if file.is_some() {
+                buf.push_str(&format!("{pc:08X}: {w:04X}  {}\n", disasm(decode(w))));
+            } else {
+                println!("{pc:08X}: {w:04X}  {}", disasm(decode(w)));
+            }
+            self.sat.debug_step_master();
+        }
+        if let Some(f) = file {
+            match std::fs::write(f, buf) {
+                Ok(()) => println!("wrote {n} master PCs to {f}"),
+                Err(e) => println!("write failed: {e}"),
+            }
+        }
+    }
+
+    /// Full-system run until a bus write to `addr` (optionally with value
+    /// `val`); reports the storing instruction's PC. The watchpoint records the
+    /// *first* matching write, so its PC is exact even though the run stops at
+    /// the enclosing frame boundary.
+    fn write_break(&mut self, addr: u32, val: Option<u32>, max_frames: u64) {
+        self.sat.bus.watch = Some((addr, val));
+        self.sat.bus.watch_hit = None;
+        for f in 0..max_frames {
+            self.sat.run_for(CYCLES_PER_FRAME);
+            if let Some((a, v, pc)) = self.sat.bus.watch_hit.take() {
+                self.sat.bus.watch = None;
+                println!("write {a:08X} = {v:08X} by pc {pc:08X} (frame {f})");
+                self.dump_regs();
+                return;
+            }
+        }
+        self.sat.bus.watch = None;
+        println!(
+            "no matching write to {addr:08X}{} in {max_frames} frames",
+            val.map(|v| format!(" =={v:08X}")).unwrap_or_default()
+        );
+    }
+
+    /// Scan memory for a 32-bit (big-endian) value over `[start, start+len)`.
+    fn find32(&mut self, value: u32, start: u32, len: u32) {
+        let end = start.saturating_add(len);
+        let (mut a, mut hits) = (start & !3, 0u32);
+        while a < end && hits < 64 {
+            if self.read_mem(a, 4) == value {
+                println!("  {a:08X}");
+                hits += 1;
+            }
+            a += 4;
+        }
+        println!("{hits} match(es) for {value:08X} in [{start:08X}..{end:08X})");
+    }
+
+    /// Scan memory for a byte pattern over `[start, start+len)`.
+    fn find_bytes(&mut self, pat: &[u8], start: u32, len: u32) {
+        let end = start.saturating_add(len);
+        let (mut a, mut hits) = (start, 0u32);
+        while a < end && hits < 64 {
+            if pat
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| self.read_mem(a + i as u32, 1) as u8 == b)
+            {
+                println!("  {a:08X}");
+                hits += 1;
+            }
+            a += 1;
+        }
+        println!(
+            "{hits} match(es) for {} bytes in [{start:08X}..{end:08X})",
+            pat.len()
         );
     }
 
@@ -354,8 +471,36 @@ impl Dbg {
             "h" | "help" | "?" => print_help(),
             "r" | "regs" => self.dump_regs(),
             "si" | "s" => self.step(a1.and_then(parse_dec).unwrap_or(1)),
+            "ssi" => self.step_slave(a1.and_then(parse_dec).unwrap_or(1)),
+            "t" => self.trace(a1.and_then(parse_dec).unwrap_or(32), a2),
             "c" | "cont" => self.cont(a1.and_then(parse_dec).unwrap_or(5_000_000)),
             "fc" => self.frame_cont(a1.and_then(parse_dec).unwrap_or(600)),
+            "bw" => match a1.and_then(parse_num) {
+                Some(addr) => self.write_break(
+                    addr,
+                    a2.and_then(parse_num),
+                    a3.and_then(parse_dec).unwrap_or(6000),
+                ),
+                None => println!("usage: bw <addr-hex> [val-hex] [max-frames]"),
+            },
+            "find32" => match a1.and_then(parse_num) {
+                Some(v) => self.find32(
+                    v,
+                    a2.and_then(parse_num).unwrap_or(0x0600_0000),
+                    a3.and_then(parse_num).unwrap_or(0x0010_0000),
+                ),
+                None => println!("usage: find32 <value-hex> [start-hex] [len-hex]"),
+            },
+            "find" => match a1.map(parse_hex_bytes) {
+                Some(pat) if !pat.is_empty() => self.find_bytes(
+                    &pat,
+                    a2.and_then(parse_num).unwrap_or(0x0600_0000),
+                    a3.and_then(parse_num).unwrap_or(0x0010_0000),
+                ),
+                _ => {
+                    println!("usage: find <hex-bytes> [start-hex] [len-hex]  (e.g. find 060B17D0)")
+                }
+            },
             "cb" => match a1.and_then(parse_num) {
                 Some(cmdbyte) => self.cd_break(
                     cmdbyte as u8,
@@ -443,6 +588,10 @@ impl Dbg {
                 Some(path) => match std::fs::read(path) {
                     Ok(bytes) => match self.sat.load_state(&bytes) {
                         Ok(()) => {
+                            // The cmd_log isn't serialized (kept out of save
+                            // states to stay lean); re-enable logging so `cdlog`
+                            // captures commands issued after the load.
+                            self.sat.bus.cd_block.cmd_log_on = true;
                             println!("loaded {path}; master @ {:08X}", self.sat.master().regs.pc)
                         }
                         Err(e) => println!("load failed: {e:?}"),
@@ -462,8 +611,12 @@ fn print_help() {
         "\
 sdbg commands:
   si [n]          step master n instructions (slave frozen)        [alias s]
+  ssi [n]         step SLAVE n instructions (master frozen)
+  t [n] [file]    trace n master insns (PC+disasm) to stdout or file
   c [n]           continue master single-step until bp/watch/max-n insns
   fc [n]          full-system continue up to n frames, stop at master bp
+  bw <addr> [val] [maxf]  full-system run until a bus write to <addr>
+                  (optional ==val), report the storing instruction's PC
   cb <cmd> [cr4] [maxf]  full-system run until the CD logs host command <cmd>
                   (hex; optional CR_in[3] match), preserving setup in cdlog
   frame [n]       run n full frames (slave+VDP+CD advance)         [alias f]
@@ -472,14 +625,16 @@ sdbg commands:
   bs [pc]         set/clear slave breakpoint
   w <addr> [sz]   add a poll watchpoint (size 1/2/4, default 2), checked in `c`
   dw              clear watchpoints
-  regs            dump master + slave registers                    [alias r]
+  find32 <v> [start] [len]  scan memory for a 32-bit value (default: high WRAM)
+  find <bytes> [start] [len]  scan memory for a hex byte pattern
+  regs            dump master + slave registers (r0-r15 each)       [alias r]
   m <addr> [len]  hex-dump memory                                  [alias x]
   d [addr] [n]    disassemble n insns from addr (default: master pc) [alias dis]
   cd              CD-block state (status/hirq/curfad/partitions)
   cdlog [n]       last n CD host commands
   vdp             VDP display state
   save <file>     write a save state (snapshot)
-  load <file>     restore a save state (rewind)
+  load <file>     restore a save state (rewind; re-enables cdlog)
   help            this help                                        [alias h ?]
   quit            exit                                             [alias q]"
     );

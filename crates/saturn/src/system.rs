@@ -337,6 +337,26 @@ impl Saturn {
         cpu.step(bus)
     }
 
+    /// Debug-only: step the **slave** SH-2 one instruction (master frozen),
+    /// for inspecting slave code. Returns 0 if the slave is halted. The slave
+    /// receives no SCU interrupt (those go to the master), so this is a plain
+    /// step; bus writes still trigger the `bw` watchpoint with the slave's PC.
+    pub fn debug_step_slave(&mut self) -> u32 {
+        let Self {
+            bus,
+            scheduler,
+            slave_id,
+            ..
+        } = self;
+        let s = scheduler.entity_mut(*slave_id).sh2_mut();
+        if s.is_halted() {
+            return 0;
+        }
+        bus.cycle = s.cpu.pipeline.cycles;
+        bus.step_pc = s.cpu.regs.pc;
+        s.cpu.step(bus)
+    }
+
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
     /// performs between scheduler batches).
     pub fn debug_drain(&mut self) {

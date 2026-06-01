@@ -116,9 +116,30 @@ pub struct SaturnBus {
     pub slave_input_capture: bool,
     #[serde(skip)]
     pub master_input_capture: bool,
+    /// Debug-only programmatic write-watchpoint (the `sdbg` debugger's `bw`):
+    /// `(addr, optional value)`. When a bus write matches, [`watch_hit`] records
+    /// `(addr, written value, writing-instruction PC)` — the *first* match only,
+    /// so the run can stop at the originating store. `#[serde(skip)]` — debug
+    /// state, never part of a save state.
+    #[serde(skip)]
+    pub watch: Option<(u32, Option<u32>)>,
+    #[serde(skip)]
+    pub watch_hit: Option<(u32, u32, u32)>,
 }
 
 impl SaturnBus {
+    /// Debug-only: record the first bus write matching the programmatic
+    /// write-watchpoint (`bw`). `val` is the size-appropriate written value;
+    /// `step_pc` is the PC of the storing instruction (refreshed per step).
+    fn note_write(&mut self, addr: u32, val: u32) {
+        if self.watch_hit.is_none()
+            && let Some((waddr, wval)) = self.watch
+            && addr == waddr
+            && wval.is_none_or(|v| v == val)
+        {
+            self.watch_hit = Some((addr, val, self.step_pc));
+        }
+    }
     /// Construct a bus with the supplied BIOS image. RAM regions are
     /// freshly allocated and zeroed.
     pub fn new(bios: Vec<u8>) -> Self {
@@ -140,6 +161,8 @@ impl SaturnBus {
             step_pc: 0,
             slave_input_capture: false,
             master_input_capture: false,
+            watch: None,
+            watch_hit: None,
         }
     }
 
@@ -305,6 +328,7 @@ impl Bus for SaturnBus {
 
     fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
         write_watch(addr, 1, val as u32, _k, self.cycle, self.step_pc);
+        self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write8(addr - SMPC_BASE, val),
@@ -330,6 +354,7 @@ impl Bus for SaturnBus {
 
     fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
         write_watch(addr, 2, val as u32, _k, self.cycle, self.step_pc);
+        self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write16(addr - SMPC_BASE, val),
@@ -365,6 +390,7 @@ impl Bus for SaturnBus {
 
     fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
         write_watch(addr, 4, val, _k, self.cycle, self.step_pc);
+        self.note_write(addr, val);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
             SMPC_BASE..=SMPC_END => self.smpc.write32(addr - SMPC_BASE, val),
