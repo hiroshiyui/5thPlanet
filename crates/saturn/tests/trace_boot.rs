@@ -140,9 +140,12 @@ fn frame_timing() {
         println!("no JP BIOS; skipped");
         return;
     };
-    let cue_path = root.join("roms/vf2_full.cue");
+    // CUE=<name> overrides the disc image (default VF2), so the same boot probe
+    // can be pointed at other commercial fixtures.
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let cue_path = root.join("roms").join(&cue_name);
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
-        println!("no vf2_full.cue; skipped");
+        println!("no roms/{cue_name}; skipped");
         return;
     };
     let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
@@ -331,9 +334,12 @@ fn dump_giveup_state() {
         println!("no JP BIOS; skipped");
         return;
     };
-    let cue_path = root.join("roms/vf2_full.cue");
+    // CUE=<name> overrides the disc image (default VF2), so the same boot probe
+    // can be pointed at other commercial fixtures.
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let cue_path = root.join("roms").join(&cue_name);
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
-        println!("no vf2_full.cue; skipped");
+        println!("no roms/{cue_name}; skipped");
         return;
     };
     let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
