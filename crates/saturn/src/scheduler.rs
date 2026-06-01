@@ -16,6 +16,16 @@
 //! linear scan over entities is O(n) per step; with n=2 that's fine.
 //! Once VDP/SCU/SCSP arrive in M3+ and n grows past a handful, swap
 //! the scan for a `BinaryHeap` keyed on `(deadline, insertion_order)`.
+//!
+//! **Saturn stepping (Phase-2 Mednafen alignment).** The live machine no
+//! longer steps the two SH-2s by this most-behind rule: [`Saturn::step_cpus`]
+//! (`system.rs`) drives them in Mednafen's **master-leads-slave** order — the
+//! master executes one instruction, then the slave catches up to the master's
+//! timestamp — because the most-behind rule could let the *slave* lead and
+//! diverged timing-sensitive inter-CPU handoffs. This generic
+//! [`run_for`](Scheduler::run_for) / [`pick_behind`](Scheduler::pick_behind) is
+//! retained for the CD-block timer it still steps and for the determinism unit
+//! test (`tests/scheduler.rs`); the live SH-2 ordering lives in `step_cpus`.
 
 /// Anything the [`Scheduler`] can run. Implementations carry their own
 /// local cycle counter; [`next_deadline`] reports it, and [`step`]
@@ -88,31 +98,6 @@ impl<E: SchedEntity> Scheduler<E> {
         let target = self.now().saturating_add(cycles);
         while self.now() < target {
             let idx = self.pick_behind();
-            let before = self.entities[idx].next_deadline();
-            self.entities[idx].step(ctx);
-            debug_assert!(
-                self.entities[idx].next_deadline() > before,
-                "SchedEntity::step must advance next_deadline()",
-            );
-        }
-    }
-
-    /// Like [`run_for`](Self::run_for), but invokes `before_step(entity, id)`
-    /// immediately before each entity is stepped. Used by the full-system
-    /// boot tracer to record the master SH-2's PC *in scheduler order* (with
-    /// the slave and CD-block interleaved), which `run_frame` produces but a
-    /// master-only single-step trace cannot. Not on the hot path.
-    pub fn run_for_traced<F>(&mut self, cycles: u64, ctx: &mut E::Context, mut before_step: F)
-    where
-        F: FnMut(&E, EntityId),
-    {
-        if self.entities.is_empty() || cycles == 0 {
-            return;
-        }
-        let target = self.now().saturating_add(cycles);
-        while self.now() < target {
-            let idx = self.pick_behind();
-            before_step(&self.entities[idx], EntityId(idx));
             let before = self.entities[idx].next_deadline();
             self.entities[idx].step(ctx);
             debug_assert!(

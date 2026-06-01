@@ -501,6 +501,70 @@ impl Saturn {
             .min(self.cycles_to_next_event(now).max(1))
     }
 
+    /// Step the SH-2 pair (+ the CD-block firmware timer) up to global cycle
+    /// `target`, in **Mednafen's RunLoop order** (`ss.cpp`: `CPU[0].Step()`
+    /// then `RunSlaveUntil(CPU[0].timestamp)`): the **master** executes one
+    /// instruction, then the **slave** runs until it catches up to the
+    /// master's timestamp (overshooting by at most one instruction). The
+    /// master therefore always leads by one instruction, so the two cores'
+    /// interleaved work-RAM accesses (and inter-CPU handoffs) match the
+    /// reference order — Phase-2 alignment. The previous most-behind-first
+    /// rule (`Scheduler::pick_behind`) could let the *slave* lead the master,
+    /// which diverged timing-sensitive game logic (the VF2 CD-load decision).
+    ///
+    /// CD-block periodic ticks fire when the master's timestamp passes their
+    /// scheduled cycle (peripheral events run against the master clock, as in
+    /// Mednafen's event loop). A halted slave is skipped — its release
+    /// resyncs its cycle (see [`release_slave`](Self::release_slave)).
+    fn step_cpus(&mut self, target: u64) {
+        self.step_cpus_hooked(target, |_| {});
+    }
+
+    /// [`step_cpus`](Self::step_cpus) with a hook invoked on the master entity
+    /// immediately before each master instruction — used by the boot PC tracer
+    /// so its trace is produced in the *same* interleave order as the real run
+    /// (the `run_frame`/`run_for` consistency lesson of the split-frame fix).
+    fn step_cpus_hooked<F: FnMut(&crate::scheduler::Sh2Entity)>(
+        &mut self,
+        target: u64,
+        mut before_master: F,
+    ) {
+        let Self {
+            bus,
+            scheduler,
+            master_id,
+            slave_id,
+            cd_id,
+            ..
+        } = self;
+        loop {
+            let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+            if mcyc >= target {
+                break;
+            }
+            // Peripheral (CD-block) events scheduled at or before the master's
+            // current timestamp fire before the master advances past them.
+            while scheduler.entity(*cd_id).next_deadline() <= mcyc {
+                scheduler.entity_mut(*cd_id).step(bus);
+            }
+            // Master leads by one instruction.
+            before_master(scheduler.entity(*master_id).sh2());
+            scheduler.entity_mut(*master_id).step(bus);
+            let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+            // Slave catches up to the master's new timestamp.
+            while {
+                let s = scheduler.entity(*slave_id).sh2();
+                !s.is_halted() && s.cpu.pipeline.cycles < mcyc
+            } {
+                scheduler.entity_mut(*slave_id).step(bus);
+            }
+        }
+        // Trailing CD-block ticks up to the batch target.
+        while scheduler.entity(*cd_id).next_deadline() <= target {
+            scheduler.entity_mut(*cd_id).step(bus);
+        }
+    }
+
     /// Advance global time by at least `cycles` cycles, interleaving
     /// the two CPUs by deadline order and polling SMPC + SCU between
     /// scheduler batches.
@@ -513,7 +577,7 @@ impl Saturn {
             // side-effects (VBlank-IN/OUT, INTBACK completion) settle
             // cycle-exactly rather than up to a batch late — see `batch_size`.
             let batch = self.batch_size(now, remaining);
-            self.scheduler.run_for(batch, &mut self.bus);
+            self.step_cpus(now + batch);
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
@@ -533,7 +597,6 @@ impl Saturn {
     /// master's interrupt phase reflects the real `run_frame` path — needed
     /// to diff the `run_frame` boot park against a reference.
     pub fn run_for_traced(&mut self, cycles: u64, pcs: &mut Vec<u32>) {
-        let master_id = self.master_id;
         // Reference traces differ on whether they log branch delay slots:
         // Yabause omits them; MAME logs them. Set PCTRACE_DELAYSLOTS to match
         // a MAME reference trace (which includes the slot PC).
@@ -543,15 +606,14 @@ impl Saturn {
             let now = self.now();
             let remaining = target - now;
             let batch = self.batch_size(now, remaining);
-            self.scheduler
-                .run_for_traced(batch, &mut self.bus, |entity, id| {
-                    if id == master_id {
-                        let cpu = &entity.sh2().cpu;
-                        if log_delay_slots || !cpu.next_is_delay_slot() {
-                            pcs.push(cpu.regs.pc);
-                        }
-                    }
-                });
+            // Same master-leads-slave order as `run_for`, recording each master
+            // PC before it steps — so the trace can't diverge from the real run.
+            self.step_cpus_hooked(now + batch, |m| {
+                let cpu = &m.cpu;
+                if log_delay_slots || !cpu.next_is_delay_slot() {
+                    pcs.push(cpu.regs.pc);
+                }
+            });
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
