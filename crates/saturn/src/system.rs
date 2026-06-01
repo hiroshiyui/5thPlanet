@@ -316,6 +316,19 @@ impl Saturn {
             master_id,
             ..
         } = self;
+        // Phase 2B: sample the SCU IRL before the instruction, exactly as
+        // `step_cpus` does on the real run, so the single-step debug path and
+        // `run_for` deliver SCU interrupts at the same (per-instruction) point.
+        let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
+        if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+            scheduler
+                .entity_mut(*master_id)
+                .sh2_mut()
+                .cpu
+                .onchip
+                .intc
+                .raise_external(level, source.vector());
+        }
         let cpu = &mut scheduler.entity_mut(*master_id).sh2_mut().cpu;
         // Mirror Sh2Entity::step: publish the current cycle to the bus so
         // time-varying peripheral reads (SMPC SF INTBACK completion) settle
@@ -340,7 +353,6 @@ impl Saturn {
         self.drain_scu_dsp();
         self.drain_vdp1();
         self.drain_scsp();
-        self.drain_scu_intc();
     }
 
     /// Step the CD-block timer entity until its deadline passes the master's
@@ -547,6 +559,24 @@ impl Saturn {
             while scheduler.entity(*cd_id).next_deadline() <= mcyc {
                 scheduler.entity_mut(*cd_id).step(bus);
             }
+            // Phase 2B: sample the SCU interrupt line at the master's *current*
+            // SR.imask, every instruction. The SCU presents the highest-priority
+            // unmasked pending source as an IRL the master samples each cycle, so
+            // an interrupt becomes deliverable at the exact instruction imask
+            // drops below its level — not up to a full batch late, as the old
+            // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
+            // per-source vector (0x40 + index) is latched, not the 64+level
+            // auto-vector.
+            let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
+            if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+                scheduler
+                    .entity_mut(*master_id)
+                    .sh2_mut()
+                    .cpu
+                    .onchip
+                    .intc
+                    .raise_external(level, source.vector());
+            }
             // Master leads by one instruction.
             before_master(scheduler.entity(*master_id).sh2());
             scheduler.entity_mut(*master_id).step(bus);
@@ -585,7 +615,6 @@ impl Saturn {
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
-            self.drain_scu_intc();
             self.drain_input_capture();
         }
     }
@@ -621,7 +650,6 @@ impl Saturn {
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
-            self.drain_scu_intc();
             self.drain_input_capture();
         }
     }
@@ -1038,34 +1066,6 @@ impl Saturn {
                 let ra0 = &mut self.bus.scu.dsp.regs.ra0;
                 *ra0 = ra0.wrapping_add(dma.size * (dma.add >> 2));
             }
-        }
-    }
-
-    /// Surface any fresh SCU interrupt assertion to the master SH-2.
-    /// One source per drain (the highest-priority unmasked one); the
-    /// `fresh_assertions` bit clears as part of `take_pending_interrupt`
-    /// so we don't re-fire the same source every batch while the SH-2
-    /// is still handling it. New raises after the SH-2 acks will fire
-    /// the source again because the SCU's `raise()` re-sets the bit.
-    fn drain_scu_intc(&mut self) {
-        let imask = self.master().regs.sr.imask();
-        if let Some((source, level)) = self.bus.scu.take_pending_interrupt(imask) {
-            #[cfg(not(test))]
-            if std::env::var_os("SAT_INTC_TRACE").is_some() && self.now() > 130_000_000 {
-                eprintln!(
-                    "INTC fwd {source:?} lvl={level} vec={:02X} master_imask={imask} now={}",
-                    source.vector(),
-                    self.now()
-                );
-            }
-            // The SCU presents a fixed vector (0x40 + index) per source
-            // during interrupt-acknowledge — not the SH-2 auto-vector
-            // 64+level. Vectoring VBlank-IN to 64+15=0x4F would run the
-            // generic stub handler instead of the real one at 0x40.
-            self.master_mut()
-                .onchip
-                .intc
-                .raise_external(level, source.vector());
         }
     }
 
