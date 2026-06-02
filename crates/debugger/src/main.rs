@@ -987,7 +987,9 @@ fn main() {
 
     let mut dbg = Dbg {
         sat,
-        fb: vec![0u8; 320 * 224 * 4],
+        // Full-size so `frame`/`f` can't panic when VDP2 switches to hi-res
+        // (run_frame asserts the buffer fits the active resolution).
+        fb: vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES],
         master_bp: None,
         master_bp_cond: None,
         slave_bp: None,

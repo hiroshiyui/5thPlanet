@@ -1726,7 +1726,15 @@ impl CdBlock {
                 let mut sectnum = self.cr4 as usize;
                 let sectofs = self.cr2 as usize;
                 let avail = self.partitions.get(bufnum).map_or(0, |p| p.blocks.len());
-                if bufnum >= MAX_FILTERS || (sectnum != 0xFFFF && avail < sectnum) {
+                // Reject the whole request if the buffer is invalid or the
+                // [offset, offset+count) range escapes the partition — the
+                // transfer indexes `blocks[pos + sect]` directly, so an
+                // offset-aware bound is required (count-only let a non-zero
+                // offset over-read past the end). 0xFFFF = "all from offset".
+                if bufnum >= MAX_FILTERS
+                    || sectofs > avail
+                    || (sectnum != 0xFFFF && sectofs + sectnum > avail)
+                {
                     self.cr1 = STAT_REJECT;
                     self.cr2 = 0;
                     self.cr3 = 0;
@@ -1757,7 +1765,14 @@ impl CdBlock {
                 let mut sectnum = self.cr4 as usize;
                 let sectofs = self.cr2 as usize;
                 let avail = self.partitions.get(bufnum).map_or(0, |p| p.blocks.len());
-                if bufnum >= MAX_FILTERS || avail == 0 {
+                // Same offset-aware bound as 0x61/0x63 (the delete itself clamps,
+                // but reject an out-of-range request like the hardware rather
+                // than silently truncating it).
+                if bufnum >= MAX_FILTERS
+                    || avail == 0
+                    || sectofs > avail
+                    || (sectnum != 0xFFFF && sectofs + sectnum > avail)
+                {
                     self.cr1 = STAT_REJECT;
                     self.cr2 = 0;
                     self.cr3 = 0;
@@ -2601,5 +2616,40 @@ mod tests {
         c.write16(0x0024, 0x0000);
         assert_eq!(c.read16(0x001C), 0x0000);
         assert_eq!(c.read16(0x0024), 0x0000);
+    }
+
+    #[test]
+    fn get_sector_data_rejects_offset_plus_count_past_partition() {
+        // Regression: 0x61 validated count alone (`avail < count`), so a
+        // non-zero offset with `offset + count > avail` slipped through and the
+        // transfer then indexed `blocks[pos + sect]` out of bounds. Now reject.
+        let mut c = CdBlock::new();
+        c.partitions[0].blocks = vec![0, 1, 2]; // 3 sectors available
+        c.hirq = 0;
+        c.write16(0x0018, 0x6100); // CR1: command 0x61 (Get Sector Data)
+        c.write16(0x001C, 2); // CR2: offset = 2
+        c.write16(0x0020, 0x0000); // CR3: buffer 0
+        c.write16(0x0024, 3); // CR4: count = 3 → 2+3 > 3 → reject (was OOB)
+        assert_eq!(
+            c.cr1, STAT_REJECT,
+            "offset+count past the partition rejected"
+        );
+        assert!(c.xfer32.is_none(), "no transfer armed on reject");
+    }
+
+    #[test]
+    fn get_sector_data_ffff_count_is_remaining_from_offset() {
+        // 0xFFFF count = "all sectors from the offset"; the armed transfer
+        // length must be `avail - offset`, not `avail`.
+        let mut c = CdBlock::new();
+        c.partitions[0].blocks = vec![0, 1, 2, 3, 4]; // 5 sectors available
+        c.write16(0x0018, 0x6100);
+        c.write16(0x001C, 2); // offset = 2
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0xFFFF); // count = all-remaining
+        let x = c.xfer32.as_ref().expect("transfer armed");
+        assert_eq!(x.pos, 2);
+        assert_eq!(x.num, 3, "0xFFFF count = avail (5) - offset (2)");
+        assert!(c.cr1 & STAT_TRANS != 0, "transfer-pending status set");
     }
 }

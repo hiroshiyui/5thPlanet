@@ -1974,23 +1974,26 @@ fn vf2_render_state() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1800);
-    let mut fb = vec![0u8; 320 * 224 * 4];
+    // Full-size buffer: VDP2 may switch to hi-res mid-boot (up to 704×512), and
+    // run_frame asserts the buffer fits the active resolution. Count non-black
+    // pixels over just the active w×h that run_frame reports.
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     for f in 0..frames {
-        sat.run_frame(&mut fb);
+        let (w, h) = sat.run_frame(&mut fb);
         if (f + 1) % 300 == 0 || f + 1 == frames {
-            let nonblack = fb
+            let nonblack = fb[..w * h * 4]
                 .chunks_exact(4)
                 .filter(|p| (p[0] | p[1] | p[2]) != 0)
                 .count();
             println!(
-                "frame {:>4}: master=0x{:08X} slave=0x{:08X} VDP2.disp={} VDP1.drawing={} fb_nonblack={}/{}",
+                "frame {:>4}: master=0x{:08X} slave=0x{:08X} {w}x{h} VDP2.disp={} VDP1.drawing={} fb_nonblack={}/{}",
                 f + 1,
                 sat.master().regs.pc,
                 sat.slave().regs.pc,
                 sat.bus.vdp2.regs.display_enabled(),
                 sat.bus.vdp1.is_drawing(),
                 nonblack,
-                320 * 224,
+                w * h,
             );
         }
     }
