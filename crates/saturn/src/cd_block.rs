@@ -70,6 +70,7 @@ const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
 const STAT_SEEK: u8 = 0x04; // drive seeking
 const STAT_PLAY: u8 = 0x03; // read/playback in progress
 const STAT_STANDBY: u8 = 0x02; // drive stopped (MAME CD_STAT_STANDBY)
+const STAT_BUSY: u8 = 0x00; // command accepted, drive transitioning (Mednafen STATUS_BUSY)
 
 // HIRQ playback-complete bit.
 const HIRQ_PEND: u16 = 0x0010; // CD playback / read range completed
@@ -205,6 +206,63 @@ const CD_CLOCK_HZ: u64 = 44_100 * 256;
 /// (44100×256) × 28.6364 MHz ≈ 44_927` master cycles.
 const ACTIVE_PERIODIC_CYCLES: u64 = 17_712 * MASTER_HZ / CD_CLOCK_HZ;
 
+/// Convert a count expressed in [`CD_CLOCK_HZ`] units (the unit Mednafen's
+/// `cdb.cpp` keeps `DriveCounter`/`PeriodicIdleCounter` in) to SH-2 master
+/// cycles, the unit our [`CdBlock::tick`] advances by. `n / CD_CLOCK_HZ`
+/// seconds × `MASTER_HZ` cycles/second.
+const fn cd2m(n: u64) -> u64 {
+    n * MASTER_HZ / CD_CLOCK_HZ
+}
+
+/// Drive-phase machine timing (master cycles), ported from Mednafen `cdb.cpp`
+/// (`Drive_Run`/`StartSeek`/`SeekStart*`). The reference keeps these in
+/// [`CD_CLOCK_HZ`] units; [`cd2m`] converts.
+///
+/// `SeekCPIUpdateDelay = 500` (cdb.cpp:1903): the short delay before the
+/// command-issued seek begins.
+const SEEK_CPI_DELAY_CYC: u64 = cd2m(500);
+/// `SeekStart2` schedules `256000 - delay_sub` (cdb.cpp:1966) before the seek
+/// time itself is computed in `SeekStart3`.
+const SEEKSTART2_CYC: u64 = cd2m(256_000);
+/// Idle periodic-report interval — `PeriodicIdleCounter_Reload` (cdb.cpp:606,
+/// `187065`), ≈16.6 ms ≈ 60 Hz.
+const PERIODIC_IDLE_CYC: i64 = cd2m(187_065) as i64;
+/// Active (PLAY/PAUSE) periodic-report interval — `17712` (cdb.cpp:2373),
+/// fires roughly once per sector.
+const PERIODIC_ACTIVE_CYC: i64 = ACTIVE_PERIODIC_CYCLES as i64;
+
+/// One unit of read/seek time at single speed: `(44100×256) / 75` per sector,
+/// halved at 2× (cdb.cpp:2291/2398, `(44100*256)/((subq&0x40)?150:75)`).
+fn sector_cyc(speed: u32) -> u64 {
+    MASTER_HZ / (75 * speed.max(1) as u64)
+}
+
+/// The drive's coarse operating phase — Mednafen `DrivePhase` (`cdb.cpp:585`),
+/// reduced to the subset our FAD-addressed (no analog/subchannel-Q) disc model
+/// needs. The host-visible *status code* (`STATUS_*`) and HIRQ-edge sequence a
+/// game's GFS server polls are driven by these transitions, so the phase set
+/// and its timing mirror the reference even though the seek internals are
+/// simplified (we address sectors directly rather than chasing the pickup via
+/// subchannel Q).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum DrivePhase {
+    /// Drive idle/stopped (post-Init PAUSE, or stopped via Seek-to-0).
+    Idle,
+    /// A seek was just commanded: compute the target, report `STATUS_BUSY`,
+    /// then schedule the seek-time (Mednafen `SEEK_START1/2/3`).
+    SeekStart,
+    /// Seeking to the target FAD: reports `STATUS_SEEK` until the seek time
+    /// elapses, then enters `Play`.
+    Seek,
+    /// Reading/playing the range `[cur_play_start, cur_play_end)`: reports
+    /// `STATUS_PLAY`, buffers one data sector per tick via the read-ahead
+    /// pipeline (`sec_prebuf`), raising `CSCT` per buffered sector.
+    Play,
+    /// Range complete (or buffer-full): a `PauseCounter`-delayed transition to
+    /// `STATUS_PAUSE`, at which point `play_end_irq` (`PEND`/`EFLS`) fires.
+    Pause,
+}
+
 // Not `Clone`: holds a `Box<dyn SectorSource>` (image or live drive) that
 // isn't cloneable; nothing clones a CdBlock.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -331,6 +389,50 @@ pub struct CdBlock {
     curblock_mode2: bool,
     /// Active 32-bit sector-data transfer, if any.
     xfer32: Option<Xfer32>,
+
+    // ---- drive-phase machine (Mednafen `cdb.cpp` `Drive_Run`) ----
+    /// Coarse drive phase driving the host-visible status sequence + HIRQ
+    /// edge timing (see [`DrivePhase`]).
+    drive_phase: DrivePhase,
+    /// Countdown (master cycles) to the next [`DrivePhase`] advance — Mednafen
+    /// `DriveCounter`. Signed: the `tick` loop processes phases while it is
+    /// `<= 0`, then reschedules.
+    drive_counter: i64,
+    /// Countdown (master cycles) to the next periodic report — Mednafen
+    /// `PeriodicIdleCounter`. Reloads to [`PERIODIC_IDLE_CYC`] idle,
+    /// [`PERIODIC_ACTIVE_CYC`] in PLAY/PAUSE.
+    periodic_idle: i64,
+    /// The drive head's next-to-read FAD — Mednafen `CurSector`. The buffered
+    /// sector lags this by one (the read-ahead pipeline), and `cd_curfad`
+    /// (= `CurPosInfo.fad`) reports the sector currently read *ahead*.
+    drive_sector: u32,
+    /// Play range start/end as the command gave them — Mednafen
+    /// `CurPlayStart`/`CurPlayEnd` (bit `0x800000` = FAD addressing).
+    cur_play_start: u32,
+    cur_play_end: u32,
+    /// Commanded repeat count and the running repeat counter — Mednafen
+    /// `CurPlayRepeat`/`PlayRepeatCounter` (bit 0x80 = "repeated, no fresh
+    /// sector since").
+    cur_play_repeat: u8,
+    play_repeat_counter: u8,
+    /// HIRQ to raise when the play range completes — `HIRQ_PEND` for Play,
+    /// `HIRQ_EFLS` for Read File (Mednafen `PlayEndIRQType`, cdb.cpp:2830/3920).
+    play_end_irq: u16,
+    /// Mednafen `PauseCounter`: sequences the `PLAY → BUSY → PAUSE` end
+    /// transition so the end IRQ fires a couple periodics *after* the last
+    /// sector, with status already PAUSE (cdb.cpp:450 FIXME / 2414-2444).
+    pause_counter: i32,
+    /// The read-ahead sector's FAD and whether one is loaded — Mednafen
+    /// `SecPreBuf`/`SecPreBuf_In`. We store only the FAD (not the bytes): our
+    /// [`SectorSource`] reads are synchronous and deterministic, so deferring
+    /// the actual read+filter to the process step is observably identical to
+    /// Mednafen reading the bytes ahead, and reuses [`read_filtered_sector`].
+    sec_prebuf_fad: u32,
+    sec_prebuf_in: bool,
+    sec_prebuf_audio: bool,
+    /// A sector was buffered since the last status downgrade — Mednafen
+    /// `PlaySectorProcessed` (drives the SEEK/BUSY→PLAY status refresh).
+    play_sector_processed: bool,
 
     // ---- ISO9660 filesystem (M7 phase 4) ----
     /// Root directory record (from the primary volume descriptor).
@@ -470,6 +572,20 @@ impl CdBlock {
             curblock: Block::free(),
             curblock_mode2: false,
             xfer32: None,
+            drive_phase: DrivePhase::Idle,
+            drive_counter: 0,
+            periodic_idle: PERIODIC_IDLE_CYC,
+            drive_sector: FAD_OFFSET,
+            cur_play_start: 0,
+            cur_play_end: 0,
+            cur_play_repeat: 0,
+            play_repeat_counter: 0,
+            play_end_irq: 0,
+            pause_counter: 0,
+            sec_prebuf_fad: FAD_OFFSET,
+            sec_prebuf_in: false,
+            sec_prebuf_audio: false,
+            play_sector_processed: false,
             curroot: DirEntry::default(),
             curdir: Vec::new(),
             numfiles: 0,
@@ -529,6 +645,9 @@ impl CdBlock {
         // the read pump actually reads a data sector (Mednafen semantics).
         self.is_cdrom = false;
         self.disc = Some(Box::new(source));
+        self.cd_curfad = FAD_OFFSET;
+        self.drive_sector = FAD_OFFSET;
+        self.drive_idle();
         // A disc appearing is always a disc-change: the FIRST Init (cold boot
         // *or* a runtime swap) reports DCHG one-shot, matching Mednafen, which
         // treats a power-on disc as a change (its recognition HIRQ carries
@@ -562,6 +681,7 @@ impl CdBlock {
     /// flagged (`HIRQ.DCHG`) so the BIOS/game notices the media left.
     pub fn eject(&mut self) {
         self.disc = None;
+        self.drive_idle();
         self.status = STAT_NODISC;
         self.ctrladdr = 0;
         self.track = 0;
@@ -931,9 +1051,11 @@ impl CdBlock {
         true
     }
 
-    /// Advance the read pump one sector (MAME `cd_playdata`): a seek completes
-    /// to PLAY; in PLAY each tick reads one filtered sector until the range is
-    /// exhausted, then pauses and raises `PEND`.
+    /// Read one sector at `cd_curfad` immediately (the pre-drive-phase-machine
+    /// read pump). Retained as a **test-only** direct-read helper for the
+    /// sector-decode unit tests (CDDA decode, `is_cdrom` latch); production now
+    /// reads through the phased [`drive_run`](Self::drive_run) pipeline.
+    #[cfg(test)]
     fn play_data(&mut self) {
         // Match on the drive-state bits only: `STAT_PERI` (0x20) is OR'd into
         // `status` by the unsolicited periodic report between commands, so an
@@ -988,6 +1110,281 @@ impl CdBlock {
                 }
             }
             _ => {}
+        }
+        self.note_hirq(HIRQ_CAUSE_READPUMP);
+    }
+
+    // ===== drive-phase machine (Mednafen `cdb.cpp` `Drive_Run` port) =====
+    //
+    // Replaces the immediate `STAT_PLAY → STAT_PAUSE` read pump with the
+    // reference's phased model so the *host-visible status sequence and HIRQ
+    // edge timing* a game's GFS server polls match Mednafen:
+    //   Play/Seek → BUSY → SEEK → PLAY → (read-ahead, CSCT/sector) → end_met
+    //            → BUSY → PauseCounter delay → PAUSE + PEND/EFLS.
+    // The seek internals are simplified for our FAD-addressed disc (no analog
+    // pickup / subchannel-Q chase), but the phases, their timing, and the edges
+    // they emit are faithful.
+
+    /// Begin a seek (Mednafen `StartSeek`, cdb.cpp:1984). Records the play range
+    /// and the end-of-range IRQ type, clears any pending read-ahead, reports
+    /// `STATUS_BUSY`, and enters the seek-startup phase. `target`/`end` carry
+    /// bit `0x800000` for FAD addressing.
+    fn start_seek(&mut self, target: u32, end: u32, repeat: u8, play_end_irq: u16) {
+        if self.disc.is_none() {
+            return;
+        }
+        self.play_repeat_counter = 0;
+        self.sec_prebuf_in = false; // ClearPendingSec
+        self.cur_play_start = target;
+        self.cur_play_end = end;
+        self.cur_play_repeat = repeat;
+        self.play_end_irq = play_end_irq;
+        self.status = STAT_BUSY;
+        self.drive_phase = DrivePhase::SeekStart;
+        self.periodic_idle = PERIODIC_IDLE_CYC;
+        self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+    }
+
+    /// Park the drive: cancel any active play/seek and return the phase machine
+    /// to idle (no read range). Called by Init / Abort File / Seek-stop / disc
+    /// insert+eject so the host-visible state is consistent with those commands'
+    /// "drive stopped/paused" semantics. The caller sets the status code.
+    fn drive_idle(&mut self) {
+        self.drive_phase = DrivePhase::Idle;
+        self.sec_prebuf_in = false;
+        self.cur_play_end = 0;
+        self.play_end_irq = 0;
+        self.pause_counter = 0;
+        self.play_repeat_counter = 0;
+        self.fadstoplay = -1;
+        self.drive_counter = 0;
+        self.periodic_idle = PERIODIC_IDLE_CYC;
+    }
+
+    /// Resolve the seek target and schedule the seek time (Mednafen
+    /// `SeekStart1`+`SeekStart2`+`SeekStart3`, cdb.cpp:1905/1957/2203). Sets the
+    /// head geometry, reports `STATUS_SEEK`, and arms the `Seek` phase.
+    fn seek_start(&mut self) {
+        let prev = self.cd_curfad;
+        // SeekStart1: resolve the target FAD. The GFS/BIOS read path always
+        // uses FAD addressing (bit 0x800000); the track/index form is
+        // approximated to the disc start (we don't chase the pickup by track).
+        let fad_target = if self.cur_play_start & 0x80_0000 != 0 {
+            (self.cur_play_start & 0x7F_FFFF).max(FAD_OFFSET)
+        } else {
+            FAD_OFFSET
+        };
+        if let Some(t) = self.disc.as_ref().and_then(|d| d.track_at_fad(fad_target)) {
+            self.ctrladdr = t.ctrl_addr;
+        }
+        self.cd_curfad = fad_target;
+        self.drive_sector = fad_target;
+        // SeekStart2/3: BUSY → SEEK, with a seek time dominated by the fixed
+        // settle (cdb.cpp:2213) plus a per-FAD-delta term.
+        self.is_cdrom = false;
+        self.repcnt = self.play_repeat_counter & 0x0F;
+        // Total seek time = the SeekStart2 settle (256000) + the SeekStart3 seek
+        // time (fixed 12·(44100·256)/150 plus a per-FAD-delta term; cdb.cpp:2213).
+        let delta = fad_target.abs_diff(prev) as u64;
+        let seek_cyc = SEEKSTART2_CYC + cd2m(12 * CD_CLOCK_HZ / 150) + cd2m(delta * 27);
+        self.status = STAT_SEEK;
+        self.drive_phase = DrivePhase::Seek;
+        self.drive_counter += seek_cyc as i64;
+    }
+
+    /// Whether the play head has reached the end of the commanded range
+    /// (Mednafen `CheckEndMet`, cdb.cpp:2054). FAD form only; the lead-out
+    /// (`track == 0xAA`) and a head behind the start also end it.
+    fn check_end_met(&self) -> bool {
+        let mut end_met = self.track == 0xAA;
+        if self.cur_play_end != 0 && (self.cur_play_end & 0x80_0000) != 0 {
+            end_met |= self.cd_curfad >= (self.cur_play_end & 0x7F_FFFF);
+        }
+        if self.cur_play_start & 0x80_0000 != 0 {
+            end_met |= self.cd_curfad < (self.cur_play_start & 0x7F_FFFF);
+        }
+        end_met
+    }
+
+    /// One `DRIVEPHASE_PLAY` step (Mednafen cdb.cpp:2304): process the
+    /// previously read-ahead sector (buffer a data sector → `CSCT`, or stream a
+    /// CDDA sector), then read the next sector ahead (`SecPreBuf`). The buffered
+    /// sector lags `cd_curfad` (= `CurPosInfo.fad`, the read-ahead position) by
+    /// one, so the final out-of-range sector is discarded by the periodic
+    /// `end_met` check before it is ever buffered.
+    fn drive_play_tick(&mut self) {
+        if self.sec_prebuf_in {
+            let fad = self.sec_prebuf_fad;
+            if self.sec_prebuf_audio {
+                // CDDA → mixer; clears is_cdrom (cdb.cpp:2319).
+                self.is_cdrom = false;
+                self.read_cd_audio_sector(fad);
+                self.sec_prebuf_in = false;
+                self.play_sector_processed = true;
+                self.drive_sector = self.drive_sector.wrapping_add(1);
+            } else {
+                // Data sector confirms is_cdrom (cdb.cpp:2324); buffer it only
+                // if the pool has room, else hold (buffer-full backpressure —
+                // the periodic moves us to a Pause).
+                self.is_cdrom = true;
+                if self.free_blocks > 0 {
+                    self.read_filtered_sector(fad);
+                    self.sectorstore = true;
+                    self.hirq |= HIRQ_CSCT;
+                    if self.free_blocks <= 0 {
+                        self.hirq |= HIRQ_BFUL;
+                    }
+                    self.sec_prebuf_in = false;
+                    self.play_sector_processed = true;
+                    self.drive_sector = self.drive_sector.wrapping_add(1);
+                }
+            }
+        }
+        // PLAY/PAUSE periodic cadence: once per sector (cdb.cpp:2373).
+        self.periodic_idle = PERIODIC_ACTIVE_CYC;
+        // Read the next sector ahead (only if the prior one was consumed).
+        if !self.sec_prebuf_in {
+            let fad = self.drive_sector;
+            self.sec_prebuf_audio = self
+                .disc
+                .as_ref()
+                .and_then(|d| d.track_at_fad(fad))
+                .is_some_and(|t| t.is_audio);
+            self.sec_prebuf_fad = fad;
+            self.sec_prebuf_in = true;
+            self.cd_curfad = fad; // CurPosInfo.fad = CurSector (cdb.cpp:2389)
+            self.fadstoplay = (self.cur_play_end & 0x7F_FFFF) as i64 - fad as i64;
+        }
+        self.drive_counter += sector_cyc(self.cd_speed) as i64;
+    }
+
+    /// The per-`PeriodicIdleCounter` work (Mednafen cdb.cpp:2403): resolve the
+    /// PLAY/PAUSE end-of-range and buffer-full transitions, then emit the
+    /// unsolicited status report (`SCDQ`). Sequenced so the end IRQ
+    /// (`PEND`/`EFLS`) fires a couple periodics *after* the last sector with the
+    /// status already `PAUSE` (cdb.cpp:450 FIXME).
+    fn drive_periodic(&mut self) {
+        self.periodic_idle = PERIODIC_IDLE_CYC;
+        if self.sec_prebuf_in && matches!(self.drive_phase, DrivePhase::Play | DrivePhase::Pause) {
+            let end_met = self.check_end_met();
+            if self.drive_phase == DrivePhase::Pause {
+                self.sec_prebuf_in = false;
+                if self.pause_counter == 1 {
+                    self.status = STAT_PAUSE;
+                    self.fadstoplay = -1;
+                    // Don't fire if we've repeated with no fresh sector since.
+                    if end_met && self.play_end_irq != 0 && (self.play_repeat_counter & 0x80) == 0 {
+                        self.hirq |= self.play_end_irq;
+                    }
+                    self.play_end_irq = 0;
+                    self.pause_counter = -1;
+                } else if self.pause_counter == -1 {
+                    self.status = STAT_PAUSE;
+                    self.fadstoplay = -1;
+                    if !end_met && self.free_blocks > 0 {
+                        // Resume from a buffer-full pause: continue reading from
+                        // where we stopped (drive_sector), not a fresh seek.
+                        self.status = STAT_BUSY;
+                        self.drive_phase = DrivePhase::Play;
+                        self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+                    }
+                } else {
+                    self.pause_counter += 1;
+                }
+            } else if end_met {
+                self.sec_prebuf_in = false;
+                if self.play_repeat_counter >= self.cur_play_repeat {
+                    self.drive_sector = self.cd_curfad;
+                    self.status = STAT_BUSY;
+                    self.drive_phase = DrivePhase::Pause;
+                    self.pause_counter = if self.play_end_irq != 0 { 0 } else { 1 };
+                } else {
+                    if self.play_repeat_counter < 0x0E {
+                        self.play_repeat_counter += 1;
+                    }
+                    self.play_repeat_counter |= 0x80;
+                    // Replay the range from the start (cdb.cpp:2468 SeekStart1/2).
+                    self.drive_phase = DrivePhase::SeekStart;
+                    self.status = STAT_BUSY;
+                    self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+                }
+            } else if self.free_blocks <= 0 {
+                // Buffer-full pause (cdb.cpp:2472).
+                self.sec_prebuf_in = false;
+                self.status = STAT_BUSY;
+                self.drive_phase = DrivePhase::Pause;
+                self.pause_counter = 0;
+            } else {
+                self.play_repeat_counter &= !0x80;
+                if self.play_sector_processed {
+                    self.status = STAT_PLAY;
+                    self.play_sector_processed = false;
+                }
+            }
+        }
+        // Emit the unsolicited periodic report (SCDQ), unless a command response
+        // is still unread (cs2.c `_command` / Mednafen `ResultsRead`).
+        if self.host_initialized && !self.command_pending {
+            self.status |= STAT_PERI;
+            self.cd_report();
+        }
+        self.hirq |= HIRQ_SCDQ;
+    }
+
+    /// Advance the drive-phase machine by `cycles` master cycles (the
+    /// disc-present path of [`tick`]; Mednafen `Drive_Run`, cdb.cpp:2134).
+    ///
+    /// Event-stepped so it is **independent of the caller's tick granularity**:
+    /// each `DriveCounter`/`PeriodicIdleCounter` crossing is processed in order,
+    /// whether the caller advances 256 cycles or a whole frame at once. (The
+    /// reference relies on being called in fine slices from its scheduler; a
+    /// coarse single advance would otherwise fire the periodic only once and
+    /// stall the multi-periodic `PauseCounter` end sequence.)
+    fn drive_run(&mut self, cycles: u64) {
+        let mut rem = cycles as i64;
+        loop {
+            // Process every drive-phase advance that is currently due.
+            let mut guard = 0;
+            while self.drive_counter <= 0 && guard < 100_000 {
+                guard += 1;
+                match self.drive_phase {
+                    DrivePhase::Idle => self.drive_counter += PERIODIC_IDLE_CYC,
+                    DrivePhase::SeekStart => self.seek_start(),
+                    DrivePhase::Seek => {
+                        self.play_sector_processed = false;
+                        self.sec_prebuf_in = false;
+                        self.drive_phase = DrivePhase::Play;
+                        self.drive_counter += sector_cyc(self.cd_speed) as i64;
+                    }
+                    DrivePhase::Play => self.drive_play_tick(),
+                    DrivePhase::Pause => {
+                        // PAUSE keeps reading the next sector ahead (cdb.cpp:2375)
+                        // so the periodic's PauseCounter sequence (which is gated
+                        // on a pending read-ahead) advances and eventually fires
+                        // the end IRQ with the status already PAUSE.
+                        self.periodic_idle = PERIODIC_ACTIVE_CYC;
+                        if !self.sec_prebuf_in {
+                            self.sec_prebuf_fad = self.drive_sector;
+                            self.cd_curfad = self.drive_sector;
+                            self.sec_prebuf_in = true;
+                        }
+                        self.drive_counter += sector_cyc(self.cd_speed) as i64;
+                    }
+                }
+            }
+            // Process a due periodic report (reloads `periodic_idle` positive).
+            if self.periodic_idle <= 0 {
+                self.drive_periodic();
+            }
+            if rem <= 0 {
+                break;
+            }
+            // Advance to the next scheduled event, bounded by what's left.
+            let next = self.drive_counter.min(self.periodic_idle).max(1);
+            let adv = next.min(rem);
+            self.drive_counter -= adv;
+            self.periodic_idle -= adv;
+            rem -= adv;
         }
         self.note_hirq(HIRQ_CAUSE_READPUMP);
     }
@@ -1406,9 +1803,10 @@ impl CdBlock {
                 // a prior Seek that stopped the drive (STANDBY) is undone and
                 // the next probe pass finds a ready drive (MAME `cmd_init_cdsystem`).
                 if self.disc.is_some() {
+                    self.drive_idle();
                     self.status = STAT_PAUSE;
                     self.cd_curfad = FAD_OFFSET;
-                    self.fadstoplay = 0;
+                    self.drive_sector = FAD_OFFSET;
                     // Init re-seats the head at track 1 with nothing read yet →
                     // `is_cdrom` clears (Mednafen cdb.cpp:4051) until the next
                     // PLAY actually reads a data sector.
@@ -1640,24 +2038,33 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             0x10 => {
-                // Play disc: start = (CR1&0xFF)<<16|CR2, end = (CR3&0xFF)<<16|CR4.
-                // Bit 0x800000 selects FAD addressing (the BIOS/game read path);
-                // an end without it plays to the lead-out.
-                let start = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
-                let end = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
-                self.status = STAT_PLAY;
-                if start & 0x80_0000 != 0 && start != 0xFF_FFFF {
-                    self.cd_curfad = start & 0x0F_FFFF;
+                // Play disc (Mednafen `COMMAND_PLAY`, cdb.cpp:2802): start =
+                // (CR1&0xFF)<<16|CR2, end = (CR3&0xFF)<<16|CR4, play-mode = CR3>>8.
+                // Bit 0x800000 = FAD addressing; when both start and end are FAD,
+                // the end field is a *sector count* added to the start
+                // (cdb.cpp:2813). A lone 0xFFFFFF reuses the prior position.
+                let mut start = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
+                let mut end = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                let pm = (self.cr3 >> 8) as u8;
+                if start == 0xFF_FFFF {
+                    start = self.cur_play_start;
                 }
-                if end & 0x80_0000 != 0 {
-                    if end != 0xFF_FFFF {
-                        self.fadstoplay = (end & 0x0F_FFFF) as i64;
-                    }
-                } else if let Some(d) = &self.disc {
-                    self.fadstoplay = d.lead_out_fad().saturating_sub(self.cd_curfad) as i64;
+                if end == 0xFF_FFFF {
+                    end = self.cur_play_end;
+                } else if (start & 0x80_0000) != 0 && (end & 0x80_0000) != 0 {
+                    end = 0x80_0000 | ((start.wrapping_add(end)) & 0x7F_FFFF);
                 }
+                let repeat = if pm & 0x70 == 0 {
+                    pm & 0x0F
+                } else {
+                    self.cur_play_repeat
+                };
                 self.sectorstore = false;
+                // BUSY now (even with play-mode 0x80); the seek machine drives
+                // BUSY → SEEK → PLAY and raises PEND at the range end.
+                self.status = STAT_BUSY;
                 self.cd_report();
+                self.start_seek(start, end, repeat, HIRQ_PEND);
                 self.hirq |= HIRQ_CMOK;
             }
             0x11 => {
@@ -1668,6 +2075,10 @@ impl CdBlock {
                 // drive between boot probe passes and waits for STANDBY before
                 // continuing, so leaving the status at PAUSE (the old default
                 // handler) stalled the boot loop and dropped to the CD shell.
+                //
+                // A Seek cancels any in-flight play/read and parks the phase
+                // machine; it positions the head and pauses (no read range).
+                self.drive_idle();
                 if self.cr1 & 0x80 != 0 {
                     let temp = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
                     if temp == 0xFF_FFFF {
@@ -1850,22 +2261,32 @@ impl CdBlock {
                 let file_id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
                 if let Some(e) = self.curdir.get(file_id as usize) {
                     let nsect = e.length.div_ceil(self.sectlenin.max(1));
-                    self.cd_curfad = e.firstfad + file_offset;
-                    self.fadstoplay = nsect.saturating_sub(file_offset) as i64;
-                    self.status = STAT_PLAY;
+                    let start_fad = e.firstfad + file_offset;
+                    let sec_count = nsect.saturating_sub(file_offset);
                     self.cd_device_filter = if (file_filter as usize) < MAX_FILTERS {
                         file_filter
                     } else {
                         NO_FILTER
                     };
                     self.sectorstore = false;
+                    // Read File ends the range with EFLS, not PEND (Mednafen
+                    // `COMMAND_READ_FILE`, cdb.cpp:3920).
+                    self.status = STAT_BUSY;
+                    self.cd_report();
+                    self.start_seek(
+                        0x80_0000 | (start_fad & 0x7F_FFFF),
+                        0x80_0000 | (start_fad.wrapping_add(sec_count) & 0x7F_FFFF),
+                        0,
+                        HIRQ_EFLS,
+                    );
+                } else {
+                    self.cd_report();
                 }
-                self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_EHST;
             }
             0x75 => {
                 // Abort file: stop any read / transfer, return to PAUSE.
-                self.fadstoplay = -1;
+                self.drive_idle();
                 self.status = STAT_PAUSE;
                 self.xfer32 = None;
                 self.cd_report();
@@ -1946,19 +2367,20 @@ impl CdBlock {
     /// our always-present dummy disc — status is already PAUSE — so it is not
     /// modelled here. It returns when the real CD-block / disc swapping does.)
     pub fn tick(&mut self, cycles: u64) {
+        // Disc present: drive the faithful `cdb.cpp` phase machine (seek →
+        // play with the read-ahead pipeline, status sequence, and the
+        // periodic/SCDQ + end-of-range IRQ timing the host polls).
+        if self.disc.is_some() {
+            self.drive_run(cycles);
+            return;
+        }
+        // No disc: keep the bespoke idle periodic-liveness cadence the no-disc
+        // BIOS splash boot depends on (the `bios_boot` golden path) — the phase
+        // machine only governs disc reads.
         self.periodic_accum += cycles;
         while self.periodic_accum >= PERIODIC_CYCLES {
             self.periodic_accum -= PERIODIC_CYCLES;
             self.emit_periodic();
-        }
-        // Read pump: one sector per 1/(75×speed) second while a disc is in.
-        if self.disc.is_some() {
-            self.sector_accum += cycles;
-            let per = MASTER_HZ / (75 * self.cd_speed.max(1) as u64);
-            while self.sector_accum >= per {
-                self.sector_accum -= per;
-                self.play_data();
-            }
         }
     }
 
@@ -2427,6 +2849,16 @@ mod tests {
         );
     }
 
+    /// Run the drive-phase machine well past the faithful seek + read +
+    /// PauseCounter latency so a test can assert the post-read end state. (The
+    /// phased model no longer reads instantly on Play — it seeks first, reads
+    /// via the one-sector read-ahead pipeline, then delays the end IRQ a couple
+    /// periodics; `drive_run` is granularity-independent, so one big advance
+    /// fires the whole internal event sequence.)
+    fn pump(c: &mut CdBlock) {
+        c.tick(12_000_000);
+    }
+
     #[test]
     fn set_sector_length_decodes_size_codes() {
         let mut c = CdBlock::new();
@@ -2442,11 +2874,15 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(data_disc());
         play(&mut c, 150, 2);
-        // Pump two sectors (75×2 Hz) plus slack.
-        let per = MASTER_HZ / (75 * 2);
-        c.tick(per * 2 + 100);
+        pump(&mut c);
         assert_eq!(c.partitions[0].blocks.len(), 2, "two sectors buffered");
-        assert_eq!(c.status, STAT_PAUSE, "paused after the read range");
+        // Mask the periodic (PERI) flag the unsolicited report ORs in over the
+        // pump — the drive-state bits are PAUSE.
+        assert_eq!(
+            c.status & !STAT_PERI,
+            STAT_PAUSE,
+            "paused after the read range"
+        );
         assert_eq!(c.hirq & HIRQ_PEND, HIRQ_PEND, "PEND on range complete");
         // Get Sector Data: partition 0, offset 0, 2 sectors.
         cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0002);
@@ -2464,7 +2900,7 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(data_disc());
         play(&mut c, 150, 1);
-        c.tick(MASTER_HZ / (75 * 2) + 100);
+        pump(&mut c);
         assert_eq!(c.partitions[0].blocks.len(), 1);
         let free_before = c.free_blocks;
         // Get-and-delete (0x63): 1 sector from partition 0.
@@ -2488,7 +2924,7 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(data_disc());
         play(&mut c, 150, 1);
-        c.tick(MASTER_HZ / (75 * 2) + 100);
+        pump(&mut c);
         assert_eq!(c.partitions[0].blocks.len(), 1);
         let free_before = c.free_blocks;
         cmd(&mut c, 0x6300, 0x0000, 0x0000, 0x0001); // get-and-delete 1 sector
@@ -2513,7 +2949,7 @@ mod tests {
         sat.insert_disc(data_disc());
         let cd = &mut sat.bus.cd_block;
         play(cd, 150, 1);
-        cd.tick(MASTER_HZ / (75 * 2) + 100);
+        pump(cd);
         cmd(cd, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
         // The SCU-DMA data-port alias at 0x0581_8000 streams the same bytes.
         let (w, _) = sat.bus.read32(0x0581_8000, AccessKind::Data);
@@ -2581,7 +3017,7 @@ mod tests {
         assert_eq!(c.read16(0x8000), 0x0800); // length lo = 2048
         // Read file id 2 via filter 0 → partition 0; pump one sector.
         cmd(&mut c, 0x7400, 0x0000, 0x0000, 0x0002);
-        c.tick(MASTER_HZ / (75 * 2) + 100);
+        pump(&mut c);
         assert_eq!(c.partitions[0].blocks.len(), 1, "file sector buffered");
         cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
         assert_eq!(c.read32(0x8000), 0xCAFE_BABE, "file content streamed");

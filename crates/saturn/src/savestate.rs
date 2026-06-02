@@ -29,8 +29,9 @@ use crate::system::Saturn;
 /// File magic: "5thPlanet Save State".
 const MAGIC: [u8; 4] = *b"5PSS";
 /// Snapshot format version. Bump on any change to a serialized struct's shape;
-/// v1 rejects mismatches rather than attempting migration.
-const VERSION: u32 = 1;
+/// rejects mismatches rather than attempting migration. v2 added the CD-block
+/// drive-phase machine fields (`cdb.cpp`-faithful `Drive_Run` port).
+const VERSION: u32 = 2;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
@@ -63,10 +64,9 @@ impl fmt::Display for SaveStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SaveStateError::BadMagic => write!(f, "not a 5thPlanet save state"),
-            SaveStateError::VersionMismatch { found, expected } => write!(
-                f,
-                "save-state version {found} != supported {expected}"
-            ),
+            SaveStateError::VersionMismatch { found, expected } => {
+                write!(f, "save-state version {found} != supported {expected}")
+            }
             SaveStateError::BiosMismatch => {
                 write!(f, "save state was taken with a different BIOS")
             }
