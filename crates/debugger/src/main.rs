@@ -369,7 +369,11 @@ impl Dbg {
             let insn = m68k_disasm::disasm(&read, base68);
             println!("  {pc:06X}: {}", insn.text);
         }
-        println!("({} PCs in ring; showed last {})", trace.len(), n.min(trace.len()));
+        println!(
+            "({} PCs in ring; showed last {})",
+            trace.len(),
+            n.min(trace.len())
+        );
     }
 
     fn dump_disasm(&mut self, addr: u32, n: u32) {
@@ -754,9 +758,10 @@ impl Dbg {
                 self.dump_disasm(addr, a2.and_then(parse_num).unwrap_or(16));
             }
             "d68" => match a1.and_then(parse_num) {
-                Some(addr) => {
-                    self.disasm68(addr, a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(16))
-                }
+                Some(addr) => self.disasm68(
+                    addr,
+                    a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(16),
+                ),
                 None => println!("usage: d68 <68k-addr> [n]  (SCSP sound 68k)"),
             },
             "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
@@ -778,17 +783,31 @@ impl Dbg {
                 let c = &s.cpu;
                 println!(
                     "  68k pc={:06X} stopped={} a7={:08X}  d0={:08X} d1={:08X} a0={:08X} a1={:08X}",
-                    c.regs.pc, c.stopped, c.regs.a[7], c.regs.d[0], c.regs.d[1], c.regs.a[0], c.regs.a[1]
+                    c.regs.pc,
+                    c.stopped,
+                    c.regs.a[7],
+                    c.regs.d[0],
+                    c.regs.d[1],
+                    c.regs.a[0],
+                    c.regs.a[1]
                 );
                 let (lvl, scieb, scipd) = s.ctrl.irq_state();
                 println!(
                     "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
                     c.regs.sr.imask, c.regs.sr.supervisor
                 );
-                let (dsp_run, efreg) = s.dsp_state();
+                let (dsp_run, efreg, efreg_hw, mixs_hw) = s.dsp_state();
                 let efmax = efreg.iter().map(|&e| (e as i32).abs()).max().unwrap_or(0);
-                println!("  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}", &efreg[..4]);
-                println!("  DSP program writes EFREG indices (EWT targets): {:?}", s.dsp_ewt_targets());
+                println!(
+                    "  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}",
+                    &efreg[..4]
+                );
+                println!("  EFREG high-water: {efreg_hw:?}");
+                println!("  MIXS  high-water: {mixs_hw:?}");
+                println!(
+                    "  DSP program writes EFREG indices (EWT targets): {:?}",
+                    s.dsp_ewt_targets()
+                );
                 // Per-active-slot playback parameters — to tell a mis-programmed
                 // slot (bad SA/pitch/loop) from a render bug (sane params).
                 for i in 0..32 {

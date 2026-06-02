@@ -2063,6 +2063,7 @@ fn vf2_render_state() {
                 break;
             };
             let n = (FILE_LEN - s * 2048).min(data.len());
+            #[allow(clippy::needless_range_loop)]
             for b in 0..n {
                 let mem = sat
                     .bus
@@ -2145,7 +2146,10 @@ fn audio_probe() {
         total += s;
         n += a.len() as u64;
         if (f + 1) % 300 == 0 {
-            println!("frame {:4}: |audio| sum over last 300 frames = {win}", f + 1);
+            println!(
+                "frame {:4}: |audio| sum over last 300 frames = {win}",
+                f + 1
+            );
             win = 0;
         }
     }

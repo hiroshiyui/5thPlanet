@@ -72,8 +72,7 @@ const SOUND_RAM_MASK: u32 = (SOUND_RAM_BYTES as u32) - 1;
 const EG_SHIFT: u32 = 16;
 
 /// The four ADSR phases.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum EgState {
     Attack,
     Decay1,
@@ -84,8 +83,7 @@ enum EgState {
 
 /// Per-slot envelope-generator state. Rates are cached at key-on (they depend
 /// on OCT/KRS); `volume` is the log loudness index (`0` silent … `0x3FF` full).
-#[derive(Clone, Copy, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Eg {
     state: EgState,
     volume: i32,
@@ -99,8 +97,7 @@ struct Eg {
 
 /// One PCM slot's runtime state (the configuration lives in the register bank;
 /// this is the per-sample playback state set up at key-on).
-#[derive(Clone, Copy, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Slot {
     active: bool,
     backwards: bool,
@@ -210,8 +207,7 @@ static PAN_TABLES: std::sync::LazyLock<([i32; 256], [i32; 256])> = std::sync::La
 });
 
 /// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Timer {
     count: u16,
     subtick: u32,
@@ -284,8 +280,7 @@ pub struct SlotDebug {
 /// SCSP control + slot + DSP registers, with timer state and the derived
 /// interrupt lines. Register reads are plain; writes to the interrupt-control
 /// window have side effects (pending/reset/recompute).
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScspCtrl {
     #[serde(with = "BigArray")]
     raw: [u8; REG_BYTES],
@@ -648,8 +643,13 @@ impl ScspCtrl {
     /// Debug: whether the effect DSP is running, plus its 16 output registers
     /// (EFREG). Lets sdbg confirm whether audible output is coming through the
     /// DSP effect path (for slots with their direct output muted, DISDL=0).
-    pub fn dsp_state(&self) -> (bool, [i16; 16]) {
-        (self.dsp.running(), self.dsp.efreg)
+    pub fn dsp_state(&self) -> (bool, [i16; 16], [i32; 16], [i32; 16]) {
+        (
+            self.dsp.running(),
+            self.dsp.efreg,
+            self.dsp.efreg_hw,
+            self.dsp.mixs_hw,
+        )
     }
 
     /// Debug: the distinct EFREG output indices the loaded DSP microprogram
@@ -767,6 +767,9 @@ impl ScspCtrl {
         // (`scsp.inc`: the sends collected this pass feed `DSP.step` below, whose
         // EFREG the next sample returns). Snapshot before the sends mutate it.
         let efreg = self.dsp.efreg;
+        // Range loop: `i` indexes the slots/EFREG *and* is passed to the
+        // `&mut self` slot methods, so it can't be an iterator.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..NUM_SLOTS {
             if !self.slots[i].active {
                 continue;
@@ -816,8 +819,7 @@ impl ScspCtrl {
     }
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
     /// 512 KiB sound RAM, shared between the SH-2 (at 0x05A0_0000) and the 68k.
     pub ram: Ram,
@@ -907,8 +909,9 @@ impl Scsp {
         self.ctrl.slot_debug(i)
     }
 
-    /// Debug: effect-DSP running flag + its EFREG output registers.
-    pub fn dsp_state(&self) -> (bool, [i16; 16]) {
+    /// Debug: effect-DSP running flag + its EFREG output registers + per-index
+    /// high-water mark (max |EFREG| ever written).
+    pub fn dsp_state(&self) -> (bool, [i16; 16], [i32; 16], [i32; 16]) {
         self.ctrl.dsp_state()
     }
 
@@ -971,7 +974,13 @@ impl Scsp {
         let mut budget = (self.frac / SH2_CLOCK_HZ) as i64;
         self.frac %= SH2_CLOCK_HZ;
 
-        let Scsp { ram, ctrl, cpu, pc_trace, .. } = &mut *self;
+        let Scsp {
+            ram,
+            ctrl,
+            cpu,
+            pc_trace,
+            ..
+        } = &mut *self;
         while budget > 0 {
             // Debug PC ring (collapses consecutive duplicates so a tight spin
             // doesn't flood it): records the 68k's execution path.

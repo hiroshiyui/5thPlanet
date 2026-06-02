@@ -23,50 +23,37 @@ fn sext(v: i32, bits: u32) -> i32 {
     (v << s) >> s
 }
 
-/// Compress a 24-bit value to the SCSP's 16-bit floating delay-RAM format.
-fn pack(val: i32) -> u16 {
-    let sign = (val >> 23) & 1;
-    let mut temp = (val ^ (val << 1)) as u32 & 0xFF_FFFF;
-    let mut exponent = 0;
-    for _ in 0..12 {
-        if temp & 0x80_0000 != 0 {
-            break;
-        }
-        temp <<= 1;
-        exponent += 1;
+/// Expand the SCSP's 16-bit "floating" delay-RAM word to a 24-bit value
+/// (Mednafen `scsp.inc` `dspfloat_to_int`): 11-bit mantissa, 4-bit exponent,
+/// sign — the exponent is a right-shift recovered on read.
+fn dspfloat_to_int(inv: u16) -> i32 {
+    // (int32)((inv & 0x8000) << 16) >> 1  ==  0 or 0xC000_0000.
+    let sign_xor: u32 = if inv & 0x8000 != 0 { 0xC000_0000 } else { 0 };
+    let exp = ((inv >> 11) & 0xF) as u32;
+    let mut ret = (inv & 0x7FF) as u32;
+    if exp < 12 {
+        ret |= 0x800;
     }
-    let mut v = if exponent < 12 {
-        (val << exponent) & 0x3F_FFFF
-    } else {
-        val << 11
-    };
-    v >>= 11;
-    v &= 0x7FF;
-    v |= sign << 15;
-    v |= exponent << 11;
-    v as u16
+    ret <<= 19; // 11 + 8
+    ret ^= sign_xor;
+    let shifted = (ret as i32) >> (8 + exp.min(11));
+    shifted & 0xFF_FFFF
 }
 
-/// Expand the 16-bit floating delay-RAM format back to 24-bit.
-fn unpack(val: u16) -> i32 {
-    let sign = ((val >> 15) & 1) as i32;
-    let mut exponent = ((val >> 11) & 0xF) as i32;
-    let mantissa = (val & 0x7FF) as i32;
-    let mut uval = mantissa << 11;
-    if exponent > 11 {
-        exponent = 11;
-        uval |= sign << 22;
-    } else {
-        uval |= (sign ^ 1) << 22;
-    }
-    uval |= sign << 23;
-    uval <<= 8;
-    uval >>= 8;
-    uval >> exponent
+/// Compress a 24-bit value to the SCSP's 16-bit floating delay-RAM word
+/// (Mednafen `scsp.inc` `int_to_dspfloat`).
+fn int_to_dspfloat(inv: i32) -> u16 {
+    let invsl8 = (inv as u32) << 8;
+    let sign_xor = ((invsl8 as i32) >> 31) as u32; // 0 or 0xFFFF_FFFF
+    let exp = (((invsl8 ^ sign_xor) << 1) | (1 << 19)).leading_zeros();
+    let shift = exp - if exp == 12 { 1 } else { 0 };
+    let mut ret = ((invsl8 as i32) >> (19 - shift)) as u32;
+    ret &= 0x87FF;
+    ret |= exp << 11;
+    ret as u16
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Dsp {
     #[serde(with = "BigArray")]
     pub coef: [i16; 64],
@@ -79,11 +66,35 @@ pub struct Dsp {
     pub mixs: [i32; 16],
     pub exts: [i16; 2],
     pub efreg: [i16; 16],
+    /// Debug high-water mark: max |EFREG[i]| ever written (never reset). Lets
+    /// sdbg see which effect outputs the DSP actually produces, past the
+    /// zero-crossings that frame-boundary snapshots catch.
+    #[serde(skip)]
+    pub efreg_hw: [i32; 16],
+    /// Debug high-water mark of the DSP input mix (max |MIXS[i]| seen).
+    #[serde(skip)]
+    pub mixs_hw: [i32; 16],
     pub rbp: u32,
     pub rbl: u32,
     dec: u32,
     stopped: bool,
     last_step: usize,
+    /// Pipeline registers that carry across steps *and* samples (Mednafen
+    /// `SS_SCSP::DSP` fields). `sft_reg` is the 26-bit accumulator; the shifter
+    /// reads the *previous* step's value. `inputs_reg` is the raw INPUTS latch
+    /// (IRA 0x32-0x3F leave it unchanged). The pending-read/write pair models the
+    /// delay-RAM access *latency*: the address is computed on the MRT/MWT step,
+    /// the access resolves on a later step.
+    sft_reg: i32,
+    inputs_reg: i32,
+    frc_reg: i32,
+    y_reg: i32,
+    adrs_reg: u16,
+    read_pending: u8,
+    read_value: i32,
+    write_pending: bool,
+    write_value: u16,
+    rw_addr: u32,
 }
 
 impl Default for Dsp {
@@ -103,11 +114,23 @@ impl Dsp {
             mixs: [0; 16],
             exts: [0; 2],
             efreg: [0; 16],
+            efreg_hw: [0; 16],
+            mixs_hw: [0; 16],
             rbp: 0,
             rbl: 8 * 1024,
             dec: 0,
             stopped: true,
             last_step: 0,
+            sft_reg: 0,
+            inputs_reg: 0,
+            frc_reg: 0,
+            y_reg: 0,
+            adrs_reg: 0,
+            read_pending: 0,
+            read_value: 0,
+            write_pending: false,
+            write_value: 0,
+            rw_addr: 0,
         }
     }
 
@@ -133,27 +156,31 @@ impl Dsp {
     /// Add a slot's effect-send into input-mix channel `sel`.
     pub fn set_sample(&mut self, sample: i32, sel: usize) {
         self.mixs[sel & 0xF] += sample;
+        let a = self.mixs[sel & 0xF].abs();
+        if a > self.mixs_hw[sel & 0xF] {
+            self.mixs_hw[sel & 0xF] = a;
+        }
     }
 
-    /// Run one full pass (all program steps) for one output sample, using
-    /// `ram` as the delay line. Clears `MIXS` afterward (consumed per sample).
+    /// Run one full 128-step pass for one output sample, using `ram` as the
+    /// delay line. Modeled faithfully on Mednafen's `SS_SCSP` DSP step
+    /// (`scsp.inc`): the shifter reads the *previous* step's 26-bit accumulator;
+    /// the Y-select value is captured *before* YRL/FRCL latch their new values;
+    /// delay-RAM access is *deferred* (the address is latched on the MRT/MWT step
+    /// and the access resolves a step later); and the pipeline registers persist
+    /// across samples. `MIXS` is cleared afterward (consumed per sample).
     pub fn step(&mut self, ram: &mut Ram) {
         if self.stopped || self.last_step == 0 {
             self.mixs.fill(0);
             return;
         }
         self.efreg.fill(0);
+        let rbl_mask = self.rbl.wrapping_sub(1);
 
-        let mut acc: i32 = 0;
-        let mut memval: i32 = 0;
-        let mut frc_reg: i32 = 0;
-        let mut y_reg: i32 = 0;
-        let mut adrs_reg: u32 = 0;
-
-        for step in 0..self.last_step {
+        for step in 0..128 {
             let ip = &self.mpro[step * 4..step * 4 + 4];
             let tra = ((ip[0] >> 8) & 0x7F) as u32;
-            let twt = (ip[0] >> 7) & 1;
+            let twt = ip[0] >> 7 & 1;
             let twa = (ip[0] & 0x7F) as u32;
             let xsel = ip[1] >> 15 & 1;
             let ysel = ip[1] >> 13 & 3;
@@ -162,143 +189,145 @@ impl Dsp {
             let iwa = (ip[1] & 0x1F) as usize;
             let table = ip[2] >> 15 & 1;
             let mwt = ip[2] >> 14 & 1;
-            let mrd = ip[2] >> 13 & 1;
+            let mrt = ip[2] >> 13 & 1;
             let ewt = ip[2] >> 12 & 1;
             let ewa = (ip[2] >> 8 & 0xF) as usize;
             let adrl = ip[2] >> 7 & 1;
             let frcl = ip[2] >> 6 & 1;
-            let shift = ip[2] >> 4 & 3;
+            let shft0 = ip[2] >> 4 & 1;
+            let shft1 = ip[2] >> 5 & 1;
             let yrl = ip[2] >> 3 & 1;
             let negb = ip[2] >> 2 & 1;
             let zero = ip[2] >> 1 & 1;
             let bsel = ip[2] & 1;
             let nofl = ip[3] >> 15 & 1;
-            let coef = (ip[3] >> 9 & 0x3F) as usize;
+            let cra = (ip[3] >> 9 & 0x3F) as usize;
             let masa = (ip[3] >> 2 & 0x1F) as usize;
-            let adreb = ip[3] >> 1 & 1;
-            let nxadr = ip[3] & 1;
+            let adrgb = ip[3] >> 1 & 1;
+            let nxaddr = ip[3] & 1;
 
-            // INPUTS (24-bit).
-            let mut inputs = if ira <= 0x1F {
-                self.mems[ira]
-            } else if ira <= 0x2F {
-                self.mixs[ira - 0x20] << 4
-            } else if ira <= 0x31 {
-                (self.exts[ira - 0x30] as i32) << 8
-            } else {
-                return;
-            };
-            inputs = sext(inputs, 24);
-            if iwt != 0 {
-                self.mems[iwa] = memval;
-                if ira == iwa {
-                    inputs = memval;
-                }
-            }
-
-            // Operands.
-            let b = if zero == 0 {
-                let mut b = if bsel != 0 {
-                    acc
+            // INPUTS latch (raw). IRA 0x32-0x3F leave the latch unchanged.
+            if ira & 0x20 != 0 {
+                if ira & 0x10 != 0 {
+                    if ira & 0xE == 0 {
+                        self.inputs_reg = (self.exts[ira & 1] as i32) << 8;
+                    }
                 } else {
-                    sext(self.temp[((tra.wrapping_add(self.dec)) & 0x7F) as usize], 24)
-                };
-                if negb != 0 {
-                    b = -b;
+                    self.inputs_reg = self.mixs[ira & 0xF] << 4;
                 }
-                b
             } else {
-                0
-            };
-            let x = if xsel != 0 {
-                inputs
-            } else {
-                sext(self.temp[((tra.wrapping_add(self.dec)) & 0x7F) as usize], 24)
-            };
-            let mut y = match ysel {
-                0 => frc_reg,
-                1 => (self.coef[coef] as i32) >> 3,
-                2 => (y_reg >> 11) & 0x1FFF,
-                _ => (y_reg >> 4) & 0xFFF,
+                self.inputs_reg = self.mems[ira & 0x1F];
+            }
+            let inputs = sext(self.inputs_reg, 24);
+
+            // Capture the Y-select operand *before* YRL/FRCL latch new values.
+            let y_in = match ysel {
+                0 => self.frc_reg,
+                1 => (self.coef[cra] as i32) >> 3,
+                2 => (self.y_reg >> 11) & 0x1FFF,
+                _ => (self.y_reg >> 4) & 0xFFF,
             };
             if yrl != 0 {
-                y_reg = inputs;
+                self.y_reg = self.inputs_reg & 0xFF_FFFF;
             }
 
-            // Shifter.
-            let shifted = match shift {
-                0 => acc.clamp(-0x80_0000, 0x7F_FFFF),
-                1 => acc.saturating_mul(2).clamp(-0x80_0000, 0x7F_FFFF),
-                2 => sext(acc.wrapping_mul(2), 24),
-                _ => sext(acc, 24),
-            };
-
-            // Multiply-accumulate (24-bit × 13-bit).
-            y = sext(y, 13);
-            let v = ((x as i64) * (y as i64)) >> 12;
-            acc = (v + b as i64) as i32;
-
-            if twt != 0 {
-                self.temp[((twa.wrapping_add(self.dec)) & 0x7F) as usize] = shifted;
+            // Shifter on the previous step's 26-bit accumulator.
+            let mut shifter = ((sext(self.sft_reg, 26) as u32) << (shft0 ^ shft1)) as i32;
+            if shft1 == 0 {
+                shifter = shifter.clamp(-0x80_0000, 0x7F_FFFF);
             }
+            let shifter = (shifter as u32 & 0xFF_FFFF) as i32;
+
             if frcl != 0 {
-                frc_reg = if shift == 3 {
-                    shifted & 0xFFF
+                self.frc_reg = if shft0 & shft1 != 0 {
+                    shifter & 0xFFF
                 } else {
-                    (shifted >> 11) & 0x1FFF
+                    (shifter >> 11) & 0x1FFF
                 };
             }
 
-            // Delay-RAM access (sound RAM), on odd steps only.
-            if mrd != 0 || mwt != 0 {
-                let mut addr = self.madrs[masa] as u32;
-                if table == 0 {
-                    addr = addr.wrapping_add(self.dec);
+            // Multiply-accumulate → new 26-bit accumulator (B = TEMP or the old
+            // accumulator, selected by BSEL).
+            let temp_rd = sext(
+                self.temp[((tra.wrapping_add(self.dec)) & 0x7F) as usize],
+                24,
+            );
+            let x = if xsel != 0 { inputs } else { temp_rd };
+            let product = (((sext(y_in, 13) as i64) * (x as i64)) >> 12) as i32;
+            let mut sga = if bsel != 0 { self.sft_reg } else { temp_rd };
+            if negb != 0 {
+                sga = sga.wrapping_neg();
+            }
+            if zero != 0 {
+                sga = 0;
+            }
+            self.sft_reg = product.wrapping_add(sga) & 0x3FF_FFFF;
+
+            if ewt != 0 {
+                self.efreg[ewa] = (shifter >> 8) as i16;
+                let a = (self.efreg[ewa] as i32).abs();
+                if a > self.efreg_hw[ewa] {
+                    self.efreg_hw[ewa] = a;
                 }
-                if adreb != 0 {
-                    addr = addr.wrapping_add(adrs_reg & 0xFFF);
-                }
-                if nxadr != 0 {
-                    addr = addr.wrapping_add(1);
-                }
-                if table == 0 {
-                    addr &= self.rbl.wrapping_sub(1);
+            }
+            if twt != 0 {
+                self.temp[((twa.wrapping_add(self.dec)) & 0x7F) as usize] = shifter;
+            }
+            if iwt != 0 {
+                self.mems[iwa] = self.read_value;
+            }
+
+            // Resolve the delay-RAM access latched on a previous step (the
+            // access has latency — Mednafen's ReadPending/WritePending).
+            if self.read_pending != 0 {
+                let w = ram.read16((self.rw_addr << 1) & SOUND_RAM_MASK);
+                self.read_value = if self.read_pending == 2 {
+                    ((w as i32) << 8) & 0xFF_FFFF
                 } else {
-                    addr &= 0xFFFF;
-                }
-                addr = addr.wrapping_add(self.rbp << 12) << 1;
-                let addr = addr & SOUND_RAM_MASK;
-                if mrd != 0 && step & 1 != 0 {
-                    let w = ram.read16(addr);
-                    memval = if nofl != 0 {
-                        (w as i32) << 8
-                    } else {
-                        unpack(w)
-                    };
-                }
-                if mwt != 0 && step & 1 != 0 {
-                    let w = if nofl != 0 {
-                        (shifted >> 8) as u16
-                    } else {
-                        pack(shifted)
-                    };
-                    ram.write16(addr, w);
-                }
+                    dspfloat_to_int(w)
+                };
+                self.read_pending = 0;
+            } else if self.write_pending {
+                ram.write16((self.rw_addr << 1) & SOUND_RAM_MASK, self.write_value);
+                self.write_pending = false;
+            }
+
+            // Compute this step's delay-RAM address and latch a pending access.
+            let mut addr = self.madrs[masa] as u32;
+            addr = addr.wrapping_add(nxaddr as u32);
+            if adrgb != 0 {
+                addr = addr.wrapping_add(sext(self.adrs_reg as i32, 12) as u32);
+            }
+            if table == 0 {
+                addr = addr.wrapping_add(self.dec) & rbl_mask;
+            } else {
+                addr &= 0xFFFF;
+            }
+            self.rw_addr = addr.wrapping_add(self.rbp << 12) & 0x7_FFFF;
+            if mrt != 0 {
+                self.read_pending = 1 + nofl as u8;
+            }
+            if mwt != 0 {
+                self.write_pending = true;
+                self.write_value = if nofl != 0 {
+                    (shifter >> 8) as u16
+                } else {
+                    int_to_dspfloat(shifter)
+                };
             }
 
             if adrl != 0 {
-                adrs_reg = if shift == 3 {
-                    ((shifted >> 12) & 0xFFF) as u32
+                self.adrs_reg = if shft0 & shft1 != 0 {
+                    (shifter >> 12) as u16
                 } else {
-                    (inputs >> 16) as u32
+                    ((inputs >> 16) & 0xFFF) as u16
                 };
             }
-            if ewt != 0 {
-                // Mednafen `scsp.inc:1340` *sets* EFREG[EWA] (last write wins),
-                // not accumulates — multiple writes to one EWA in a pass must
-                // take the latest, else they sum (and can cancel to 0).
-                self.efreg[ewa] = (shifted >> 8) as i16;
-            }
+        }
+
+        // MDEC_CT counts down once per sample, wrapping at the ring length.
+        if self.dec == 0 {
+            self.dec = self.rbl;
         }
         self.dec = self.dec.wrapping_sub(1);
         self.mixs.fill(0);
@@ -311,13 +340,17 @@ mod tests {
     use crate::memory::Ram;
 
     #[test]
-    fn pack_unpack_round_trip_is_close() {
-        // The float format is lossy, but small magnitudes round-trip exactly.
-        for v in [0, 1, -1, 0x1000, -0x1000, 0x7FFF, -0x8000] {
-            let r = unpack(pack(v));
+    fn dspfloat_round_trip_is_close() {
+        // dspfloat operates in 24-bit signed space (the shifter output domain).
+        // Lossy (11-bit mantissa), but the round-trip stays within the mantissa's
+        // relative error.
+        for v in [
+            0i32, 1, -1, 0x1000, -0x1000, 0x7FFF, -0x8000, 0x7F_FFFF, -0x80_0000,
+        ] {
+            let r = sext(dspfloat_to_int(int_to_dspfloat(v & 0xFF_FFFF)), 24);
             assert!(
                 (r - v).abs() <= (v.abs() >> 10) + 1,
-                "pack/unpack {v} → {r}"
+                "dspfloat round-trip {v} → {r}"
             );
         }
     }
