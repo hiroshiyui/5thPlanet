@@ -18,11 +18,11 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SMPC | ✅ | Slave hold/release, staged INTBACK + digital pad, NMIREQ, SNDON/SNDOFF, live RTC (SETTIME + host-seeded), SETSMEM, configurable region; clock-change/SYSRES still no-op |
 | SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct + indirect, D*AD strides, hardware start factors: VBlank/sprite-end/sound), interrupt aggregation → master INTC; cycle-stealing bus timing a refinement |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
-| VDP2 | ✅ | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation (4×4-page planes, line-coefficient, screen-over) + VDP1 sprite layer, priority composited; colour calc + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll/zoom + vertical cell scroll; CRAM modes 0/1/2. Sprite window unmodelled (as in the reference) |
+| VDP2 | ✅ | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation (4×4-page planes, line-coefficient, screen-over) + VDP1 sprite layer, priority composited; colour calc + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll/zoom + vertical cell scroll; CRAM modes 0/1/2; hi-res output (320/352/640/704 from TVMD). Sprite window unmodelled (as in the reference) |
 | VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
 | MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
 | SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
-| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. **M10** adds CDDA→SCSP playback and live physical-disc reads (via the `SectorSource` trait + the `physdisc`/libcdio crate). Remaining: MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
+| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. **M10** adds CDDA→SCSP playback and live physical-disc reads (via the `SectorSource` trait + the `physdisc`/libcdio crate). **M11** adds the SCU external interrupt (vector 0x50, level 7). Remaining: MPEG card, move/copy sector ops, realistic seek timing. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
 | Cartridge slot | ✅ | Extension DRAM (1 MB / 4 MB, two banks), battery backup-RAM (odd-byte packing), and game ROM carts, mapped at `0x0200_0000..0x04FF_FFFF` with the probed cart-ID byte at `0x04FF_FFFF`; `--cart=` frontend flag. (CDDA→SCSP, MPEG card, move/copy ops still deferred within M7) |
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad, F5/F9 save-state hotkeys |
 | Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
@@ -573,31 +573,35 @@ trace-diffed against Mednafen (itself LLE — the only mode in which a master-SH
 PC-trace-diff is valid). An opt-in HLE direct boot was tried and **removed** —
 see "Removed: the HLE-boot detour" below.
 
-**Status: VF2 boots the real BIOS, runs game code on both SH-2s, and streams its
-CD asset load correctly — but stalls partway through loading (display stays off),
-and the remaining blocker is now proven to be scheduler/interrupt-timing
-accuracy, not the CD-block.** After the boot breakthrough (Phase 3) a chain of
-post-boot fixes (Phase 4) carried VF2 from "reaches its load address" to "runs +
-loads assets": the **BCR1 master/slave bit** (so an `SSHON`-released slave takes
-the BIOS slave path and doesn't re-init work RAM over the running game), and
-**`run_frame` no longer splitting the frame into two `run_for` calls** (the split
-re-anchored the batch grid and diverged the master's execution from the headless
-path). A **Mednafen dev-build CD trace-diff** then proved the CD command/response
-stream is **byte-identical to Mednafen** through the divergence and the data
-transfer is correct by construction — so the next-file decision the game makes
-mid-load diverges on **timing** (the stall point oscillates with every timing
-change). Phase 2 of the Mednafen scheduler alignment landed (**2A** master-leads-
-slave interleave, **2B** per-instruction SCU interrupt sampling) but isn't
-sufficient alone; closing the gap needs the deeper Phase-3 timing model. An
-interactive debugger (`crates/debugger`/`sdbg`) was built to drive this work.
-**Remaining: bit-accurate timing (Phase-3) to reach the first game screen.**
+**Status: a commercial game now boots to a correctly-rendered title screen.**
+*Doukyuusei ~if~* (NEC InterChannel) boots the real BIOS, loads its 1st-read,
+runs game code on both SH-2s, and reaches its **title screen** (「同級生」 "PRESS
+START"), displayed at its native **640×224 hi-res**. The chain: the boot
+breakthrough (Phase 3, the `DCHG` fix) → both VF2 and Doukyuusei load their
+1st-read → Doukyuusei's intro **slave crash** turned out to be a **SH7604 FRT
+`FTCSR` write-0-to-clear bug** (Phase 5): the inter-CPU FRT input-capture (FTI)
+handshake clears `ICF` by writing 0 to it, which ours (wrongly W1C) ignored, so
+`ICF` stuck set, the slave's wait-loop never waited, and it called a master-built
+function-pointer table mid-rebuild (null) → fatal halt. With `ICF` clearing
+correctly the slave waits properly and the game advances to its title; **VDP2
+hi-res rendering** (320/352/640/704) then displays it without the overflow ours'
+fixed 320-wide framebuffer caused.
+
+**VF2 (the original M11 target) remains on a separate wall:** its intro demo-
+script job engine loops on a **polled CD-state divergence**. This round exhausted
+the CD-HIRQ axis for VF2 — the HIRQ *value* matches Mednafen, DCHG matches, and
+the newly-added CD-block SCU interrupt is *masked* by VF2 (it polls) — so the
+remaining divergence is other polled CD state (the CR1–4 status report / partition
+block-count) or residual scheduler timing. The interactive debugger
+(`crates/debugger`/`sdbg`), extended again this round, drives both investigations.
 
 | # | Phase | Notes |
 |---|-------|-------|
 | 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
 | 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture; `SAT_SHELL_BASE` tunes the give-up detection) / `SAT_BIOSTRACE` / `SAT_WWATCH` / `SAT_IRQ_DUMP` / `SAT_INTC_TRACE` / `SAT_MEMDUMP` / `SAT_DUMP`. |
 | 3 | **LLE trace-diff vs Mednafen** ✅ done — VF2 + Doukyuusei ~if~ boot to game code | Both run the **same BIOS CD-boot loader**; auth, region, and the IP.BIN read all pass. Our loader rejected the disc and re-recognized (`GetToc`/`Init` → CD player) where Mednafen reads the 1st-read (`ChangeDir`→`GetFileScope`→`ReadFile` → game). **Root: the CD-block re-raised `DCHG` (Disc Changed, HIRQ `0x20`) on the first `Init` after recognition** — the internal `disk_changed` latch was cleared only *inside* the Init handler, so that Init reported a fresh disc swap and the BIOS looped recognition forever. **Fix: clear `disk_changed` when the host write-1-to-clear-acknowledges `DCHG`** (matching Mednafen, which clears it once during recognition and never re-raises it at Init). **The method that cracked it:** the BIOS code is identical on both LLE sides, so the root had to be a differing CD-block response → a **command-level CD trace-diff** (detailed `cmd_log`: caller PC + CR1–4 in→out + HIRQ in→out, poll bursts collapsed) showed the streams match exactly through the 19th command (2nd `GetSession`), then the *only* state difference was the HIRQ — ours' Init left `DCHG` set (`0FC4→0FE5`) where Mednafen left it clear (`0F84`). With the fix, ours' command stream matches Mednafen and the master reaches VF2's load address `0x06004000` and executes game code (frame 653); Doukyuusei ~if~ likewise reaches `ReadFile`. `bios_boot` golden unchanged, full saturn suite green. (Earlier notes — state-diff beats the unreliable PC-diff; the CR1 `is_cdrom` fix — stand but weren't the decider; the *general recipe* is: find the first differing **input**, not the first differing behavior.) |
-| 4 | **Post-boot run + blocker localization** 🚧 localized to the intro job engine | After Phase 3 the game runs but stalls mid asset-load (display off). Fixes: **BCR1 bit-15 master/slave** (`1f584d6`) — an `SSHON`-released slave takes the BIOS slave path instead of re-initialising work RAM over the running game (it was clobbering the loaded code → master fault); **`run_frame` = one `run_for(CYCLES_PER_FRAME)`** (`0b78733`) — the old active/VBLANK split re-anchored `run_for`'s batch grid and diverged the master's execution from the headless path. A **Mednafen dev-build** (`--enable-dev-build`, `-ss.dbg_mask cdb`) **CD trace-diff** then proved the CD command/response stream is **byte-identical to Mednafen** through the divergence and the data transfer is correct by construction; the game's next-file decision diverges on **timing** (stall point oscillates FAD 2596 ↔ 7772 with each timing change). **Mednafen scheduler alignment Phase 2** landed — **2A** master-leads-slave interleave (`b583cc4`), **2B** per-instruction SCU interrupt sampling (`70f4049`) — correct accuracy gains, `bios_boot` golden unchanged, but not sufficient alone. An evidence-driven cadence alignment followed (`cacffca`): the CD periodic/`SCDQ` report now fires **per-sector during PLAY** (matching Mednafen's `17712`-clock reload — was a flat ~60 Hz), found via the dev-build trace-diff — it advanced VF2's load further (stall moved 2596 → 7772). A later **file-load comparison** (full ordered Play streams, both sides) showed the next-file divergence is **not** timing-sensitive selection: ours loads the **same** intro files as Mednafen (`SOUNDS`/`SNDDAT`/`SLAU`) then **loops** instead of advancing. The loop is VF2's **intro demo-script job engine** (a linked list of timed jobs on the master at `0x06047xxx`; processor `0x06047718`, producer `0x06047544`, list driver `0x06047B2C`) where a job never reaches its terminal state nibble (`7`/`0xA`). **CD, sound (SCSP 68k), and the slave SH-2 are all ruled out:** the 68k runs its driver fine and cycles with SNDON/SNDOFF, and the slave's spin on a sound-RAM signal (`0x05A03C2A`) is a downstream symptom — the master *clears* that signal but, looping, never *sets* it to release the slave. **Tooling: `sdbg`** (`crates/debugger`) — breakpoints incl. register-guarded + stack backtrace, single-step, SH-2 **and** SCSP-68k disasm (`d68`) + 68k PC-trace (`t68`), read/write watchpoints (`SAT_RWATCH`/`bw`), memory search, CD-command / windowed-PC-trace breaks (`cb`/`t`), and SCSP/68k state probes (`scsp`). **Open task: instrument the master job's state nibble to find the sub-step that never completes** — the genuine root, with all sound-side suspects now cleared. |
+| 4 | **Post-boot run + blocker localization** 🚧 localized to the intro job engine | After Phase 3 the game runs but stalls mid asset-load (display off). Fixes: **BCR1 bit-15 master/slave** (`1f584d6`) — an `SSHON`-released slave takes the BIOS slave path instead of re-initialising work RAM over the running game (it was clobbering the loaded code → master fault); **`run_frame` = one `run_for(CYCLES_PER_FRAME)`** (`0b78733`) — the old active/VBLANK split re-anchored `run_for`'s batch grid and diverged the master's execution from the headless path. A **Mednafen dev-build** (`--enable-dev-build`, `-ss.dbg_mask cdb`) **CD trace-diff** then proved the CD command/response stream is **byte-identical to Mednafen** through the divergence and the data transfer is correct by construction; the game's next-file decision diverges on **timing** (stall point oscillates FAD 2596 ↔ 7772 with each timing change). **Mednafen scheduler alignment Phase 2** landed — **2A** master-leads-slave interleave (`b583cc4`), **2B** per-instruction SCU interrupt sampling (`70f4049`) — correct accuracy gains, `bios_boot` golden unchanged, but not sufficient alone. An evidence-driven cadence alignment followed (`cacffca`): the CD periodic/`SCDQ` report now fires **per-sector during PLAY** (matching Mednafen's `17712`-clock reload — was a flat ~60 Hz), found via the dev-build trace-diff — it advanced VF2's load further (stall moved 2596 → 7772). A later **file-load comparison** (full ordered Play streams, both sides) showed the next-file divergence is **not** timing-sensitive selection: ours loads the **same** intro files as Mednafen (`SOUNDS`/`SNDDAT`/`SLAU`) then **loops** instead of advancing. The loop is VF2's **intro demo-script job engine** (a linked list of timed jobs on the master at `0x06047xxx`; processor `0x06047718`, producer `0x06047544`, list driver `0x06047B2C`) where a job never reaches its terminal state nibble (`7`/`0xA`). **CD, sound (SCSP 68k), and the slave SH-2 are all ruled out:** the 68k runs its driver fine and cycles with SNDON/SNDOFF, and the slave's spin on a sound-RAM signal (`0x05A03C2A`) is a downstream symptom — the master *clears* that signal but, looping, never *sets* it to release the slave. **Tooling: `sdbg`** (`crates/debugger`) — breakpoints incl. register-guarded + stack backtrace, single-step, SH-2 **and** SCSP-68k disasm (`d68`) + 68k PC-trace (`t68`), read/write watchpoints (`SAT_RWATCH`/`bw`), memory search, CD-command / windowed-PC-trace breaks (`cb`/`t`), and SCSP/68k state probes (`scsp`). **Open task (VF2):** the divergence is now proven to be *non-CD-HIRQ* polled state — see the M11 status above. |
+| 5 | **Doukyuusei ~if~ boots to its title screen** ✅ | A *different* commercial game reached its title via two fixes. (a) **SH7604 FRT `FTCSR` write-0-to-clear** (`073805d`): Doukyuusei renders its Inter Channel logo then its slave SH-2 crashed — a null `JSR @R2` (`R2 = [0x0602739C]`). Diagnosed (new `sdbg` register-guarded *slave* breakpoint + bus-level **memory probe**, `3e4c270`) as the slave reading a master-built function-pointer table *mid-rebuild* (transiently 0), because its inter-CPU FTI `ICF` never cleared: ours treated `FTCSR` as W1C, but the SH7604 clears its status flags by writing 0 after reading 1, so the slave's `ICF`-clear (write 0) was ignored and its wait-loop spun through. Fixed → the slave waits, reads a valid pointer, the game advances logo → title. (b) **VDP2 hi-res rendering** (`c0f2344`): Doukyuusei runs at **640×224** (TVMD HRESO=2) but ours hardcoded 320 → overflow. `Vdp2Regs::screen_dims()` decodes TVMD (320/352/640/704 × 224/240/256[×2]); `render_frame` renders the active w×h (returns the dims); the frontend re-creates its SDL texture on resolution change. `bios_boot` golden unchanged (hashes only the active region). Also landed (a real missing feature, though VF2 masks it): the **CD-block SCU external interrupt** (vector 0x50, level 7; `57a1066`) + the HIRQ-edge `hirqlog` trace (`94dfdd4`). |
 
 ### Spun out of M11 — kept general accuracy fixes
 
@@ -644,6 +648,22 @@ their own (independent of any boot path):
   once per scheduler batch, so an interrupt is delivered at the exact instruction
   `SR.imask` drops below its level (matching Mednafen's per-instruction IRL
   sampling) rather than up to a batch late. `drain_scu_intc` retired.
+- **SH7604 FRT `FTCSR` write-0-to-clear** (`073805d`) — the free-running timer's
+  status flags (ICF/OCFA/OCFB/OVF) clear by writing 0 after reading 1 (the
+  Hitachi semantic; consistent with our WDT `TCSR`), not W1C as ours had it. Was
+  load-bearing for the inter-CPU FTI handshake (a core polling `FTCSR.ICF` clears
+  it by writing 0; under W1C `ICF` stuck set and its wait-loop never waited) — it
+  fixed Doukyuusei's intro slave crash (M11 Phase 5). Two FRT tests corrected.
+- **CD-block SCU external interrupt** (`57a1066`) — the CD-block now drives SCU
+  external interrupt 0 (IST bit 16, **vector 0x50, level 7**), asserted as a
+  level `(HIRQ & HIRQ_Mask) != 0`, masked by IMS **bit 15** (the SCU sign-extends
+  the 16-bit mask), and re-armed via the AIACK write (Mednafen `RecalcIRQOut` /
+  `ABusIRQCheck`). ours had no CD interrupt at all. Unit-tested; golden unchanged.
+- **VDP2 hi-res rendering** (`c0f2344`) — the renderer reads the active resolution
+  from TVMD (`Vdp2Regs::screen_dims`: 320/352/640/704 × 224/240/256[×2]) and
+  renders that width×height (returning the dims) instead of a fixed 320×224; the
+  SDL frontend re-creates its texture on a mode change. Fixed the 640-wide
+  Doukyuusei title-screen overflow (M11 Phase 5); `bios_boot` golden unchanged.
 - **`sdbg` interactive debugger** (`crates/debugger`) — a headless gdb-style REPL
   over the core: breakpoints (incl. register-guarded, with a stack backtrace on
   hit), single-step, SH-2 + **SCSP-68k** disassembly (`d68`) and 68k PC-trace
