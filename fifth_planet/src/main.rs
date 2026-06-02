@@ -293,6 +293,9 @@ fn run(
     // last frame (we redraw the menu over the same frame while it's open).
     let mut compose = vec![0u8; FRAMEBUFFER_BYTES];
     let mut osd = Osd::new();
+    // Current texture (and frozen-frame) resolution; updated when a game
+    // switches video mode so the texture/pitch track the active display size.
+    let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
 
     // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
     // the slot-less `<bios>.state`).
@@ -371,10 +374,11 @@ fn run(
             // menu over a dimmed copy of the last frame.
             saturn.set_pad1(0);
             osd.tick_toast();
+            let (w, h) = cur_dims;
             compose.copy_from_slice(&framebuffer);
-            osd.render_overlay(&mut compose, FRAME_WIDTH, FRAME_HEIGHT, &ctx);
+            osd.render_overlay(&mut compose, w, h, &ctx);
             texture
-                .update(None, &compose, FRAME_WIDTH * 4)
+                .update(None, &compose, w * 4)
                 .expect("upload framebuffer");
         } else {
             // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
@@ -402,7 +406,16 @@ fn run(
             }
             saturn.set_pad1(held);
 
-            saturn.run_frame(&mut framebuffer);
+            // The active display size (320/352/640/704 × …) comes from TVMD;
+            // re-create the streaming texture when a game switches resolution
+            // (e.g. a hi-res 640-wide title screen) so the content isn't cut.
+            let (w, h) = saturn.run_frame(&mut framebuffer);
+            if (w, h) != cur_dims {
+                texture = creator
+                    .create_texture_streaming(PixelFormatEnum::ABGR8888, w as u32, h as u32)
+                    .expect("recreate streaming texture");
+                cur_dims = (w, h);
+            }
 
             // Queue this frame's SCSP audio, unless we're already buffered well
             // ahead (keeps latency bounded if the host runs faster than realtime).
@@ -413,9 +426,9 @@ fn run(
 
             // A lingering toast (e.g. "Quicksave") is drawn over the live frame.
             osd.tick_toast();
-            osd.render_overlay(&mut framebuffer, FRAME_WIDTH, FRAME_HEIGHT, &ctx);
+            osd.render_overlay(&mut framebuffer, w, h, &ctx);
             texture
-                .update(None, &framebuffer, FRAME_WIDTH * 4)
+                .update(None, &framebuffer, w * 4)
                 .expect("upload framebuffer");
         }
 
@@ -653,7 +666,7 @@ fn run(
             }
         }
         match hit {
-            Some((r, pr, gbr, code)) => {
+            Some((r, pr, gbr, code, _probe)) => {
                 eprintln!("FBP {bp:08X} hit. PR={pr:08X} GBR={gbr:08X} regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");
@@ -778,13 +791,14 @@ fn run(
     // illegal-instruction fault only with this on, the cache is incoherent).
     let cache_purge = std::env::var_os("SAT_CACHE_PURGE").is_some();
     let mut last_pc = u32::MAX;
+    let mut dump_dims = (FRAME_WIDTH, FRAME_HEIGHT);
     for f in 0..headless_frames {
         apply_scripted_pad(&mut saturn, f);
         if cache_purge {
             saturn.master_mut().cache.purge();
             saturn.slave_mut().cache.purge();
         }
-        saturn.run_frame(&mut framebuffer);
+        dump_dims = saturn.run_frame(&mut framebuffer);
         if pctrace {
             let pc = saturn.master().regs.pc;
             if pc != last_pc {
@@ -869,8 +883,9 @@ fn run(
     // writes the final frame as a binary PPM (P6) — lets a boot run be inspected
     // (CD-player vs splash vs game) without opening a window.
     if let Ok(path) = std::env::var("SAT_DUMP") {
-        let mut ppm = format!("P6\n{FRAME_WIDTH} {FRAME_HEIGHT}\n255\n").into_bytes();
-        for px in framebuffer.chunks_exact(4) {
+        let (w, h) = dump_dims;
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for px in framebuffer[..w * h * 4].chunks_exact(4) {
             ppm.extend_from_slice(&px[..3]); // RGBA → RGB
         }
         match fs::write(&path, &ppm) {

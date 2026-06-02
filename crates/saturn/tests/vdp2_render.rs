@@ -14,19 +14,21 @@ const REG_BGON: u32 = 0x05F8_0020;
 const REG_CHCTLA: u32 = 0x05F8_0028;
 
 #[test]
-fn run_frame_returns_buffer_of_expected_size() {
+fn run_frame_returns_default_resolution() {
     let mut sat = Saturn::with_blank_bios();
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
-    sat.run_frame(&mut out);
-    assert_eq!(out.len(), FRAME_WIDTH * FRAME_HEIGHT * 4);
+    // Power-on/default TVMD is NTSC low-res; run_frame reports the active dims.
+    let dims = sat.run_frame(&mut out);
+    assert_eq!(dims, (FRAME_WIDTH, FRAME_HEIGHT));
+    assert!(out.len() >= dims.0 * dims.1 * 4);
 }
 
 #[test]
 fn display_off_yields_opaque_black_frame_even_after_running() {
     let mut sat = Saturn::with_blank_bios();
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
-    sat.run_frame(&mut out);
-    for px in out.chunks_exact(4) {
+    let (w, h) = sat.run_frame(&mut out);
+    for px in out[..w * h * 4].chunks_exact(4) {
         assert_eq!(px, &[0, 0, 0, 0xFF]);
     }
 }

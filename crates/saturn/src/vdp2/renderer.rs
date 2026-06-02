@@ -71,34 +71,49 @@ use super::rotation::RotationParams;
 use super::{Vdp2, cram};
 use crate::vdp1::Framebuffer;
 
+/// Default (NTSC low-res 320×224) display size: the power-on resolution and the
+/// frontend's default window/texture size. The *active* size is dynamic — the
+/// game selects it via TVMD ([`crate::vdp2::Vdp2Regs::screen_dims`]) and
+/// [`render_frame`] returns it — so hi-res games (640/704) render correctly.
 pub const FRAME_WIDTH: usize = 320;
 pub const FRAME_HEIGHT: usize = 224;
-pub const FRAMEBUFFER_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
+/// Largest display the VDP2 produces: 704 wide × 256 lines × 2 (double-density
+/// interlace). The framebuffer passed to [`render_frame`] must be this many
+/// bytes; the renderer packs the *active* `width × height` tightly at its start
+/// (row stride = active width) and returns those dims, so the caller uploads
+/// only `width × height` with a `width × 4` pitch.
+pub const MAX_FRAME_WIDTH: usize = 704;
+pub const MAX_FRAME_HEIGHT: usize = 512;
+pub const FRAMEBUFFER_BYTES: usize = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
 
 const BACKDROP_PALETTE_INDEX: usize = 0;
 
 /// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
 /// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
 /// frame buffer to read). Panics if `out`'s length isn't [`FRAMEBUFFER_BYTES`].
-pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) {
-    assert_eq!(
-        out.len(),
-        FRAMEBUFFER_BYTES,
-        "framebuffer must be 320×224×4"
+pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) -> (usize, usize) {
+    // Active resolution from TVMD (320/352/640/704 × 224/240/256[×2]). The
+    // content is packed tightly with row stride = `w`, so the caller uploads
+    // `w × h` with a `w × 4` pitch.
+    let (w, h) = vdp2.regs.screen_dims();
+    assert!(
+        out.len() >= w * h * 4,
+        "framebuffer {} too small for {w}×{h}",
+        out.len()
     );
 
     if !vdp2.regs.display_enabled() {
         // Opaque black so SDL doesn't show a transparent hole.
-        for px in out.chunks_exact_mut(4) {
+        for px in out[..w * h * 4].chunks_exact_mut(4) {
             px.copy_from_slice(&[0, 0, 0, 0xFF]);
         }
-        return;
+        return (w, h);
     }
 
     let backdrop = cram(vdp2, BACKDROP_PALETTE_INDEX);
 
-    for y in 0..FRAME_HEIGHT {
-        for x in 0..FRAME_WIDTH {
+    for y in 0..h {
+        for x in 0..w {
             let (sx, sy) = (x as u32, y as u32);
             // Evaluate layers in VDP2's default front-to-back order, keeping
             // the top two by priority (front order wins ties) so colour
@@ -137,9 +152,10 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
             if shadow {
                 rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
             }
-            put_pixel(out, x, y, rgb.0, rgb.1, rgb.2);
+            put_pixel(out, x, y, w, rgb.0, rgb.1, rgb.2);
         }
     }
+    (w, h)
 }
 
 /// One layer's contribution at a pixel: priority, colour, and the colour-calc
@@ -277,8 +293,8 @@ fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Dot> {
 }
 
 #[inline]
-fn put_pixel(out: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
-    let dst = (y * FRAME_WIDTH + x) * 4;
+fn put_pixel(out: &mut [u8], x: usize, y: usize, stride: usize, r: u8, g: u8, b: u8) {
+    let dst = (y * stride + x) * 4;
     out[dst] = r;
     out[dst + 1] = g;
     out[dst + 2] = b;
@@ -888,8 +904,8 @@ mod tests {
     fn display_disabled_emits_opaque_black() {
         let v = Vdp2::new();
         let mut buf = fresh_buf();
-        render_frame(&v, None, &mut buf);
-        for chunk in buf.chunks_exact(4) {
+        let (w, h) = render_frame(&v, None, &mut buf);
+        for chunk in buf[..w * h * 4].chunks_exact(4) {
             assert_eq!(chunk, &[0, 0, 0, 0xFF]);
         }
     }
@@ -900,8 +916,8 @@ mod tests {
         v.regs.write16(0x000, 0x8000); // DISP
         v.cram.write16(0, 0x001F); // backdrop = red
         let mut buf = fresh_buf();
-        render_frame(&v, None, &mut buf);
-        for chunk in buf.chunks_exact(4) {
+        let (w, h) = render_frame(&v, None, &mut buf);
+        for chunk in buf[..w * h * 4].chunks_exact(4) {
             assert_eq!(chunk, &[0xFF, 0, 0, 0xFF]);
         }
     }
@@ -1470,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "framebuffer must be 320×224×4")]
+    #[should_panic(expected = "too small")]
     fn wrong_buffer_size_panics_loudly() {
         let v = Vdp2::new();
         let mut tiny = [0u8; 64];

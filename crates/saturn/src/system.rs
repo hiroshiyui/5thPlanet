@@ -1180,9 +1180,12 @@ impl Saturn {
     /// runs the active region, snapshots the frame at the active→VBLANK
     /// boundary, and runs the VBLANK region.
     ///
-    /// Writes into `out`, which must be exactly
-    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes (RGBA8888 320×224).
-    pub fn run_frame(&mut self, out: &mut [u8]) {
+    /// Writes RGBA8888 into `out`, which must be at least
+    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes. Returns the active display size
+    /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
+    /// pixels are packed tightly with row stride = `width`, so the caller uploads
+    /// `width × height` with a `width × 4` pitch.
+    pub fn run_frame(&mut self, out: &mut [u8]) -> (usize, usize) {
         // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
         // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short
         // (per-line integer truncation — the very drift `VBLANK_IN_CYCLE`'s
@@ -1205,7 +1208,7 @@ impl Saturn {
         // The framebuffer is snapshotted at the frame boundary; the VDP state
         // a game commits at VBlank is what it intends to display.
         self.run_for(CYCLES_PER_FRAME);
-        crate::vdp2::render_frame(&self.bus.vdp2, Some(self.bus.vdp1.display_fb()), out);
+        crate::vdp2::render_frame(&self.bus.vdp2, Some(self.bus.vdp1.display_fb()), out)
     }
 
     /// Take the SCSP's generated audio for this period (interleaved L,R at

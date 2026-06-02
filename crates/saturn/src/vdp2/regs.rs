@@ -120,6 +120,32 @@ impl Vdp2Regs {
     pub fn v_resolution(&self) -> u8 {
         ((self.tvmd() >> 4) & 0b11) as u8
     }
+    /// Active display size `(width, height)` in pixels, decoded from TVMD.
+    /// HRESO (bits 2..0) selects the horizontal dot count — 320 / 352 / 640 /
+    /// 704 (bit 2 picks the 31 kHz "exclusive monitor" variants, same pixel
+    /// widths). VRESO (bits 5..4) selects 224 / 240 / 256 lines. LSMD (bits
+    /// 7..6) == 3 is double-density interlace, which doubles the displayed line
+    /// count. Hi-res (640/704) games — e.g. Doukyuusei ~if~ at 640×224 — need
+    /// this so the renderer produces the correct width instead of a fixed 320.
+    pub fn screen_dims(&self) -> (usize, usize) {
+        let width = match self.h_resolution() & 0b11 {
+            0 => 320,
+            1 => 352,
+            2 => 640,
+            _ => 704,
+        };
+        let base_h = match self.v_resolution() {
+            0 => 224,
+            1 => 240,
+            _ => 256,
+        };
+        let height = if (self.tvmd() >> 6) & 0b11 == 3 {
+            base_h * 2 // double-density interlace
+        } else {
+            base_h
+        };
+        (width, height)
+    }
     pub fn ramctl(&self) -> u16 {
         self.read16(0x00E)
     }

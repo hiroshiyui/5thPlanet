@@ -67,10 +67,14 @@ fn bios_boots_to_stable_framebuffer_hash() {
     let mut sat = Saturn::new(bios);
     sat.reset();
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut dims = (0usize, 0usize);
     for _ in 0..FRAMES_TO_RUN {
-        sat.run_frame(&mut fb);
+        dims = sat.run_frame(&mut fb);
     }
-    let hash = fnv1a_64(&fb);
+    // Hash only the active width×height region (packed tightly at the buffer
+    // start) — not the whole MAX-sized buffer — so the golden is independent of
+    // MAX_FRAME_* and stays valid for the 320×224 splash.
+    let hash = fnv1a_64(&fb[..dims.0 * dims.1 * 4]);
 
     let golden_full = workspace_root().join("crates/saturn").join(GOLDEN_PATH);
     match std::fs::read_to_string(&golden_full) {
