@@ -2126,9 +2126,20 @@ fn audio_probe() {
         .unwrap_or(2500);
     let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
     let (mut win, mut total, mut n): (i64, i64, u64) = (0, 0, 0);
+    // AUDIO_OUT=<path>: also dump the raw interleaved i16-LE stereo (44100 Hz) —
+    // exactly what take_audio (hence the SDL queue) receives — so the SCSP output
+    // can be analysed/played (`aplay -f S16_LE -r 44100 -c 2 <path>`) independent
+    // of the SDL path: separates "SCSP renders garbage" from "SDL mangles it".
+    let dump = std::env::var("AUDIO_OUT").ok();
+    let mut pcm: Vec<u8> = Vec::new();
     for f in 0..frames {
         sat.run_frame(&mut fb);
         let a = sat.take_audio();
+        if dump.is_some() {
+            for &x in &a {
+                pcm.extend_from_slice(&x.to_le_bytes());
+            }
+        }
         let s: i64 = a.iter().map(|&x| (x as i64).abs()).sum();
         win += s;
         total += s;
@@ -2140,4 +2151,11 @@ fn audio_probe() {
     }
     let avg = if n > 0 { total / n as i64 } else { 0 };
     println!("AUDIO total |sum|={total} over {n} samples; avg |amplitude|={avg} (0 = silent)");
+    if let Some(p) = dump {
+        std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
+        println!(
+            "wrote {} bytes to {p} — play: aplay -f S16_LE -r 44100 -c 2 {p}",
+            pcm.len()
+        );
+    }
 }
