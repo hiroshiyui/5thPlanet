@@ -42,6 +42,13 @@ struct Dbg {
     /// fires only when `R[idx] == val`. Set via `b <addr> <regidx> <val>`.
     master_bp_cond: Option<(usize, u32)>,
     slave_bp: Option<u32>,
+    /// Optional register guard on `slave_bp`: `(reg-index, value)` — fires only
+    /// when slave `R[idx] == val`. Set via `bs <addr> <regidx> <val>`.
+    slave_bp_cond: Option<(usize, u32)>,
+    /// Optional memory probe address captured (read through the bus = raw WRAM,
+    /// no CPU cache) on any breakpoint hit. Set via `probe <addr>`. Compares
+    /// what a CPU loaded (via its cache) against true memory at the bp cycle.
+    bp_probe: Option<u32>,
     /// Poll watchpoints checked during `c`: (addr, size-in-bytes).
     watches: Vec<(u32, u8)>,
 }
@@ -511,15 +518,24 @@ impl Dbg {
             }
         }
         if let Some(pc) = self.slave_bp {
-            self.sat.set_slave_bp(pc);
+            match self.slave_bp_cond {
+                Some((idx, val)) => self.sat.set_slave_bp_cond(pc, idx, val),
+                None => self.sat.set_slave_bp(pc),
+            }
         }
+        // Arm the memory probe on whichever CPU breakpoint fires.
+        self.sat.set_master_bp_probe(self.bp_probe);
+        self.sat.set_slave_bp_probe(self.bp_probe);
         for f in 0..max_frames {
             self.sat.run_for(CYCLES_PER_FRAME);
-            if let Some((r, pr, gbr, code)) = self.sat.take_master_bp_hit() {
+            if let Some((r, pr, gbr, code, probe)) = self.sat.take_master_bp_hit() {
                 println!(
                     "master breakpoint hit at frame {f}: pc={:08X}",
                     self.master_bp.unwrap_or(0)
                 );
+                if let Some(a) = self.bp_probe {
+                    println!("  probe [{a:08X}] = {probe:08X} (raw WRAM via bus)");
+                }
                 println!(
                     "  r0-7:  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
                     r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
@@ -552,10 +568,25 @@ impl Dbg {
                 }
                 return;
             }
-            if let Some((r, ..)) = self.sat.take_slave_bp_hit() {
+            if let Some((r, pr, gbr, code, probe)) = self.sat.take_slave_bp_hit() {
                 println!(
-                    "slave breakpoint hit at frame {f}; r0={:08X} r15={:08X}",
-                    r[0], r[15]
+                    "slave breakpoint hit at frame {f}: pc={:08X}",
+                    self.slave_bp.unwrap_or(0)
+                );
+                if let Some(a) = self.bp_probe {
+                    println!("  probe [{a:08X}] = {probe:08X} (raw WRAM via bus)");
+                }
+                println!(
+                    "  r0-7:  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+                );
+                println!(
+                    "  r8-15: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+                );
+                println!(
+                    "  pr={pr:08X} gbr={gbr:08X} code={:04X?}",
+                    &code[..code.len().min(8)]
                 );
                 return;
             }
@@ -686,11 +717,32 @@ impl Dbg {
             "bs" => match a1.and_then(parse_num) {
                 Some(pc) => {
                     self.slave_bp = Some(pc);
-                    println!("slave bp @ {pc:08X}");
+                    // Optional register guard: `bs <addr> <regidx> <val>`.
+                    self.slave_bp_cond = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
+                        (Some(idx), Some(val)) if idx < 16 => Some((idx as usize, val)),
+                        _ => None,
+                    };
+                    match self.slave_bp_cond {
+                        Some((idx, val)) => {
+                            println!("slave bp @ {pc:08X} when R{idx}=={val:08X}")
+                        }
+                        None => println!("slave bp @ {pc:08X}"),
+                    }
                 }
                 None => {
                     self.slave_bp = None;
+                    self.slave_bp_cond = None;
                     println!("slave bp cleared");
+                }
+            },
+            "probe" => match a1.and_then(parse_num) {
+                Some(addr) => {
+                    self.bp_probe = Some(addr);
+                    println!("bp probe @ {addr:08X} (raw WRAM captured on next bp hit)");
+                }
+                None => {
+                    self.bp_probe = None;
+                    println!("bp probe cleared");
                 }
             },
             "m" | "x" => match a1.and_then(parse_num) {
@@ -791,7 +843,8 @@ sdbg commands:
   frame [n]       run n full frames (slave+VDP+CD advance)         [alias f]
   run <cyc>       run_for <cyc> master cycles (full system)
   b [pc] [ri v]   set/clear master bp (hex); optional guard: fire only when R[ri]==v
-  bs [pc]         set/clear slave breakpoint
+  bs [pc] [ri v]  set/clear slave breakpoint (opt. guard: fire when slave R<ri>==v); use with fc
+  probe [addr]    set/clear bp memory probe — capture raw-WRAM [addr] (via bus, no cache) on a bp hit
   w <addr> [sz]   add a poll watchpoint (size 1/2/4, default 2), checked in `c`
   dw              clear watchpoints
   find32 <v> [start] [len]  scan memory for a 32-bit value (default: high WRAM)
@@ -887,6 +940,8 @@ fn main() {
         master_bp: None,
         master_bp_cond: None,
         slave_bp: None,
+        slave_bp_cond: None,
+        bp_probe: None,
         watches: Vec::new(),
     };
     println!(

@@ -497,7 +497,7 @@ fn dump_giveup_state() {
         }
     }
 
-    let Some((r, pr, gbr, code)) = hit else {
+    let Some((r, pr, gbr, code, _probe)) = hit else {
         println!(
             "give-up 0x{giveup:08X} NOT hit in {frames} frames (pc=0x{:08X})",
             sat.master().regs.pc

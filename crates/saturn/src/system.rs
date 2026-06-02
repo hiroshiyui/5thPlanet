@@ -283,12 +283,23 @@ impl Saturn {
             .set_bp_cond(pc, idx, val);
     }
 
-    /// Debug-only: take a breakpoint hit's (R0..R15, PR, GBR, code words), if it fired.
-    pub fn take_master_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
+    /// Debug-only: take a master breakpoint hit's (R0..R15, PR, GBR, code words,
+    /// probe-value), if it fired. The probe value is the bus read of the address
+    /// set via [`set_master_bp_probe`] at the hit cycle (0 if unset).
+    pub fn take_master_bp_hit(&mut self) -> Option<crate::scheduler::BpHit> {
         self.scheduler
             .entity_mut(self.master_id)
             .sh2_mut()
             .take_bp_hit()
+    }
+
+    /// Debug-only: set/clear the master breakpoint memory probe (see
+    /// [`crate::scheduler::Sh2Entity::set_bp_probe`]).
+    pub fn set_master_bp_probe(&mut self, addr: Option<u32>) {
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_bp_probe(addr);
     }
 
     /// Debug-only: arm a full-speed breakpoint on the *slave* SH-2.
@@ -299,12 +310,34 @@ impl Saturn {
             .set_bp(pc);
     }
 
-    /// Debug-only: take the slave breakpoint hit's (R0..R15, PR, GBR, code words).
-    pub fn take_slave_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
+    /// Debug-only: arm a register-guarded *slave* breakpoint — fires at `pc`
+    /// only when `R[idx] == val` (mirror of [`set_master_bp_cond`]). Used for
+    /// slave-crash debugging — e.g. stop at a `JSR @Rn` exactly on the call
+    /// where the function-pointer register is null (the Doukyuusei intro crash).
+    pub fn set_slave_bp_cond(&mut self, pc: u32, idx: usize, val: u32) {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_bp_cond(pc, idx, val);
+    }
+
+    /// Debug-only: take the slave breakpoint hit's (R0..R15, PR, GBR, code words,
+    /// probe-value). The probe value is the bus read of [`set_slave_bp_probe`]'s
+    /// address at the hit cycle (0 if unset).
+    pub fn take_slave_bp_hit(&mut self) -> Option<crate::scheduler::BpHit> {
         self.scheduler
             .entity_mut(self.slave_id)
             .sh2_mut()
             .take_bp_hit()
+    }
+
+    /// Debug-only: set/clear the slave breakpoint memory probe (see
+    /// [`crate::scheduler::Sh2Entity::set_bp_probe`]).
+    pub fn set_slave_bp_probe(&mut self, addr: Option<u32>) {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_bp_probe(addr);
     }
 
     /// Debug-only: step the master SH-2 exactly one instruction, then

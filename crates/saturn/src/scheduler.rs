@@ -130,6 +130,11 @@ pub struct EntityId(pub(crate) usize);
 
 // ---- Concrete entity: SH-2 wrapped for the Saturn bus context. -----------
 
+/// A captured breakpoint hit: `(R0..R15, PR, GBR, 48 code words at the bp,
+/// probe-value)`. The probe value is the bus (raw-WRAM) read of the configured
+/// [`Sh2Entity::set_bp_probe`] address at the hit cycle (0 if unset).
+pub type BpHit = ([u32; 16], u32, u32, Vec<u16>, u32);
+
 /// Schedulable wrapper around an `sh2::Cpu`. The entity's `next_deadline`
 /// is the CPU's `pipeline.cycles` when running, or `u64::MAX` when
 /// halted — that way the scheduler's "most-behind wins" rule naturally
@@ -160,13 +165,20 @@ pub struct Sh2Entity {
     #[serde(skip)]
     bp: Option<u32>,
     #[serde(skip)]
-    bp_hit: Option<([u32; 16], u32, u32, Vec<u16>)>,
+    bp_hit: Option<BpHit>,
     /// Optional register guard on [`bp`]: when `Some((idx, val))` the breakpoint
     /// fires only if `regs.r[idx] == val` at the PC. Lets a debugger stop at a
     /// shared routine (e.g. the generic CD-command writer) on the *one* call
     /// that carries a specific argument, instead of the first call. `#[serde(skip)]`.
     #[serde(skip)]
     bp_cond: Option<(usize, u32)>,
+    /// Optional memory probe: when set, a breakpoint hit also captures the
+    /// 32-bit value at this address read **through the bus** (raw WRAM, *not*
+    /// the CPU cache). Lets a debugger compare what a CPU loaded (via its cache /
+    /// cache-through) against the true backing memory at the exact bp cycle —
+    /// the decisive test for a cache-coherency vs torn-write bug. `#[serde(skip)]`.
+    #[serde(skip)]
+    bp_probe: Option<u32>,
 }
 
 impl Sh2Entity {
@@ -179,6 +191,7 @@ impl Sh2Entity {
             bp: None,
             bp_hit: None,
             bp_cond: None,
+            bp_probe: None,
         }
     }
 
@@ -192,6 +205,7 @@ impl Sh2Entity {
             bp: None,
             bp_hit: None,
             bp_cond: None,
+            bp_probe: None,
         }
     }
 
@@ -238,8 +252,17 @@ impl Sh2Entity {
         self.bp_cond = Some((idx, val));
     }
 
-    /// Take the captured (registers, code-words) from a breakpoint hit, if any.
-    pub fn take_bp_hit(&mut self) -> Option<([u32; 16], u32, u32, Vec<u16>)> {
+    /// Set (or clear) the breakpoint memory probe — the 32-bit address whose
+    /// bus value is captured alongside the registers on the next bp hit (see
+    /// [`bp_probe`]). Independent of [`set_bp`]/[`set_bp_cond`].
+    pub fn set_bp_probe(&mut self, addr: Option<u32>) {
+        self.bp_probe = addr;
+    }
+
+    /// Take the captured (registers, PR, GBR, code-words, probe-value) from a
+    /// breakpoint hit, if any. The probe value is the bus (raw-WRAM) read of
+    /// [`bp_probe`] at the hit cycle, or 0 if no probe was set.
+    pub fn take_bp_hit(&mut self) -> Option<BpHit> {
         self.bp_hit.take()
     }
 }
@@ -275,7 +298,19 @@ impl SchedEntity for Sh2Entity {
                 for i in 0..48u32 {
                     code.push(ctx.read16(bp + i * 2, AccessKind::Data).0);
                 }
-                self.bp_hit = Some((self.cpu.regs.r, self.cpu.regs.pr, self.cpu.regs.gbr, code));
+                // Probe the backing memory through the bus (raw WRAM, no CPU
+                // cache) at the exact bp cycle — for cache/torn-write diagnosis.
+                let probe = self
+                    .bp_probe
+                    .map(|a| ctx.read32(a, AccessKind::Data).0)
+                    .unwrap_or(0);
+                self.bp_hit = Some((
+                    self.cpu.regs.r,
+                    self.cpu.regs.pr,
+                    self.cpu.regs.gbr,
+                    code,
+                    probe,
+                ));
             }
             if let Some(trace) = &mut self.pc_trace {
                 let pc = self.cpu.regs.pc;
