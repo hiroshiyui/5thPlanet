@@ -788,6 +788,7 @@ impl Dbg {
                 let (dsp_run, efreg) = s.dsp_state();
                 let efmax = efreg.iter().map(|&e| (e as i32).abs()).max().unwrap_or(0);
                 println!("  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}", &efreg[..4]);
+                println!("  DSP program writes EFREG indices (EWT targets): {:?}", s.dsp_ewt_targets());
                 // Per-active-slot playback parameters — to tell a mis-programmed
                 // slot (bad SA/pitch/loop) from a render bug (sane params).
                 for i in 0..32 {

@@ -652,6 +652,26 @@ impl ScspCtrl {
         (self.dsp.running(), self.dsp.efreg)
     }
 
+    /// Debug: the distinct EFREG output indices the loaded DSP microprogram
+    /// writes (its EWT instructions' EWA fields, bits 27-24). A slot's effect
+    /// return reads `EFREG[slot]`, so this shows which slots' returns the program
+    /// actually feeds — i.e. whether a DSP-routed voice (e.g. slot 0) is ever
+    /// produced at all.
+    pub fn dsp_ewt_targets(&self) -> Vec<u8> {
+        let mut t = Vec::new();
+        for step in 0..128 {
+            let ip2 = self.dsp.mpro[step * 4 + 2];
+            if (ip2 >> 12) & 1 != 0 {
+                let ewa = ((ip2 >> 8) & 0xF) as u8;
+                if !t.contains(&ewa) {
+                    t.push(ewa);
+                }
+            }
+        }
+        t.sort_unstable();
+        t
+    }
+
     /// Produce one output sample (signed 16-bit, pre-envelope) for slot `i`,
     /// advancing its phase and applying the loop mode. Reads waveform data
     /// from `ram` (the SCSP sound RAM). Returns 0 for an inactive slot.
@@ -890,6 +910,12 @@ impl Scsp {
     /// Debug: effect-DSP running flag + its EFREG output registers.
     pub fn dsp_state(&self) -> (bool, [i16; 16]) {
         self.ctrl.dsp_state()
+    }
+
+    /// Debug: EFREG indices the loaded DSP microprogram writes (see
+    /// [`ScspCtrl::dsp_ewt_targets`]).
+    pub fn dsp_ewt_targets(&self) -> Vec<u8> {
+        self.ctrl.dsp_ewt_targets()
     }
 
     /// One output sample (pre-envelope) for slot `i`, reading the shared sound
