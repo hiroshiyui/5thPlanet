@@ -102,10 +102,22 @@ impl Frt {
         match offset & 0x0F {
             0x00 => self.tier = val,
             0x01 => {
-                // FTCSR status bits are write-1-to-clear (W1C). The CCLRA
-                // bit (bit 0) is read/write.
-                let w1c_mask = 0b1111_1110;
-                self.ftcsr = (self.ftcsr & !(val & w1c_mask)) | (val & 0x01);
+                // SH7604 FRT FTCSR status flags (ICF bit7, OCFA bit3, OCFB bit2,
+                // OVF bit1) are **write-0-to-clear after a read-1**, NOT W1C: the
+                // hardware clears a flag when software writes 0 to it after
+                // having read it as 1. Model the common, sufficient form
+                // (write-0-clears: `new = old & written` for the status bits) —
+                // a flag is kept when 1 is written, cleared when 0 is written.
+                // CCLRA (bit 0) is an ordinary read/write control bit.
+                //
+                // The previous W1C was wrong and load-bearing: software (e.g. the
+                // SH-2 inter-CPU FRT input-capture handshake) clears ICF by
+                // writing 0 to it; under W1C that write was ignored, so ICF
+                // stayed stuck set and an ICF-polling wait loop never actually
+                // waited — it spun through, reading shared state at the wrong
+                // time (the Doukyuusei intro slave crash).
+                const STATUS: u8 = 0b1000_1110; // ICF|OCFA|OCFB|OVF
+                self.ftcsr = (self.ftcsr & val & STATUS) | (val & 0x01);
             }
             0x02 => self.frc = ((val as u16) << 8) | (self.frc & 0x00FF),
             0x03 => self.frc = (self.frc & 0xFF00) | val as u16,
@@ -196,11 +208,18 @@ mod tests {
     }
 
     #[test]
-    fn write_one_clears_status_flags() {
+    fn write_zero_clears_status_flags_write_one_keeps() {
+        // SH7604 FRT FTCSR: status flags (ICF/OCFA/OCFB/OVF) are cleared by
+        // writing 0 after reading 1 — NOT W1C. Writing 1 keeps the flag.
         let mut f = Frt::new();
         f.ftcsr = 0x0E; // OCFA | OCFB | OVF set
-        f.write8(0x01, 0x0F); // W1C all status, also set CCLRA
-        assert_eq!(f.ftcsr, 0x01);
+        f.write8(0x01, 0x01); // status bits = 0 → clear all; CCLRA (bit 0) = 1
+        assert_eq!(f.ftcsr, 0x01, "write-0 clears the status flags; CCLRA set");
+
+        // Writing 1 to a status flag does NOT clear it (cannot set either).
+        f.ftcsr = 0x0E;
+        f.write8(0x01, 0x0E); // status bits = 1 → kept
+        assert_eq!(f.ftcsr, 0x0E, "write-1 keeps the status flags (not W1C)");
     }
 
     #[test]

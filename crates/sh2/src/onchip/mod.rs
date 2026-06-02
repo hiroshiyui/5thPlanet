@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn frt_compare_match_raises_ocia_and_clears_on_w1c() {
+    fn frt_compare_match_raises_ocia_and_clears_on_write_zero() {
         let mut o = OnChip::new();
         o.write16(0xFFFF_FE60, 0x0700); // IPRB FRT priority (bits 11..8) = 7
         o.write8(0xFFFF_FE10, 0x08); // TIER: OCIAE (output-compare-A int enable)
@@ -368,10 +368,11 @@ mod tests {
             Some((Source::FrtOcia, 7)),
             "OCIA asserted while OCFA is set"
         );
-        // Software clears OCFA via W1C; the pending bit drops next refresh.
-        o.write8(0xFFFF_FE11, 0x08); // FTCSR W1C of OCFA
+        // SH7604 FRT: software clears OCFA by writing 0 to it (after reading 1),
+        // not W1C; the pending bit drops next refresh.
+        o.write8(0xFFFF_FE11, 0x00); // FTCSR: write 0 to the status flags → clear
         o.refresh_interrupts();
-        assert_eq!(o.intc.next_pending(0), None, "cleared after W1C");
+        assert_eq!(o.intc.next_pending(0), None, "cleared after write-0");
     }
 
     #[test]
