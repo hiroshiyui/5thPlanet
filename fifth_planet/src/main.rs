@@ -305,6 +305,14 @@ fn run(
     // Current texture (and frozen-frame) resolution; updated when a game
     // switches video mode so the texture/pitch track the active display size.
     let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+    // Audio-paced emulation: keep ~this many bytes of SCSP output buffered in the
+    // SDL queue. `44_100 * 2 * 2` is one second (44.1 kHz × 2 channels × 2 bytes),
+    // so `/ 12` ≈ 83 ms (~5 frames) — comfortably above SDL's ~23 ms period. The
+    // audio draining in real time, not the display vsync, sets the emulator speed.
+    let audio_target_bytes = 44_100 * 2 * 2 / 12;
+    // Cap frames run per render iteration so a slow frame / stalled audio device
+    // can't starve the UI (it just falls a little behind and catches up next time).
+    let max_frames_per_burst = 8;
 
     // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
     // the slot-less `<bios>.state`).
@@ -415,25 +423,36 @@ fn run(
             }
             saturn.set_pad1(held);
 
-            // The active display size (320/352/640/704 × …) comes from TVMD;
-            // re-create the streaming texture when a game switches resolution
-            // (e.g. a hi-res 640-wide title screen) so the content isn't cut.
-            let (w, h) = saturn.run_frame(&mut framebuffer);
-            if (w, h) != cur_dims {
-                texture = creator
-                    .create_texture_streaming(PixelFormatEnum::ABGR8888, w as u32, h as u32)
-                    .expect("recreate streaming texture");
-                cur_dims = (w, h);
+            // Audio-paced emulation: run frames until the SDL audio queue holds
+            // the target latency, then stop. The SCSP's 44.1 kHz output drains in
+            // real time, so *the audio device* sets the emulator's speed — not the
+            // display vsync — and the queue never under-runs (smooth BGM on any
+            // refresh rate). *All* audio is queued (no dropping). The burst is
+            // capped so a slow frame / stalled device can't starve the render; it
+            // just falls a little behind and catches up next iteration. The TVMD
+            // resolution can change mid-burst (a hi-res title), so re-create the
+            // texture on change.
+            let mut burst = 0;
+            while audio_queue.size() < audio_target_bytes && burst < max_frames_per_burst {
+                let dims = saturn.run_frame(&mut framebuffer);
+                if dims != cur_dims {
+                    texture = creator
+                        .create_texture_streaming(
+                            PixelFormatEnum::ABGR8888,
+                            dims.0 as u32,
+                            dims.1 as u32,
+                        )
+                        .expect("recreate streaming texture");
+                    cur_dims = dims;
+                }
+                audio_queue.queue_audio(&saturn.take_audio()).ok();
+                burst += 1;
             }
 
-            // Queue this frame's SCSP audio, unless we're already buffered well
-            // ahead (keeps latency bounded if the host runs faster than realtime).
-            let audio_samples = saturn.take_audio();
-            if audio_queue.size() < 44_100 * 2 * 2 / 4 {
-                audio_queue.queue_audio(&audio_samples).ok();
-            }
-
-            // A lingering toast (e.g. "Quicksave") is drawn over the live frame.
+            // Present the latest frame (re-presents the last one if the queue was
+            // already full and no frame ran). A lingering toast (e.g. "Quicksave")
+            // is drawn over it.
+            let (w, h) = cur_dims;
             osd.tick_toast();
             osd.render_overlay(&mut framebuffer, w, h, &ctx);
             texture
