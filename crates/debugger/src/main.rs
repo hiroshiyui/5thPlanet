@@ -75,6 +75,34 @@ fn parse_hex_bytes(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Decode set HIRQ bits to their names (for the `hirqlog` CD-timing trace).
+fn hirq_bits(v: u16) -> String {
+    const NAMES: [(u16, &str); 12] = [
+        (0x001, "CMOK"),
+        (0x002, "DRDY"),
+        (0x004, "CSCT"),
+        (0x008, "BFUL"),
+        (0x010, "PEND"),
+        (0x020, "DCHG"),
+        (0x040, "ESEL"),
+        (0x080, "EHST"),
+        (0x100, "ECPY"),
+        (0x200, "EFLS"),
+        (0x400, "SCDQ"),
+        (0x800, "MPED"),
+    ];
+    let s: Vec<&str> = NAMES
+        .iter()
+        .filter(|(b, _)| v & b != 0)
+        .map(|(_, n)| *n)
+        .collect();
+    if s.is_empty() {
+        "-".into()
+    } else {
+        s.join("|")
+    }
+}
+
 /// Short mnemonic for a CD-block host command (subset; falls back to hex).
 fn cd_name(cmd: u8) -> &'static str {
     match cmd {
@@ -400,6 +428,32 @@ impl Dbg {
         }
     }
 
+    /// Dump the last `n` HIRQ-edge entries (M11 CD-timing alignment): each
+    /// `old -> new (cause)` with the bits set (+) and cleared (-). The cause is
+    /// the command mnemonic, or `readpump`/`w1c`. Diff this timeline against
+    /// Mednafen's `cdb.cpp` HIRQ to pin the exact bit/edge the GFS server reads.
+    fn hirqlog(&self, n: usize) {
+        let log = &self.sat.bus.cd_block.hirq_log;
+        if log.is_empty() {
+            println!("(HIRQ-edge log empty — enabled at startup; run something first)");
+            return;
+        }
+        let start = log.len().saturating_sub(n);
+        for &(old, new, cause) in &log[start..] {
+            let cause_s = match cause {
+                0x100 => "readpump".to_string(),
+                0x101 => "w1c".to_string(),
+                c => format!("cmd:{}", cd_name(c as u8)),
+            };
+            println!(
+                "  {old:04X} -> {new:04X}  {cause_s:<18} +{}  -{}",
+                hirq_bits(new & !old),
+                hirq_bits(old & !new),
+            );
+        }
+        println!("({} entries; showed last {})", log.len(), n.min(log.len()));
+    }
+
     /// Single-step the master `n` instructions (slave frozen; peripherals drained).
     fn step(&mut self, n: u64) {
         for _ in 0..n {
@@ -656,6 +710,7 @@ impl Dbg {
             "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
             "cd" => self.cd_state(),
             "cdlog" => self.cdlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(20)),
+            "hirqlog" => self.hirqlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(40)),
             "vdp" => println!(
                 "VDP2 display_enabled={}  VDP1 drawing={}",
                 self.sat.bus.vdp2.regs.display_enabled(),
@@ -748,6 +803,7 @@ sdbg commands:
   t68 [n]         dump last n 68k PCs (disassembled) from the trace ring
   cd              CD-block state (status/hirq/curfad/partitions)
   cdlog [n]       last n CD host commands
+  hirqlog [n]     last n HIRQ-edge changes (old->new +set -clr, cause) [CD-timing]
   vdp             VDP display state
   scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)
@@ -820,6 +876,8 @@ fn main() {
     }
     // CD command history on by default — the debugger's most-used view.
     sat.bus.cd_block.cmd_log_on = true;
+    // HIRQ-edge log on by default (M11 CD-timing alignment; `hirqlog`).
+    sat.bus.cd_block.hirq_log_on = true;
     // SCSP 68k PC ring on by default (for `t68` sound-driver tracing).
     sat.bus.scsp.enable_68k_trace();
 

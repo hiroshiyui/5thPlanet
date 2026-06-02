@@ -370,7 +370,27 @@ pub struct CdBlock {
     /// can record the caller in [`cmd_log`](Self::cmd_log). Debug-only.
     #[serde(skip)]
     pub caller_pc: u32,
+
+    /// Debug-only HIRQ-edge log (M11 CD-timing alignment, plan Phase 1): when
+    /// `hirq_log_on`, records `(old, new, cause)` on every HIRQ change —
+    /// including the *between-command* read-pump (CSCT/PEND) and host-W1C edges
+    /// that the per-command [`cmd_log`](Self::cmd_log) misses — so our HIRQ
+    /// *timeline* can be diffed against Mednafen's `cdb.cpp` to pin the exact
+    /// bit/edge whose timing the game's GFS server reads. `cause` is the command
+    /// byte (0x00..=0xFF), or [`HIRQ_CAUSE_READPUMP`]/[`HIRQ_CAUSE_W1C`].
+    /// `#[serde(skip)]` (debug-only — save-state determinism untouched).
+    #[serde(skip)]
+    pub hirq_log: Vec<(u16, u16, u32)>,
+    #[serde(skip)]
+    pub hirq_log_on: bool,
+    #[serde(skip)]
+    last_hirq: u16,
 }
+
+/// [`CdBlock::hirq_log`] cause: the read pump (`play_data`) changed HIRQ.
+pub const HIRQ_CAUSE_READPUMP: u32 = 0x100;
+/// [`CdBlock::hirq_log`] cause: the host write-1-to-clear changed HIRQ.
+pub const HIRQ_CAUSE_W1C: u32 = 0x101;
 
 /// One [`CdBlock::cmd_log`] entry — a detailed CD host-command record for the
 /// M11 boot trace: the master-SH-2 PC that issued the command, the command
@@ -461,6 +481,20 @@ impl CdBlock {
             cmd_log: Vec::new(),
             cmd_log_on: false,
             caller_pc: 0,
+            hirq_log: Vec::new(),
+            hirq_log_on: false,
+            last_hirq: HIRQ_MPED, // matches the power-on `hirq` above
+        }
+    }
+
+    /// Record a HIRQ change to [`hirq_log`](Self::hirq_log) (debug-only; no-op
+    /// unless `hirq_log_on`). Called after every site that mutates `hirq`.
+    fn note_hirq(&mut self, cause: u32) {
+        if self.hirq_log_on && self.hirq != self.last_hirq {
+            if self.hirq_log.len() < 16384 {
+                self.hirq_log.push((self.last_hirq, self.hirq, cause));
+            }
+            self.last_hirq = self.hirq;
         }
     }
 
@@ -645,6 +679,7 @@ impl CdBlock {
                     self.disk_changed = false;
                 }
                 self.hirq = (self.hirq & val) | HIRQ_MPED;
+                self.note_hirq(HIRQ_CAUSE_W1C);
             }
             0x000C => self.hirq_mask = val,
             0x0018 => {
@@ -944,6 +979,7 @@ impl CdBlock {
             }
             _ => {}
         }
+        self.note_hirq(HIRQ_CAUSE_READPUMP);
     }
 
     /// Decode one Red Book audio sector at `fad` into the CD-DA FIFO: 2352 raw
@@ -1253,6 +1289,7 @@ impl CdBlock {
     /// `hirq_in` is the HIRQ the host saw just before issuing it.
     fn dispatch(&mut self, command: u8, cr_in: [u16; 4], hirq_in: u16) {
         self.dispatch_inner(command, cr_in);
+        self.note_hirq(command as u32);
         // M11 boot-trace ring (off by default; see `cmd_log`). Collapse a run of
         // consecutive GetStatus(0x00) polls from the same caller into a single
         // entry (the stall spins on it) so the ring keeps the meaningful command
