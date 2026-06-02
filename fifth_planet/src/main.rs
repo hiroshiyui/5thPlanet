@@ -261,6 +261,15 @@ fn run(
             },
         )
         .expect("open audio queue");
+    // Report what SDL actually opened. If you hear nothing, check this line: a
+    // dummy/empty driver or a spec far from 44100/2/S16 means SDL didn't get a
+    // working backend — try `SDL_AUDIODRIVER=pulseaudio` (or `pipewire`/`alsa`)
+    // and confirm the app shows up in your system mixer.
+    eprintln!(
+        "SDL audio: driver={:?}, obtained spec={:?}",
+        audio.current_audio_driver(),
+        audio_queue.spec()
+    );
     audio_queue.resume();
     let window = video
         .window("5thPlanet", FRAME_WIDTH as u32 * 2, FRAME_HEIGHT as u32 * 2)
