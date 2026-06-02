@@ -251,8 +251,13 @@ input-capture pin so the other CPU drives it: a **16-bit** write to
 `0x0100_0000..0x017F_FFFF` pulses the [slave]'s FTI, `0x0180_0000..0x01FF_FFFF`
 the master's, setting that core's `FTCSR.ICF`. A core polling `ICF` (or taking
 the input-capture interrupt) is thereby woken by the other — the dispatch
-mechanism VF2 uses to hand work to its slave. Modeled by `SaturnBus` flagging
-the write and `Saturn::drain_input_capture` pulsing the target FRT.
+mechanism VF2 and Doukyuusei ~if~ use to hand work to their slave. Modeled by
+`SaturnBus` flagging the write and `Saturn::drain_input_capture` pulsing the
+target FRT. **The woken core clears `ICF` by writing 0 to it** (the SH7604
+write-0-after-read semantic — *not* W1C); ours wrongly modeled `FTCSR` as W1C, so
+that clear was ignored, `ICF` stuck set, and the slave's `ICF` wait-loop never
+waited (it read shared work mid-update) — the Doukyuusei intro slave crash, fixed
+in `073805d`.
 
 ---
 
@@ -270,6 +275,15 @@ global cycle alongside [VCNT] / [TVSTAT].
 [Low Work RAM] (1-cycle vs 3-cycle wait states). Saturn programs
 typically run code from here.
 
+**HRESO / hi-res** — Horizontal-resolution field of [TVMD] (bits 2..0):
+0/4 → 320, 1/5 → 352, 2/6 → 640, 3/7 → 704 dots (the bit-2 variants are the
+31 kHz "exclusive monitor" modes). 640/704 are *hi-res* — twice the dot count
+(finer, half-width dots), used by text-heavy games (e.g. *Doukyuusei ~if~*'s
+640×224 title). Vertical resolution is a separate TVMD field (224/240/256, ×2
+for double-density interlace). The VDP2 renderer decodes the active size via
+`Vdp2Regs::screen_dims`; `render_frame` renders it and returns the dims, and the
+frontend re-creates its SDL texture when the mode changes (M11).
+
 **HIRQ** — Host Interrupt Request flags, the [CD-block]'s 16-bit status
 register at `0x0589_8008`. Each bit signals an event the host polls: `CMOK`
 (command complete, `0x01`), `DRDY` (data ready), `CSCT` (sector read), `PEND`
@@ -277,7 +291,10 @@ register at `0x0589_8008`. Each bit signals an event the host polls: `CMOK`
 end), `EFLS` (filesystem), `SCDQ` (subcode-Q), `MPED` (MPEG — held set since
 there is no MPEG card). Write-1-to-clear: the host writes a word and a written
 `0` clears that flag (`HIRQ &= val`). The BIOS polls HIRQ between CD commands to
-sequence disc recognition and the game boot.
+sequence disc recognition and the game boot. **(M11)** `(HIRQ & HIRQ_Mask)` also
+drives the CD-block's **SCU external interrupt** ([SCU] source 16, vector 0x50,
+level 7) for interrupt-driven CD I/O — though many games (VF2) leave it masked
+and poll HIRQ instead.
 
 ---
 

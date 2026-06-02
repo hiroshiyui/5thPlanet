@@ -24,9 +24,9 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 boots + runs; timing-accuracy blocker |
+| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 Doukyuusei ~if~ boots to its title screen (640×224 hi-res); VF2 on a CD-state wall |
 
-Current test count: **530 workspace-wide, 0 failures.** Task-by-task
+Current test count: **531 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
@@ -192,11 +192,13 @@ instruction:
   stream to diff against ours (both running the real BIOS). That diff
   pinned the M11 root — a spurious `DCHG` (Disc Changed) our CD-block
   re-raised at `Init`, which made the BIOS loop recognition — and with it
-  fixed, VF2 and Doukyuusei ~if~ now load their 1st-read program and reach
-  their own game code (VF2 at `0x06004000`). Post-boot, a dev-build CD-command
-  trace-diff proved our CD layer byte-identical to Mednafen through VF2's asset
-  load, localizing the remaining blocker to scheduler/interrupt-timing accuracy
-  (Mednafen-alignment Phase 2+) rather than the CD-block.
+  fixed, VF2 and Doukyuusei ~if~ now load their 1st-read program and run their
+  own game code. **Doukyuusei ~if~ boots all the way to its title screen**
+  (rendered at its native 640×224 hi-res): its intro slave crash was a SH7604
+  FRT `FTCSR` write-0-to-clear bug (the inter-CPU FRT input-capture handshake),
+  and VDP2 hi-res rendering then displayed it without overflow. VF2 still loops
+  in its intro on a polled-CD-state divergence — the remaining game-boot
+  blocker — with the CD-HIRQ axis now exhausted for it.
 - [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
   reference. Its Saturn driver models the chips closely (down to a
   low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
