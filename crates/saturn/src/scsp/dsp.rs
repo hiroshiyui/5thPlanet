@@ -294,7 +294,10 @@ impl Dsp {
                 };
             }
             if ewt != 0 {
-                self.efreg[ewa] = self.efreg[ewa].wrapping_add((shifted >> 8) as i16);
+                // Mednafen `scsp.inc:1340` *sets* EFREG[EWA] (last write wins),
+                // not accumulates — multiple writes to one EWA in a pass must
+                // take the latest, else they sum (and can cancel to 0).
+                self.efreg[ewa] = (shifted >> 8) as i16;
             }
         }
         self.dec = self.dec.wrapping_sub(1);

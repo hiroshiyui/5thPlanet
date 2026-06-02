@@ -242,6 +242,45 @@ impl Timer {
     }
 }
 
+/// Debug snapshot of a slot's key playback parameters (sdbg `scsp`): the
+/// register-derived config (sample address / loop / pitch / pan / total level)
+/// plus the live phase and envelope state. Lets a garbled-audio diagnosis tell a
+/// mis-programmed slot (wrong SA/pitch/loop from the sound driver) from a render
+/// bug (sane params, bad output).
+#[derive(Clone, Copy, Debug)]
+pub struct SlotDebug {
+    pub active: bool,
+    /// Sample start byte address into sound RAM (20-bit).
+    pub sa: u32,
+    /// Loop start / end (sample index past SA).
+    pub lsa: u16,
+    pub lea: u16,
+    /// 8-bit PCM (else 16-bit).
+    pub pcm8: bool,
+    /// Loop control: 0 none, 1 normal, 2 reverse, 3 ping-pong.
+    pub lpctl: u8,
+    /// Pitch: signed octave (−8..+7) and 10-bit fine.
+    pub oct: i8,
+    pub fns: u16,
+    /// Live phase accumulator + increment (`cur >> 12` = sample index).
+    pub step: u32,
+    pub cur: u32,
+    /// Envelope phase ("ATK"/"D1"/"D2"/"REL") and log volume (0 silent … 0x3FF).
+    pub eg_state: &'static str,
+    pub eg_volume: i32,
+    /// Direct output: send level (0 muted … 7 full) and pan (bit4 = side).
+    pub disdl: u8,
+    pub dipan: u8,
+    /// Total level attenuation (0 loudest … 0xFF).
+    pub tl: u16,
+    /// Effect send to the DSP: input level (IMXL, 0 = none) + input select (ISEL).
+    pub imxl: u8,
+    pub isel: u8,
+    /// Effect return from the DSP: output level (EFSDL, 0 = none) + pan (EFPAN).
+    pub efsdl: u8,
+    pub efpan: u8,
+}
+
 /// SCSP control + slot + DSP registers, with timer state and the derived
 /// interrupt lines. Register reads are plain; writes to the interrupt-control
 /// window have side effects (pending/reset/recompute).
@@ -571,6 +610,48 @@ impl ScspCtrl {
         self.slots[i].active
     }
 
+    /// Snapshot slot `i`'s playback parameters for debugging (see [`SlotDebug`]).
+    pub fn slot_debug(&self, i: usize) -> SlotDebug {
+        let data0 = self.slot_reg(i, 0);
+        let pitch = self.slot_reg(i, 8);
+        let oct_raw = ((pitch >> 11) & 0xF) as i32;
+        let regb = self.slot_reg(i, 0xB);
+        let s = &self.slots[i];
+        SlotDebug {
+            active: s.active,
+            sa: ((data0 as u32 & 0xF) << 16) | self.slot_reg(i, 1) as u32,
+            lsa: self.slot_reg(i, 2),
+            lea: self.slot_reg(i, 3),
+            pcm8: data0 & 0x0010 != 0,
+            lpctl: ((data0 >> 5) & 3) as u8,
+            oct: ((oct_raw ^ 8) - 8) as i8,
+            fns: pitch & 0x3FF,
+            step: s.step,
+            cur: s.cur,
+            eg_state: match s.eg.state {
+                EgState::Attack => "ATK",
+                EgState::Decay1 => "D1",
+                EgState::Decay2 => "D2",
+                EgState::Release => "REL",
+            },
+            eg_volume: s.eg.volume,
+            disdl: ((regb >> 13) & 7) as u8,
+            dipan: ((regb >> 8) & 0x1F) as u8,
+            tl: self.slot_reg(i, 6) & 0xFF,
+            imxl: (self.slot_reg(i, 0xA) & 7) as u8,
+            isel: ((self.slot_reg(i, 0xA) >> 3) & 0xF) as u8,
+            efsdl: ((regb >> 5) & 7) as u8,
+            efpan: (regb & 0x1F) as u8,
+        }
+    }
+
+    /// Debug: whether the effect DSP is running, plus its 16 output registers
+    /// (EFREG). Lets sdbg confirm whether audible output is coming through the
+    /// DSP effect path (for slots with their direct output muted, DISDL=0).
+    pub fn dsp_state(&self) -> (bool, [i16; 16]) {
+        (self.dsp.running(), self.dsp.efreg)
+    }
+
     /// Produce one output sample (signed 16-bit, pre-envelope) for slot `i`,
     /// advancing its phase and applying the loop mode. Reads waveform data
     /// from `ram` (the SCSP sound RAM). Returns 0 for an inactive slot.
@@ -661,19 +742,34 @@ impl ScspCtrl {
         let (lp, rp) = &*PAN_TABLES;
         let (mut l, mut r) = (0i32, 0i32);
         let dsp_on = self.dsp.running();
+        // The slot effect-return reads the DSP outputs (EFREG) produced from the
+        // *previous* sample's sends — Mednafen's one-sample effect pipeline
+        // (`scsp.inc`: the sends collected this pass feed `DSP.step` below, whose
+        // EFREG the next sample returns). Snapshot before the sends mutate it.
+        let efreg = self.dsp.efreg;
         for i in 0..NUM_SLOTS {
             if !self.slots[i].active {
                 continue;
             }
             let pcm = self.slot_sample(i, ram) as i32;
             let voice = (pcm * self.eg_advance(i)) >> PHASE_SHIFT;
-            // Direct output: pan + direct-sound level.
             let reg_b = self.slot_reg(i, 0xB);
-            let idx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
-            l += (voice * lp[idx]) >> PHASE_SHIFT;
-            r += (voice * rp[idx]) >> PHASE_SHIFT;
-            // Effect send: route the voice into the DSP input mix (ISEL) at
-            // the IMXL level (reg 0xA). Only when a DSP program is running.
+            // Direct output: DISDL send level (bits 15-13) + DIPAN (12-8).
+            let didx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
+            l += (voice * lp[didx]) >> PHASE_SHIFT;
+            r += (voice * rp[didx]) >> PHASE_SHIFT;
+            // Effect return: this slot's DSP output `EFREG[i]` (slots 0..15) at
+            // EFSDL send level (bits 7-5) + EFPAN (4-0). Same pan/level table as
+            // the direct path (Mednafen derives both via `SDL_PAN_ToVolume`;
+            // mixed `EFREG[slot] * EffectVolume` per slot, `scsp.inc:1669`).
+            if dsp_on && i < 16 {
+                let eidx = ((((reg_b >> 5) & 7) << 5) | (reg_b & 0x1F)) as usize;
+                let eff = efreg[i] as i32;
+                l += (eff * lp[eidx]) >> PHASE_SHIFT;
+                r += (eff * rp[eidx]) >> PHASE_SHIFT;
+            }
+            // Effect send: route the voice into the DSP input mix MIXS[ISEL] at
+            // the IMXL level (reg 0xA).
             if dsp_on {
                 let reg_a = self.slot_reg(i, 0xA);
                 let imxl = (reg_a & 7) as u32;
@@ -684,19 +780,13 @@ impl ScspCtrl {
             }
         }
         if dsp_on {
-            // Configure the delay ring from RBL/RBP (reg 0x402), run the
-            // effect program, and fold its outputs back (EFREG even→L, odd→R).
+            // Configure the delay ring from RBL/RBP (reg 0x402) and run the
+            // effect program; its EFREG outputs are read by the next sample's
+            // per-slot effect-return above.
             let rbc = self.read16(0x402);
             self.dsp.rbp = (rbc & 0x3F) as u32;
             self.dsp.rbl = 0x2000u32 << ((rbc >> 7) & 3);
             self.dsp.step(ram);
-            for (i, &e) in self.dsp.efreg.iter().enumerate() {
-                if i & 1 == 0 {
-                    l += (e as i32) << 4;
-                } else {
-                    r += (e as i32) << 4;
-                }
-            }
         }
         // The pan gains carry ×4 headroom (FIX(4·…)); undo it and clamp.
         (
@@ -790,6 +880,16 @@ impl Scsp {
     /// Whether PCM slot `i` is currently playing.
     pub fn slot_active(&self, i: usize) -> bool {
         self.ctrl.slot_active(i)
+    }
+
+    /// Snapshot slot `i`'s playback parameters for debugging (see [`SlotDebug`]).
+    pub fn slot_debug(&self, i: usize) -> SlotDebug {
+        self.ctrl.slot_debug(i)
+    }
+
+    /// Debug: effect-DSP running flag + its EFREG output registers.
+    pub fn dsp_state(&self) -> (bool, [i16; 16]) {
+        self.ctrl.dsp_state()
     }
 
     /// One output sample (pre-envelope) for slot `i`, reading the shared sound

@@ -785,6 +785,37 @@ impl Dbg {
                     "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
                     c.regs.sr.imask, c.regs.sr.supervisor
                 );
+                let (dsp_run, efreg) = s.dsp_state();
+                let efmax = efreg.iter().map(|&e| (e as i32).abs()).max().unwrap_or(0);
+                println!("  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}", &efreg[..4]);
+                // Per-active-slot playback parameters — to tell a mis-programmed
+                // slot (bad SA/pitch/loop) from a render bug (sane params).
+                for i in 0..32 {
+                    if !s.slot_active(i) {
+                        continue;
+                    }
+                    let d = s.slot_debug(i);
+                    println!(
+                        "  slot{i:02} SA={:05X} loop={}[{:04X}..{:04X}] {} oct={:+} fns={:03X} step={:05X} eg={}/{:03X} | direct(disdl={} pan={:02X}) tl={:02X} | dsp-send(imxl={} isel={}) dsp-ret(efsdl={} efpan={:02X})",
+                        d.sa,
+                        d.lpctl,
+                        d.lsa,
+                        d.lea,
+                        if d.pcm8 { "8b" } else { "16b" },
+                        d.oct,
+                        d.fns,
+                        d.step,
+                        d.eg_state,
+                        d.eg_volume >> 16,
+                        d.disdl,
+                        d.dipan,
+                        d.tl,
+                        d.imxl,
+                        d.isel,
+                        d.efsdl,
+                        d.efpan,
+                    );
+                }
             }
             "w" => match a1.and_then(parse_num) {
                 Some(addr) => {
