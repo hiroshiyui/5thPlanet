@@ -487,6 +487,16 @@ impl CdBlock {
         }
     }
 
+    /// Whether the CD-block is currently asserting its SCU external interrupt
+    /// ([`crate::scu::Source::Cd`]): `(HIRQ & HIRQ_Mask) != 0`, exactly
+    /// Mednafen's `RecalcIRQOut` condition (`cdb.cpp`). The Saturn aggregate
+    /// samples this each master instruction and feeds it to
+    /// [`Scu::set_cd_int`](crate::scu::Scu::set_cd_int) — the CD-block can't
+    /// reach the SCU from inside the bus, so the level is sampled at the top.
+    pub fn irq_active(&self) -> bool {
+        (self.hirq & self.hirq_mask) != 0
+    }
+
     /// Record a HIRQ change to [`hirq_log`](Self::hirq_log) (debug-only; no-op
     /// unless `hirq_log_on`). Called after every site that mutates `hirq`.
     fn note_hirq(&mut self, cause: u32) {

@@ -329,6 +329,8 @@ impl Saturn {
         // Phase 2B: sample the SCU IRL before the instruction, exactly as
         // `step_cpus` does on the real run, so the single-step debug path and
         // `run_for` deliver SCU interrupts at the same (per-instruction) point.
+        let cd_active = bus.cd_block.irq_active();
+        bus.scu.set_cd_int(cd_active);
         let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
         if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
             scheduler
@@ -589,6 +591,12 @@ impl Saturn {
             while scheduler.entity(*cd_id).next_deadline() <= mcyc {
                 scheduler.entity_mut(*cd_id).step(bus);
             }
+            // CD-block external interrupt (Source::Cd, vector 0x50, level 7):
+            // assert/deassert the SCU level from the live CD HIRQ before each
+            // instruction (Mednafen `RecalcIRQOut`). VF2's GFS file library is
+            // driven by this interrupt; without it the intro loops forever.
+            let cd_active = bus.cd_block.irq_active();
+            bus.scu.set_cd_int(cd_active);
             // Phase 2B: sample the SCU interrupt line at the master's *current*
             // SR.imask, every instruction. The SCU presents the highest-priority
             // unmasked pending source as an IRL the master samples each cycle, so

@@ -69,6 +69,16 @@ pub enum Source {
     Level0DmaEnd = 11,
     DmaIllegal = 12,
     SpriteDrawEnd = 13,
+    /// CD-block host-interface interrupt (SCU **external** interrupt 0 — bit 16,
+    /// vector 0x50 [= `0x40 + 16`], level 7; `external_tab[0]` in Mednafen
+    /// `scu.inc`). The CD-block asserts it as a *level* `(CD HIRQ & HIRQ_Mask)
+    /// != 0` ([`set_cd_int`](Scu::set_cd_int)); VF2's GFS file library is driven
+    /// by it (its handler advances the file-read state machine — without it the
+    /// intro loops re-reading the same files forever). Masked by IMS **bit 15**
+    /// (the SCU sign-extends the 16-bit IMS so bit 15 gates all external
+    /// interrupts) and re-armed after firing via the AIACK write (0xA8 bit 0),
+    /// matching Mednafen's `ABusIProhibit` latch.
+    Cd = 16,
 }
 
 impl Source {
@@ -101,6 +111,7 @@ impl Source {
             Source::Level0DmaEnd => 5,
             Source::DmaIllegal => 3,
             Source::SpriteDrawEnd => 2,
+            Source::Cd => 7, // external_tab[0] (Mednafen scu.inc)
         }
     }
 }
@@ -117,6 +128,7 @@ const ALL_SOURCES: &[Source] = &[
     Source::SoundRequest,
     Source::Smpc,
     Source::Pad,
+    Source::Cd, // level 7 — between Pad (8) and the DMA-end sources (6)
     Source::Level2DmaEnd,
     Source::Level1DmaEnd,
     Source::Level0DmaEnd,
@@ -206,6 +218,13 @@ pub struct Scu {
     /// `fresh_assertions` tracks edges so we don't re-fire on the SH-2
     /// every batch while software is still handling the previous one.
     fresh_assertions: u32,
+    /// External-interrupt prohibit latch for the CD-block ([`Source::Cd`]):
+    /// once the CD interrupt fires it is latched off until software writes the
+    /// AIACK register (0xA8 bit 0), exactly like Mednafen's `ABusIProhibit`
+    /// (`scu.inc` `ABusIRQCheck` / case 0xA8). Without this the CD interrupt
+    /// would re-fire on every per-sector HIRQ edge instead of once per ack.
+    /// Serialized machine state.
+    cd_prohibit: bool,
 }
 
 /// Snapshot of a queued DMA request handed to the bus drainer. The drainer
@@ -288,7 +307,16 @@ impl Scu {
             // IST is write-1-to-clear: software acknowledges interrupts
             // by writing the bit it wants to clear.
             0xA4 => self.ist &= !val,
-            0xA8 => self.aiack = val,
+            0xA8 => {
+                self.aiack = val;
+                // A-bus interrupt acknowledge: writing bit 0 clears the
+                // external-interrupt prohibit latch so the CD interrupt can
+                // re-fire (Mednafen scu.inc case 0xA8 → `ABusIProhibit = 0`).
+                // The next `set_cd_int` re-asserts it if the CD is still active.
+                if val & 1 != 0 {
+                    self.cd_prohibit = false;
+                }
+            }
             0xB0 => self.asr0 = val,
             0xB4 => self.asr1 = val,
             0xB8 => self.aref = val,
@@ -566,8 +594,31 @@ impl Scu {
     /// run), so without ack-clear the IST bits accumulate stale-set
     /// forever and any handler that reads IST to decide masking sees the
     /// wrong state.
+    /// Assert/deassert the CD-block external interrupt ([`Source::Cd`]) as a
+    /// level = `active` (`(CD HIRQ & HIRQ_Mask) != 0`). Mirrors Mednafen's
+    /// `RecalcIRQOut` → `ABusIRQCheck` (`cdb.cpp` / `scu.inc`): a fresh SCU
+    /// assertion is raised only when the CD becomes active **and** the prohibit
+    /// latch is clear, then the latch is set so it does not re-fire until the
+    /// handler acknowledges via AIACK (0xA8). Called every master instruction by
+    /// [`system`](crate::system) with the live CD HIRQ state, so the interrupt
+    /// lands the instant the CD raises an unmasked HIRQ bit — the GFS file
+    /// library polls nothing; it is driven by this interrupt.
+    pub fn set_cd_int(&mut self, active: bool) {
+        if active && !self.cd_prohibit {
+            let bit = 1u32 << Source::Cd.bit();
+            self.fresh_assertions |= bit;
+            self.ist |= bit;
+            self.cd_prohibit = true;
+        }
+    }
+
     pub fn take_pending_interrupt(&mut self, sh2_imask: u8) -> Option<(Source, u8)> {
-        let unmasked = self.fresh_assertions & !self.ims;
+        // External interrupts (bits 16+, i.e. the CD-block) are masked by IMS
+        // **bit 15**: Mednafen computes `IPending & ~(int16)IMask`, sign-
+        // extending the 16-bit mask so bit 15 gates all of bits 16..31.
+        // Replicate that so the CD interrupt honours its real mask bit while
+        // the internal sources (bits 0..13) keep their own mask bits.
+        let unmasked = self.fresh_assertions & !(self.ims as i16 as i32 as u32);
         for &source in ALL_SOURCES {
             let bit = 1 << source.bit();
             if unmasked & bit == 0 {
@@ -595,6 +646,51 @@ mod tests {
         assert_eq!(s.read32(0xC8), 0x04);
         s.write32(0xC8, 0xDEAD_BEEF);
         assert_eq!(s.read32(0xC8), 0x04, "VER ignores writes");
+    }
+
+    #[test]
+    fn cd_external_interrupt_vector_level_mask_and_aiack() {
+        let mut s = Scu::new();
+        // Vector/level match Mednafen scu.inc (external_tab[0]): 0x50, level 7.
+        assert_eq!(Source::Cd.vector(), 0x50);
+        assert_eq!(Source::Cd.priority(), 7);
+
+        // Unmask the external interrupts (IMS bit 15 clear); leave room above
+        // SR.imask so a level-7 source is deliverable.
+        s.write32(0xA0, 0x0000); // all unmasked
+
+        // Asserting the CD level raises a fresh assertion; it is taken at the
+        // CD's level/vector when SR.imask is below 7.
+        s.set_cd_int(true);
+        assert_eq!(s.take_pending_interrupt(0), Some((Source::Cd, 7)));
+
+        // Latched off after firing: re-asserting without an AIACK does NOT
+        // re-fire (the ABusIProhibit latch).
+        s.set_cd_int(true);
+        assert_eq!(s.take_pending_interrupt(0), None, "no re-fire until AIACK");
+
+        // AIACK (0xA8 bit 0) clears the latch → the next assert re-fires.
+        s.write32(0xA8, 1);
+        s.set_cd_int(true);
+        assert_eq!(s.take_pending_interrupt(0), Some((Source::Cd, 7)));
+
+        // IMS bit 15 masks the external interrupt (the SCU sign-extends the
+        // 16-bit mask): with bit 15 set, the CD interrupt is not delivered.
+        s.write32(0xA8, 1); // re-arm
+        s.write32(0xA0, 0x8000); // IMS bit 15 set → externals masked
+        s.set_cd_int(true);
+        assert_eq!(
+            s.take_pending_interrupt(0),
+            None,
+            "IMS bit 15 masks all external interrupts (incl. the CD-block)"
+        );
+
+        // SR.imask >= 7 also gates it (level 7 needs imask < 7).
+        s.write32(0xA8, 1);
+        s.write32(0xA0, 0x0000);
+        s.set_cd_int(true);
+        assert_eq!(s.take_pending_interrupt(7), None, "imask 7 gates the level-7 CD int");
+        assert_eq!(s.take_pending_interrupt(6), Some((Source::Cd, 7)));
     }
 
     #[test]
