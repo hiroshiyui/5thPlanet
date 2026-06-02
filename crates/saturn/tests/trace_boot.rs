@@ -2084,3 +2084,60 @@ fn vf2_render_state() {
         }
     }
 }
+
+/// SCSP audio-output probe (M11): run a disc for FRAMES frames, draining
+/// `take_audio` each frame exactly as the SDL frontend does, and report the
+/// per-window + total absolute sample level — confirms the SCSP produces
+/// non-silent audio end-to-end (active slots → output samples). Defaults to
+/// *Doukyuusei ~if~* (it actually boots to a title with BGM, so audio is
+/// meaningful — VF2 never reaches gameplay); override with `CUE=`.
+#[test]
+#[ignore = "manual: SCSP audio-output probe (CUE=/FRAMES=)"]
+fn audio_probe() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let disc = match saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cue parse failed: {e}");
+            return;
+        }
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2500);
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
+    let (mut win, mut total, mut n): (i64, i64, u64) = (0, 0, 0);
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        let a = sat.take_audio();
+        let s: i64 = a.iter().map(|&x| (x as i64).abs()).sum();
+        win += s;
+        total += s;
+        n += a.len() as u64;
+        if (f + 1) % 300 == 0 {
+            println!("frame {:4}: |audio| sum over last 300 frames = {win}", f + 1);
+            win = 0;
+        }
+    }
+    let avg = if n > 0 { total / n as i64 } else { 0 };
+    println!("AUDIO total |sum|={total} over {n} samples; avg |amplitude|={avg} (0 = silent)");
+}
