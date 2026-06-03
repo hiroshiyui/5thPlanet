@@ -2285,9 +2285,18 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_EHST;
             }
             0x75 => {
-                // Abort file: stop any read / transfer, return to PAUSE.
+                // Abort file: stop any read / transfer, return the drive to idle.
+                // With a disc that's PAUSE; with an empty tray the drive stays
+                // NODISC — AbortFile is a buffer/transfer abort, not a physical
+                // drive operation, so it must not fabricate a disc-present status.
+                // (The old unconditional `STAT_PAUSE` clobbered NODISC→PAUSE on
+                // the no-disc CD-player panel, so the BIOS perceived a disc and
+                // never settled to the live "no disc" idle state. Same disc-guard
+                // as the auth handler below.)
                 self.drive_idle();
-                self.status = STAT_PAUSE;
+                if self.disc.is_some() {
+                    self.status = STAT_PAUSE;
+                }
                 self.xfer32 = None;
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
