@@ -292,6 +292,14 @@ pub struct ScspCtrl {
     asserted_level: u8,
     /// Main-CPU sound interrupt pending (forwarded to the SCU).
     main_pending: bool,
+    /// Debug-only lifetime counters: how many times KYONEX was strobed
+    /// (`key_on_execute`) and how many slot starts (`start_slot`) resulted.
+    /// Distinguishes "driver never tries to play" from "key-on fails". Not
+    /// machine state — skipped in save states.
+    #[serde(skip)]
+    dbg_keyon_execs: u32,
+    #[serde(skip)]
+    dbg_slot_starts: u32,
 }
 
 impl Default for ScspCtrl {
@@ -309,7 +317,14 @@ impl ScspCtrl {
             dsp: dsp::Dsp::new(),
             asserted_level: 0,
             main_pending: false,
+            dbg_keyon_execs: 0,
+            dbg_slot_starts: 0,
         }
+    }
+
+    /// Debug: (KYONEX strobes, slot starts) seen over the run.
+    pub fn dbg_keyon_counts(&self) -> (u32, u32) {
+        (self.dbg_keyon_execs, self.dbg_slot_starts)
     }
 
     #[inline]
@@ -477,6 +492,7 @@ impl ScspCtrl {
     /// Execute key-on/off for all slots based on each one's KYONB bit, then
     /// clear the KYONEX strobe wherever it's set.
     fn key_on_execute(&mut self) {
+        self.dbg_keyon_execs += 1;
         for i in 0..NUM_SLOTS {
             let data0 = self.slot_reg(i, 0);
             if data0 & 0x0800 != 0 {
@@ -494,6 +510,7 @@ impl ScspCtrl {
     }
 
     fn start_slot(&mut self, i: usize) {
+        self.dbg_slot_starts += 1;
         let step = self.slot_step(i);
         let eg = self.compute_eg(i);
         self.slots[i] = Slot {

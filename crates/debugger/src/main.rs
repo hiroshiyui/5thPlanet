@@ -774,6 +774,13 @@ impl Dbg {
                 self.sat.bus.vdp1.is_drawing(),
             ),
             "scsp" => {
+                // a6 = sound-driver work-area base. The driver's command ring
+                // lives at a6+0x1840 (write ptr) / a6+0x1842 (read ptr): the main
+                // loop (0x1066) keys a voice only when they differ. Capture a6 and
+                // the bytes around 0x1840 first (needs &mut self) so we can watch
+                // whether the BIOS master ever queues a sound command.
+                let a6 = self.sat.bus.scsp.cpu.regs.a[6];
+                let ring = self.read_sound_words(a6.wrapping_add(0x1840), 4);
                 let s = &self.sat.bus.scsp;
                 let active = (0..32).filter(|&i| s.slot_active(i)).count();
                 println!(
@@ -790,6 +797,14 @@ impl Dbg {
                     c.regs.d[1],
                     c.regs.a[0],
                     c.regs.a[1]
+                );
+                println!(
+                    "  68k a6={a6:06X}  cmd-ring @a6+0x1840: {:04X} {:04X} {:04X} {:04X}  (write/read ptrs)",
+                    ring[0], ring[1], ring[2], ring[3]
+                );
+                let (keyon_execs, slot_starts) = s.ctrl.dbg_keyon_counts();
+                println!(
+                    "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
                 );
                 let (lvl, scieb, scipd) = s.ctrl.irq_state();
                 println!(
