@@ -18,3 +18,15 @@ license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Release profile tuned for emulation throughput. This is an accuracy-first
+# core with no JIT/dynarec, so real-time playback depends entirely on how fast
+# the interpreter runs — these are pure compiler optimizations (no emulation
+# shortcut, no behavioural change). `lto = "thin"` does cross-crate inlining
+# (the hot path crosses sh2 → saturn → m68k boundaries every instruction) and
+# `codegen-units = 1` lets the optimizer see each crate whole; together ~5-9%
+# over the default release profile. Deliberately portable — no
+# `target-cpu=native`, so the binary still runs on any host CPU.
+[profile.release]
+lto = "thin"
+codegen-units = 1
