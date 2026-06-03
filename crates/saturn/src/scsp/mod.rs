@@ -87,7 +87,11 @@ enum EgState {
 struct Eg {
     state: EgState,
     volume: i32,
-    ar: i32,
+    /// Attack right-shift: the rise step is `(0x3FF - volume) >> ar_shift`, an
+    /// **exponential** approach to full (the real SCSP / Mednafen attack curve,
+    /// `EnvLevel += ~EnvLevel >> srac`), not a fixed linear step. Smaller =
+    /// faster. Derived from the attack rate in [`Self::compute_eg`].
+    ar_shift: u32,
     d1r: i32,
     d2r: i32,
     rr: i32,
@@ -575,10 +579,19 @@ impl ScspCtrl {
         };
         let ar =
             |field: u16, tbl: &[i32; 64]| tbl[(rate + ((field as i32) << 1)).clamp(0, 63) as usize];
+        // Attack is exponential (`volume += (0x3FF - volume) >> ar_shift`), so we
+        // need a shift, not a linear step. Pick it so the exponential reaches
+        // full in roughly the same sample count the old linear step (`ar_step`)
+        // took — preserving the rate while fixing the *shape*: at max AR the old
+        // step covered the whole range in one sample (an instant jump); the
+        // exponential ramps over ~16 samples like the real SCSP / Mednafen.
+        let ar_step = ar(reg4 & 0x1F, &t.ar);
+        let lin_samples = ((0x280i64 << EG_SHIFT) / (ar_step as i64).max(1)).max(1) as u64;
+        let ar_shift = (lin_samples.ilog2() + 1).clamp(2, 15);
         Eg {
             state: EgState::Attack,
             volume: 0x17F << EG_SHIFT,
-            ar: ar(reg4 & 0x1F, &t.ar),
+            ar_shift,
             d1r: ar((reg4 >> 6) & 0x1F, &t.dr),
             d2r: ar((reg4 >> 11) & 0x1F, &t.dr),
             rr: ar(reg5 & 0x1F, &t.dr),
@@ -595,14 +608,18 @@ impl ScspCtrl {
             return 0;
         }
         let tl = (self.slot_reg(i, 6) & 0xFF) as usize;
-        let was_attack = self.slots[i].eg.state == EgState::Attack;
         let mut deactivate = false;
         // EG_Update: advance volume / state, yield the raw EG value.
         let raw = {
             let eg = &mut self.slots[i].eg;
             match eg.state {
                 EgState::Attack => {
-                    eg.volume += eg.ar;
+                    // Exponential rise toward full: step a rate-determined
+                    // fraction of the remaining distance (the SCSP attack
+                    // curve), snapping the last bit once the step rounds to 0.
+                    let remaining = (0x3FF << EG_SHIFT) - eg.volume;
+                    let inc = remaining >> eg.ar_shift;
+                    eg.volume += if inc > 0 { inc } else { remaining };
                     if eg.volume >= (0x3FF << EG_SHIFT) {
                         eg.volume = 0x3FF << EG_SHIFT;
                         eg.state = if eg.d1r >= (1024 << EG_SHIFT) {
@@ -642,13 +659,13 @@ impl ScspCtrl {
             self.slots[i].active = false;
         }
         let t = &*EG_TABLES;
-        // Attack uses the raw value as a linear ramp; the other phases index
-        // the log→linear envelope curve.
-        let eg_mul = if was_attack {
-            raw
-        } else {
-            t.eg[((raw >> (PHASE_SHIFT - 10)) as usize) & 0x3FF]
-        };
+        // All phases — attack included — index the log→linear (dB) envelope
+        // curve: the EG counter is an attenuation step, not a linear amplitude.
+        // Mednafen runs `EnvLevel` through the same dB conversion at every phase
+        // (scsp.inc RunSample), so a mid-attack `volume` of 0x17F (= attenuation
+        // 0x280) maps to ≈ -60 dB, a near-silent start that ramps up — not the
+        // 37 %-amplitude jump the old linear `raw` produced.
+        let eg_mul = t.eg[((raw >> (PHASE_SHIFT - 10)) as usize) & 0x3FF];
         (eg_mul * t.tl[tl]) >> PHASE_SHIFT
     }
 
