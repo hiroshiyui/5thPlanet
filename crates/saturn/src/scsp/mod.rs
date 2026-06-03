@@ -914,6 +914,11 @@ pub struct Scsp {
     bp68: Option<(u32, Option<(u8, u32)>)>,
     #[serde(skip)]
     bp68_hit: Option<M68kBpHit>,
+    /// Debug-only set of *every* distinct 68k PC executed since enabled (unlike
+    /// `pc_trace`, which is a bounded ring). Answers "does the sound driver ever
+    /// reach routine X?" over a whole run. `#[serde(skip)]` — not machine state.
+    #[serde(skip)]
+    pc_seen: Option<std::collections::BTreeSet<u32>>,
 }
 
 /// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
@@ -946,6 +951,7 @@ impl Scsp {
             sample_frac: 0,
             out: Vec::new(),
             pc_trace: None,
+            pc_seen: None,
             bp68: None,
             bp68_hit: None,
         }
@@ -974,6 +980,21 @@ impl Scsp {
     pub fn take_68k_trace(&mut self) -> Vec<u32> {
         match &mut self.pc_trace {
             Some(t) => t.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Begin accumulating the set of every distinct 68k PC executed (debug; see
+    /// [`pc_seen`]). Unlike the ring, this never forgets — for "did the driver
+    /// ever reach routine X?" over a whole run.
+    pub fn enable_68k_footprint(&mut self) {
+        self.pc_seen = Some(std::collections::BTreeSet::new());
+    }
+
+    /// Snapshot the accumulated distinct-68k-PC footprint (sorted), if enabled.
+    pub fn take_68k_footprint(&mut self) -> Vec<u32> {
+        match &self.pc_seen {
+            Some(s) => s.iter().copied().collect(),
             None => Vec::new(),
         }
     }
@@ -1080,6 +1101,7 @@ impl Scsp {
             ctrl,
             cpu,
             pc_trace,
+            pc_seen,
             bp68,
             bp68_hit,
             ..
@@ -1094,6 +1116,10 @@ impl Scsp {
                 if t.len() > 16384 {
                     t.pop_front();
                 }
+            }
+            // Debug footprint: every distinct PC ever executed (unbounded).
+            if let Some(s) = pc_seen.as_mut() {
+                s.insert(cpu.regs.pc);
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about
             // to execute the target PC (with any guard satisfied).

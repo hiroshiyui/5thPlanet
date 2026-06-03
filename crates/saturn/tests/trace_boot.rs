@@ -2265,6 +2265,13 @@ fn bios_audio_probe() {
 
     let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
     let dump = std::env::var("AUDIO_OUT").ok();
+    // TRACE68=<n>: record the 68k PC ring over the last <n> frames, then print
+    // the distinct execution path — shows the driver's steady-state loop (what
+    // it polls instead of building the BGM voices).
+    let trace68: Option<u32> = std::env::var("TRACE68").ok().and_then(|s| s.parse().ok());
+    if trace68.is_some() {
+        sat.bus.scsp.enable_68k_footprint(); // distinct PCs over the WHOLE run
+    }
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2319,6 +2326,75 @@ fn bios_audio_probe() {
                 "  slot{i:02} eg={}/{:#X} disdl={} tl={:#04X} loop={} sa={:#07X}",
                 d.eg_state, d.eg_volume, d.disdl, d.tl, d.lpctl, d.sa
             );
+        }
+    }
+    // 68k work-area census: the BGM driver builds its per-channel/voice
+    // structures in sound RAM (the prior trace put them near 0x7000-0x7FFF). If
+    // the driver never sets these up, the per-channel processor finds nothing to
+    // key. Scan the whole 512 KiB in 256-byte blocks and report non-zero spans
+    // so the driver/program/work-area map is visible without assuming addresses.
+    {
+        let ram = &sat.bus.scsp.ram;
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut cur: Option<(u32, u32)> = None;
+        for blk in (0..0x8_0000u32).step_by(0x100) {
+            let nz = (0..0x100u32).step_by(4).any(|o| ram.read32(blk + o) != 0);
+            match (&mut cur, nz) {
+                (None, true) => cur = Some((blk, blk + 0x100)),
+                (Some((_, end)), true) => *end = blk + 0x100,
+                (Some(s), false) => {
+                    spans.push(*s);
+                    cur = None;
+                }
+                (None, false) => {}
+            }
+        }
+        if let Some(s) = cur {
+            spans.push(s);
+        }
+        println!("  sound-RAM non-zero spans (256B blocks):");
+        for (a, b) in &spans {
+            println!("    {a:#08X}..{b:#08X}  ({} KiB)", (b - a) / 1024);
+        }
+        // The master->68k command channel (per prior trace: 0x500 / 0x700).
+        let w = |o: u32| ram.read16(o);
+        println!(
+            "  cmd 0x500: {:04X} {:04X} {:04X} {:04X} | 0x700: {:04X} {:04X} {:04X} {:04X}",
+            w(0x500),
+            w(0x504),
+            w(0x508),
+            w(0x50C),
+            w(0x700),
+            w(0x704),
+            w(0x708),
+            w(0x70C)
+        );
+    }
+    if trace68.is_some() {
+        // Whole-run footprint: every distinct 68k PC executed, bucketed by 0x100
+        // so it lines up with the Mednafen pcring histogram. The question is
+        // which regions Mednafen's driver runs (the 0x4000-0x5000 BGM sequence
+        // engine) that ours never reaches.
+        let seen = sat.bus.scsp.take_68k_footprint();
+        let mut buckets: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for pc in &seen {
+            *buckets.entry(pc & !0xFF).or_default() += 1;
+        }
+        println!("  68k whole-run footprint: {} distinct PCs", seen.len());
+        for (b, c) in &buckets {
+            println!("    {b:#06X}: {c} PCs");
+        }
+        let reached = |lo: u32, hi: u32| seen.iter().any(|&p| p >= lo && p < hi);
+        println!(
+            "    reaches: 0x13A2 dispatch={}  0x2C00-0x3070 voice-key={}  0x4000-0x5100 seq-engine={}",
+            seen.contains(&0x13A2),
+            reached(0x2C00, 0x3070),
+            reached(0x4000, 0x5100),
+        );
+        if let Ok(p) = std::env::var("FOOT_OUT") {
+            let s: String = seen.iter().map(|pc| format!("{pc:06X}\n")).collect();
+            std::fs::write(&p, s).unwrap();
+            println!("    wrote {} footprint PCs to {p}", seen.len());
         }
     }
     if let Some(p) = dump {
