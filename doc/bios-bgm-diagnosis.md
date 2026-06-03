@@ -1,8 +1,20 @@
 # BIOS boot BGM — diagnosis
 
-**Date:** 2026-06-03 · **Reference:** MAME v0.287 single-driver Saturn build
-(`mameref/saturn`, HLE CD-block like ours) · **Status:** animation **fixed**;
-audio still open.
+**Date:** 2026-06-04 · **References:** MAME v0.287 (`mameref/saturn`, no-disc) +
+**Mednafen dev build** (`mednaref`, audio-CD, LLE oracle) · **Status:** animation
+**fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
+in the sound 68k — a timing-accumulation bug, not a missing feature.
+
+> **Update (2026-06-04) — root localized via a Mednafen lockstep 68k diff.**
+> Using an **audio CD** (which Mednafen *can* boot, unlike no-disc) as an LLE
+> oracle, a layered trace-down proved the SCSP synthesis, the 68k→SCSP path, and
+> the BGM sequence data all **byte-for-byte correct**, then pinned the **first
+> 68k control-flow divergence** to a single instruction — `0x484C: bcc`, a
+> per-voice timing divider `[a4+3]` that is at a **different phase** in ours vs
+> Mednafen when the BGM starts. The note-mis-processing and stall are downstream
+> of that. See **[Update (2026-06-04): the audio-CD lockstep trace-down](#update-2026-06-04-the-audio-cd-lockstep-trace-down)**
+> below; it supersedes the "candidate roots / suggested next step" of the earlier
+> MAME-based analysis. Commits `43e7e94`, `32fdd11`, `f47cfc2`, `1d82aa4`.
 
 > **Update (2026-06-03) — the disc-present boot animation is fixed (commit
 > `e2884e7`).** A second reference run — MAME with an **audio CD inserted**
@@ -20,12 +32,135 @@ audio still open.
 > *necessary* (it gates the whole boot-sound path) but not *sufficient* — the
 > silent-voices issue is the next piece.
 
+## Update (2026-06-04): the audio-CD lockstep trace-down
+
+The earlier analysis (below) localized the gap to the sound 68k but stalled on
+*tooling*: MAME's no-disc boot couldn't be trace-diffed (the imgui debugger
+needs a GPU; the SCSP write-tap was unreliable). This update switched references
+and cracked the localization open.
+
+### Why the reference changed — Mednafen, with an audio CD
+
+Mednafen cannot boot no-disc, but it **can** boot with an **audio CD inserted**
+(`mednaref/src/mednafen -force_module ss roms/audiocd.cue`), reaching the same
+CD-player panel and playing its BGM. Mednafen is a true **LLE** core, so it runs
+the *same* BIOS + sound-driver code ours does — making a byte-level lockstep diff
+possible. Run it **headless** (`SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`) so
+no window lands on the active display.
+
+The whole trace-down used the **JAP BIOS + `roms/audiocd.cue`** on both sides.
+
+### What is now proven *correct* (newly ruled out)
+
+| Layer | How it was proven | Verdict |
+|---|---|---|
+| **SCSP synthesis** (slot/FM/interp/EG/pan/mix) | A self-contained SH-2 **sine test ROM** (`audio_pipeline.rs`) cross-checked vs a mednaref `SS_SINETEST` hook | matches **0.4 % mean / 1.3 % max** |
+| **68k→SCSP path** | A **68k**-driven sine ROM (`audio_pipeline_sine_68k`): the sound CPU keys a voice through its own SCSP window | full-scale tone — **works** |
+| **BGM sequence data** | `sdbg m 0x05A18200` vs mednaref `SS_SEQDUMP` | **byte-identical** (`7F 00 B0 0A 3B 01 …`) |
+| **BGM start** | ours' enqueue stream `ENQLOG` vs `SS_SEQDUMP` | first events identical (`B0 C0 B0 90/33 …`) |
+| **Voices processed** | itrace `a4` set `{0x6000,0x7000,0x9800}` | identical — same voices |
+
+So the bug is **none** of: synthesis, the 68k→SCSP register path, the sample
+load, the sequence data, the master command stream, the CD-block data transfer.
+
+### The BGM pipeline, mapped end-to-end (audio-CD CD-player driver)
+
+Driver code lives at sound-RAM `0x1000–0x5100`; work base `a6 = 0x6000`.
+
+```
+Timer-B ISR  0x1388 ─┐ (lea 0x6000,a6 ; inc counters ; lea 0x1F00,a6 → 0x7F00)
+                     └─ jsr 0x40F2  seq-tick
+                          ├─ note-on interpreter  (0x46C2 ctrl-changes ; 0x4802/0x4812 notes)
+                          │     reads event byte [a6+0x2D], delta-time gate
+                          │     [a6+0x18] -= [a6+0x14] ; bcc (not-yet)
+                          │     └─ jsr 0x4B9A  ENQUEUE → 4-byte cmd into the ring @0x7A00
+                          │           (a2 = [0x0450]+0x1A00 ; cmd = (event>>4)&7)
+                          └─ 8× jsr 0x4570  per-channel processor (reads 0x7F00 channels)
+main thread ── seq-player 0x2162 ─ dispatch 0x21A4 `jmp (2,pc,d0.w)` on cmd&7
+                  cmd 3 (0xBX) → 0x21C8 → table 0x2200 → 0x28A4 → 0x2E78  KYONEX (voice key)
+                  cmd 0/1/4    → idle / note handlers
+```
+
+The ring at `0x7A00` is the 68k-internal command queue the interpreter fills and
+the player drains; **only `0xBX` control-change events (ring cmd 3) reach the
+voice-key strobe `0x2E78`.**
+
+### The lockstep diff — the first divergence
+
+An aligned **instruction-boundary** trace on both sides (ours `ITRACE`, mednaref
+`SS_ITRACE` hooked at the M68K opcode fetch `PC-2`), armed at the first enqueue
+(`0x4B9A`) and restricted to the seq-engine range `[0x4000,0x4C40)`:
+
+```
+both run BYTE-IDENTICAL PC paths for 1310 instructions, then:
+  … 483E 4844 4848 484C
+  ours → 4850   (bcc NOT taken)
+  mfn  → 48AC   (bcc taken)
+```
+
+`0x484C: bcc 0x48ac` follows `0x4848: subq.b #1,(0x3,a4)` and is gated by
+`0x483E: btst #7,(0x2,a4)` (voice active). **Same voice (`a4 = 0x9800` in both),
+same instruction, identical decrement count in the window** — yet ours' divider
+`[a4+3]` has already underflowed to **0** (carry set → branch *not* taken → reset
+to 7 and run the periodic action at `0x4856+`) while Mednafen's is **≥1** (branch
+taken → skip). Ours' `[a4+3]` at `0x4848` reads `02, 01, 00` then borrows.
+
+### Root: a per-voice timing-divider *phase* divergence
+
+Because the PC path is identical up to the divergence and both decrement the
+divider equally, ours' divider must have **started the BGM window at a different
+phase** than Mednafen's — a difference set *before* the first enqueue (the
+reg-hash variant of the trace differs from line 1). This is **not** a single
+pokeable opcode and **not** a different voice; it is a **timing-accumulation**
+divergence: when ours triggers the BGM, the driver's internal voice dividers are
+out of phase with the reference, so the periodic voice action fires a phase early,
+the note stream mis-processes (each chord note enqueued once instead of twice —
+`33,38,3C` vs `33,33,38,38,3C,3C`), and the sequence **stalls after the intro**
+(9 events vs Mednafen's continuing stream) → the ring drains → silence.
+
+The most likely origin is that **ours triggers the BGM at a different absolute
+tick** than Mednafen — i.e. ours' CD/SMPC/Timer cycle-timing is not yet
+cycle-identical to the reference (this ties back to the M11 CD-timing work and
+[mednafen-divergence-review.md](mednafen-divergence-review.md)).
+
+### Tooling built (all committed, debug-only, `#[serde(skip)]`, golden-safe)
+
+| Tool | Where | Purpose |
+|---|---|---|
+| `audio_pipeline_sine` / `_68k` | `crates/saturn/tests/audio_pipeline.rs` | prove SCSP synthesis (SH-2- and 68k-driven) |
+| 68k **footprint** | `Scsp::enable_68k_footprint`, `bios_audio_probe` `TRACE68=`/`FOOT_OUT=` | every distinct 68k PC over a whole run |
+| sound-RAM **census** | `bios_audio_probe` | non-zero spans + the `0x500`/`0x700` command channel |
+| **enqueue log** `ENQLOG=` | `Scsp::enable_enq_log` | `[d0-3,a6]` at a hot PC (the BGM event stream) |
+| **itrace** `ITRACE=` | `Scsp::enable_68k_itrace` | aligned instruction-boundary `(pc,a4)` trace |
+| mednaref hooks | `scsp.inc`, `sound.cpp`, `m68k.cpp` (gitignored tree) | `SS_SINETEST`, `SS_KYONEX`, `SS_SEQDUMP`, `SS_WWATCH`, `SS_ITRACE` |
+
+### Honest status & next step
+
+The BGM gap is now a **well-characterized timing bug**, not a mystery: a per-voice
+divider phase set before the BGM, downstream of (probably) the CD/Timer trigger
+tick. The two strategic continuations:
+
+1. **Arm the itrace earlier** (before the BGM setup) to catch where the voice
+   phase *first* diverges — a larger, harder-to-align window.
+2. **Compare the BGM-trigger tick** — does ours start the sequence at the same
+   cycle as Mednafen? This rejoins the broader CD/SMPC/Timer cycle-timing work
+   and is the higher-leverage path (it would benefit game audio generally).
+
+This is parked deliberately: the next push is cycle-timing engineering, not more
+tracing.
+
 ## Target
 
 Boot a Saturn BIOS with **no disc** and produce audio: the multimedia
 CD-player panel's background music, plus the direction-key "feature select"
 nav SFX. On real hardware this panel animates and plays BGM with no disc
 inserted.
+
+> **Note (2026-06-04):** the deep root analysis above used the **audio-CD**
+> CD-player driver (the Mednafen-bootable oracle). The no-disc panel below is the
+> *original* target; both exercise the same sound-driver execution and the same
+> per-voice-divider machinery, so the finding applies to both. The sections that
+> follow are the earlier **MAME / no-disc** investigation that led here.
 
 > **Why MAME, and why the USA BIOS.** Mednafen — our usual LLE oracle — **cannot
 > boot with no disc** (it only launches via a game image), so it is unavailable
