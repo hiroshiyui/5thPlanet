@@ -152,8 +152,9 @@ gamepad support are planned M9 phases.)
 - [`jupiter`](jupiter) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
-  (Named for Jupiter — the 5th planet, hence the project name *5thPlanet* —
-  the neighbour of Saturn: closest to it, but not identical.)
+  `cargo run -p jupiter -- <bios.bin> [disc.cue]`. (The binary is named
+  `jupiter` for Jupiter — the 5th planet, hence the project name
+  *5thPlanet* — the neighbour of Saturn: closest to it, but not identical.)
 
 ## BIOS
 
