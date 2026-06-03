@@ -24,7 +24,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run the binary with `cargo run -p fifth_planet -- <bios.bin>` — the SDL2 frontend (default-on `sdl2-frontend` feature) opens a window and runs the BIOS; `--no-default-features` runs headless.
+Run the binary with `cargo run -p jupiter -- <bios.bin>` — the SDL2 frontend (default-on `sdl2-frontend` feature) opens a window and runs the BIOS; `--no-default-features` runs headless.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ crates/debugger/   — interactive headless Saturn debugger (bin `sdbg`): a
                      save-state rewind. Depends only on `saturn` + `sh2`; an
                      observer/driver that adds no core behaviour (it bundles a
                      small MC68000 disassembler).
-fifth_planet/      — SDL2 frontend binary (window + framebuffer upload +
+jupiter/           — SDL2 frontend binary (window + framebuffer upload +
                      audio, or headless), behind the default-on
                      `sdl2-frontend` feature. The `osd` module (in-window
                      menu, ADR-0008) is hand-rolled + software-composited and

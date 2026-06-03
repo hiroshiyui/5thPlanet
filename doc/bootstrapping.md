@@ -261,7 +261,7 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 - `SS_CDTRACE` survives the kill (it `fflush`es per command); `SS_PCTRACE`
   buffers, so a long Mednafen PC trace usually loses everything on the kill —
   prefer the command trace for the recognition window.
-- Headless runs **must** build `-p fifth_planet --no-default-features` (passing
+- Headless runs **must** build `-p jupiter --no-default-features` (passing
   `--no-default-features` as a *runtime* arg silently opens the SDL window).
 
 ---

@@ -1,5 +1,5 @@
 [package]
-name = "fifth_planet"
+name = "jupiter"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -15,7 +15,7 @@ sdl2 = { version = "0.37", optional = true }
 default = ["sdl2-frontend"]
 # Toggle the SDL2 window off if the host doesn't have libsdl2-dev
 # installed or if you want a headless build for CI. With the feature
-# off, `cargo run -p fifth_planet -- BIOS` still loads the BIOS,
+# off, `cargo run -p jupiter -- BIOS` still loads the BIOS,
 # runs a fixed number of frames, and dumps a one-line status report —
 # useful for the BIOS-boot regression in M3 task #8.
 sdl2-frontend = ["dep:sdl2"]

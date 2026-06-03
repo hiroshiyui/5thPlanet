@@ -7,7 +7,7 @@ members = [
     "crates/m68k",
     "crates/physdisc",
     "crates/debugger",
-    "fifth_planet",
+    "jupiter",
 ]
 
 [workspace.package]

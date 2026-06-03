@@ -2,12 +2,12 @@
 //!
 //! Two builds:
 //!
-//! * `cargo run -p fifth_planet -- BIOS.bin`
+//! * `cargo run -p jupiter -- BIOS.bin`
 //!   (default features) — opens an SDL2 window, runs the Saturn at
 //!   60 Hz, uploads each frame to a streaming texture. Quit with
 //!   Esc or the window's close button.
 //!
-//! * `cargo run -p fifth_planet --no-default-features -- BIOS.bin`
+//! * `cargo run -p jupiter --no-default-features -- BIOS.bin`
 //!   — headless. Runs a fixed number of frames and prints a short
 //!   status report. Useful when libsdl2-dev isn't available, or
 //!   for the BIOS-boot regression test that doesn't need a window.
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
         Some(p) => p.clone(),
         None => {
             eprintln!(
-                "usage: fifth_planet <BIOS.bin> [game.cue|.iso|.ccd | cdrom:<device>] [--cart=<kind>]"
+                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd | cdrom:<device>] [--cart=<kind>]"
             );
             eprintln!();
             eprintln!(

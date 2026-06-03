@@ -401,7 +401,7 @@ its encoding is fixed and it takes exactly 1 cycle.
 ## O
 
 **OSD** — On-Screen Display: the frontend's hand-rolled in-window menu
-(M9, `fifth_planet/src/osd/`, ZSNES/fwNES-style; see ADR-0008). Software-
+(M9, `jupiter/src/osd/`, ZSNES/fwNES-style; see ADR-0008). Software-
 composited into the 320×224 RGBA framebuffer with an embedded 8×8 bitmap
 font; **Esc** opens it. The module is deliberately `sdl2`-free and core-free
 (it draws into a `&mut [u8]` buffer and consumes a `Nav` enum), so it's

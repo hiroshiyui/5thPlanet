@@ -90,7 +90,7 @@ cargo test -p sh2 -- decoder::tests::decodes_branches
 
 # SDL2 frontend (default-on `sdl2-frontend` feature): opens a window and
 # runs the supplied BIOS. Use --no-default-features for a headless run.
-cargo run -p fifth_planet -- "bios/Sega Saturn BIOS (USA).bin"
+cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
 ```
 
 ## Controls
@@ -149,9 +149,11 @@ gamepad support are planned M9 phases.)
   register-guarded), single-step, SH-2 **and** SCSP-68k disassembly + PC-trace,
   read/write watchpoints, memory search, CD-block + SCSP/68k state, command
   history, and save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
-- [`fifth_planet`](fifth_planet) — SDL2 frontend binary (window +
+- [`jupiter`](jupiter) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
+  (Named for Jupiter — the 5th planet, hence the project name *5thPlanet* —
+  the neighbour of Saturn: closest to it, but not identical.)
 
 ## BIOS
 

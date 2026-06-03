@@ -5,7 +5,7 @@
 
 ## Context
 
-The `fifth_planet` frontend was keyboard-only with a few hardcoded hotkeys
+The `jupiter` frontend was keyboard-only with a few hardcoded hotkeys
 (Esc=quit, F5/F9 save/load). Everything M7/M8 added — save states, disc and
 cartridge insertion, reset, the persisted battery — had no in-window UI. We
 want an on-screen menu in the spirit of ZSNES / fwNES: a chunky, navigable
@@ -30,7 +30,7 @@ Forces at play:
 We will build the OSD **by hand**, **software-composited** into the RGBA
 framebuffer, and keep its logic **`sdl2`-free and core-free**:
 
-- The `fifth_planet::osd` module draws with an embedded public-domain 8×8
+- The `jupiter::osd` module draws with an embedded public-domain 8×8
   bitmap font (font8x8 "basic", CC0) directly into a `&mut [u8]` RGBA buffer.
   No GUI dependency; no new SDL render calls.
 - The module takes input as an abstract `Nav { Up, Down, Select, Back }` enum

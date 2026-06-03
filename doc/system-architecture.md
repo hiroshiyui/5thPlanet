@@ -222,7 +222,7 @@ host file.
 | `crates/scu_dsp/` | SCU's embedded 32-bit DSP (ADR-0006) |
 | `crates/saturn/` | System glue: bus, scheduler, SMPC, SCU, VDP1, VDP2, SCSP, CD-block, cartridge, save states |
 | `crates/physdisc/` | Live optical-drive `SectorSource` via libcdio; the sole FFI/`unsafe` crate (ADR-0009) |
-| `fifth_planet/` | SDL2 frontend (window + audio) or headless; the `osd/` in-window menu (ADR-0008) |
+| `jupiter/` | SDL2 frontend (window + audio) or headless; the `osd/` in-window menu (ADR-0008) |
 | `doc/` | This file, [`roadmap.md`](roadmap.md), [`glossary.md`](glossary.md), [`adr/`](adr/) |
 
 The root `Cargo.toml` is a `[workspace]` (resolver 3, edition 2024) with
@@ -262,7 +262,7 @@ frontend 12).
 | Live optical drive | `crates/physdisc/` | ~80% | 1 backend (libcdio) | M10: libcdio `SectorSource` (TOC + raw sectors + CD-DA), feature-gated. Linux-verified; other OSes untested. |
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
 | Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
-| Frontend (SDL2 + OSD) | `fifth_planet/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
+| Frontend (SDL2 + OSD) | `jupiter/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
 | LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The boot blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Post-boot, VF2 runs on both SH-2s and streams its CD asset load (after the BCR1 master/slave + `run_frame`-no-split fixes), then stalls mid-load: a dev-build CD trace-diff proved the CD layer byte-identical to Mednafen, so the remaining blocker is scheduler/interrupt-timing accuracy (Mednafen-alignment Phase 2 landed — master-leads interleave + per-instruction SCU sampling — Phase 3 remains). |
 
 ---

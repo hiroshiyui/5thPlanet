@@ -70,6 +70,6 @@ crate `crates/physdisc`** that is the single, documented exception to ADR-0007:
 - **Keep `forbid(unsafe_code)` everywhere and skip physical discs** — would
   drop a feature the project wants; ripping to an image is the only path. The
   feature-gated, isolated exception is a better trade than forgoing it.
-- **Embed the FFI in `fifth_planet` behind a feature** — workable, but mixes the
+- **Embed the FFI in `jupiter` behind a feature** — workable, but mixes the
   `unsafe` boundary into the frontend binary; a dedicated crate confines the
   ADR-0007 exception to one place and keeps the frontend safe.
