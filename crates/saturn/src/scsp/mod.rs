@@ -300,6 +300,15 @@ pub struct ScspCtrl {
     dbg_keyon_execs: u32,
     #[serde(skip)]
     dbg_slot_starts: u32,
+    /// Debug-only: lifetime timer-overflow counts [A,B,C], tick_timers calls, and
+    /// total samples ticked — to see whether the SCSP timers keep firing (the
+    /// sound driver polls Timer A; if it stops overflowing the driver stalls).
+    #[serde(skip)]
+    dbg_timer_of: [u32; 3],
+    #[serde(skip)]
+    dbg_tt_calls: u32,
+    #[serde(skip)]
+    dbg_tt_samples: u32,
 }
 
 impl Default for ScspCtrl {
@@ -319,12 +328,20 @@ impl ScspCtrl {
             main_pending: false,
             dbg_keyon_execs: 0,
             dbg_slot_starts: 0,
+            dbg_timer_of: [0; 3],
+            dbg_tt_calls: 0,
+            dbg_tt_samples: 0,
         }
     }
 
     /// Debug: (KYONEX strobes, slot starts) seen over the run.
     pub fn dbg_keyon_counts(&self) -> (u32, u32) {
         (self.dbg_keyon_execs, self.dbg_slot_starts)
+    }
+
+    /// Debug: ([Timer A,B,C overflow counts], tick_timers calls, samples ticked).
+    pub fn dbg_timer_counts(&self) -> ([u32; 3], u32, u32) {
+        (self.dbg_timer_of, self.dbg_tt_calls, self.dbg_tt_samples)
     }
 
     #[inline]
@@ -417,12 +434,15 @@ impl ScspCtrl {
         if samples == 0 {
             return;
         }
+        self.dbg_tt_calls = self.dbg_tt_calls.wrapping_add(1);
+        self.dbg_tt_samples = self.dbg_tt_samples.wrapping_add(samples);
         let regs = [self.read16(TIMA), self.read16(TIMB), self.read16(TIMC)];
         let bits = [INT_TIMER_A, INT_TIMER_B, INT_TIMER_C];
         let mut scipd = false;
         let mut mcipd = false;
         for i in 0..3 {
             if self.timers[i].tick(regs[i], samples) {
+                self.dbg_timer_of[i] = self.dbg_timer_of[i].wrapping_add(1);
                 self.store16(SCIPD, self.read16(SCIPD) | bits[i]);
                 scipd = true;
                 if i == 0 {

@@ -850,6 +850,11 @@ impl Dbg {
                 println!(
                     "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
                 );
+                let (tof, ttc, tts) = s.ctrl.dbg_timer_counts();
+                println!(
+                    "  timers (lifetime): overflow A/B/C={}/{}/{}  tick_timers calls={ttc} samples={tts}",
+                    tof[0], tof[1], tof[2]
+                );
                 let (lvl, scieb, scipd) = s.ctrl.irq_state();
                 println!(
                     "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
