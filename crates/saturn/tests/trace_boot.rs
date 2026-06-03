@@ -2280,6 +2280,11 @@ fn bios_audio_probe() {
     if let Some(pc) = enqlog {
         sat.bus.scsp.enable_enq_log(pc);
     }
+    // ITRACE=<file>: aligned instruction-boundary 68k trace (vs mednaref SS_ITRACE).
+    let itrace_out = std::env::var("ITRACE").ok();
+    if itrace_out.is_some() {
+        sat.bus.scsp.enable_68k_itrace();
+    }
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2425,6 +2430,12 @@ fn bios_audio_probe() {
             std::fs::write(&p, s).unwrap();
             println!("    wrote {} enqueue events to {p}", log.len());
         }
+    }
+    if let Some(p) = itrace_out {
+        let t = sat.bus.scsp.take_68k_itrace();
+        let s: String = t.iter().map(|(pc, h)| format!("{pc:04X} {h:06X}\n")).collect();
+        std::fs::write(&p, s).unwrap();
+        println!("  wrote {} itrace entries to {p}", t.len());
     }
     if let Some(p) = dump {
         std::fs::write(&p, &pcm).expect("write AUDIO_OUT");

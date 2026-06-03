@@ -924,6 +924,13 @@ pub struct Scsp {
     /// reference diff vs Mednafen — unlike `bp68` (first hit only). `#[serde(skip)]`.
     #[serde(skip)]
     enq_log: Option<(u32, Vec<[u32; 5]>)>,
+    /// Debug-only *instruction-boundary* trace `(pc, a4)`, restricted to
+    /// `[0x4000,0x4C40)` and armed at the first `0x4B9A` enqueue: `(armed, log)`.
+    /// An aligned 68k interpreter diff vs Mednafen's `SS_ITRACE` — the per-row
+    /// value (here a4, the voice pointer) finds value divergences even when the
+    /// PC path matches. `#[serde(skip)]`.
+    #[serde(skip)]
+    itrace: Option<(bool, Vec<(u32, u32)>)>,
 }
 
 /// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
@@ -958,6 +965,7 @@ impl Scsp {
             pc_trace: None,
             pc_seen: None,
             enq_log: None,
+            itrace: None,
             bp68: None,
             bp68_hit: None,
         }
@@ -1014,6 +1022,19 @@ impl Scsp {
     /// Snapshot the captured enqueue register log (oldest→newest), if enabled.
     pub fn take_enq_log(&mut self) -> Vec<[u32; 5]> {
         match &self.enq_log {
+            Some((_, v)) => v.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Begin the aligned instruction-boundary trace (see [`itrace`]).
+    pub fn enable_68k_itrace(&mut self) {
+        self.itrace = Some((false, Vec::new()));
+    }
+
+    /// Snapshot the instruction-boundary trace `(pc, reg-hash)`, if enabled.
+    pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32)> {
+        match &self.itrace {
             Some((_, v)) => v.clone(),
             None => Vec::new(),
         }
@@ -1123,6 +1144,7 @@ impl Scsp {
             pc_trace,
             pc_seen,
             enq_log,
+            itrace,
             bp68,
             bp68_hit,
             ..
@@ -1154,6 +1176,18 @@ impl Scsp {
                     cpu.regs.d[3],
                     cpu.regs.a[6],
                 ]);
+            }
+            // Debug aligned instruction trace: dup-collapsed instruction PCs in
+            // the seq-engine range, armed at the first enqueue (mirrors mednaref
+            // SS_ITRACE for a lockstep interpreter diff).
+            if let Some((armed, log)) = itrace.as_mut() {
+                let pc = cpu.regs.pc;
+                if pc == 0x4B9A {
+                    *armed = true;
+                }
+                if *armed && (0x4000..0x4C40).contains(&pc) && log.len() < 8000 {
+                    log.push((pc, cpu.regs.a[4] & 0x00FF_FFFF)); // a4 (voice ptr)
+                }
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about
             // to execute the target PC (with any guard satisfied).
