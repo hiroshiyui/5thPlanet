@@ -51,6 +51,9 @@ struct Dbg {
     bp_probe: Option<u32>,
     /// Poll watchpoints checked during `c`: (addr, size-in-bytes).
     watches: Vec<(u32, u8)>,
+    /// Optional SCSP 68k breakpoint: `(pc, optional (reg, val) guard)` — reg 0-7 =
+    /// D0-D7, 8-15 = A0-A7. Set via `b68 <addr> [reg val]`; armed/checked in `fc`.
+    bp68: Option<(u32, Option<(u8, u32)>)>,
 }
 
 fn parse_num(s: &str) -> Option<u32> {
@@ -530,8 +533,23 @@ impl Dbg {
         // Arm the memory probe on whichever CPU breakpoint fires.
         self.sat.set_master_bp_probe(self.bp_probe);
         self.sat.set_slave_bp_probe(self.bp_probe);
+        // Arm the SCSP 68k breakpoint (sound-driver debugging).
+        self.sat.set_scsp_bp68(self.bp68);
         for f in 0..max_frames {
             self.sat.run_for(CYCLES_PER_FRAME);
+            if let Some(h) = self.sat.take_scsp_bp68_hit() {
+                println!("68k breakpoint hit at frame {f}: pc={:06X}", h.pc);
+                println!(
+                    "  d0-7: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    h.d[0], h.d[1], h.d[2], h.d[3], h.d[4], h.d[5], h.d[6], h.d[7]
+                );
+                println!(
+                    "  a0-7: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    h.a[0], h.a[1], h.a[2], h.a[3], h.a[4], h.a[5], h.a[6], h.a[7]
+                );
+                println!("  sr: imask={} super={}", h.sr_imask, h.sr_super);
+                return;
+            }
             if let Some((r, pr, gbr, code, probe)) = self.sat.take_master_bp_hit() {
                 println!(
                     "master breakpoint hit at frame {f}: pc={:08X}",
@@ -739,6 +757,32 @@ impl Dbg {
                     println!("slave bp cleared");
                 }
             },
+            "b68" => match a1.and_then(parse_num) {
+                Some(pc) => {
+                    // Optional register guard: `b68 <addr> <reg> <val>` where reg
+                    // 0-7 = D0-D7, 8-15 = A0-A7.
+                    let guard = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
+                        (Some(idx), Some(val)) if idx < 16 => Some((idx as u8, val)),
+                        _ => None,
+                    };
+                    self.bp68 = Some((pc, guard));
+                    match guard {
+                        Some((ri, v)) => {
+                            let name = if ri < 8 {
+                                format!("D{ri}")
+                            } else {
+                                format!("A{}", ri - 8)
+                            };
+                            println!("68k bp @ {pc:06X} when {name}=={v:08X} (arm with `fc`)");
+                        }
+                        None => println!("68k bp @ {pc:06X} (arm with `fc`)"),
+                    }
+                }
+                None => {
+                    self.bp68 = None;
+                    println!("68k bp cleared");
+                }
+            },
             "probe" => match a1.and_then(parse_num) {
                 Some(addr) => {
                     self.bp_probe = Some(addr);
@@ -910,6 +954,7 @@ sdbg commands:
   run <cyc>       run_for <cyc> master cycles (full system)
   b [pc] [ri v]   set/clear master bp (hex); optional guard: fire only when R[ri]==v
   bs [pc] [ri v]  set/clear slave breakpoint (opt. guard: fire when slave R<ri>==v); use with fc
+  b68 [pc] [r v]  set/clear SCSP 68k breakpoint (opt. guard: fire when r==v; r 0-7=D, 8-15=A); use with fc
   probe [addr]    set/clear bp memory probe — capture raw-WRAM [addr] (via bus, no cache) on a bp hit
   w <addr> [sz]   add a poll watchpoint (size 1/2/4, default 2), checked in `c`
   dw              clear watchpoints
@@ -1007,6 +1052,7 @@ fn main() {
         fb: vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES],
         master_bp: None,
         master_bp_cond: None,
+        bp68: None,
         slave_bp: None,
         slave_bp_cond: None,
         bp_probe: None,

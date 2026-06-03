@@ -340,6 +340,19 @@ impl Saturn {
             .set_bp_probe(addr);
     }
 
+    /// Debug-only: arm (or clear, with `None`) a breakpoint on the SCSP's hosted
+    /// MC68EC000 sound CPU at `pc`, optionally guarded (`reg`, `val`) where reg
+    /// 0-7 = D0-D7, 8-15 = A0-A7. Used to break inside the BIOS sound driver — e.g.
+    /// at the voice key-on code — and inspect why a key-on isn't issued (M11 BGM).
+    pub fn set_scsp_bp68(&mut self, bp: Option<(u32, Option<(u8, u32)>)>) {
+        self.bus.scsp.set_bp68(bp);
+    }
+
+    /// Debug-only: take the SCSP 68k breakpoint hit's register snapshot, if fired.
+    pub fn take_scsp_bp68_hit(&mut self) -> Option<crate::scsp::M68kBpHit> {
+        self.bus.scsp.take_bp68_hit()
+    }
+
     /// Debug-only: step the master SH-2 exactly one instruction, then
     /// drain SMPC/SCU side effects. Used by the reference-emulator PC
     /// trace diff (M4 task #5). Returns the cycles the instruction took.

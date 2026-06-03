@@ -856,6 +856,23 @@ pub struct Scsp {
     /// the `sdbg` `t68` sound-driver trace. `#[serde(skip)]` — not machine state.
     #[serde(skip)]
     pc_trace: Option<std::collections::VecDeque<u32>>,
+    /// Debug-only 68k breakpoint: `(pc, optional (reg, val) guard)`. The reg index
+    /// is 0-7 = D0-D7, 8-15 = A0-A7. Captures [`M68kBpHit`] the first time the 68k
+    /// is about to execute `pc` (with the guard satisfied). `#[serde(skip)]`.
+    #[serde(skip)]
+    bp68: Option<(u32, Option<(u8, u32)>)>,
+    #[serde(skip)]
+    bp68_hit: Option<M68kBpHit>,
+}
+
+/// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
+#[derive(Clone, Debug, Default)]
+pub struct M68kBpHit {
+    pub pc: u32,
+    pub d: [u32; 8],
+    pub a: [u32; 8],
+    pub sr_imask: u8,
+    pub sr_super: bool,
 }
 
 /// Cap on the buffered audio (interleaved samples ≈ 46 ms) — overrun guard.
@@ -878,7 +895,23 @@ impl Scsp {
             sample_frac: 0,
             out: Vec::new(),
             pc_trace: None,
+            bp68: None,
+            bp68_hit: None,
         }
+    }
+
+    /// Arm (or, with `None`, clear) a 68k breakpoint at `pc`, optionally guarded
+    /// so it fires only when `reg == val` (reg 0-7 = D0-D7, 8-15 = A0-A7). Clears
+    /// any pending hit. Debug-only; used by sdbg `b68` to break inside the SCSP
+    /// sound driver (e.g. at the voice key-on code).
+    pub fn set_bp68(&mut self, bp: Option<(u32, Option<(u8, u32)>)>) {
+        self.bp68 = bp;
+        self.bp68_hit = None;
+    }
+
+    /// Take the 68k breakpoint hit's register snapshot, if it fired.
+    pub fn take_bp68_hit(&mut self) -> Option<M68kBpHit> {
+        self.bp68_hit.take()
     }
 
     /// Begin recording a ring of recent 68k PCs (debug; see [`pc_trace`]).
@@ -996,6 +1029,8 @@ impl Scsp {
             ctrl,
             cpu,
             pc_trace,
+            bp68,
+            bp68_hit,
             ..
         } = &mut *self;
         while budget > 0 {
@@ -1007,6 +1042,33 @@ impl Scsp {
                 t.push_back(cpu.regs.pc);
                 if t.len() > 16384 {
                     t.pop_front();
+                }
+            }
+            // Debug 68k breakpoint: capture regs the first time the 68k is about
+            // to execute the target PC (with any guard satisfied).
+            if let Some((bp_pc, guard)) = bp68
+                && cpu.regs.pc == *bp_pc
+                && bp68_hit.is_none()
+            {
+                let pass = match guard {
+                    Some((ri, v)) => {
+                        let r = if (*ri as usize) < 8 {
+                            cpu.regs.d[*ri as usize]
+                        } else {
+                            cpu.regs.a[(*ri as usize) & 7]
+                        };
+                        r == *v
+                    }
+                    None => true,
+                };
+                if pass {
+                    *bp68_hit = Some(M68kBpHit {
+                        pc: cpu.regs.pc,
+                        d: cpu.regs.d,
+                        a: cpu.regs.a,
+                        sr_imask: cpu.regs.sr.imask,
+                        sr_super: cpu.regs.sr.supervisor,
+                    });
                 }
             }
             // Present the level-triggered SCSP IRQ line at each boundary.
