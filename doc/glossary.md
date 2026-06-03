@@ -108,8 +108,12 @@ addressing, [TOC]); a 200-block buffer pool with 24 [Filter]s / partitions;
 a read pump feeding partitions; data transfer (16-bit FIFO + the 32-bit
 SCU-DMA port at `0x0581_8000`); the [ISO9660] filesystem; and disc
 authentication (`0xE0`/`0xE1`). `insert_disc` / `eject_disc` move the drive
-between disc-present (status `PAUSE`) and empty (status `NODISC` `0x07`, what a
-closed empty drive reports, matching MAME). Reads go through a
+between disc-present and empty (status `NODISC` `0x07`, what a closed empty
+drive reports, matching MAME). A disc present at power-on/insert first
+**spins up** — it reports `STATUS_BUSY` for ~1 s (the `Startup` drive phase,
+Mednafen `DRIVEPHASE_STARTUP`) while the [TOC] is read, then settles to `PAUSE`;
+that recognition window is what the BIOS fills with its boot animation (a drive
+that reports `PAUSE` immediately skips it). Reads go through a
 [SectorSource] — an in-memory image or a live drive (see [physical disc]).
 M10 adds [CDDA]→[SCSP] playback; remaining: the MPEG card and move/copy ops.
 

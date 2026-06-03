@@ -178,6 +178,24 @@ auth/Play/ReadFile; looping back to `AbortFile` retries and eventually gives up.
 That branch is data-driven on the recognition's HIRQ shadow — which is why
 [§B.2](#b2-the-reset-hirq-the-load-bearing-detail) is load-bearing.
 
+**Recognition spin-up (the `Startup` drive phase, commit `e2884e7`).** A disc
+present at power-on/insert does not report ready instantly: it reports
+`STATUS_BUSY` for ~1 s (Mednafen `DRIVEPHASE_STARTUP`, `cdb.cpp:2175` =
+`1*44100*256` CD clocks) while the pickup spins up and the TOC is read, then
+settles to `PAUSE`. During that window the BIOS plays its **disc-present boot
+animation** (the morphing SEGA-SATURN logo). `insert_disc` enters
+`DrivePhase::Startup` reporting BUSY; crucially the host `Init (0x04)` is guarded
+*not* to park the drive while it is in `Startup` — it still resets the
+buffer/filter engine, but the physical pickup keeps spinning up. Reporting
+`PAUSE` immediately (the old behaviour) made the BIOS see an already-ready /
+door-closed drive and skip straight to the static logo with no animation; every
+earlier "just report BUSY" attempt failed because the BIOS's own `Init` reset the
+drive back to `PAUSE` before the window was ever observed (the symptom the user
+spotted: ours jumped to the logo "as if the CD door were open"). Verified against
+MAME with an audio CD inserted — ours now plays the animation, and Doukyuusei
+~if~ still boots to its title. The boot *sound* over the animation is still
+missing (a separate SCSP voice-keying issue; see `doc/bios-bgm-diagnosis.md`).
+
 ### B.4 Authentication & region
 
 `Auth (0xE0)` is header-only HLE: it checks the `"SEGA SEGASATURN"` security
@@ -316,3 +334,10 @@ blocker is **scheduler/interrupt-timing accuracy** (Mednafen-alignment Phase 2
 landed — master-leads interleave + per-instruction SCU sampling — Phase 3
 remains). See [`roadmap.md`](roadmap.md) M11 and the memory log for the
 trace-by-trace history.
+
+**Boot fidelity (latest, `e2884e7`):** with a disc inserted the BIOS now plays
+its disc-present **boot animation** — the recognition spin-up (the `Startup`
+drive phase, [§B.3](#b3-the-recognition-command-sequence)) holds `STATUS_BUSY`
+for ~1 s so the BIOS animates instead of jumping straight to the static logo.
+The animation is still **silent** — a separate SCSP voice-keying issue, tracked
+in [`bios-bgm-diagnosis.md`](bios-bgm-diagnosis.md).
