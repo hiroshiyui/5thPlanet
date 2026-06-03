@@ -12,7 +12,7 @@ When committing and pushing changes, always follow these steps:
 3. **Compose the message** following the [Conventional Commits](https://www.conventionalcommits.org/) standard. Use these scopes for this project:
    - `sh2` — anything inside `crates/sh2/`
    - `saturn` — anything inside `crates/saturn/`
-   - `frontend` — `jupiter/` binary
+   - `jupiter` — `jupiter/` frontend binary
    - `workspace` — root `Cargo.toml`, `.gitignore`, shared lints
    - `doc` — `doc/**`, `README.md`, `CLAUDE.md`
    - `ci` — `.github/`, hooks, scripts
