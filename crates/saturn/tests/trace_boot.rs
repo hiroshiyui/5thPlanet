@@ -1273,34 +1273,64 @@ fn splash_timeline() {
 #[ignore = "manual: dump the framebuffer at several frames to PPM for visual splash check"]
 fn dump_framebuffer() {
     use std::io::Write;
-    let Some((bios, _)) = load_bios() else {
-        println!("no BIOS; skipped");
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
         return;
+    };
+    let region = match std::env::var("REGION").as_deref() {
+        Ok("us") | Ok("usa") => saturn::smpc::region::NORTH_AMERICA,
+        Ok("eu") | Ok("europe") => saturn::smpc::region::EUROPE_PAL,
+        _ => saturn::smpc::region::JAPAN,
     };
     let mut sat = Saturn::new(bios);
     sat.reset();
+    sat.set_region(region);
+    sat.set_rtc_unix(1_700_000_000);
+    if let Ok(cue_name) = std::env::var("CUE") {
+        if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) {
+            if let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+                std::fs::read(root.join("roms").join(name)).ok()
+            }) {
+                sat.insert_disc(d);
+                println!("inserted disc roms/{cue_name}");
+            }
+        }
+    }
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
-    let w = 320usize;
-    let h = 224usize;
+    let mut dims = (320usize, 224usize);
     let mut next = 0u32;
-    for snap in [90u32, 120, 150, 180, 240, 300] {
+    let frames: Vec<u32> = std::env::var("SNAP_FRAMES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![240, 300, 360, 420, 480, 540]);
+    for snap in frames {
         while next < snap {
-            sat.run_frame(&mut fb);
+            dims = sat.run_frame(&mut fb);
             next += 1;
         }
+        let (w, h) = dims;
         // Write a binary PPM (P6, RGB) — drop the RGBA alpha byte.
         let path = format!("/tmp/fb_{snap:03}.ppm");
         let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
         write!(out, "P6\n{w} {h}\n255\n").unwrap();
-        for px in fb.chunks_exact(4) {
+        // The renderer packs the active frame tightly at row stride = `w`, so
+        // the image is the first `w*h` RGBA pixels (not the whole MAX buffer).
+        for px in fb.chunks_exact(4).take(w * h) {
             out.write_all(&px[0..3]).unwrap();
         }
         out.flush().unwrap();
         let nonblack = fb
             .chunks_exact(4)
+            .take(w * h)
             .filter(|p| p[0] | p[1] | p[2] != 0)
             .count();
-        println!("frame {snap}: wrote {path} ({nonblack} non-black px)");
+        println!("frame {snap}: wrote {path} ({w}x{h}, {nonblack} non-black px)");
     }
 }
 
@@ -2182,14 +2212,26 @@ fn audio_probe() {
 #[ignore = "manual: BIOS-only SCSP audio probe (no disc; SAT_PAD=/AUDIO_OUT=/FRAMES=)"]
 fn bios_audio_probe() {
     let root = workspace_root();
-    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    // BIOS=<path-or-name> overrides the default JP BIOS; REGION=us|jp|eu picks
+    // the SMPC region byte (default JP). Use BIOS="bios/Sega Saturn BIOS (USA).bin"
+    // REGION=us to mirror MAME's `saturn` (USA) driver.
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
     let Ok(bios) = std::fs::read(&bios_path) else {
-        println!("no JP BIOS; skipped");
+        println!("no BIOS at {}; skipped", bios_path.display());
         return;
+    };
+    let region = match std::env::var("REGION").as_deref() {
+        Ok("us") | Ok("usa") => saturn::smpc::region::NORTH_AMERICA,
+        Ok("eu") | Ok("europe") => saturn::smpc::region::EUROPE_PAL,
+        _ => saturn::smpc::region::JAPAN,
     };
     let mut sat = Saturn::new(bios);
     sat.reset();
-    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_region(region);
     sat.set_rtc_unix(1_700_000_000);
     // No disc by default (the bare BIOS menu); CUE=<name> inserts a disc from
     // roms/ — e.g. CUE=audiocd.cue to reach the CD-player panel WITH an audio
