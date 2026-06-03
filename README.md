@@ -26,7 +26,7 @@ foundation stays solid.
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 | M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 Doukyuusei ~if~ boots to its title screen (640×224 hi-res); the disc-present boot animation now plays (CD recognition spin-up); VF2 on a CD-state wall |
 
-Current test count: **533 workspace-wide, 0 failures.** Task-by-task
+Current test count: **534 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
