@@ -2191,7 +2191,23 @@ fn bios_audio_probe() {
     sat.reset();
     sat.set_region(saturn::smpc::region::JAPAN);
     sat.set_rtc_unix(1_700_000_000);
-    // No disc inserted — this is the bare BIOS menu the user boots.
+    // No disc by default (the bare BIOS menu); CUE=<name> inserts a disc from
+    // roms/ — e.g. CUE=audiocd.cue to reach the CD-player panel WITH an audio
+    // disc (the Mednafen oracle path, since Mednafen can't boot no-disc).
+    if let Ok(cue_name) = std::env::var("CUE") {
+        match std::fs::read_to_string(root.join("roms").join(&cue_name)) {
+            Ok(cue) => match saturn::disc::Disc::from_cue(&cue, |name| {
+                std::fs::read(root.join("roms").join(name)).ok()
+            }) {
+                Ok(d) => {
+                    sat.insert_disc(d);
+                    println!("inserted disc roms/{cue_name}");
+                }
+                Err(e) => println!("cue parse failed: {e}"),
+            },
+            Err(_) => println!("no roms/{cue_name}; running no-disc"),
+        }
+    }
     let frames: u32 = std::env::var("FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2242,12 +2258,16 @@ fn bios_audio_probe() {
         n += a.len() as u64;
     }
     let avg = if n > 0 { total / n as i64 } else { 0 };
+    let (keyon_execs, slot_starts) = sat.bus.scsp.ctrl.dbg_keyon_counts();
     println!(
         "BIOS-only audio: peak active slots={peak_slots}/32, first key-on at frame {}, \
          total |sum|={total}, avg |amplitude|={avg} (0 = silent)",
         first_keyon
             .map(|f| f.to_string())
             .unwrap_or_else(|| "NEVER".into())
+    );
+    println!(
+        "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
     );
     if let Some(p) = dump {
         std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
