@@ -310,9 +310,17 @@ fn run(
     // so `/ 12` ≈ 83 ms (~5 frames) — comfortably above SDL's ~23 ms period. The
     // audio draining in real time, not the display vsync, sets the emulator speed.
     let audio_target_bytes = 44_100 * 2 * 2 / 12;
-    // Cap frames run per render iteration so a slow frame / stalled audio device
-    // can't starve the UI (it just falls a little behind and catches up next time).
-    let max_frames_per_burst = 8;
+    // Cap emulated frames run per *displayed* frame. This is the smoothness
+    // knob: the burst below advances the machine until audio is buffered, but
+    // only the LAST frame of the burst is ever presented — so a large cap turns
+    // a throughput deficit into a big visual lurch (run 8, show 1 = motion jumps
+    // 8 frames at once, the "heavy frame-skip" symptom). A small cap keeps each
+    // displayed frame within a few emulated frames of the last, so motion stays
+    // smooth even when the core can't sustain full real-time; the trade is that
+    // audio catch-up after a stall (menu close, state load, slow CD seek) takes
+    // a few more iterations instead of one gallop. 2 keeps the visual jump to at
+    // most one extra frame while still allowing modest catch-up.
+    let max_frames_per_burst = 2;
 
     // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
     // the slot-less `<bios>.state`).
