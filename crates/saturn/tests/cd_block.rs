@@ -72,13 +72,16 @@ fn insert_then_eject_round_trips_to_nodisc() {
     // A small synthetic ISO is enough to flip the drive to disc-present.
     sat.insert_disc(saturn::disc::Disc::from_iso(vec![0u8; 2048 * 4]));
     assert!(sat.has_disc(), "disc present after insert");
-    // Get Status now reports PAUSE (0x01 in the high byte).
+    // Get Status now reports BUSY (0x00 in the high byte): a freshly-inserted
+    // disc is in the recognition spin-up (Mednafen `DRIVEPHASE_STARTUP`),
+    // reporting STATUS_BUSY for ~1 s before it settles to PAUSE — the window
+    // the BIOS fills with its boot animation.
     sat.bus.write16(CR1, 0x0000, AccessKind::Data);
     sat.bus.write16(CR2, 0x0000, AccessKind::Data);
     sat.bus.write16(CR3, 0x0000, AccessKind::Data);
     sat.bus.write16(CR4, 0x0000, AccessKind::Data);
     let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
-    assert_eq!(cr1 >> 8, 0x01, "PAUSE while a disc is loaded");
+    assert_eq!(cr1 >> 8, 0x00, "BUSY (recognition spin-up) right after insert");
 
     sat.eject_disc();
     assert!(!sat.has_disc(), "no disc after eject");

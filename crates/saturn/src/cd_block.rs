@@ -230,6 +230,13 @@ const PERIODIC_IDLE_CYC: i64 = cd2m(187_065) as i64;
 /// Active (PLAY/PAUSE) periodic-report interval — `17712` (cdb.cpp:2373),
 /// fires roughly once per sector.
 const PERIODIC_ACTIVE_CYC: i64 = ACTIVE_PERIODIC_CYCLES as i64;
+/// Recognition spin-up time for a disc present at power-on/insert — Mednafen
+/// `DRIVEPHASE_STARTUP` holds `STATUS_BUSY` for `1 * 44100 * 256` CD clocks
+/// (`cdb.cpp:2175`), i.e. exactly one second of the CD clock, before it reads
+/// the TOC and settles to PAUSE. `cd2m(CD_CLOCK_HZ)` is that one second in
+/// master cycles. The BIOS plays its boot animation + sets up the menu sounds
+/// during this window; reporting PAUSE immediately skips the whole sequence.
+const STARTUP_CYC: i64 = cd2m(CD_CLOCK_HZ) as i64;
 
 /// One unit of read/seek time at single speed: `(44100×256) / 75` per sector,
 /// halved at 2× (cdb.cpp:2291/2398, `(44100*256)/((subq&0x40)?150:75)`).
@@ -248,6 +255,15 @@ fn sector_cyc(speed: u32) -> u64 {
 enum DrivePhase {
     /// Drive idle/stopped (post-Init PAUSE, or stopped via Seek-to-0).
     Idle,
+    /// Power-on/insert recognition spin-up (Mednafen `DRIVEPHASE_STARTUP`,
+    /// `cdb.cpp:2182`): a disc present at reset reports `STATUS_BUSY` for ~1 s
+    /// (`1*44100*256` CD clocks) while the pickup spins up and the TOC is read,
+    /// then settles to PAUSE. The BIOS fills this window with its boot
+    /// animation + menu-sound setup, so a drive that reports PAUSE *immediately*
+    /// (our old `insert_disc`) skips both. A host-level Init does **not** abort
+    /// it — the physical pickup keeps spinning up regardless of the buffer/filter
+    /// reset the Init command performs.
+    Startup,
     /// A seek was just commanded: compute the target, report `STATUS_BUSY`,
     /// then schedule the seek-time (Mednafen `SEEK_START1/2/3`).
     SeekStart,
@@ -640,14 +656,21 @@ impl CdBlock {
         self.track = source.first_track();
         self.index = 1;
         self.fad = FAD_OFFSET;
-        self.status = STAT_PAUSE;
+        // Mednafen `DRIVEPHASE_STARTUP`: a disc present at power-on/insert spins
+        // up reporting `STATUS_BUSY` for ~1 s (recognition) before the TOC is
+        // read and the drive settles to PAUSE. The BIOS plays its boot animation
+        // and sets up the menu sounds during that window — reporting PAUSE
+        // immediately (the old behaviour) made the BIOS perceive a
+        // ready/door-already-closed drive and jump straight to the static logo
+        // with no animation and no sound. See [`DrivePhase::Startup`].
+        self.status = STAT_BUSY;
         // A freshly-loaded disc has not been read yet → `is_cdrom` clears until
         // the read pump actually reads a data sector (Mednafen semantics).
         self.is_cdrom = false;
         self.disc = Some(Box::new(source));
         self.cd_curfad = FAD_OFFSET;
         self.drive_sector = FAD_OFFSET;
-        self.drive_idle();
+        self.drive_startup();
         // A disc appearing is always a disc-change: the FIRST Init (cold boot
         // *or* a runtime swap) reports DCHG one-shot, matching Mednafen, which
         // treats a power-on disc as a change (its recognition HIRQ carries
@@ -1161,6 +1184,24 @@ impl CdBlock {
         self.periodic_idle = PERIODIC_IDLE_CYC;
     }
 
+    /// Begin the recognition spin-up (Mednafen `DRIVEPHASE_STARTUP`): park the
+    /// read pipeline like [`drive_idle`] but enter [`DrivePhase::Startup`] for
+    /// [`STARTUP_CYC`] (~1 s) instead of going idle. The caller sets
+    /// `status = STAT_BUSY`. Periodic reports are suppressed during recognition
+    /// (Mednafen parks `PeriodicIdleCounter` at "never"), so the host keeps
+    /// seeing BUSY until the spin-up completes in [`Self::drive_run`].
+    fn drive_startup(&mut self) {
+        self.drive_phase = DrivePhase::Startup;
+        self.sec_prebuf_in = false;
+        self.cur_play_end = 0;
+        self.play_end_irq = 0;
+        self.pause_counter = 0;
+        self.play_repeat_counter = 0;
+        self.fadstoplay = -1;
+        self.drive_counter = STARTUP_CYC;
+        self.periodic_idle = i64::MAX;
+    }
+
     /// Resolve the seek target and schedule the seek time (Mednafen
     /// `SeekStart1`+`SeekStart2`+`SeekStart3`, cdb.cpp:1905/1957/2203). Sets the
     /// head geometry, reports `STATUS_SEEK`, and arms the `Seek` phase.
@@ -1349,6 +1390,20 @@ impl CdBlock {
                 guard += 1;
                 match self.drive_phase {
                     DrivePhase::Idle => self.drive_counter += PERIODIC_IDLE_CYC,
+                    DrivePhase::Startup => {
+                        // Recognition spin-up complete (Mednafen `STARTUP` →
+                        // `TranslateTOC` + `StartSeek(150)`, cdb.cpp:2183). Our
+                        // FAD-addressed disc model already holds the TOC and is
+                        // positioned at track 1, so we settle straight to a ready
+                        // PAUSE and resume idle periodic reports — the host has
+                        // seen BUSY for the whole ~1 s window.
+                        self.status = STAT_PAUSE | (self.status & STAT_PERI);
+                        self.drive_phase = DrivePhase::Idle;
+                        self.cd_curfad = FAD_OFFSET;
+                        self.drive_sector = FAD_OFFSET;
+                        self.drive_counter += PERIODIC_IDLE_CYC;
+                        self.periodic_idle = PERIODIC_IDLE_CYC;
+                    }
                     DrivePhase::SeekStart => self.seek_start(),
                     DrivePhase::Seek => {
                         self.play_sector_processed = false;
@@ -1802,7 +1857,14 @@ impl CdBlock {
                 // PAUSE at the start of track 1 and clears the play range — so
                 // a prior Seek that stopped the drive (STANDBY) is undone and
                 // the next probe pass finds a ready drive (MAME `cmd_init_cdsystem`).
-                if self.disc.is_some() {
+                // During recognition spin-up (`DrivePhase::Startup`) a host-level
+                // Init resets the buffer/filter engine but must NOT park the
+                // physical pickup — the drive keeps reporting BUSY until spin-up
+                // completes (Mednafen leaves the `DrivePhase` running across the
+                // Init). Unconditionally parking it here is precisely what
+                // cancelled the BUSY window and skipped the boot animation when an
+                // earlier "report BUSY" attempt was tried (and then reverted).
+                if self.disc.is_some() && self.drive_phase != DrivePhase::Startup {
                     self.drive_idle();
                     self.status = STAT_PAUSE;
                     self.cd_curfad = FAD_OFFSET;
@@ -2658,16 +2720,19 @@ mod tests {
         c.write16(0x001C, 0x0000);
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000);
-        // CR1 = PAUSE status (0x01) in the high byte. The `is_cdrom` bit (0x80,
-        // low byte) is **read-based** (Mednafen `CurPosInfo.is_cdrom`): a
-        // freshly-inserted disc has read no data sector yet, so it is 0 here —
-        // the real drive / Mednafen report `is_cdrom = 0` during recognition,
-        // before any PLAY. (A `track_at_fad` position lookup wrongly reported 1,
-        // derailing the BIOS recognition into its give-up loop.)
+        // CR1 = BUSY status (0x00) in the high byte: a freshly-inserted disc is
+        // in the recognition spin-up (Mednafen `DRIVEPHASE_STARTUP`), reporting
+        // STATUS_BUSY for ~1 s while the pickup spins up and reads the TOC,
+        // *before* it settles to PAUSE — the BIOS plays its boot animation
+        // during this window, which reporting PAUSE immediately (the old
+        // behaviour this assertion used to lock in) skipped entirely. The
+        // `is_cdrom` bit (0x80, low byte) is **read-based** (Mednafen
+        // `CurPosInfo.is_cdrom`): a freshly-inserted disc has read no data
+        // sector yet, so it is 0 here.
         assert_eq!(
             c.read16(0x0018),
-            0x0100,
-            "PAUSE status, is_cdrom=0 (no read yet)"
+            0x0000,
+            "BUSY status (recognition spin-up), is_cdrom=0 (no read yet)"
         );
         assert_eq!(c.read16(0x001C), 0x4101, "ctrl/adr 0x41, track 1");
         assert_eq!(c.read16(0x0020), 0x0100, "index 1, FAD hi 0");
