@@ -919,6 +919,11 @@ pub struct Scsp {
     /// reach routine X?" over a whole run. `#[serde(skip)]` — not machine state.
     #[serde(skip)]
     pc_seen: Option<std::collections::BTreeSet<u32>>,
+    /// Debug-only multi-hit 68k register log: `(watch_pc, [d0,d1,d2,d3,a6] per
+    /// hit)`. Captures the value stream at a hot PC (e.g. the BGM enqueue) for a
+    /// reference diff vs Mednafen — unlike `bp68` (first hit only). `#[serde(skip)]`.
+    #[serde(skip)]
+    enq_log: Option<(u32, Vec<[u32; 5]>)>,
 }
 
 /// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
@@ -952,6 +957,7 @@ impl Scsp {
             out: Vec::new(),
             pc_trace: None,
             pc_seen: None,
+            enq_log: None,
             bp68: None,
             bp68_hit: None,
         }
@@ -995,6 +1001,20 @@ impl Scsp {
     pub fn take_68k_footprint(&mut self) -> Vec<u32> {
         match &self.pc_seen {
             Some(s) => s.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Begin logging `[d0,d1,d2,d3,a6]` at every 68k execution of `pc` (debug;
+    /// the BGM enqueue-stream diff). Capped internally to bound growth.
+    pub fn enable_enq_log(&mut self, pc: u32) {
+        self.enq_log = Some((pc, Vec::new()));
+    }
+
+    /// Snapshot the captured enqueue register log (oldest→newest), if enabled.
+    pub fn take_enq_log(&mut self) -> Vec<[u32; 5]> {
+        match &self.enq_log {
+            Some((_, v)) => v.clone(),
             None => Vec::new(),
         }
     }
@@ -1102,6 +1122,7 @@ impl Scsp {
             cpu,
             pc_trace,
             pc_seen,
+            enq_log,
             bp68,
             bp68_hit,
             ..
@@ -1120,6 +1141,19 @@ impl Scsp {
             // Debug footprint: every distinct PC ever executed (unbounded).
             if let Some(s) = pc_seen.as_mut() {
                 s.insert(cpu.regs.pc);
+            }
+            // Debug enqueue-stream log: capture the value regs at the watched PC.
+            if let Some((wpc, log)) = enq_log.as_mut()
+                && cpu.regs.pc == *wpc
+                && log.len() < 8192
+            {
+                log.push([
+                    cpu.regs.d[0],
+                    cpu.regs.d[1],
+                    cpu.regs.d[2],
+                    cpu.regs.d[3],
+                    cpu.regs.a[6],
+                ]);
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about
             // to execute the target PC (with any guard satisfied).

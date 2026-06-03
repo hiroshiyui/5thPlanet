@@ -2272,6 +2272,14 @@ fn bios_audio_probe() {
     if trace68.is_some() {
         sat.bus.scsp.enable_68k_footprint(); // distinct PCs over the WHOLE run
     }
+    // ENQLOG=<pc>: capture the 68k value regs at every hit of the BGM enqueue
+    // PC (default 0x4B9A), to diff the event stream vs Mednafen's SS_SEQDUMP.
+    let enqlog: Option<u32> = std::env::var("ENQLOG").ok().map(|s| {
+        u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0x4B9A)
+    });
+    if let Some(pc) = enqlog {
+        sat.bus.scsp.enable_enq_log(pc);
+    }
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2395,6 +2403,27 @@ fn bios_audio_probe() {
             let s: String = seen.iter().map(|pc| format!("{pc:06X}\n")).collect();
             std::fs::write(&p, s).unwrap();
             println!("    wrote {} footprint PCs to {p}", seen.len());
+        }
+    }
+    if enqlog.is_some() {
+        let log = sat.bus.scsp.take_enq_log();
+        let mut hist = [0u32; 8];
+        for r in &log {
+            hist[((r[0] >> 4) & 7) as usize] += 1;
+        }
+        println!(
+            "  68k enqueue stream: {} events, cmd histogram (cmd0..7)={hist:?}",
+            log.len()
+        );
+        let evs: Vec<String> = log.iter().take(48).map(|r| format!("{:02X}", r[0] & 0xFF)).collect();
+        println!("    first events (d0 low byte): {}", evs.join(" "));
+        if let Ok(p) = std::env::var("ENQ_OUT") {
+            let s: String = log
+                .iter()
+                .map(|r| format!("{:02X} a6={:06X} d1={:02X} d2={:02X}\n", r[0] & 0xFF, r[4], r[1] & 0xFF, r[2] & 0xFF))
+                .collect();
+            std::fs::write(&p, s).unwrap();
+            println!("    wrote {} enqueue events to {p}", log.len());
         }
     }
     if let Some(p) = dump {
