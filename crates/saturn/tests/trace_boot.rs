@@ -2166,3 +2166,91 @@ fn audio_probe() {
         );
     }
 }
+
+/// BIOS-only SCSP audio probe (M11 sound target): boot the JAP BIOS with **no
+/// disc**, exactly as the frontend does (region JAPAN + host RTC set, so the
+/// machine reaches the multiplayer menu rather than sitting on the clock-setup
+/// screen), and report whether the BIOS ever keys an SCSP slot / produces
+/// non-silent output. This is the faithful repro for "I want to hear the BIOS
+/// boot BGM + menu nav SFX": sdbg (no region/RTC) is a less-faithful repro.
+///
+/// `SAT_PAD=0xBITS` (saturn pad mask) taps the port-1 pad for ~6 frames once a
+/// second after `PAD_FROM` frames, to exercise the direction-key nav SFX.
+/// `AUDIO_OUT=<path>` dumps the raw i16-LE stereo (play: aplay -f S16_LE -r
+/// 44100 -c 2 <path>). `FRAMES=` overrides the run length.
+#[test]
+#[ignore = "manual: BIOS-only SCSP audio probe (no disc; SAT_PAD=/AUDIO_OUT=/FRAMES=)"]
+fn bios_audio_probe() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    // No disc inserted — this is the bare BIOS menu the user boots.
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1200);
+    let pad: u16 = std::env::var("SAT_PAD")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    let pad_from: u32 = std::env::var("PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
+    let dump = std::env::var("AUDIO_OUT").ok();
+    let mut pcm: Vec<u8> = Vec::new();
+    let (mut total, mut n): (i64, u64) = (0, 0);
+    let mut peak_slots = 0usize;
+    let mut first_keyon: Option<u32> = None;
+    for f in 0..frames {
+        // Optional scripted nav: tap the pad for 6 frames at the top of each
+        // second, after the menu is up — drives the direction-key SFX path.
+        let held = if pad != 0 && f >= pad_from && (f % 60) < 6 {
+            pad
+        } else {
+            0
+        };
+        sat.set_pad1(held);
+
+        sat.run_frame(&mut fb);
+
+        let active = (0..32).filter(|&i| sat.bus.scsp.slot_active(i)).count();
+        if active > peak_slots {
+            peak_slots = active;
+        }
+        if active > 0 && first_keyon.is_none() {
+            first_keyon = Some(f);
+        }
+
+        let a = sat.take_audio();
+        if dump.is_some() {
+            for &x in &a {
+                pcm.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let s: i64 = a.iter().map(|&x| (x as i64).abs()).sum();
+        total += s;
+        n += a.len() as u64;
+    }
+    let avg = if n > 0 { total / n as i64 } else { 0 };
+    println!(
+        "BIOS-only audio: peak active slots={peak_slots}/32, first key-on at frame {}, \
+         total |sum|={total}, avg |amplitude|={avg} (0 = silent)",
+        first_keyon
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "NEVER".into())
+    );
+    if let Some(p) = dump {
+        std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
+        println!("wrote {} bytes to {p}", pcm.len());
+    }
+}
