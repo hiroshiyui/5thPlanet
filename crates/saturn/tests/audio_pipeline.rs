@@ -56,6 +56,11 @@ const SCSP_REGS: u32 = 0x05B0_0000;
 const CODE_PC: u32 = 0x0000_0020;
 const STACK: u32 = 0x0601_0000;
 
+// --- 68k-driven variant: the sound CPU (not the SH-2) sets up the slot ---
+const M68K_PC: u32 = 0x0000_1000; // 68k driver program, sound-RAM offset
+const M68K_SSP: u32 = 0x0001_0000; // 68k supervisor stack pointer
+const M68K_SCSP: u32 = 0x0010_0000; // SCSP registers, as the 68k addresses them
+
 /// Build the self-contained sine-playback ROM. Layout: reset vector (PC, SP) at
 /// 0, code at 0x20, a longword + word constant pool after the code.
 fn build_sine_rom() -> Vec<u8> {
@@ -185,4 +190,108 @@ fn audio_pipeline_sine() {
     assert!(nonzero > 0, "slot produced audio (the sine plays)");
     assert!(peak >= AMP as u16 / 4, "sine reaches a meaningful level (peak={peak})");
     assert!(peak < 30000, "steady single voice must not clip (peak={peak})");
+}
+
+// ===========================================================================
+// 68k-driven variant — the *sound CPU* sets up the slot, not the SH-2.
+//
+// The SH-2 sine ROM above proves the SCSP *synthesis* is correct, but in a real
+// boot it's the hosted MC68EC000 sound driver (not the SH-2) that programs the
+// slots and strobes key-on — and that path is the prime suspect for the silent
+// game/BIOS BGM. This test removes the SH-2 from the picture: the SH-2 just
+// spins, and a tiny 68k program staged in sound RAM does the entire slot setup
+// + key-on through the 68k's own view of the SCSP registers (0x10_0000). If the
+// sine comes out, our hosted 68k *can* drive the SCSP to make sound, so the BGM
+// blocker is the real driver's control flow (it never reaches key-on), not the
+// 68k→SCSP path itself.
+// ===========================================================================
+
+/// `MOV.W #imm, (abs).L` (68k) — store a 16-bit immediate to an absolute long
+/// address. Encoding `0x33FC`, then the immediate word, then the 32-bit address;
+/// all big-endian (the 68k, like the SH-2, is big-endian). Self-contained (no
+/// address register), so each register write is independently verifiable.
+fn m68k_movw_imm_abs(imm: u16, abs: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[0..2].copy_from_slice(&0x33FCu16.to_be_bytes());
+    b[2..4].copy_from_slice(&imm.to_be_bytes());
+    b[4..8].copy_from_slice(&abs.to_be_bytes());
+    b
+}
+
+/// The 68k driver: program slot 0 (same values as the SH-2 sine ROM) through the
+/// 68k's SCSP window, key-on last, then spin. `BRA *` is `0x60FE`.
+fn build_sine_68k_driver() -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&m68k_movw_imm_abs(SA_LOW, M68K_SCSP + 0x02)); // reg1 SA-low
+    p.extend_from_slice(&m68k_movw_imm_abs(REG_LEA as u16, M68K_SCSP + 0x06)); // reg3 LEA=63
+    p.extend_from_slice(&m68k_movw_imm_abs(REG_AR as u16, M68K_SCSP + 0x08)); // reg4 AR=max
+    p.extend_from_slice(&m68k_movw_imm_abs(DISDL_FULL, M68K_SCSP + 0x16)); // reg0xB DISDL=7
+    p.extend_from_slice(&m68k_movw_imm_abs(KEY_ON, M68K_SCSP)); // reg0 = KEY ON (last)
+    p.extend_from_slice(&0x60FEu16.to_be_bytes()); // BRA self
+    p
+}
+
+/// An SH-2 ROM that does nothing but spin (so the master keeps time advancing
+/// while the 68k does the real work).
+fn build_park_rom() -> Vec<u8> {
+    let mut rom = vec![0u8; 0x30];
+    rom[0..4].copy_from_slice(&CODE_PC.to_be_bytes()); // reset PC
+    rom[4..8].copy_from_slice(&STACK.to_be_bytes()); // reset SP
+    rom[CODE_PC as usize..CODE_PC as usize + 2].copy_from_slice(&BRA_SELF.to_be_bytes());
+    rom[CODE_PC as usize + 2..CODE_PC as usize + 4].copy_from_slice(&NOP.to_be_bytes());
+    rom
+}
+
+#[test]
+#[ignore = "manual: plays a sine through one SCSP slot DRIVEN BY THE 68k; AUDIO_OUT=<file> dumps PCM"]
+fn audio_pipeline_sine_68k() {
+    const N: usize = 64;
+    const AMP: i16 = 0x4000;
+
+    let mut sat = Saturn::new(build_park_rom()); // SH-2 just spins; the 68k works
+    sat.reset();
+
+    // Seed the sine into sound RAM at SA (shared RAM — same offset either CPU's
+    // view), then stage the 68k driver + its reset vectors. `start()` (SNDON)
+    // reloads SSP/PC from sound RAM [0]/[4] and runs the driver.
+    let sine = sine_period(N, AMP);
+    for (i, &s) in sine.iter().enumerate() {
+        sat.bus.scsp.ram.write16(SA_LOW as u32 + i as u32 * 2, s as u16);
+    }
+    sat.bus.scsp.ram.write32(0, M68K_SSP);
+    sat.bus.scsp.ram.write32(4, M68K_PC);
+    for (i, &b) in build_sine_68k_driver().iter().enumerate() {
+        sat.bus.scsp.ram.write8(M68K_PC + i as u32, b);
+    }
+    sat.bus.scsp.start();
+
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
+    let mut pcm: Vec<i16> = Vec::new();
+    for _ in 0..8 {
+        sat.run_frame(&mut fb);
+        pcm.extend(sat.take_audio());
+    }
+
+    // Proof the 68k actually drove the SCSP: slot 0 must carry the values the
+    // driver wrote (SA/LEA), independent of whether audio came out.
+    let d = sat.bus.scsp.slot_debug(0);
+    println!(
+        "after 68k driver: 68k pc={:06X}  slot0 active={} sa={:#07X} lea={} eg={}",
+        sat.bus.scsp.cpu.regs.pc, d.active, d.sa, d.lea, d.eg_state
+    );
+    assert_eq!(d.sa, SA_LOW as u32, "68k wrote slot0 SA");
+    assert_eq!(d.lea, REG_LEA as u16, "68k wrote slot0 LEA");
+
+    let peak = pcm.iter().map(|&x| x.unsigned_abs()).max().unwrap_or(0);
+    let nonzero = pcm.iter().filter(|&&x| x != 0).count();
+    println!("68k-driven output: {} samples, {nonzero} non-zero, peak={peak}", pcm.len());
+    if let Ok(p) = std::env::var("AUDIO_OUT") {
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(&p, &bytes).unwrap();
+        println!("wrote {} bytes to {p}", bytes.len());
+    }
+
+    assert!(nonzero > 0, "the 68k-keyed slot produces audio (the sine plays)");
+    assert!(peak >= AMP as u16 / 4, "sine reaches a meaningful level (peak={peak})");
+    assert!(peak < 30000, "single voice must not clip (peak={peak})");
 }
