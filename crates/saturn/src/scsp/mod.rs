@@ -511,15 +511,29 @@ impl ScspCtrl {
 
     /// Execute key-on/off for all slots based on each one's KYONB bit, then
     /// clear the KYONEX strobe wherever it's set.
+    ///
+    /// **Edge-triggered**, matching Mednafen (`scsp.inc:1496`,
+    /// `if(KeyExecute && (EnvPhase == RELEASE) == KeyBit)`): a KYONEX strobe acts
+    /// only on a *transition*. A slot is "off" (re-keyable) iff it is inactive or
+    /// already releasing. KYONB=1 starts an *off* slot; it must **not** restart a
+    /// slot that is still in Attack/Decay (re-strobing an already-playing voice
+    /// does nothing). KYONB=0 releases a *playing* slot. Unconditionally calling
+    /// `start_slot` for every KYONB=1 slot on every strobe (the old behaviour)
+    /// let menu SFX the BIOS re-strobes with KYONB still set pile up at full
+    /// volume — all 32 slots stuck in Decay2 — and clip to a growing buzz.
     fn key_on_execute(&mut self) {
         self.dbg_keyon_execs += 1;
         for i in 0..NUM_SLOTS {
             let data0 = self.slot_reg(i, 0);
-            if data0 & 0x0800 != 0 {
-                self.start_slot(i);
-            } else if self.slots[i].active {
-                // Key-off enters the release phase (the slot keeps playing
-                // until the release envelope decays to silence).
+            let kyonb = data0 & 0x0800 != 0;
+            let off = !self.slots[i].active || self.slots[i].eg.state == EgState::Release;
+            if kyonb {
+                if off {
+                    self.start_slot(i);
+                }
+            } else if !off {
+                // Key-off a playing slot: enter the release phase (the slot keeps
+                // playing until the release envelope decays to silence).
                 self.slots[i].eg.state = EgState::Release;
             }
             // Clear KYONEX (bit 12) so the strobe is one-shot.
@@ -1454,6 +1468,32 @@ mod tests {
         assert!(!audio.is_empty(), "audio was generated");
         assert!(audio.iter().any(|&x| x != 0), "output is non-silent");
         assert!(s.take_audio().is_empty(), "buffer drained");
+    }
+
+    #[test]
+    fn keyon_is_edge_triggered_no_restart_of_a_playing_slot() {
+        // A KYONEX strobe with KYONB still set must NOT restart an already-
+        // playing slot (Mednafen's edge guard, `scsp.inc:1496`). The old code
+        // called `start_slot` for every KYONB=1 slot on every strobe, so BIOS
+        // menu SFX — which the BIOS re-strobes with KYONB still set — piled up at
+        // full volume across all 32 slots (stuck in Decay2) and clipped to a
+        // growing buzz.
+        let mut s = Scsp::new();
+        keyon_panned(&mut s, 0, 0x4000, 7, 0x00); // key slot 0
+        assert!(s.ctrl.slots[0].active, "slot 0 keyed on");
+        let (_, starts1) = s.ctrl.dbg_keyon_counts();
+        assert_eq!(starts1, 1, "exactly one slot start so far");
+        // Re-strobe KYONEX (bit 12) with KYONB (bit 11) still set: no restart.
+        s.ctrl.write16(0, 0x1800);
+        let (_, starts2) = s.ctrl.dbg_keyon_counts();
+        assert_eq!(starts2, 1, "re-strobe must not restart the already-playing slot");
+        // A genuine key-off (KYONB=0) still releases the slot.
+        s.ctrl.write16(0, 0x1000); // KYONEX only, KYONB clear
+        assert_eq!(
+            s.ctrl.slots[0].eg.state,
+            EgState::Release,
+            "key-off releases the playing slot"
+        );
     }
 
     #[test]

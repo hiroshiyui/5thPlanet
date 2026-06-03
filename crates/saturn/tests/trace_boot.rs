@@ -2311,6 +2311,16 @@ fn bios_audio_probe() {
     println!(
         "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
     );
+    // Buzz diagnosis: every active slot at the end of the run — why didn't it free?
+    for i in 0..32 {
+        if sat.bus.scsp.slot_active(i) {
+            let d = sat.bus.scsp.slot_debug(i);
+            println!(
+                "  slot{i:02} eg={}/{:#X} disdl={} tl={:#04X} loop={} sa={:#07X}",
+                d.eg_state, d.eg_volume, d.disdl, d.tl, d.lpctl, d.sa
+            );
+        }
+    }
     if let Some(p) = dump {
         std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
         println!("wrote {} bytes to {p}", pcm.len());
