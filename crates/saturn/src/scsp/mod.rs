@@ -1098,6 +1098,26 @@ pub struct Scsp {
     /// value first diverges on an otherwise-identical PC path. `#[serde(skip)]`.
     #[serde(skip)]
     itrace: Option<ITrace>,
+    /// Debug-only **signal scope** (the cross-emulator "oscilloscope"): at each
+    /// 68k execution of `trigger_pc`, sample a set of sound-RAM channels into a
+    /// row. One row per trigger hit is one *timeframe* (e.g. the seq-tick PC
+    /// `0x40F2` → one row per Timer-B tick). Dumped as CSV and overlaid against
+    /// the matching mednaref capture to see, per channel and per timeframe,
+    /// exactly where ours' and Mednafen's signals diverge — the generalization
+    /// of the one-off ENQLOG/itrace/gate probes. `#[serde(skip)]`.
+    #[serde(skip)]
+    scope: Option<ScopeCap>,
+}
+
+/// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
+/// channel is `(name, sound-RAM byte address, width 1|2|4)`; `rows` holds one
+/// sample-vector per `trigger_pc` hit (the timebase), capped at `max`.
+#[derive(Clone, Debug)]
+pub struct ScopeCap {
+    pub trigger_pc: u32,
+    pub channels: Vec<(String, u32, u8)>,
+    pub rows: Vec<Vec<u32>>,
+    pub max: usize,
 }
 
 /// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
@@ -1133,9 +1153,22 @@ impl Scsp {
             pc_seen: None,
             enq_log: None,
             itrace: None,
+            scope: None,
             bp68: None,
             bp68_hit: None,
         }
+    }
+
+    /// Arm the cross-emulator signal scope: at each 68k execution of
+    /// `trigger_pc`, sample each `(name, sound-RAM addr, width)` channel into a
+    /// row (capped at `max` rows). Drain with [`Self::take_scope`].
+    pub fn enable_scope(&mut self, trigger_pc: u32, channels: Vec<(String, u32, u8)>, max: usize) {
+        self.scope = Some(ScopeCap { trigger_pc, channels, rows: Vec::new(), max });
+    }
+
+    /// Take the captured signal-scope rows, if armed.
+    pub fn take_scope(&mut self) -> Option<ScopeCap> {
+        self.scope.take()
     }
 
     /// Arm (or, with `None`, clear) a 68k breakpoint at `pc`, optionally guarded
@@ -1331,6 +1364,7 @@ impl Scsp {
             pc_seen,
             enq_log,
             itrace,
+            scope,
             bp68,
             bp68_hit,
             ..
@@ -1389,6 +1423,23 @@ impl Scsp {
                         *frozen = true; // stop at the first enqueue
                     }
                 }
+            }
+            // Signal scope: at the trigger PC, sample the configured sound-RAM
+            // channels into a row (one row per timeframe).
+            if let Some(sc) = scope.as_mut()
+                && cpu.regs.pc == sc.trigger_pc
+                && sc.rows.len() < sc.max
+            {
+                let row: Vec<u32> = sc
+                    .channels
+                    .iter()
+                    .map(|&(_, addr, w)| match w {
+                        1 => ram.read8(addr) as u32,
+                        2 => ram.read16(addr) as u32,
+                        _ => ram.read32(addr),
+                    })
+                    .collect();
+                sc.rows.push(row);
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about
             // to execute the target PC (with any guard satisfied).

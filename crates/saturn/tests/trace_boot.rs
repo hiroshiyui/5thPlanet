@@ -2285,6 +2285,34 @@ fn bios_audio_probe() {
     if itrace_out.is_some() {
         sat.bus.scsp.enable_68k_itrace();
     }
+    // SCOPE: the cross-emulator signal "oscilloscope". SCOPE_PC=<68k PC> is the
+    // timebase trigger (default 0x40F2 = the seq-tick, so one row per Timer-B
+    // tick); SCOPE_CH="name:addr:width,..." lists sound-RAM channels (addr+width
+    // hex); SCOPE_OUT=<file> dumps the CSV. The same SCOPE_PC/SCOPE_CH drive the
+    // matching mednaref capture for an aligned overlay/diff.
+    let scope_on = std::env::var("SCOPE_CH").is_ok();
+    if scope_on {
+        let pc = std::env::var("SCOPE_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x40F2);
+        let channels: Vec<(String, u32, u8)> = std::env::var("SCOPE_CH")
+            .unwrap()
+            .split(',')
+            .filter_map(|spec| {
+                let mut it = spec.split(':');
+                let name = it.next()?.to_string();
+                let addr = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                let w = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(4u8);
+                Some((name, addr, w))
+            })
+            .collect();
+        let max = std::env::var("SCOPE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8000);
+        sat.bus.scsp.enable_scope(pc, channels, max);
+    }
     // MASTERHIST: histogram the master SH-2 PC ring at the end — what loop the
     // master is in near the BGM trigger (the master-side trigger gate, M12 #5).
     // Run with FRAMES set to just before the trigger (~594).
@@ -2504,10 +2532,25 @@ fn bios_audio_probe() {
         if let Ok(p) = std::env::var("ENQ_OUT") {
             let s: String = log
                 .iter()
-                .map(|r| format!("{:02X} a6={:06X} d1={:02X} d2={:02X}\n", r[0] & 0xFF, r[4], r[1] & 0xFF, r[2] & 0xFF))
+                .map(|r| format!("a6={:06X} d0={:08X} d1={:08X} d2={:08X} d3={:08X}\n", r[4], r[0], r[1], r[2], r[3]))
                 .collect();
             std::fs::write(&p, s).unwrap();
             println!("    wrote {} enqueue events to {p}", log.len());
+        }
+    }
+    if scope_on && let Some(sc) = sat.bus.scsp.take_scope() {
+        let names: Vec<&str> = sc.channels.iter().map(|(n, _, _)| n.as_str()).collect();
+        let mut out = format!("# pc={:04X} timebase-hits={}\nrow {}\n", sc.trigger_pc, sc.rows.len(), names.join(" "));
+        for (i, row) in sc.rows.iter().enumerate() {
+            let vals: Vec<String> = row.iter().map(|v| format!("{v:X}")).collect();
+            out.push_str(&format!("{i} {}\n", vals.join(" ")));
+        }
+        match std::env::var("SCOPE_OUT") {
+            Ok(p) => {
+                std::fs::write(&p, &out).unwrap();
+                println!("  SCOPE: wrote {} rows × {} channels to {p}", sc.rows.len(), sc.channels.len());
+            }
+            Err(_) => print!("{out}"),
         }
     }
     if let Some(p) = itrace_out {
