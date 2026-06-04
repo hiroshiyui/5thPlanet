@@ -2539,7 +2539,10 @@ fn bios_audio_probe() {
         }
     }
     if scope_on && let Some(sc) = sat.bus.scsp.take_scope() {
-        let names: Vec<&str> = sc.channels.iter().map(|(n, _, _)| n.as_str()).collect();
+        // "t68" (the built-in 68k-cycle time axis) is the first value of each row.
+        let names: Vec<&str> = std::iter::once("t68")
+            .chain(sc.channels.iter().map(|(n, _, _)| n.as_str()))
+            .collect();
         let mut out = format!("# pc={:04X} timebase-hits={}\nrow {}\n", sc.trigger_pc, sc.rows.len(), names.join(" "));
         for (i, row) in sc.rows.iter().enumerate() {
             let vals: Vec<String> = row.iter().map(|v| format!("{v:X}")).collect();

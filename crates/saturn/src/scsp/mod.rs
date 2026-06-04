@@ -1430,15 +1430,16 @@ impl Scsp {
                 && cpu.regs.pc == sc.trigger_pc
                 && sc.rows.len() < sc.max
             {
-                let row: Vec<u32> = sc
-                    .channels
-                    .iter()
-                    .map(|&(_, addr, w)| match w {
-                        1 => ram.read8(addr) as u32,
-                        2 => ram.read16(addr) as u32,
-                        _ => ram.read32(addr),
-                    })
-                    .collect();
+                // Built-in time axis: the 68k accumulated cycle (low 32 bits) is
+                // the first column of every row, so the scope shows *when* each
+                // timeframe occurred — the X-axis. Lets the overlay tell a
+                // tick-delivery (SCSP timer) divergence from a 68k-logic one.
+                let mut row: Vec<u32> = vec![cpu.cycles as u32];
+                row.extend(sc.channels.iter().map(|&(_, addr, w)| match w {
+                    1 => ram.read8(addr) as u32,
+                    2 => ram.read16(addr) as u32,
+                    _ => ram.read32(addr),
+                }));
                 sc.rows.push(row);
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about
