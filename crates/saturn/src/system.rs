@@ -465,6 +465,9 @@ impl Saturn {
         let line_cycle = frame_cycle % CYCLES_PER_LINE;
 
         let prev = self.bus.vdp2.regs.read16(0x004);
+        // Previous scanline (the VCNT register before we overwrite it below) —
+        // the edge reference for the SCU Timer-0 line compare.
+        let prev_line = self.bus.vdp2.regs.read16(0x00A);
         // Use the precise frame-derived edge (matches the `run_for` clamp and
         // the reference) rather than the rounded per-line `line >= 224`.
         let vblank = frame_cycle >= Self::VBLANK_IN_CYCLE;
@@ -513,6 +516,21 @@ impl Saturn {
             #[cfg(not(test))]
             if std::env::var_os("SAT_INTC_TRACE").is_some() && now > 130_000_000 {
                 eprintln!("RAISE VBlankOut now={now} IMS={:08X}", self.bus.scu.ims);
+            }
+        }
+
+        // SCU Timer 0 — a per-frame line compare. When the timer is enabled
+        // (T1MD bit 0, TENB) the SCU raises the Timer-0 interrupt as the raster
+        // first reaches scanline T0C (a 10-bit value), letting games schedule a
+        // mid-frame (raster-split) interrupt. Edge-detected against the previous
+        // scanline so it fires once per frame. Dormant unless software sets
+        // TENB, so the BIOS boot path is unaffected. (Timer 1 — the sub-line
+        // H-position timer — needs dot-granular raster timing and is deferred;
+        // *SCU User's Manual*, T0C/T1MD.)
+        if self.bus.scu.t1md & 1 != 0 {
+            let t0c = (self.bus.scu.t0c & 0x3FF) as u16;
+            if line as u16 == t0c && prev_line != t0c {
+                self.bus.scu.raise(crate::scu::Source::Timer0);
             }
         }
 

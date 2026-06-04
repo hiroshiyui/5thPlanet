@@ -363,3 +363,34 @@ fn scu_dsp_dma_copies_work_ram_into_data_ram() {
     // RA0 advanced by 2 words (hold=0 → write-back).
     assert_eq!(sat.bus.scu.dsp.regs.ra0, ra0 + 2);
 }
+
+#[test]
+fn scu_timer0_fires_at_the_compare_line() {
+    let mut sat = build();
+    // Mask all SCU interrupts so the (garbage-running) master never acks
+    // Timer 0, leaving its IST status bit set for us to observe.
+    sat.bus.scu.ims = 0xFFFF;
+    sat.bus.scu.t0c = 10; // compare at scanline 10
+    sat.bus.scu.t1md = 1; // TENB — timer enable
+    // Advance past scanline 10 (~10 lines) but stay inside the frame.
+    sat.run_for(40_000);
+    assert_ne!(
+        sat.bus.scu.ist & (1 << 3),
+        0,
+        "Timer 0 raised when the raster first reaches T0C"
+    );
+}
+
+#[test]
+fn scu_timer0_dormant_when_disabled() {
+    let mut sat = build();
+    sat.bus.scu.ims = 0xFFFF;
+    sat.bus.scu.t0c = 10;
+    // T1MD left 0 → timer disabled.
+    sat.run_for(40_000);
+    assert_eq!(
+        sat.bus.scu.ist & (1 << 3),
+        0,
+        "no Timer 0 interrupt while TENB is clear"
+    );
+}
