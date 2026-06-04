@@ -80,6 +80,21 @@ const ACTIVE_LINES: u64 = 224;
 /// `CYCLES_PER_FRAME` directly to avoid per-line integer-rounding drift.
 const CYCLES_PER_LINE: u64 = CYCLES_PER_FRAME / LINES_PER_FRAME;
 
+/// TVSTAT HBLANK (bit 2): asserted once the dot counter passes the active
+/// display width, per Mednafen's `HTimings` (`vdp2.cpp`): the 320-family line is
+/// 427 dots with 320 active (HBLANK ≈ last 25 %), the 352-family line is 455
+/// with 352 active (HBLANK ≈ last 22.6 %). The HRESO LSB picks the family
+/// (320/640 → 0, 352/704 → 1); the ×2 hi-res modes share the fraction. Pure +
+/// testable: `line_cycle / cycles_per_line ≥ active / total`.
+fn hblank_active(line_cycle: u64, h_res: u8, cycles_per_line: u64) -> bool {
+    let (active, total) = if h_res & 1 == 1 {
+        (352u64, 455u64)
+    } else {
+        (320u64, 427u64)
+    };
+    line_cycle * total >= active * cycles_per_line
+}
+
 /// Sub-frame granularity at which the CD-block periodic-firmware timer
 /// ticks. One scanline matches the reference (Yabause drives `Cs2Exec`
 /// per scanline); the CD-block's own accumulator carries the remainder, so
@@ -475,12 +490,7 @@ impl Saturn {
         if vblank {
             tvstat |= 0x0008; // VBLANK
         }
-        // REVIEW(magic): HBLANK as "last ~20% of the scanline" is an
-        // invented approximation, not the real H-blank dot count (the VDP2
-        // H-blank period is a specific number of dots in the 427-dot line).
-        // Harmless unless the BIOS times something off HBLANK; revisit if a
-        // divergence points at TVSTAT.HBLANK.
-        if line_cycle * 5 >= CYCLES_PER_LINE * 4 {
+        if hblank_active(line_cycle, self.bus.vdp2.regs.h_resolution(), CYCLES_PER_LINE) {
             tvstat |= 0x0004; // HBLANK
         }
         if frame & 1 == 1 {
@@ -1258,5 +1268,27 @@ impl Saturn {
             }
         }
         samples
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hblank_active;
+
+    #[test]
+    fn hblank_asserts_past_the_active_display_width() {
+        // 320-family (HRESO LSB 0): 320 active dots of 427. Using cycles_per_line
+        // = total dots makes the boundary land exactly at `active`.
+        assert!(!hblank_active(319, 0, 427), "still in active display");
+        assert!(hblank_active(320, 0, 427), "HBLANK at the active-display edge");
+        assert!(hblank_active(426, 0, 427), "HBLANK through to line end");
+        // 640 hi-res shares the 320 family (HRESO=2, LSB 0).
+        assert!(!hblank_active(319, 2, 427));
+        assert!(hblank_active(320, 2, 427));
+        // 352-family (LSB 1): 352 active of 455.
+        assert!(!hblank_active(351, 1, 455), "still active in 352 mode");
+        assert!(hblank_active(352, 1, 455), "HBLANK at the 352-mode edge");
+        // 704 hi-res shares the 352 family (HRESO=3, LSB 1).
+        assert!(hblank_active(352, 3, 455));
     }
 }
