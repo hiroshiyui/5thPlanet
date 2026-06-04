@@ -722,6 +722,78 @@ master-trace-diff harness.
 | 6 | **VDP1-VRAM SH-2 draw-slowdown — primitive done, gated on the draw-DURATION model** 🚧 | Ported Mednafen's `Write_/Read_CheckDrawSlowdown` (commit `9934411`): `Vdp1::draw_slowdown` charges SH-2 VDP1-VRAM/FB accesses 25/22/41/44 cy capped by the inter-access gap while `is_drawing()`, wired into all 6 `SaturnBus` return sites. Golden-safe (`bios_boot` unchanged, 537 tests green) and it fires correctly during the CD-player UI. **BUT instrumentation (`dbg_slowdown`/`dbg_plots`, both `#[serde(skip)]`) proves it is currently a NO-OP for the BGM**: over the 530-frame audio-CD boot the master makes **407,354** VDP1 accesses, **0 while drawing**. Cause: our modelled draw is **~100× too short** — 326 `begin_plot` calls, **avg 2000 cy / max 4992 cy** each, vs a ~479,151-cy frame, so `is_drawing()` covers ~0.4 % of a frame and never overlaps the master's ~768 VDP1 writes/frame (spread across the whole frame). **So the real lever is the VDP1 draw-DURATION model**: our `begin_plot` duration (`commands×16 + dots×1`) counts only ~1800 processed dots/frame; Mednafen's `DoDrawing` charges per-command setup + a per-pixel **resume loop** (`resume_table`) so `DrawingActive` spans the real rasterization (much of a frame for a logo morph). **Open question before investing:** is Mednafen's boot-animation draw actually large (needs a mednaref `CycleCounter`/`DrawingActive`-span probe to confirm)? **Refuted en route:** the CD-startup lever — `STARTUP_CYC ×2` moved the trigger the *wrong* way (4414→1653) and killed the throwaway key-on, so the recognition-BUSY window is **not** a clean animation-length knob. |
 | 7 | **Validate against the targets** | BGM plays (seq-tick count / divider phase matches, voices key); VF2's intro advances past the timing-gated stall; *Doukyuusei ~if~* stable; master-PC-trace aligned over a multi-second run; `bios_boot` golden + full suite green throughout. |
 
+## Milestone 13 — Hardware completeness & fidelity-gap backlog 📋
+
+The output of a **full architecture audit** (2026-06-04, fanned out per chip). The
+emulator is **"boot-complete" but not "hardware-complete"**: it reaches game code
+on the real-BIOS LLE path, but a number of hardware features and timing behaviours
+are stubbed, approximated, or absent. **None of these block the current targets**
+(BIOS boot, VF2, *Doukyuusei ~if~* to title) — which is *why* they're still open —
+but together they are the path to **broad game compatibility + full cycle-accuracy**.
+
+This is a **prioritized backlog**, not a single-goal sprint: tasks are pulled in
+when a specific game or accuracy need surfaces, golden-safe throughout. The
+whole-system **timing** items (Tier A) extend M12 and partly overlap it (cross-ref
+noted). Ordered by relevance to the accuracy-first axis. The cache-fidelity audit
+that produced this list also closed one gap in passing — the SH-2 associative purge
+(`46d3f24`); the cache itself is now verified write-through + invalidation-complete.
+
+**Tier A — Whole-system timing** (the cycle-accuracy frontier; extends M12)
+
+| # | Gap | Notes |
+|---|-----|-------|
+| A1 | **Continuous event timeline (kill batch-drain jitter)** | Peripherals settle *between* batches at ≤256-cy (`SMPC_POLL_QUANTUM`) granularity, not their exact cycle — VCNT/TVSTAT, SMPC, VDP1 draw-end, inter-CPU FTI, SCSP. Mednafen runs a continuous next-event timeline (`ss.cpp`). This is the **structural ceiling** on cycle-exactness. `system.rs` `run_for`/`cycles_to_next_event`. |
+| A2 | **SCSP per-sample interleave** ⏸ tracked as M12 #3 | 68k + mixer run per-batch; Mednafen interleaves at each 44.1 kHz output sample. Timer-B *rate* matches (88.0) but *phase* can jitter. |
+| A3 | **SCU-DMA cycle-stealing** | A DMA block completes instantaneously at the batch boundary (`drain_scu_dma`); real HW steals bus cycles from the CPU over the transfer. Code polling `D*ST` mid-transfer, or timing-overlapping work, would diverge. |
+| A4 | **Bus contention beyond VDP1** | Only the VDP1 draw-slowdown is modeled. **No VDP2-VRAM contention, no CPU↔CPU bus arbitration, no DMA↔CPU stealing** — the two SH-2s never stall each other, which real HW does constantly. `bus.rs`. |
+| A5 | **Real HBlank dot-count + draw-end/FTI jitter** | TVSTAT.HBLANK is an invented "last ~20 % of line" (`update_video_timing`, flagged `REVIEW(magic)`), not the per-mode (320/352/640/704) dot range; VDP1 draw-end + inter-CPU FTI pulses land at batch boundaries, not their exact cycle. |
+| A6 | **VDP1 draw-DURATION model** ⏸ tracked as M12 #6 | `begin_plot` under-counts real command lists ~50× (≤4992 cy vs Mednafen's 25k–258k per `SS_VDP1DRAW`); the per-access draw-slowdown (`9934411`) is a no-op until this is fixed. |
+
+**Tier B — SCSP audio features** (adjacent to the BGM goal)
+
+| # | Gap | Notes |
+|---|-----|-------|
+| B1 | **SCSP LFO** | Pitch (vibrato) + amplitude (tremolo) low-frequency oscillator — the 4 waveforms (saw/square/triangle/noise), PLFOS/ALFOS depth, LFO reset — **entirely absent**. Highest-value audio gap: a large fraction of Saturn music uses LFO, so even once BGM keys, modulated parts sound flat. No code in `scsp/`. |
+| B2 | **SCSP FM / slot-to-slot modulation** | MDL/MDXSL/MDYSL modulation-input routing (and self-modulation) — absent; synthesis is PCM-only. |
+| B3 | **SCSP misc** | MIDI I/O (MIBUF/MOBUF), slot/EG readback (MSLC monitor, CA call-address, SGC envelope-phase), global MVOL/DAC18B/MEM4MB. Low impact. |
+
+**Tier C — VDP2 / VDP1 rendering features** (visible as the game library widens)
+
+| # | Gap | Notes |
+|---|-----|-------|
+| C1 | **VDP2 mosaic** | MZCTL pixel-grouping (fade/pixelation transitions) — absent; no register decode or renderer pass. |
+| C2 | **VDP2 shadow on NBG/RBG** | Only the sprite MSB-shadow composites (`renderer.rs`); the NBG/RBG shadow-calc modes are missing. |
+| C3 | **VDP2 line-color screen + back-screen register** | Backdrop is hardcoded to `CRAM[0]`; the back-screen color/table (BKTAU/BKTAL) and the line-color screen (LCCLMD/LCTA) are unmodeled. Visible in gradient skies/water. |
+| C4 | **VDP2 special priority + special color-calc** | The special-priority function (SFPRMD / special-function-code) and per-dot special color-calc (EXCCEN) — absent. |
+| C5 | **VDP2 windows + rotation edge cases** | Sprite window (WCTL SWE/SWA), dual-parameter window selection; RBG coefficient **mode 3** (Xp) + screen-over **mode 1**; CRAM **mode 3**. |
+| C6 | **VDP1 framebuffer TVM modes** | Rotated / 8bpp framebuffer layouts; only the default RGB555 512×256 (TVM mode 0) is modeled. `vdp1/framebuffer.rs`. |
+
+**Tier D — CPU & SCU peripherals**
+
+| # | Gap | Notes |
+|---|-----|-------|
+| D1 | **SH-2 DIVU timing + overflow IRQ** | Division *results* are correct but complete synchronously (no 39-cycle latency) and never raise the DIVU overflow interrupt (DVCR.OVFIE stored, unused). Games that poll DVCR or use the divide-done IRQ would diverge. `sh2/onchip/divu.rs`. |
+| D2 | **SH-2 on-chip DMAC transfers** | Register stub — stores SAR/DAR/TCR/CHCR but performs **no transfers** (no `run_channel`). Low impact: Saturn games use the SCU DMA. `sh2/onchip/dmac.rs`. |
+| D3 | **SH-2 address-generation interlock** | A load feeding the *next* instruction's address base should stall 1 cycle; not modeled. `sh2/pipeline.rs`. |
+| D4 | **MC68EC000 timing + exceptions** ⏸ partly M12 #4 | Bus-cycle-only timing (no MUL/DIV/shift instruction-internal penalties); no address-error (vec 3) / bus-error (vec 2) / trace-mode exceptions; minimal exception stack frame. `m68k/`. |
+| D5 | **SCU timers + unraised interrupts** | Timer 0/1 (T0C/T1S/T1MD) are register stubs → no timer interrupt fires; several IST sources are declared but never asserted (HBlank, pad, DMA-illegal); the A/B-bus refresh registers (ASR0/1, AREF, RSEL) are stored but unused. `scu.rs`. |
+
+**Tier E — Input devices** (only one digital pad on port 1 today)
+
+| # | Gap | Notes |
+|---|-----|-------|
+| E1 | **Multitap + port-2 scanning** | No 4/6-player multitap and no port-2 peripheral chain; INTBACK returns "no device" for port 2. `smpc.rs` / INTBACK peripheral phase. |
+| E2 | **Analog peripherals** | 3D Control Pad, Mission Stick, racing controller — no analog peripheral IDs or data formats. |
+| E3 | **Specialty peripherals** | Mouse, light gun (needs raster crosshair position), keyboard. |
+
+**Tier F — Already-deferred** (cross-referenced)
+
+| # | Gap | Notes |
+|---|-----|-------|
+| F1 | **MPEG card** ⏸ | Deferred from M7 — see *Later milestones* below. |
+| F2 | **CD move/copy sector ops** ⏸ | Deferred from M7. |
+| F3 | **Cache address/data arrays** | The direct-access spaces `0x60000000` (address array) and `0xC0000000` (data array) fall through to open bus; rarely used outside cache-as-RAM mode. `sh2/interpreter.rs` `classify`. |
+
 ## Later milestones (queued)
 
 - **MPEG card** + CD move/copy sector ops (deferred from M7).
