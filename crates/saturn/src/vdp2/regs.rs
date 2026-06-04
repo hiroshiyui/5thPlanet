@@ -201,6 +201,23 @@ impl Vdp2Regs {
         self.bgon() & (1 << n) != 0
     }
 
+    /// Snap `(x, y)` to the mosaic block origin for a background layer, per
+    /// MZCTL (0x022): bits 0–3 enable NBG0–3 mosaic, bit 4 RBG0; the block is
+    /// `MZSZH+1` (bits 11:8) wide and `MZSZV+1` (bits 15:12) tall, so every dot
+    /// in a block shows the colour of the block's top-left dot. `enable_bit`
+    /// selects the layer (`1 << n` for NBG, `0x10` for RBG0); when that bit is
+    /// clear the coordinate is returned unchanged (mosaic off → no-op).
+    /// (*VDP2 User's Manual*, MZCTL.)
+    pub fn mosaic_coord(&self, enable_bit: u16, x: u32, y: u32) -> (u32, u32) {
+        let mzctl = self.read16(0x022);
+        if mzctl & enable_bit == 0 {
+            return (x, y);
+        }
+        let szh = (((mzctl >> 8) & 0xF) + 1) as u32;
+        let szv = (((mzctl >> 12) & 0xF) + 1) as u32;
+        (x - x % szh, y - y % szv)
+    }
+
     /// Priority number for NBG`n` (PRINA: N0 2..0 / N1 10..8;
     /// PRINB: N2 2..0 / N3 10..8). Priority 0 means the layer is not shown.
     pub fn nbg_priority(&self, n: usize) -> u8 {
@@ -725,6 +742,22 @@ impl Vdp2Regs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mosaic_coord_snaps_to_block_origin_when_enabled() {
+        let mut r = Vdp2Regs::new();
+        // No mosaic configured → coordinate unchanged for every layer.
+        assert_eq!(r.mosaic_coord(1 << 0, 7, 5), (7, 5));
+
+        // MZCTL: enable NBG0 (bit 0), 4×2 blocks (MZSZH=3 → width 4, MZSZV=1 → height 2).
+        r.write16(0x022, (1 << 0) | (3 << 8) | (1 << 12));
+        assert_eq!(r.mosaic_coord(1 << 0, 0, 0), (0, 0));
+        assert_eq!(r.mosaic_coord(1 << 0, 3, 1), (0, 0), "snaps to the 4×2 block origin");
+        assert_eq!(r.mosaic_coord(1 << 0, 5, 3), (4, 2), "next block over");
+        // A layer whose enable bit is clear is untouched (NBG1, RBG0).
+        assert_eq!(r.mosaic_coord(1 << 1, 5, 3), (5, 3));
+        assert_eq!(r.mosaic_coord(0x10, 5, 3), (5, 3));
+    }
 
     #[test]
     fn tvmd_round_trip_and_display_bit_decode() {

@@ -264,7 +264,9 @@ fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Dot> {
     if pri == 0 || !window_allows(vdp2, vdp2.regs.nbg_window_control(n), x, y) {
         return None;
     }
-    let rgb = sample_nbg(vdp2, n, x, y)?;
+    // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
+    let (mx, my) = vdp2.regs.mosaic_coord(1 << n, x, y);
+    let rgb = sample_nbg(vdp2, n, mx, my)?;
     Some(Dot {
         pri,
         rgb,
@@ -284,7 +286,13 @@ fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Dot> {
     if pri == 0 || !gated {
         return None;
     }
-    let rgb = sample_rbg(vdp2, which, x, y)?;
+    // Mosaic (MZCTL bit 4) applies to RBG0 only.
+    let (mx, my) = if which == 0 {
+        vdp2.regs.mosaic_coord(0x10, x, y)
+    } else {
+        (x, y)
+    };
+    let rgb = sample_rbg(vdp2, which, mx, my)?;
     Some(Dot {
         pri,
         rgb,
