@@ -177,6 +177,13 @@ impl OnChip {
             .set_pending(Source::FrtOvi, tier & 0x02 != 0 && ftcsr & 0x02 != 0);
         self.intc
             .set_pending(Source::Wdt, self.wdt.interrupt_active());
+        // DIVU overflow interrupt: DVCR.OVF (bit 0) AND DVCR.OVFIE (bit 1) both
+        // set (level-triggered; cleared when software writes DVCR.OVF back to 0).
+        // VCRDIV lives in the DIVU register block, so mirror it into the INTC
+        // (which owns the vector lookup) before arming the source.
+        self.intc.vcrdiv = self.divu.vcrdiv;
+        self.intc
+            .set_pending(Source::DivuOvf, self.divu.dvcr & 0b11 == 0b11);
         // CHCR transfer-end interrupt: TE (bit 1) AND IE (bit 2) both set.
         for (ch, src) in [(0usize, Source::DmacCh0), (1, Source::DmacCh1)] {
             self.intc
@@ -310,6 +317,40 @@ mod tests {
         o.write32(0xFFFF_FF04, 25);
         assert_eq!(o.read32(0xFFFF_FF04) as i32, 6, "quotient lands in DVDNT");
         assert_eq!(o.read32(0xFFFF_FF10) as i32, 1, "remainder lands in DVDNTH");
+    }
+
+    #[test]
+    fn divu_overflow_raises_interrupt_only_when_enabled() {
+        use intc::Source;
+        // OVFIE clear: an overflow sets OVF but raises no interrupt.
+        let mut o = OnChip::new();
+        o.intc.ipra = 0xF000; // DIVU priority 15
+        o.write32(0xFFFF_FF00, 0); // DVSR = 0
+        o.write32(0xFFFF_FF04, 100); // DVDNT → divide-by-zero → OVF
+        assert_eq!(o.read32(0xFFFF_FF08) & 1, 1, "OVF set");
+        o.refresh_interrupts();
+        assert_eq!(
+            o.intc.next_pending(0),
+            None,
+            "OVF set but OVFIE clear → no interrupt"
+        );
+
+        // OVFIE set: the same overflow now requests the interrupt at the
+        // IPRA-programmed level, with the VCRDIV-programmed vector.
+        let mut o = OnChip::new();
+        o.intc.ipra = 0xF000;
+        o.write32(0xFFFF_FF0C, 0x42); // VCRDIV vector
+        o.write32(0xFFFF_FF08, 0b10); // DVCR.OVFIE
+        o.write32(0xFFFF_FF00, 0); // DVSR = 0
+        o.write32(0xFFFF_FF04, 100); // DVDNT → OVF
+        o.refresh_interrupts();
+        assert_eq!(o.intc.next_pending(0), Some((Source::DivuOvf, 15)));
+        assert_eq!(o.intc.vector_for(Source::DivuOvf), 0x42);
+
+        // Clearing OVF (write DVCR back without bit 0) drops the request.
+        o.write32(0xFFFF_FF08, 0b10); // OVFIE stays, OVF cleared
+        o.refresh_interrupts();
+        assert_eq!(o.intc.next_pending(0), None, "cleared OVF → request dropped");
     }
 
     #[test]

@@ -13,7 +13,14 @@
 //!   1C  DVDNTUL mirror of DVDNTL
 //! ```
 //!
-//! Real hardware spends 39 cycles on a divide; M1 completes it synchronously.
+//! On overflow (divide-by-zero or a quotient that doesn't fit 32 bits signed)
+//! the DVCR.OVF status bit is set; if DVCR.OVFIE is also set, the divider
+//! requests the overflow interrupt — armed level-triggered by
+//! [`OnChip::refresh_interrupts`](super::OnChip::refresh_interrupts) via
+//! [`Source::DivuOvf`](super::intc::Source::DivuOvf) at the IPRA-programmed
+//! level with the VCRDIV vector (M13 D1).
+//!
+//! Real hardware spends 39 cycles on a divide; this completes it synchronously.
 //! A future timing pass can defer the result by N cycles via the pipeline
 //! scoreboard if a game is observed to poll DVCR.OVF before reading the
 //! quotient.
