@@ -753,7 +753,7 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 
 | # | Gap | Notes |
 |---|-----|-------|
-| B1 | **SCSP LFO** | Pitch (vibrato) + amplitude (tremolo) low-frequency oscillator — the 4 waveforms (saw/square/triangle/noise), PLFOS/ALFOS depth, LFO reset — **entirely absent**. Highest-value audio gap: a large fraction of Saturn music uses LFO, so even once BGM keys, modulated parts sound flat. No code in `scsp/`. |
+| B1 | **SCSP LFO** ✅ done (`b1085eb`) | Pitch (vibrato) + amplitude (tremolo) LFO — saw/square/triangle/noise waveforms, PLFOS/ALFOS depth, LFOF rate, LFORE reset, shared 17-bit noise LFSR (32×/sample). Ported Mednafen `RunLFO`/`GetPLFO`/`GetALFO`: PLFO joins the phase increment inside the octave shift, ALFO joins the EG dB index. No-LFO path byte-identical (golden + 28 prior SCSP tests unchanged); new `lfo_modulates_pitch_and_amplitude` test. |
 | B2 | **SCSP FM / slot-to-slot modulation** | MDL/MDXSL/MDYSL modulation-input routing (and self-modulation) — absent; synthesis is PCM-only. |
 | B3 | **SCSP misc** | MIDI I/O (MIBUF/MOBUF), slot/EG readback (MSLC monitor, CA call-address, SGC envelope-phase), global MVOL/DAC18B/MEM4MB. Low impact. |
 
@@ -761,7 +761,7 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 
 | # | Gap | Notes |
 |---|-----|-------|
-| C1 | **VDP2 mosaic** | MZCTL pixel-grouping (fade/pixelation transitions) — absent; no register decode or renderer pass. |
+| C1 | **VDP2 mosaic** ✅ done (`8419717`) | MZCTL (0x022) pixel-grouping: `Vdp2Regs::mosaic_coord` snaps a layer's colour-sample coordinate to its block origin (MZSZH+1 × MZSZV+1), applied to NBG0–3 (bits 0–3) + RBG0 (bit 4). Dormant when MZCTL=0 → golden + render tests unchanged. (Sprite mosaic still TODO.) |
 | C2 | **VDP2 shadow on NBG/RBG** | Only the sprite MSB-shadow composites (`renderer.rs`); the NBG/RBG shadow-calc modes are missing. |
 | C3 | **VDP2 line-color screen + back-screen register** | Backdrop is hardcoded to `CRAM[0]`; the back-screen color/table (BKTAU/BKTAL) and the line-color screen (LCCLMD/LCTA) are unmodeled. Visible in gradient skies/water. |
 | C4 | **VDP2 special priority + special color-calc** | The special-priority function (SFPRMD / special-function-code) and per-dot special color-calc (EXCCEN) — absent. |
@@ -772,7 +772,7 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 
 | # | Gap | Notes |
 |---|-----|-------|
-| D1 | **SH-2 DIVU timing + overflow IRQ** | Division *results* are correct but complete synchronously (no 39-cycle latency) and never raise the DIVU overflow interrupt (DVCR.OVFIE stored, unused). Games that poll DVCR or use the divide-done IRQ would diverge. `sh2/onchip/divu.rs`. |
+| D1 | **SH-2 DIVU timing + overflow IRQ** 🚧 IRQ done (`f00c866`), latency deferred | The overflow interrupt is now wired: `refresh_interrupts` arms `Source::DivuOvf` level-triggered on DVCR.OVF & OVFIE (mirroring VCRDIV into the INTC vector slot), at the IPRA priority. Golden-safe (BIOS never sets OVFIE); new test covers enabled/disabled/clear. **Still deferred:** the 39-cycle divide latency (changes every divide's timing → risks the boot trace; do under M12 with the trace harness). |
 | D2 | **SH-2 on-chip DMAC transfers** | Register stub — stores SAR/DAR/TCR/CHCR but performs **no transfers** (no `run_channel`). Low impact: Saturn games use the SCU DMA. `sh2/onchip/dmac.rs`. |
 | D3 | **SH-2 address-generation interlock** | A load feeding the *next* instruction's address base should stall 1 cycle; not modeled. `sh2/pipeline.rs`. |
 | D4 | **MC68EC000 timing + exceptions** ⏸ partly M12 #4 | Bus-cycle-only timing (no MUL/DIV/shift instruction-internal penalties); no address-error (vec 3) / bus-error (vec 2) / trace-mode exceptions; minimal exception stack frame. `m68k/`. |
