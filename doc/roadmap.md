@@ -776,7 +776,7 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 | D2 | **SH-2 on-chip DMAC transfers** | Register stub — stores SAR/DAR/TCR/CHCR but performs **no transfers** (no `run_channel`). Low impact: Saturn games use the SCU DMA. `sh2/onchip/dmac.rs`. |
 | D3 | **SH-2 address-generation interlock** | A load feeding the *next* instruction's address base should stall 1 cycle; not modeled. `sh2/pipeline.rs`. |
 | D4 | **MC68EC000 timing + exceptions** ⏸ partly M12 #4 | Bus-cycle-only timing (no MUL/DIV/shift instruction-internal penalties); no address-error (vec 3) / bus-error (vec 2) / trace-mode exceptions; minimal exception stack frame. `m68k/`. |
-| D5 | **SCU timers + unraised interrupts** | Timer 0/1 (T0C/T1S/T1MD) are register stubs → no timer interrupt fires; several IST sources are declared but never asserted (HBlank, pad, DMA-illegal); the A/B-bus refresh registers (ASR0/1, AREF, RSEL) are stored but unused. `scu.rs`. |
+| D5 | **SCU timers + unraised interrupts** 🚧 Timer 0 done (`694eb89`) | **Timer 0 line-compare wired**: `update_video_timing` raises `Source::Timer0` when the raster first reaches scanline T0C and TENB (T1MD bit 0) is set — the raster-split interrupt. Gated on TENB → dormant in boot, golden-safe; firing + dormant tests. **Still open:** Timer 1 (sub-line H-position timer — needs dot-granular raster, defer to M12); the other unraised IST sources (HBlank, pad, DMA-illegal); the A/B-bus refresh registers (ASR0/1, AREF, RSEL) stored but unused. |
 
 **Tier E — Input devices** (only one digital pad on port 1 today)
 
