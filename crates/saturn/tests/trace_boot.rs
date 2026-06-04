@@ -2317,7 +2317,15 @@ fn bios_audio_probe() {
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
     let mut first_keyon: Option<u32> = None;
+    // M12: stamp the frame the CD drive finishes recognition spin-up (leaves
+    // DrivePhase::Startup) to split the BGM-trigger lead into recognition vs
+    // post-recognition.
+    let mut recog_done: Option<u32> = None;
+    let started_in_startup = sat.bus.cd_block.dbg_in_startup();
     for f in 0..frames {
+        if recog_done.is_none() && started_in_startup && !sat.bus.cd_block.dbg_in_startup() {
+            recog_done = Some(f);
+        }
         // Optional scripted nav: tap the pad for 6 frames at the top of each
         // second, after the menu is up — drives the direction-key SFX path.
         let held = if pad != 0 && f >= pad_from && (f % 60) < 6 {
@@ -2358,6 +2366,12 @@ fn bios_audio_probe() {
     );
     println!(
         "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
+    );
+    println!(
+        "  CD recognition (Startup→settle) completed at frame {}",
+        recog_done
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "NEVER/not-in-startup".into())
     );
     // Buzz diagnosis: every active slot at the end of the run — why didn't it free?
     for i in 0..32 {

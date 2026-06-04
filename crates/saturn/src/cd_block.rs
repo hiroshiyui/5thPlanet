@@ -629,6 +629,14 @@ impl CdBlock {
         (self.hirq & self.hirq_mask) != 0
     }
 
+    /// Debug-only: true while the drive is still in recognition spin-up
+    /// ([`DrivePhase::Startup`]). Lets a boot-timing probe stamp the frame the
+    /// drive settles (recognition complete), to localize where ours' boot
+    /// diverges in frame-count from the reference (M12 BGM-trigger-tick chase).
+    pub fn dbg_in_startup(&self) -> bool {
+        matches!(self.drive_phase, DrivePhase::Startup)
+    }
+
     /// Record a HIRQ change to [`hirq_log`](Self::hirq_log) (debug-only; no-op
     /// unless `hirq_log_on`). Called after every site that mutates `hirq`.
     fn note_hirq(&mut self, cause: u32) {
