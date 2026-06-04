@@ -1462,37 +1462,59 @@ struct M68kView<'a> {
     ctrl: &'a mut ScspCtrl,
 }
 
+/// SCSP sound-RAM/register access penalty charged to the 68k, in 68k clocks
+/// **per 16-bit bus cycle** (a long = two cycles = `2 × WAIT`). The MC68EC000
+/// has a 16-bit data bus; each access to the SCSP-arbitrated sound RAM (or the
+/// SCSP register file) costs the 4-clock bus cycle the m68k core already charges
+/// **plus this penalty**. Mirrors Mednafen `sound.cpp` `SoundCPU_BusRead/Write`,
+/// which adds `timestamp += 2` after every `SCSP.RW` (data, instruction-fetch,
+/// and write alike). Without it the sound 68k runs ~1.5× too fast — the root of
+/// the BGM-trigger lead (it advances the sequence too quickly so the trigger
+/// fires early and the per-voice divider lands at the wrong phase). Found by a
+/// cycle-exact 68k lockstep vs Mednafen (`take_68k_itrace`).
+const SCSP_ACCESS_WAIT: u32 = 2;
+
 impl M68kView<'_> {
     #[inline]
     fn is_reg(addr: u32) -> bool {
         (0x10_0000..0x10_1000).contains(&addr)
     }
+    /// True for a real SCSP access (sound RAM or register file) — the accesses
+    /// that incur [`SCSP_ACCESS_WAIT`]; an out-of-range access is open bus.
+    #[inline]
+    fn is_scsp(addr: u32) -> bool {
+        addr < 0x10_0000 || Self::is_reg(addr)
+    }
 }
 
 impl Bus for M68kView<'_> {
     fn read8(&mut self, addr: u32, _: AccessKind) -> (u8, u32) {
+        let w = if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 };
         if Self::is_reg(addr) {
-            (self.ctrl.read8(addr - 0x10_0000), 0)
+            (self.ctrl.read8(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
-            (self.ram.read8(addr), 0)
+            (self.ram.read8(addr), w)
         } else {
             (0, 0)
         }
     }
     fn read16(&mut self, addr: u32, _: AccessKind) -> (u16, u32) {
+        let w = if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 };
         if Self::is_reg(addr) {
-            (self.ctrl.read16(addr - 0x10_0000), 0)
+            (self.ctrl.read16(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
-            (self.ram.read16(addr), 0)
+            (self.ram.read16(addr), w)
         } else {
             (0, 0)
         }
     }
     fn read32(&mut self, addr: u32, _: AccessKind) -> (u32, u32) {
+        // A long is two 16-bit bus cycles on the 68000 → two penalties.
+        let w = if Self::is_scsp(addr) { 2 * SCSP_ACCESS_WAIT } else { 0 };
         if Self::is_reg(addr) {
-            (self.ctrl.read32(addr - 0x10_0000), 0)
+            (self.ctrl.read32(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
-            (self.ram.read32(addr), 0)
+            (self.ram.read32(addr), w)
         } else {
             (0, 0)
         }
@@ -1503,7 +1525,7 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write8(addr, val);
         }
-        0
+        if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 }
     }
     fn write16(&mut self, addr: u32, val: u16, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
@@ -1511,7 +1533,7 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write16(addr, val);
         }
-        0
+        if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 }
     }
     fn write32(&mut self, addr: u32, val: u32, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
@@ -1519,7 +1541,7 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write32(addr, val);
         }
-        0
+        if Self::is_scsp(addr) { 2 * SCSP_ACCESS_WAIT } else { 0 }
     }
 }
 
