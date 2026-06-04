@@ -5,6 +5,37 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-04e) — CHECKPOINT: a cross-emulator signal "oscilloscope"
+> built; two more 68k timing fixes landed; the BGM lead is now localized to the
+> 68k *sequence-advance*, with master / CD / 68k-cycle / SCSP-interleave all ruled
+> out by evidence.** Built a config-driven, multi-channel, cross-emulator **signal
+> scope** (`c7efb89`, `92aad72`; `Scsp::enable_scope`/`take_scope` + a matching
+> mednaref `sound.cpp` `scope_tick`, overlaid by `tools/scope_diff.py`) — the
+> generalization of the one-off ENQLOG/itrace/gate/write-watch probes. Timebase =
+> a 68k trigger PC (default `0x40F2` = the seq-tick → one row per Timer-B tick);
+> channels = sound-RAM signals; a built-in `t68` 68k-cycle column is the X-axis.
+> It pinned the BGM divergence to a single event: **ours activates the panel-BGM
+> channel `0x9900` at seq-tick 4164/4165 vs Mednafen's 4496** — with **byte-identical
+> setup** (`acc=0x1E300, step=0x199`). Two fixes the scope's time axis then exposed:
+> (1) **`729bfc3`** the SCSP sound-RAM 68k **access wait-state** (+2 cy/access; the
+> 68k ran ~1.5× too fast per instruction); (2) **`d755708`** the SCSP↔68k
+> **interleave budget overshoot** (the 68k discarded each tiny batch's
+> whole-instruction overshoot → ran ~270 cost-cy/sample not 256; the per-seq-tick
+> interval was 23808 vs Mednafen's 22528, now **22512** after carrying the
+> overshoot). **Both are real, oracle-validated accuracy wins — but NEITHER moved
+> the BGM activation** (still seq-tick 4165). The reason is decisive: the activation
+> is a seq-tick **count**, and neither per-instruction cost nor cycles-per-tick
+> changes how many Timer-B ticks the sequence takes to reach the activation event.
+> ⇒ **The BGM lead is upstream, in the 68k's sequence-advance**: with identical data
+> and an identical 88-sample Timer-B rate, ours reaches the activation in **331 fewer
+> ticks** — so the 68k either **starts** the BGM sequence earlier or **advances** it
+> faster per tick (a tempo / delta-time difference), upstream of the (identical)
+> channel `0x9900`. **NEXT (decisive):** scope a slice of the sequence work area
+> (≈`0x6000–0x7FFF`) per tick on both sides; the first-divergence detector names the
+> earliest divergent address = start-early vs advance-too-fast. The cycle axis is
+> exhausted; this is the remaining axis. *Chip that acts too soon = the sound 68k,
+> via its sequence-advance logic (not its raw speed, now corrected).*
+>
 > **Update (2026-06-04d) — cycle-exact 68k lockstep: found + fixed a real 68k
 > cycle bug, and DECISIVELY ruled the BGM trigger out of both the 68k-cycle and
 > the master/CD-state axes.** A cycle-exact 68k lockstep vs Mednafen (the new
