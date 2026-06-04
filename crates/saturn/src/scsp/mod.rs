@@ -111,6 +111,19 @@ struct Slot {
     /// Phase increment per output sample (from OCT/FNS).
     step: u32,
     eg: Eg,
+    /// LFO phase counter (8-bit), advanced by [`ScspCtrl::run_lfo`]. The
+    /// PLFO/ALFO waveforms are derived from it. (SCSP LFO; Mednafen `LFOCounter`.)
+    lfo_counter: u8,
+    /// Countdown to the next `lfo_counter` increment; reloaded from LFOF.
+    /// (Mednafen `LFOTimeCounter`.)
+    lfo_timer: i32,
+    /// This sample's PLFO contribution to the phase increment (signed, added to
+    /// [`Self::step`] in `slot_sample`). 0 when the pitch LFO is off — keeping
+    /// the no-LFO path byte-identical.
+    step_mod: i32,
+    /// This sample's ALFO amplitude-attenuation offset, added to the EG index
+    /// in `eg_advance`. 0 when the amplitude LFO is off.
+    alfo: i32,
 }
 
 /// Attack / decay envelope time constants (ms) for each of the 64 rates
@@ -311,6 +324,10 @@ pub struct ScspCtrl {
     /// samples as the reference, independent of when `TIMx` was written.
     sample_counter: u64,
     slots: [Slot; NUM_SLOTS],
+    /// 17-bit Galois LFSR — the SCSP's shared noise source (LFO noise waveform
+    /// and the noise sound-source). Clocked once per slot-cycle (32×/output
+    /// sample), matching Mednafen `LFSR`. Resets to 1.
+    lfsr: u32,
     /// The effect DSP (reverb/echo); fed by slot effect-sends, mixed back in.
     dsp: dsp::Dsp,
     /// Current 68k interrupt-line level (0 = none); level-triggered.
@@ -349,6 +366,7 @@ impl ScspCtrl {
             timers: Default::default(),
             sample_counter: 0,
             slots: [Slot::default(); NUM_SLOTS],
+            lfsr: 1,
             dsp: dsp::Dsp::new(),
             asserted_level: 0,
             main_pending: false,
@@ -550,6 +568,83 @@ impl ScspCtrl {
         fnv
     }
 
+    /// Advance slot `i`'s low-frequency oscillator one output sample and stash
+    /// this sample's PLFO phase delta ([`Slot::step_mod`]) and ALFO amplitude
+    /// offset ([`Slot::alfo`]). Faithful to Mednafen `RunLFO`/`GetPLFO`/`GetALFO`
+    /// (`scsp.inc`): the pitch LFO reads the **pre-advance** counter and the
+    /// amplitude LFO the **post-advance** counter; the noise waveform is drawn
+    /// from the shared [`Self::lfsr`]. The LFO register is slot word 9 —
+    /// `[15] LFORE | [14:10] LFOF | [9:8] PLFOWS | [7:5] PLFOS | [4:3] ALFOWS |
+    /// [2:0] ALFOS`. With both mod levels 0 the deltas stay 0, so the no-LFO
+    /// path is byte-identical.
+    fn run_lfo(&mut self, i: usize) {
+        let srv = self.slot_reg(i, 9);
+        let alfo_level = (srv & 0x7) as u32;
+        let alfo_wave = (srv >> 3) & 0x3;
+        let plfo_level = (srv >> 5) & 0x7;
+        let plfo_wave = (srv >> 8) & 0x3;
+        let lfo_freq = ((srv >> 10) & 0x1F) as u32;
+        let lfo_reset = (srv >> 15) & 1 != 0;
+        let lfsr = self.lfsr as u8;
+        let reg8 = self.slot_reg(i, 8);
+        let fns = (reg8 & 0x3FF) as u32;
+
+        // --- PLFO (pitch), from the pre-advance counter ---
+        let counter = self.slots[i].lfo_counter;
+        let plfo = if plfo_level == 0 {
+            0
+        } else {
+            let raw = match plfo_wave {
+                0 => (counter & !1) as i8 as i32, // saw
+                1 => (if counter & 0x80 != 0 { 0x80u8 } else { 0x7E }) as i8 as i32, // square
+                2 => {
+                    let t = (counter & 0x3F)
+                        ^ if counter & 0x40 != 0 { 0x3F } else { 0 }
+                        ^ if counter & 0x80 != 0 { 0x7F } else { 0 };
+                    t.wrapping_shl(1) as i8 as i32 // triangle
+                }
+                _ => (lfsr & !1) as i8 as i32, // noise
+            };
+            let scaled = raw >> (7 - plfo_level);
+            ((0x40 ^ (fns >> 4)) as i32 * scaled) >> 6
+        };
+        // PLFO adds to (FNS+0x400) *inside* the octave shift, so its phase-step
+        // contribution is `plfo` put through the same shift as [`Self::slot_step`].
+        let octave = (((reg8 >> 11) & 0xF) as i32 ^ 8) - 8 + PHASE_SHIFT as i32 - 10;
+        self.slots[i].step_mod = if octave >= 0 {
+            plfo << octave
+        } else {
+            plfo >> -octave
+        };
+
+        // --- RunLFO: advance the phase counter, then optional reset ---
+        {
+            let s = &mut self.slots[i];
+            s.lfo_timer -= 1;
+            if s.lfo_timer <= 0 {
+                s.lfo_counter = s.lfo_counter.wrapping_add(1);
+                s.lfo_timer = (((8 - (lfo_freq & 0x3)) << 7) >> (lfo_freq >> 2)) as i32 - 4;
+            }
+            if lfo_reset {
+                s.lfo_counter = 0;
+            }
+        }
+
+        // --- ALFO (amplitude attenuation), from the post-advance counter ---
+        let counter = self.slots[i].lfo_counter;
+        self.slots[i].alfo = if alfo_level == 0 {
+            0
+        } else {
+            let raw: u32 = match alfo_wave {
+                0 => (counter & !1) as u32, // saw
+                1 => ((counter as i8 >> 7) as u8 & !1) as u32, // square (0x00 or 0xFE)
+                2 => (counter ^ (counter as i8 >> 7) as u8).wrapping_shl(1) as u32, // triangle
+                _ => (lfsr & !1) as u32,    // noise
+            };
+            (raw >> (7 - alfo_level)) as i32
+        };
+    }
+
     /// Execute key-on/off for all slots based on each one's KYONB bit, then
     /// clear the KYONEX strobe wherever it's set.
     ///
@@ -595,6 +690,12 @@ impl ScspCtrl {
             nxt: 1 << PHASE_SHIFT,
             step,
             eg,
+            lfo_counter: 0,
+            // Mednafen seeds LFOTimeCounter to 1 at key-on, so the LFO advances
+            // on the next sample.
+            lfo_timer: 1,
+            step_mod: 0,
+            alfo: 0,
         };
     }
 
@@ -702,7 +803,13 @@ impl ScspCtrl {
         // (scsp.inc RunSample), so a mid-attack `volume` of 0x17F (= attenuation
         // 0x280) maps to ≈ -60 dB, a near-silent start that ramps up — not the
         // 37 %-amplitude jump the old linear `raw` produced.
-        let eg_mul = t.eg[((raw >> (PHASE_SHIFT - 10)) as usize) & 0x3FF];
+        // ALFO (amplitude LFO) adds attenuation in the same dB domain as the EG
+        // index (Mednafen sums it into `vlevel` before the log→linear lookup);
+        // `alfo` is 0 unless the LFO is active, so the no-LFO path is unchanged
+        // (the index is already in `0..=0x3FF`, so the clamp matches the old mask).
+        let alfo = self.slots[i].alfo;
+        let eg_idx = ((raw >> (PHASE_SHIFT - 10)) + alfo).clamp(0, 0x3FF) as usize;
+        let eg_mul = t.eg[eg_idx];
         (eg_mul * t.tl[tl]) >> PHASE_SHIFT
     }
 
@@ -812,12 +919,15 @@ impl ScspCtrl {
         };
         let sample = ((p1 * (one - frac) + p2 * frac) >> PHASE_SHIFT) as i16;
 
-        // Advance the phase and re-derive the next-sample address.
+        // Advance the phase and re-derive the next-sample address. `step_mod`
+        // is this sample's PLFO (pitch-LFO) contribution — 0 unless the LFO is
+        // active, so the no-LFO path is unchanged.
         let slot = &mut self.slots[i];
+        let step = slot.step.wrapping_add(slot.step_mod as u32);
         if slot.backwards {
-            slot.cur = slot.cur.wrapping_sub(slot.step);
+            slot.cur = slot.cur.wrapping_sub(step);
         } else {
-            slot.cur = slot.cur.wrapping_add(slot.step);
+            slot.cur = slot.cur.wrapping_add(step);
         }
         slot.nxt = slot.cur.wrapping_add(1 << PHASE_SHIFT);
 
@@ -876,9 +986,16 @@ impl ScspCtrl {
         // `&mut self` slot methods, so it can't be an iterator.
         #[allow(clippy::needless_range_loop)]
         for i in 0..NUM_SLOTS {
+            // The shared noise LFSR clocks once per slot-cycle — 32× per output
+            // sample, regardless of slot activity (Mednafen `scsp.inc`: the
+            // 17-bit Galois step `(LFSR>>1) | (((LFSR>>5)^LFSR)&1)<<16`).
+            self.lfsr = (self.lfsr >> 1) | ((((self.lfsr >> 5) ^ self.lfsr) & 1) << 16);
             if !self.slots[i].active {
                 continue;
             }
+            // Advance the slot's LFO (sets this sample's PLFO phase delta + ALFO
+            // attenuation, consumed by `slot_sample`/`eg_advance`).
+            self.run_lfo(i);
             let pcm = self.slot_sample(i, ram) as i32;
             let voice = (pcm * self.eg_advance(i)) >> PHASE_SHIFT;
             let reg_b = self.slot_reg(i, 0xB);
@@ -1555,6 +1672,60 @@ mod tests {
         keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 1 << 11);
         assert_eq!(s.slot_sample(0), 0x0000);
         assert_eq!(s.slot_sample(0), 0x2000);
+    }
+
+    #[test]
+    fn lfo_modulates_pitch_and_amplitude() {
+        use std::collections::HashSet;
+        let mut s = Scsp::new();
+        // Active slot with a non-zero FNS (the PLFO depth scales with pitch).
+        keyon_slot0(&mut s, 0, 0x100, 0, 0xFFFF, 0x0300); // OCT 0, FNS 0x300
+        let reg9 = 0x12;
+        let lfof_fast = 31u16 << 10; // LFOF 31 → fastest reload (1), counter ++/sample
+
+        // --- PLFO (pitch): saw waveform, max depth (PLFOS=7, bits 7:5) ---
+        s.ctrl.write16(reg9, lfof_fast | (7 << 5));
+        let mut mods = Vec::new();
+        for _ in 0..32 {
+            s.ctrl.run_lfo(0);
+            mods.push(s.ctrl.slots[0].step_mod);
+        }
+        assert!(
+            mods.iter().any(|&m| m != 0),
+            "PLFO produces a non-zero pitch delta"
+        );
+        assert!(
+            mods.iter().collect::<HashSet<_>>().len() > 1,
+            "PLFO modulates the pitch over the LFO phase"
+        );
+
+        // --- ALFO (amplitude): saw waveform, max depth (ALFOS=7, bits 2:0) ---
+        // Re-key to reset the LFO phase/timer, then drive the amplitude LFO.
+        keyon_slot0(&mut s, 0, 0x100, 0, 0xFFFF, 0x0300);
+        s.ctrl.write16(reg9, lfof_fast | 7);
+        let mut alfos = Vec::new();
+        for _ in 0..32 {
+            s.ctrl.run_lfo(0);
+            alfos.push(s.ctrl.slots[0].alfo);
+        }
+        assert!(
+            alfos.iter().any(|&a| a > 0),
+            "ALFO produces a non-zero attenuation"
+        );
+        assert!(
+            alfos.iter().all(|&a| a >= 0),
+            "ALFO attenuation is never negative (it darkens, never brightens)"
+        );
+        assert!(
+            alfos.iter().collect::<HashSet<_>>().len() > 1,
+            "ALFO modulates the amplitude over the LFO phase"
+        );
+
+        // With both LFO depths 0, the deltas are 0 — the no-LFO path is unchanged.
+        s.ctrl.write16(reg9, 0);
+        s.ctrl.run_lfo(0);
+        assert_eq!(s.ctrl.slots[0].step_mod, 0, "no PLFO → no pitch delta");
+        assert_eq!(s.ctrl.slots[0].alfo, 0, "no ALFO → no attenuation offset");
     }
 
     #[test]
