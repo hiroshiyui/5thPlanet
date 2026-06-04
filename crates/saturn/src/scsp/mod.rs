@@ -1297,32 +1297,33 @@ impl Scsp {
         if !self.running {
             return;
         }
-        // Sample clock → timers + audio generation.
+        // How many 44.1 kHz output samples this batch earns (sample clock), and
+        // how many 68k cycles (the 68k clock). The 68k clock is exactly 256× the
+        // sample clock (11.2896 MHz / 44100), so one sample falls due every 256
+        // 68k cycles.
         self.sample_frac += sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ);
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
-        self.ctrl.tick_timers(samples);
-        for _ in 0..samples {
-            if self.out.len() >= MAX_AUDIO_SAMPLES {
-                break; // overrun (frontend not draining) — drop the excess
-            }
-            let (l, r) = {
-                let Scsp { ctrl, ram, .. } = &mut *self;
-                ctrl.mix(ram)
-            };
-            self.out.push(l);
-            self.out.push(r);
-        }
-
-        // 68k clock → instruction stepping.
         self.frac += sh2_cycles.saturating_mul(SCSP_CLOCK_HZ);
         let mut budget = (self.frac / SH2_CLOCK_HZ) as i64;
         self.frac %= SH2_CLOCK_HZ;
+
+        // Per-sample interleave (Mednafen runs the sound 68k to each output-sample
+        // edge — `RunSCSP` scheduled at sample edges): produce one sample (timer
+        // tick + mixer) every 256 68k cycles, *interleaved with* the 68k stepping,
+        // rather than lumping all the samples then all the 68k. The totals (sample
+        // count, timer ticks, 68k cycles) are identical, so the verified Timer-B
+        // rate (88.0 samples/seq-tick) is unchanged — only the 68k's phase against
+        // the sample/timer clock is corrected (M13 A2 / M12 #3).
+        const CYCLES_PER_SAMPLE_68K: i64 = (SCSP_CLOCK_HZ / SCSP_SAMPLE_HZ) as i64; // 256
+        let mut samples_left = samples;
+        let mut sample_acc: i64 = 0; // 68k cycles since the last sample edge
 
         let Scsp {
             ram,
             ctrl,
             cpu,
+            out,
             pc_trace,
             pc_seen,
             enq_log,
@@ -1419,7 +1420,34 @@ impl Scsp {
                 ram: &mut *ram,
                 ctrl: &mut *ctrl,
             };
-            budget -= (cpu.step(&mut bus) as i64).max(1);
+            let cost = (cpu.step(&mut bus) as i64).max(1);
+            budget -= cost;
+            // Produce every output sample whose 256-cycle edge falls within this
+            // 68k step — the timer ticks and the mixer run interleaved with the
+            // 68k, not lumped before it.
+            sample_acc += cost;
+            while sample_acc >= CYCLES_PER_SAMPLE_68K && samples_left > 0 {
+                sample_acc -= CYCLES_PER_SAMPLE_68K;
+                samples_left -= 1;
+                ctrl.tick_timers(1);
+                if out.len() < MAX_AUDIO_SAMPLES {
+                    let (l, r) = ctrl.mix(ram);
+                    out.push(l);
+                    out.push(r);
+                }
+            }
+        }
+        // Any samples the 68k budget didn't reach (budget < 256×samples) are
+        // produced here, so the per-batch sample + timer totals stay exact (and
+        // the rate is preserved when the 68k is idle/held short).
+        while samples_left > 0 {
+            samples_left -= 1;
+            ctrl.tick_timers(1);
+            if out.len() < MAX_AUDIO_SAMPLES {
+                let (l, r) = ctrl.mix(ram);
+                out.push(l);
+                out.push(r);
+            }
         }
     }
 }
