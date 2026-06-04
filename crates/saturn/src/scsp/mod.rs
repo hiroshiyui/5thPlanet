@@ -1227,15 +1227,12 @@ impl Scsp {
             {
                 let pc = cpu.regs.pc;
                 if (0x1000..0x5200).contains(&pc) {
-                    // Record the d4/d7 *change* history across the whole driver:
-                    // push only when (d4,d7) differs from the last entry, so the
-                    // ring holds the write history, not every instruction.
-                    let cur = (cpu.regs.d[4], cpu.regs.d[7]);
-                    if ring.back().map(|e| (e.1, e.2)) != Some(cur) {
-                        ring.push_back((pc, cur.0, cur.1));
-                        if ring.len() > 3000 {
-                            ring.pop_front();
-                        }
+                    // Per-instruction PC path across the whole driver (capped
+                    // ring), to tail-align vs Mednafen and find where the paths
+                    // into the first enqueue split.
+                    ring.push_back((pc, cpu.regs.d[4], cpu.regs.d[7]));
+                    if ring.len() > 6000 {
+                        ring.pop_front();
                     }
                     if pc == 0x4B9A {
                         *frozen = true; // stop at the first enqueue
