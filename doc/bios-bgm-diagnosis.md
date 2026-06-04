@@ -5,6 +5,25 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-04b) — three suspects for the trigger-tick lead ruled out;
+> the lead is localized to *post-recognition* polled CD state.** Following the
+> lockstep diff below (root = ours triggers the BGM ~83 seq-ticks / ~10 frames
+> early, putting a per-voice divider 3 phases off), this session eliminated three
+> candidate causes of the early trigger: (1) the **VDP1 draw-slowdown** — ported
+> the Mednafen primitive, then a `SS_VDP1DRAW` probe proved the boot-animation
+> draws are *trivial* on both sides (~997 cy, empty list), so there is no draw to
+> slow (`9934411`); (2) the **CD recognition duration** — `STARTUP_CYC ×2` moved
+> the trigger the *wrong* way; and a recognition-frame probe (`0444b2b`) shows
+> ours settles `Startup→PAUSE` at **frame 60** = the 1 s constant Mednafen also
+> uses, so recognition is *not* the lead — it is entirely **post-recognition**
+> (frames 60→529); (3) **SH-2 cache staleness** — the master reads sound RAM
+> 100 % cache-through on both sides (`a82de6f`), so no stale read. With the CD
+> command stream already proven byte-identical, the early trigger now points at
+> **polled CD state** (the CR1–4 status report / partition sector-count
+> transitioning early) — the *same* lead as the VF2 intro stall. **Next:**
+> compare ours' vs Mednafen's CR1–4 status report + partition block-count across
+> the post-recognition file-load window.
+>
 > **Update (2026-06-04) — root localized via a Mednafen lockstep 68k diff.**
 > Using an **audio CD** (which Mednafen *can* boot, unlike no-disc) as an LLE
 > oracle, a layered trace-down proved the SCSP synthesis, the 68k→SCSP path, and
