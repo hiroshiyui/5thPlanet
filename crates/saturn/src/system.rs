@@ -611,6 +611,20 @@ impl Saturn {
         {
             next = next.min(t - now);
         }
+        // SCU Timer 0 line compare (when enabled, T1MD bit 0): the next match is
+        // the start of scanline T0C — this frame if not yet passed, else next —
+        // so the Timer-0 interrupt fires at the exact line, not a batch late.
+        if self.bus.scu.t1md & 1 != 0 {
+            let t0c = (self.bus.scu.t0c & 0x3FF) as u64;
+            if t0c < LINES_PER_FRAME {
+                let frame_start = (now / CYCLES_PER_FRAME) * CYCLES_PER_FRAME;
+                let mut t = frame_start + t0c * CYCLES_PER_LINE;
+                if t <= now {
+                    t += CYCLES_PER_FRAME;
+                }
+                next = next.min(t - now);
+            }
+        }
         next
     }
 
