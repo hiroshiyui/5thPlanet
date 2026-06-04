@@ -2438,10 +2438,16 @@ fn bios_audio_probe() {
             .map(|(pc, d4, d7)| format!("{pc:04X} {d4:08X} {d7:08X}\n"))
             .collect();
         std::fs::write(&p, s).unwrap();
+        let (n, s_first, s_trig) = sat.bus.scsp.take_68k_trigger_timing();
+        let period = if n > 1 {
+            (s_trig.saturating_sub(s_first)) as f64 / (n - 1) as f64
+        } else {
+            0.0
+        };
         println!(
-            "  wrote {} itrace entries to {p}; seq-ticks (0x40F2) before enqueue = {}",
-            t.len(),
-            sat.bus.scsp.take_68k_seq_ticks()
+            "  wrote {} itrace entries to {p}; seq-ticks={n}, sample@first-tick={s_first}, \
+             sample@trigger={s_trig}, Timer-B period={period:.4} samples/tick",
+            t.len()
         );
     }
     if let Some(p) = dump {

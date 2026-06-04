@@ -924,12 +924,15 @@ impl ScspCtrl {
     }
 }
 
-/// Frozen value-trace for the BGM interpreter diff: `(frozen, seq_ticks, ring)`.
-/// Records the per-instruction `(pc, d4, d7)` ring across the driver until the
-/// first enqueue, then freezes; `seq_ticks` counts seq-tick entries (`0x40F2`)
-/// until the freeze, to compare the Timer-interrupt count vs the reference. See
-/// [`Scsp::enable_68k_itrace`].
-type ITrace = (bool, u32, std::collections::VecDeque<(u32, u32, u32)>);
+/// Frozen value-trace for the BGM interpreter diff:
+/// `(frozen, seq_ticks, sample_at_first_tick, sample_at_trigger, ring)`. Records
+/// the per-instruction `(pc, d4, d7)` ring across the driver until the first
+/// enqueue, then freezes. `seq_ticks` counts seq-tick entries (`0x40F2`) and the
+/// two sample-counter snapshots (at the first seq-tick and at the enqueue) give
+/// the Timer-B **period** `(s_trig − s_first)/(seq_ticks−1)` — a zero-point-
+/// independent rate to compare vs the reference, disambiguating a trigger-time
+/// gap from a seq-tick-rate gap (M12 task 2). See [`Scsp::enable_68k_itrace`].
+type ITrace = (bool, u32, u64, u64, std::collections::VecDeque<(u32, u32, u32)>);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
@@ -1073,13 +1076,13 @@ impl Scsp {
 
     /// Begin the aligned instruction-boundary value trace (see [`itrace`]).
     pub fn enable_68k_itrace(&mut self) {
-        self.itrace = Some((false, 0, std::collections::VecDeque::new()));
+        self.itrace = Some((false, 0, 0, 0, std::collections::VecDeque::new()));
     }
 
     /// Snapshot the frozen `(pc, d4, d7)` ring (oldest→newest), if enabled.
     pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32, u32)> {
         match &self.itrace {
-            Some((_, _, v)) => v.iter().copied().collect(),
+            Some((.., v)) => v.iter().copied().collect(),
             None => Vec::new(),
         }
     }
@@ -1088,8 +1091,17 @@ impl Scsp {
     /// 68k Timer-interrupt count to compare against the reference.
     pub fn take_68k_seq_ticks(&self) -> u32 {
         match &self.itrace {
-            Some((_, n, _)) => *n,
+            Some((_, n, ..)) => *n,
             None => 0,
+        }
+    }
+
+    /// `(seq_ticks, sample_at_first_tick, sample_at_trigger)` at the BGM trigger,
+    /// if enabled — the inputs to the Timer-B period (M12 task 2).
+    pub fn take_68k_trigger_timing(&self) -> (u32, u64, u64) {
+        match &self.itrace {
+            Some((_, n, s_first, s_trig, _)) => (*n, *s_first, *s_trig),
+            None => (0, 0, 0),
         }
     }
 
@@ -1233,11 +1245,14 @@ impl Scsp {
             // Debug aligned instruction trace: dup-collapsed instruction PCs in
             // the seq-engine range, armed at the first enqueue (mirrors mednaref
             // SS_ITRACE for a lockstep interpreter diff).
-            if let Some((frozen, seq_ticks, ring)) = itrace.as_mut()
+            if let Some((frozen, seq_ticks, s_first, s_trig, ring)) = itrace.as_mut()
                 && !*frozen
             {
                 let pc = cpu.regs.pc;
                 if pc == 0x40F2 {
+                    if *seq_ticks == 0 {
+                        *s_first = ctrl.sample_counter; // sample at the 1st seq-tick
+                    }
                     *seq_ticks += 1; // count seq-tick entries until the enqueue
                 }
                 if (0x1000..0x5200).contains(&pc) {
@@ -1249,6 +1264,7 @@ impl Scsp {
                         ring.pop_front();
                     }
                     if pc == 0x4B9A {
+                        *s_trig = ctrl.sample_counter; // sample at the trigger
                         *frozen = true; // stop at the first enqueue
                     }
                 }
