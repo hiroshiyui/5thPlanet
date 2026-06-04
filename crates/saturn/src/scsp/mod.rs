@@ -924,6 +924,11 @@ impl ScspCtrl {
     }
 }
 
+/// Frozen `(pc, d4, d7)` value-trace ring for the BGM interpreter diff: records
+/// the d4/d7 change-history across the driver until the first enqueue, then
+/// freezes. `(frozen, ring)`. See [`Scsp::enable_68k_itrace`].
+type ITrace = (bool, std::collections::VecDeque<(u32, u32, u32)>);
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
     /// 512 KiB sound RAM, shared between the SH-2 (at 0x05A0_0000) and the 68k.
@@ -961,13 +966,13 @@ pub struct Scsp {
     /// reference diff vs Mednafen — unlike `bp68` (first hit only). `#[serde(skip)]`.
     #[serde(skip)]
     enq_log: Option<(u32, Vec<[u32; 5]>)>,
-    /// Debug-only *instruction-boundary* trace `(pc, a4)`, restricted to
-    /// `[0x4000,0x4C40)` and armed at the first `0x4B9A` enqueue: `(armed, log)`.
-    /// An aligned 68k interpreter diff vs Mednafen's `SS_ITRACE` — the per-row
-    /// value (here a4, the voice pointer) finds value divergences even when the
-    /// PC path matches. `#[serde(skip)]`.
+    /// Debug-only *instruction-boundary* value trace, a frozen ring of
+    /// `(pc, d4, d7)` over `[0x4000,0x4C40)` that records until the first
+    /// `0x4B9A` enqueue then freezes (`(frozen, ring)`). Dumped + diffed vs
+    /// Mednafen's `SS_ITRACE` to find the exact instruction where a register
+    /// value first diverges on an otherwise-identical PC path. `#[serde(skip)]`.
     #[serde(skip)]
-    itrace: Option<(bool, Vec<(u32, u32)>)>,
+    itrace: Option<ITrace>,
 }
 
 /// A captured 68k register snapshot at a [`Scsp`] 68k breakpoint hit (sdbg `b68`).
@@ -1064,15 +1069,15 @@ impl Scsp {
         }
     }
 
-    /// Begin the aligned instruction-boundary trace (see [`itrace`]).
+    /// Begin the aligned instruction-boundary value trace (see [`itrace`]).
     pub fn enable_68k_itrace(&mut self) {
-        self.itrace = Some((false, Vec::new()));
+        self.itrace = Some((false, std::collections::VecDeque::new()));
     }
 
-    /// Snapshot the instruction-boundary trace `(pc, reg-hash)`, if enabled.
-    pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32)> {
+    /// Snapshot the frozen `(pc, d4, d7)` ring (oldest→newest), if enabled.
+    pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32, u32)> {
         match &self.itrace {
-            Some((_, v)) => v.clone(),
+            Some((_, v)) => v.iter().copied().collect(),
             None => Vec::new(),
         }
     }
@@ -1217,13 +1222,24 @@ impl Scsp {
             // Debug aligned instruction trace: dup-collapsed instruction PCs in
             // the seq-engine range, armed at the first enqueue (mirrors mednaref
             // SS_ITRACE for a lockstep interpreter diff).
-            if let Some((armed, log)) = itrace.as_mut() {
+            if let Some((frozen, ring)) = itrace.as_mut()
+                && !*frozen
+            {
                 let pc = cpu.regs.pc;
-                if pc == 0x4B9A {
-                    *armed = true;
-                }
-                if *armed && (0x4000..0x4C40).contains(&pc) && log.len() < 8000 {
-                    log.push((pc, cpu.regs.a[4] & 0x00FF_FFFF)); // a4 (voice ptr)
+                if (0x1000..0x5200).contains(&pc) {
+                    // Record the d4/d7 *change* history across the whole driver:
+                    // push only when (d4,d7) differs from the last entry, so the
+                    // ring holds the write history, not every instruction.
+                    let cur = (cpu.regs.d[4], cpu.regs.d[7]);
+                    if ring.back().map(|e| (e.1, e.2)) != Some(cur) {
+                        ring.push_back((pc, cur.0, cur.1));
+                        if ring.len() > 3000 {
+                            ring.pop_front();
+                        }
+                    }
+                    if pc == 0x4B9A {
+                        *frozen = true; // stop at the first enqueue
+                    }
                 }
             }
             // Debug 68k breakpoint: capture regs the first time the 68k is about

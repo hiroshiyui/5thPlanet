@@ -2433,7 +2433,10 @@ fn bios_audio_probe() {
     }
     if let Some(p) = itrace_out {
         let t = sat.bus.scsp.take_68k_itrace();
-        let s: String = t.iter().map(|(pc, h)| format!("{pc:04X} {h:06X}\n")).collect();
+        let s: String = t
+            .iter()
+            .map(|(pc, d4, d7)| format!("{pc:04X} {d4:08X} {d7:08X}\n"))
+            .collect();
         std::fs::write(&p, s).unwrap();
         println!("  wrote {} itrace entries to {p}", t.len());
     }
