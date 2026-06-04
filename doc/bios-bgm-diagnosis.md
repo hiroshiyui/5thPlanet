@@ -5,6 +5,24 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-05) — the BGM sequence is a4=0x9800; the earliest BGM-struct
+> divergence is a VOLUME-FADE target, not a rate.** A scope **checksum sweep** (the
+> new width-0 channel, `1e99f34`) of the 68k work area localized the upstream
+> divergence, then disassembly resolved the context that had been ambiguous: the
+> seq-tick setup `0x49bc` sets **a4 = [0x450](=0x6000) + 0x3800 = 0x9800** (voices
+> a5=a4+0x400=0x9C00, **channels a6=a4+0x100=0x9900** ✓). The b68 showing a4=0x7000
+> was the *stale* entry value before `0x49bc` runs — so **r7000 is a different
+> structure, not the BGM**, and a tentative "advances ~8% too fast" reading that had
+> leaned on r7000 is **retracted**. In the real BGM struct (0x9800), the earliest
+> divergent word is **`0x9809` @row 156 (ours=0x0F, mfn=0x00)**; `0x4924` decodes
+> `0x9808/9/A` as a **volume-fade engine** (`[a4+8]`=state, **`[a4+9]`=fade target**,
+> `[a4+0xA]`=current, ramped into SCSP reg `0x401`). So **ours' panel-BGM fade target
+> is 0x0F where Mednafen's is 0x00** — a concrete behavioral divergence that may bear
+> on the silence. The seq-tick `0x40F2` (a4=0x9800) runs `0x483e` (reads SCSP regs,
+> /8 divider `[a4+3]`) + `0x48ae` (/8 divider `[a4+4]`) + `0x4924` (fade) then 8×
+> channel `0x4570` + 32× voice `0x47d4`. **Next:** find who writes `[0x9809]` (the
+> fade target) and why ours writes 0x0F — that is the BGM divergence now.
+>
 > **Update (2026-06-04e) — CHECKPOINT: a cross-emulator signal "oscilloscope"
 > built; two more 68k timing fixes landed; the BGM lead is now localized to the
 > 68k *sequence-advance*, with master / CD / 68k-cycle / SCSP-interleave all ruled
