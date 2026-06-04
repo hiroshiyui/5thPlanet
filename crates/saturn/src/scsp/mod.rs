@@ -1449,6 +1449,11 @@ impl Scsp {
                 // tick-delivery (SCSP timer) divergence from a 68k-logic one.
                 let mut row: Vec<u32> = vec![cpu.cycles as u32];
                 row.extend(sc.channels.iter().map(|&(_, addr, w)| match w {
+                    // width 0 = a checksum (sum of bytes) over a 0x100 region,
+                    // for a coarse work-area sweep: any change in the region
+                    // shows, so the overlay's first-divergence row points at the
+                    // earliest divergent block to then zoom into.
+                    0 => (0..0x100u32).fold(0u32, |s, k| s.wrapping_add(ram.read8(addr + k) as u32)),
                     1 => ram.read8(addr) as u32,
                     2 => ram.read16(addr) as u32,
                     _ => ram.read32(addr),
