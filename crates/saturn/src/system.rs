@@ -677,6 +677,32 @@ impl Saturn {
             cd_id,
             ..
         } = self;
+        // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
+        // instruction flagged on the bus — pulse the *sibling's* FRT now so it
+        // sees the input-capture on its next instruction, not up to a batch
+        // (≤256 cy) later (M13 A1, incremental: FTI as a per-instruction event).
+        macro_rules! apply_fti {
+            () => {
+                if core::mem::take(&mut bus.slave_input_capture) {
+                    scheduler
+                        .entity_mut(*slave_id)
+                        .sh2_mut()
+                        .cpu
+                        .onchip
+                        .frt
+                        .input_capture();
+                }
+                if core::mem::take(&mut bus.master_input_capture) {
+                    scheduler
+                        .entity_mut(*master_id)
+                        .sh2_mut()
+                        .cpu
+                        .onchip
+                        .frt
+                        .input_capture();
+                }
+            };
+        }
         loop {
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             if mcyc >= target {
@@ -714,6 +740,7 @@ impl Saturn {
             // Master leads by one instruction.
             before_master(scheduler.entity(*master_id).sh2());
             scheduler.entity_mut(*master_id).step(bus);
+            apply_fti!(); // master may have pulsed the slave's (or its own) FTI
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             // Slave catches up to the master's new timestamp.
             while {
@@ -721,6 +748,7 @@ impl Saturn {
                 !s.is_halted() && s.cpu.pipeline.cycles < mcyc
             } {
                 scheduler.entity_mut(*slave_id).step(bus);
+                apply_fti!(); // slave may have pulsed the master's FTI
             }
         }
         // Trailing CD-block ticks up to the batch target.
