@@ -924,10 +924,12 @@ impl ScspCtrl {
     }
 }
 
-/// Frozen `(pc, d4, d7)` value-trace ring for the BGM interpreter diff: records
-/// the d4/d7 change-history across the driver until the first enqueue, then
-/// freezes. `(frozen, ring)`. See [`Scsp::enable_68k_itrace`].
-type ITrace = (bool, std::collections::VecDeque<(u32, u32, u32)>);
+/// Frozen value-trace for the BGM interpreter diff: `(frozen, seq_ticks, ring)`.
+/// Records the per-instruction `(pc, d4, d7)` ring across the driver until the
+/// first enqueue, then freezes; `seq_ticks` counts seq-tick entries (`0x40F2`)
+/// until the freeze, to compare the Timer-interrupt count vs the reference. See
+/// [`Scsp::enable_68k_itrace`].
+type ITrace = (bool, u32, std::collections::VecDeque<(u32, u32, u32)>);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
@@ -1071,14 +1073,23 @@ impl Scsp {
 
     /// Begin the aligned instruction-boundary value trace (see [`itrace`]).
     pub fn enable_68k_itrace(&mut self) {
-        self.itrace = Some((false, std::collections::VecDeque::new()));
+        self.itrace = Some((false, 0, std::collections::VecDeque::new()));
     }
 
     /// Snapshot the frozen `(pc, d4, d7)` ring (oldest→newest), if enabled.
     pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32, u32)> {
         match &self.itrace {
-            Some((_, v)) => v.iter().copied().collect(),
+            Some((_, _, v)) => v.iter().copied().collect(),
             None => Vec::new(),
+        }
+    }
+
+    /// The seq-tick (`0x40F2`) count up to the first enqueue, if enabled — the
+    /// 68k Timer-interrupt count to compare against the reference.
+    pub fn take_68k_seq_ticks(&self) -> u32 {
+        match &self.itrace {
+            Some((_, n, _)) => *n,
+            None => 0,
         }
     }
 
@@ -1222,10 +1233,13 @@ impl Scsp {
             // Debug aligned instruction trace: dup-collapsed instruction PCs in
             // the seq-engine range, armed at the first enqueue (mirrors mednaref
             // SS_ITRACE for a lockstep interpreter diff).
-            if let Some((frozen, ring)) = itrace.as_mut()
+            if let Some((frozen, seq_ticks, ring)) = itrace.as_mut()
                 && !*frozen
             {
                 let pc = cpu.regs.pc;
+                if pc == 0x40F2 {
+                    *seq_ticks += 1; // count seq-tick entries until the enqueue
+                }
                 if (0x1000..0x5200).contains(&pc) {
                     // Per-instruction PC path across the whole driver (capped
                     // ring), to tail-align vs Mednafen and find where the paths

@@ -2438,7 +2438,11 @@ fn bios_audio_probe() {
             .map(|(pc, d4, d7)| format!("{pc:04X} {d4:08X} {d7:08X}\n"))
             .collect();
         std::fs::write(&p, s).unwrap();
-        println!("  wrote {} itrace entries to {p}", t.len());
+        println!(
+            "  wrote {} itrace entries to {p}; seq-ticks (0x40F2) before enqueue = {}",
+            t.len(),
+            sat.bus.scsp.take_68k_seq_ticks()
+        );
     }
     if let Some(p) = dump {
         std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
