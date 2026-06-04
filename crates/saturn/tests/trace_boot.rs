@@ -2285,6 +2285,14 @@ fn bios_audio_probe() {
     if itrace_out.is_some() {
         sat.bus.scsp.enable_68k_itrace();
     }
+    // MASTERHIST: histogram the master SH-2 PC ring at the end — what loop the
+    // master is in near the BGM trigger (the master-side trigger gate, M12 #5).
+    // Run with FRAMES set to just before the trigger (~594).
+    let masterhist = std::env::var("MASTERHIST").is_ok();
+    if masterhist {
+        sat.enable_master_pc_trace();
+        sat.set_master_trace_freeze(0xFFFF_FFFE, 0xFFFF_FFFF); // never freeze (M11 default would)
+    }
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2449,6 +2457,28 @@ fn bios_audio_probe() {
              sample@trigger={s_trig}, Timer-B period={period:.4} samples/tick",
             t.len()
         );
+    }
+    if masterhist {
+        let pcs = sat.take_master_pc_trace();
+        let mut hist: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for pc in &pcs {
+            *hist.entry(*pc).or_default() += 1;
+        }
+        let mut v: Vec<(u32, u32)> = hist.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        println!(
+            "  master PC histogram (ring={}, top 24) at frame {frames}, master @ {:08X}:",
+            pcs.len(),
+            sat.master().regs.pc
+        );
+        for (pc, c) in v.iter().take(24) {
+            println!("    {pc:08X}: {c}");
+        }
+        print!("  ordered tail (last 40):");
+        for pc in pcs.iter().rev().take(40).rev() {
+            print!(" {:06X}", pc & 0xFFFFFF);
+        }
+        println!();
     }
     if let Some(p) = dump {
         std::fs::write(&p, &pcm).expect("write AUDIO_OUT");
