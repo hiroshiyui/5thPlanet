@@ -681,6 +681,46 @@ boot — broke the PC-trace-diff methodology. Since the reference oracle (Mednaf
 is LLE, the path was **removed** to keep the codebase clean and the diff valid.
 The general fixes above were salvaged from it.
 
+## Milestone 12 — Whole-system cycle accuracy (cycle-exact timing vs Mednafen) 🚧
+
+The project's accuracy-first axis demands **cycle-exact timing**, not just correct
+final values. M11 and the SCSP **BGM trace-down** independently hit the same wall:
+timing-dependent behaviour diverges from the LLE reference (Mednafen) even when the
+game/driver **code and data are byte-identical**. This milestone closes the residual
+whole-system timing gaps so timing-gated behaviour matches the reference.
+
+Two concrete, quantified failing cases drive it:
+
+- **SCSP BGM trigger phase.** On the audio-CD BIOS CD-player, ours processes **4414
+  seq-ticks (Timer-B interrupts) before the BGM vs Mednafen's 4497 — 83 fewer
+  (~1.8 %)**. Since `83 mod 8 = 3`, the sound driver's two per-voice dividers
+  (`[a4+3]` @`0x484C`, `[a4+4]` @`0x48AE`) land 3 phases off, so its note-processing
+  branches skip → a thin chord then a stall → **silence**. The SCSP synthesis, the
+  68k→SCSP path, the sequence data, and the clocks are all proven correct (and the
+  SCSP timer model was fixed to match Mednafen — task #1), so the gap is *when* the
+  BGM is triggered: ours reaches the trigger ~1.8 % early. Full trace-down in
+  `doc/bios-bgm-diagnosis.md`.
+- **VF2 intro demo-script engine** (M11 Phase 4). The intro stall is timing-gated —
+  the stall point oscillates (FAD 2596 ↔ 7772) with each timing change, and the CD
+  command/response stream is byte-identical to Mednafen; the job nibble's `3 → 0xA`
+  advance bottoms out on timing.
+
+**Goal / acceptance:** the BGM plays (the seq-tick count / divider phase matches
+Mednafen and the BGM voices key); VF2's intro job engine advances past its
+timing-gated stall; *Doukyuusei ~if~* stays stable; and the master-SH-2 PC-trace
+stays aligned with Mednafen over a multi-second run. `bios_boot` golden unchanged
+throughout, validated with the seq-tick / divider-phase metric and the
+master-trace-diff harness.
+
+| # | Phase | Notes |
+|---|-------|-------|
+| 1 | **SCSP timer + clock-model cycle-accuracy + measurement harness** ✅ done | The SCSP timers were auto-reload counters overflowing one clock late (at `0x100`); rewrote them as Mednafen's **free-running 8-bit** model — load `TIMx` into the counter on a register *write* only, interrupt when the counter reaches `0xFF`, then wrap `0xFF→0x00` and free-run (period 256), with the `2^Control` prescale **phase-locked to a global sample counter** (`d7f5444`, two unit tests; `bios_boot` golden unchanged). Verified the clock constants match the reference (SH-2 `28636360`, sample `44100`, 68k `11289600`; Mednafen NTSC master `1746818182`/61 = the same SH-2 clock). Built the **measurement harness** that quantifies the divergence: the `ITRACE`/mednaref `SS_ITRACE` frozen value-ring + a **seq-tick counter** (`0829eea`/`9847b89`/`68b49e8`), plus `ENQLOG`, `SS_SEQDUMP`, `SS_WWATCH`, the 68k footprint. |
+| 2 | **Disambiguate the 83-tick gap: trigger-time vs seq-tick-rate** | Measure the sample / SH-2-cycle count *at the BGM trigger* in both emulators (controlling for the sample-clock zero-point) to settle whether ours reaches the trigger **earlier** (a master-side boot-timing difference → task #5) or services Timer-B interrupts at a **lower rate** (a 68k/SCSP scheduling or 68k-cycle difference → tasks #3/#4). The clocks + Timer-B period match, which *indicates* trigger-time, but it is not yet directly measured. Directs the rest of the milestone. |
+| 3 | **68k ↔ SCSP scheduling granularity + IRQ delivery** | ours steps the 68k and the SCSP/timers in **scheduler-quantum batches** (`Scsp::run`); Mednafen interleaves them **per output sample** (`RunSCSP` scheduled at sample edges, the 68k run to the next sample edge). Align ours' interleaving so the 68k observes each timer interrupt at the cycle-exact sample, with no merged or dropped level-triggered overflows. |
+| 4 | **68k instruction cycle-count audit** | the sound 68k's effective execution rate sets how many Timer-B interrupts it services per unit time, so a systematic per-instruction cycle error shifts the seq-tick count. Audit the `m68k` crate's cycle counts against the MC68000 manual / Mednafen — especially the long ops the crate still flags (MUL/DIV/MOVEM, memory shifts/rotates) and the address/bus-error exception timing. |
+| 5 | **Master-side boot/CD/SMPC trigger timing** | the headline root: ours reaches the BGM-trigger point ~1.8 % early. Apply the M11 **master-PC-trace-diff** methodology to the BGM trigger — find where ours' SH-2 / CD / SMPC boot-to-trigger timeline diverges from Mednafen and close it. This **subsumes the VF2 intro-timing divergence** (M11 Phase 4), the same class of bug. |
+| 6 | **Validate against the targets** | BGM plays (seq-tick count / divider phase matches, voices key); VF2's intro advances past the timing-gated stall; *Doukyuusei ~if~* stable; master-PC-trace aligned over a multi-second run; `bios_boot` golden + full suite green throughout. |
+
 ## Later milestones (queued)
 
 - **MPEG card** + CD move/copy sector ops (deferred from M7).
