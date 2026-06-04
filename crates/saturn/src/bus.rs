@@ -276,12 +276,32 @@ fn read_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32
 }
 
 #[inline]
-fn waits_for(addr: u32) -> u32 {
+fn waits_for(addr: u32, write: bool) -> u32 {
     match addr {
         BIOS_BASE..=BIOS_END => BIOS_WAITS,
         BACKUP_BASE..=BACKUP_END => BACKUP_WAITS,
         LOW_WRAM_BASE..=LOW_WRAM_END => LOW_WRAM_WAITS,
         HIGH_WRAM_BASE..=HIGH_WRAM_END => HIGH_WRAM_WAITS,
+        // VDP1 VRAM / framebuffer / registers — the B-bus charges the SH-2 a base
+        // access cost (separate from, and on top of, the draw-slowdown). Mednafen
+        // `scu.inc` BBusRW: a read costs +14; a write +2 immediate + 9 deferred
+        // write-finish (≈11 for the back-to-back writes the BIOS animation does).
+        0x05C0_0000..=0x05D7_FFFF => {
+            if write {
+                11
+            } else {
+                14
+            }
+        }
+        // VDP2 VRAM / CRAM / registers — read +20, write +2 immediate + 3 deferred
+        // (≈5). The asymmetry (slow reads) matches Mednafen `scu.inc` BBusRW.
+        0x05E0_0000..=0x05FB_FFFF => {
+            if write {
+                5
+            } else {
+                20
+            }
+        }
         _ => STUB_WAITS,
     }
 }
@@ -312,7 +332,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 1, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
+        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
     }
 
     fn read16(&mut self, addr: u32, _k: AccessKind) -> (u16, u32) {
@@ -340,7 +360,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 2, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
+        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
     }
 
     fn read32(&mut self, addr: u32, _k: AccessKind) -> (u32, u32) {
@@ -370,7 +390,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 4, v, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
+        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
     }
 
     fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
@@ -396,7 +416,7 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr) + self.vdp1_draw_stall(addr, true)
+        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
     }
 
     fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
@@ -432,7 +452,7 @@ impl Bus for SaturnBus {
             MASTER_FTI_BASE..=MASTER_FTI_END => self.master_input_capture = true,
             _ => {}
         }
-        waits_for(addr) + self.vdp1_draw_stall(addr, true)
+        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
     }
 
     fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
@@ -458,6 +478,6 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr) + self.vdp1_draw_stall(addr, true)
+        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
     }
 }
