@@ -110,8 +110,13 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 // Behaviour is unchanged: still a synchronous block transfer at the drain point.
 
 /// Run every DMA the SCU queued. Direct or indirect (table-driven) mode; a
-/// transfer sourced from the BIOS A-bus is illegal and moves nothing.
-fn drain_dma(bus: &mut SaturnBus) {
+/// transfer sourced from the BIOS A-bus is illegal and moves nothing. Returns
+/// the **cycle-stealing cost** — the sum of the per-access bus wait-states the
+/// transfer incurs (the same `waits_for` the CPU pays for those addresses), so
+/// the caller can stall the triggering CPU for the transfer's duration instead
+/// of treating the DMA as free (M13 A3).
+fn drain_dma(bus: &mut SaturnBus) -> u64 {
+    let mut cost = 0u64;
     while let Some(req) = bus.scu.take_pending_dma() {
         let bios_src = |a: u32| a & 0x07F0_0000 == 0;
         let (final_src, final_dst) = if req.indirect {
@@ -121,15 +126,16 @@ fn drain_dma(bus: &mut SaturnBus) {
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
             loop {
-                let (size, _) = bus.read32(index, AccessKind::Dma);
-                let (idst, _) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
-                let (isrc_raw, _) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
+                let (size, s0) = bus.read32(index, AccessKind::Dma);
+                let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
+                let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
+                cost += (s0 + s1 + s2) as u64;
                 let last = isrc_raw & 0x8000_0000 != 0;
                 let isrc = isrc_raw & 0x07FF_FFFF;
                 let idst = idst & 0x07FF_FFFF;
                 let count = dma_count(req.channel, size);
                 if !bios_src(isrc) {
-                    scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add);
+                    scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
                 }
                 index = index.wrapping_add(0xC);
                 walked += 1;
@@ -142,10 +148,11 @@ fn drain_dma(bus: &mut SaturnBus) {
             (req.src, req.dst)
         } else {
             let count = dma_count(req.channel, req.bytes);
-            scu_transfer(bus, req.src, req.dst, count, req.src_add, req.dst_add)
+            scu_transfer(bus, req.src, req.dst, count, req.src_add, req.dst_add, &mut cost)
         };
         bus.scu.finish_dma(req.channel, final_src, final_dst);
     }
+    cost
 }
 
 /// SCU DMA byte count: a programmed 0 means the channel's maximum (1 MiB for
@@ -171,13 +178,15 @@ fn scu_transfer(
     bytes: u32,
     src_add: u32,
     dst_add: u32,
+    cost: &mut u64,
 ) -> (u32, u32) {
     let mut src_shift = ((src & 2) >> 1) ^ 1;
     let mut i = 0u32;
     while i < bytes {
-        let (word, _) = bus.read32(src & 0x07FF_FFFC, AccessKind::Dma);
+        let (word, sr) = bus.read32(src & 0x07FF_FFFC, AccessKind::Dma);
         let half = (word >> (src_shift * 16)) as u16;
-        bus.write16(dst & 0x07FF_FFFE, half, AccessKind::Dma);
+        let sw = bus.write16(dst & 0x07FF_FFFE, half, AccessKind::Dma);
+        *cost += (sr + sw) as u64;
         src_shift ^= 1;
         if src_shift != 0 {
             src = src.wrapping_add(src_add);
@@ -535,7 +544,7 @@ impl Saturn {
         self.catch_up_cd_block();
         self.update_video_timing();
         self.drain_smpc();
-        drain_dma(&mut self.bus);
+        let _ = drain_dma(&mut self.bus); // backstop; step_cpus drains+charges per-instruction
         self.drain_scu_dsp();
         self.drain_vdp1();
         self.drain_scsp();
@@ -834,6 +843,15 @@ impl Saturn {
             before_master(scheduler.entity(*master_id).sh2());
             scheduler.entity_mut(*master_id).step(bus);
             apply_fti!(); // master may have pulsed the slave's (or its own) FTI
+            // If the master's instruction triggered an SCU DMA, run it now and
+            // stall the master for the transfer's cycle-stealing cost — the SCU
+            // holds the bus, so the master can't advance during it (M13 A3). The
+            // slave then catches up to the *stalled* timestamp, i.e. it runs
+            // while the master is DMA-blocked.
+            let dma_cost = drain_dma(bus);
+            if dma_cost != 0 {
+                scheduler.entity_mut(*master_id).sh2_mut().cpu.pipeline.cycles += dma_cost;
+            }
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             // Slave catches up to the master's new timestamp.
             while {
@@ -842,6 +860,11 @@ impl Saturn {
             } {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
+                // A slave-triggered DMA stalls the slave for the same reason.
+                let dma_cost = drain_dma(bus);
+                if dma_cost != 0 {
+                    scheduler.entity_mut(*slave_id).sh2_mut().cpu.pipeline.cycles += dma_cost;
+                }
             }
         }
         // Trailing CD-block ticks up to the batch target.
@@ -866,7 +889,7 @@ impl Saturn {
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
-            drain_dma(&mut self.bus);
+            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
@@ -901,7 +924,7 @@ impl Saturn {
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
-            drain_dma(&mut self.bus);
+            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
