@@ -67,6 +67,16 @@ pub struct Vdp1 {
     now: u64,
     /// When a timed plot is in flight, the global cycle it completes at.
     busy_until: Option<u64>,
+    /// Cycle of the last SH-2 access that incurred a draw-slowdown stall — the
+    /// cap reference for [`Self::draw_slowdown`] (Mednafen `LastRWTS`).
+    last_rw_ts: u64,
+    /// Debug-only: lifetime
+    /// `(total VDP1 accesses, accesses-while-drawing, stall hits, stall cycles)`.
+    #[serde(skip)]
+    dbg_slowdown: (u32, u32, u32, u64),
+    /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
+    #[serde(skip)]
+    dbg_plots: (u32, u64, u64),
 }
 
 impl Default for Vdp1 {
@@ -85,7 +95,58 @@ impl Vdp1 {
             draw_end_pending: false,
             now: 0,
             busy_until: None,
+            last_rw_ts: 0,
+            dbg_slowdown: (0, 0, 0, 0),
+            dbg_plots: (0, 0, 0),
         }
+    }
+
+    /// The extra SH-2 stall cycles for an access to VDP1 VRAM/FB while the
+    /// plotter is **drawing** — the SH-2↔VDP1 VRAM bus contention. A faithful
+    /// port of Mednafen `vdp1.cpp` `Write_/Read_CheckDrawSlowdown`
+    /// (`HORRIBLEHACK_VDP1RWDRAWSLOWDOWN`): while drawing, an access costs up to
+    /// `count` cycles, *capped by the gap since the last slowed access* so the
+    /// SH-2 is throttled to the draw rate, not stalled unboundedly. `count` is
+    /// 25 cy for a VRAM/FB write (22 for a register write), 41 for a VRAM read
+    /// (44 for an FB read); register reads aren't slowed. Without this, ours'
+    /// 0-wait VDP1 VRAM lets graphics-drawing code outrun the reference (M12 #6).
+    pub fn draw_slowdown(&mut self, addr: u32, now: u64, write: bool) -> u32 {
+        self.dbg_slowdown.0 += 1;
+        if self.busy_until.is_none() || now <= self.last_rw_ts {
+            return 0;
+        }
+        self.dbg_slowdown.1 += 1;
+        let a = addr & 0x1F_FFFF; // offset within the 2 MB VDP1 window
+        let count: u32 = if write {
+            if a & 0x10_0000 != 0 { 22 } else { 25 } // regs : VRAM/FB
+        } else if a & 0x10_0000 != 0 {
+            return 0; // register reads aren't slowed
+        } else if a & 0x8_0000 != 0 {
+            44 // FB read
+        } else {
+            41 // VRAM read
+        };
+        let stall = count.min((now - self.last_rw_ts) as u32);
+        self.last_rw_ts = now;
+        if stall != 0 {
+            self.dbg_slowdown.2 += 1;
+            self.dbg_slowdown.3 += stall as u64;
+        }
+        stall
+    }
+
+    /// Debug-only: lifetime
+    /// `(total VDP1 accesses, accesses-while-drawing, stall hits, stall cycles)`
+    /// accumulated by [`Self::draw_slowdown`]. Used by the BGM trigger-timing
+    /// probe (M12 #6) to confirm the slowdown actually fires while the master
+    /// copies the boot animation into VDP1 VRAM.
+    pub fn dbg_slowdown(&self) -> (u32, u32, u32, u64) {
+        self.dbg_slowdown
+    }
+
+    /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
+    pub fn dbg_plots(&self) -> (u32, u64, u64) {
+        self.dbg_plots
     }
 
     /// The buffer VDP2 reads as the sprite layer (the front/display buffer).
@@ -271,6 +332,11 @@ impl Vdp1 {
         let duration =
             r.command_count as u64 * DRAW_CMD_CYCLES + r.pixels as u64 * DRAW_PIXEL_CYCLES;
         self.busy_until = Some(self.now + duration);
+        self.dbg_plots.0 += 1;
+        self.dbg_plots.1 += duration;
+        if duration > self.dbg_plots.2 {
+            self.dbg_plots.2 = duration;
+        }
     }
 
     /// Latch draw-end now (plot finished or force-terminated via ENDR).

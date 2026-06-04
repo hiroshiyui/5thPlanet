@@ -128,6 +128,19 @@ pub struct SaturnBus {
 }
 
 impl SaturnBus {
+    /// Extra SH-2 stall for an access to VDP1 VRAM/FB while the plotter is
+    /// drawing — the SH-2↔VDP1 VRAM bus contention (M12 #6). 0 elsewhere. Added
+    /// on top of [`waits_for`] so graphics-drawing code can't outrun the
+    /// reference; see [`crate::vdp1::Vdp1::draw_slowdown`].
+    #[inline]
+    fn vdp1_draw_stall(&mut self, addr: u32, write: bool) -> u32 {
+        if Vdp1::owns(addr) {
+            self.vdp1.draw_slowdown(addr, self.cycle, write)
+        } else {
+            0
+        }
+    }
+
     /// Debug-only: record the first bus write matching the programmatic
     /// write-watchpoint (`bw`). `val` is the size-appropriate written value;
     /// `step_pc` is the PC of the storing instruction (refreshed per step).
@@ -299,7 +312,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 1, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr))
+        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
     }
 
     fn read16(&mut self, addr: u32, _k: AccessKind) -> (u16, u32) {
@@ -327,7 +340,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 2, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr))
+        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
     }
 
     fn read32(&mut self, addr: u32, _k: AccessKind) -> (u32, u32) {
@@ -357,7 +370,7 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 4, v, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr))
+        (v, waits_for(addr) + self.vdp1_draw_stall(addr, false))
     }
 
     fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
@@ -383,7 +396,7 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr)
+        waits_for(addr) + self.vdp1_draw_stall(addr, true)
     }
 
     fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
@@ -419,7 +432,7 @@ impl Bus for SaturnBus {
             MASTER_FTI_BASE..=MASTER_FTI_END => self.master_input_capture = true,
             _ => {}
         }
-        waits_for(addr)
+        waits_for(addr) + self.vdp1_draw_stall(addr, true)
     }
 
     fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
@@ -445,6 +458,6 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr)
+        waits_for(addr) + self.vdp1_draw_stall(addr, true)
     }
 }

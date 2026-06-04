@@ -2457,6 +2457,17 @@ fn bios_audio_probe() {
              sample@trigger={s_trig}, Timer-B period={period:.4} samples/tick",
             t.len()
         );
+        let (calls, drawing, hits, cycles) = sat.bus.vdp1.dbg_slowdown();
+        println!(
+            "  VDP1 draw-slowdown: {calls} total accesses, {drawing} while-drawing, \
+             {hits} stall hits, {cycles} stall cycles charged"
+        );
+        let (plots, dur_sum, dur_max) = sat.bus.vdp1.dbg_plots();
+        let dur_avg = if plots > 0 { dur_sum / plots as u64 } else { 0 };
+        println!(
+            "  VDP1 plots: {plots} begin_plot calls, avg duration={dur_avg} cy, max={dur_max} cy \
+             (frame budget ~479151 cy)"
+        );
     }
     if masterhist {
         let pcs = sat.take_master_pc_trace();
