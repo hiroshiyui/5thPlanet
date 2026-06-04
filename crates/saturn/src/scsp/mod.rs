@@ -210,35 +210,52 @@ static PAN_TABLES: std::sync::LazyLock<([i32; 256], [i32; 256])> = std::sync::La
     (lp, rp)
 });
 
-/// One SCSP timer: an 8-bit up-counter incremented every `2^prescale` samples.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// One SCSP timer, modelled on Mednafen (`scsp.inc` `Timers[]` + `RunSample`): a
+/// **free-running 8-bit** up-counter clocked once every `2^Control` output
+/// samples (the prescale; the *which sample* is aligned to the global sample
+/// counter, see [`ScspCtrl::tick_timers`]). `TIMx` is loaded into the counter
+/// **only on a register write** (a one-shot `reload`); the interrupt pends when
+/// the counter **reaches `0xFF`**, after which it wraps `0xFF→0x00` and keeps
+/// free-running (steady-state period 256) — it does **not** auto-reload from
+/// `TIMx`. (Getting this wrong — auto-reloading, or overflowing one clock late at
+/// `0x100` — shifts the timer cadence and drifts the sound driver's per-voice
+/// dividers out of phase vs the reference.)
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Timer {
-    count: u16,
-    subtick: u32,
-    last_reg: u16,
+    counter: u8,
+    /// Prescale exponent (`TIMx` bits 10-8): clock every `2^control` samples.
+    control: u8,
+    /// `-1` = none pending; else the value to load into `counter` on the next
+    /// clock (latched on a `TIMx` register write).
+    reload: i32,
+}
+
+impl Default for Timer {
+    fn default() -> Self {
+        // Power-on: no reload pending (matches Mednafen `Reset`, `Reload = -1`).
+        Self { counter: 0, control: 0, reload: -1 }
+    }
 }
 
 impl Timer {
-    /// Advance by `samples`; returns true on each overflow (8-bit wrap). A
-    /// register rewrite reloads the counter from the new `TIMx` value.
-    fn tick(&mut self, reg: u16, samples: u32) -> bool {
-        if reg != self.last_reg {
-            self.last_reg = reg;
-            self.count = reg & 0xFF;
-            self.subtick = 0;
+    /// A `TIMx` register write: latch the prescale (bits 10-8) and a one-shot
+    /// reload of the counter (bits 7-0).
+    fn write(&mut self, reg: u16) {
+        self.control = ((reg >> 8) & 7) as u8;
+        self.reload = (reg & 0xFF) as i32;
+    }
+
+    /// Advance one clock (call only on a `DoClock` sample for this timer's
+    /// prescale); returns `true` when the counter reaches `0xFF` — the overflow
+    /// that pends the timer interrupt.
+    fn clock(&mut self) -> bool {
+        if self.reload >= 0 {
+            self.counter = self.reload as u8;
+            self.reload = -1;
+        } else {
+            self.counter = self.counter.wrapping_add(1);
         }
-        let prescale = 1u32 << ((reg >> 8) & 7);
-        self.subtick += samples;
-        let mut overflowed = false;
-        while self.subtick >= prescale {
-            self.subtick -= prescale;
-            self.count += 1;
-            if self.count > 0xFF {
-                self.count = reg & 0xFF;
-                overflowed = true;
-            }
-        }
-        overflowed
+        self.counter == 0xFF
     }
 }
 
@@ -289,6 +306,10 @@ pub struct ScspCtrl {
     #[serde(with = "BigArray")]
     raw: [u8; REG_BYTES],
     timers: [Timer; 3],
+    /// Global output-sample counter (Mednafen `SampleCounter`): drives the
+    /// timer-clock alignment so a timer's `2^Control` prescale lands on the same
+    /// samples as the reference, independent of when `TIMx` was written.
+    sample_counter: u64,
     slots: [Slot; NUM_SLOTS],
     /// The effect DSP (reverb/echo); fed by slot effect-sends, mixed back in.
     dsp: dsp::Dsp,
@@ -326,6 +347,7 @@ impl ScspCtrl {
         Self {
             raw: [0; REG_BYTES],
             timers: Default::default(),
+            sample_counter: 0,
             slots: [Slot::default(); NUM_SLOTS],
             dsp: dsp::Dsp::new(),
             asserted_level: 0,
@@ -425,6 +447,11 @@ impl ScspCtrl {
             }
             SCIEB | SCIPD | SCILV0 | SCILV1 | SCILV2 => self.recompute_irq(),
             MCIEB | MCIPD => self.recompute_main(),
+            // Latch the prescale + one-shot counter reload (the bank still holds
+            // the written value for reads; the timer logic uses the latch).
+            TIMA => self.timers[0].write(v),
+            TIMB => self.timers[1].write(v),
+            TIMC => self.timers[2].write(v),
             _ => {}
         }
     }
@@ -440,19 +467,29 @@ impl ScspCtrl {
         }
         self.dbg_tt_calls = self.dbg_tt_calls.wrapping_add(1);
         self.dbg_tt_samples = self.dbg_tt_samples.wrapping_add(samples);
-        let regs = [self.read16(TIMA), self.read16(TIMB), self.read16(TIMC)];
         let bits = [INT_TIMER_A, INT_TIMER_B, INT_TIMER_C];
         let mut scipd = false;
         let mut mcipd = false;
-        for i in 0..3 {
-            if self.timers[i].tick(regs[i], samples) {
-                self.dbg_timer_of[i] = self.dbg_timer_of[i].wrapping_add(1);
-                self.store16(SCIPD, self.read16(SCIPD) | bits[i]);
-                scipd = true;
-                if i == 0 {
-                    // Timer A also pends the main-CPU sound interrupt.
-                    self.store16(MCIPD, self.read16(MCIPD) | INT_TIMER_A);
-                    mcipd = true;
+        // Per output sample: each timer is clocked when the global sample
+        // counter's low `Control` bits are 0 (Mednafen `DoClock =
+        // !(SampleCounter & ((1<<Control)-1))`), so its `2^Control` prescale is
+        // phase-locked to the sample clock, not to the `TIMx` write.
+        for _ in 0..samples {
+            let sc = self.sample_counter;
+            self.sample_counter = self.sample_counter.wrapping_add(1);
+            for (i, &bit) in bits.iter().enumerate() {
+                if sc & ((1u64 << self.timers[i].control) - 1) != 0 {
+                    continue; // not a clock edge for this prescale
+                }
+                if self.timers[i].clock() {
+                    self.dbg_timer_of[i] = self.dbg_timer_of[i].wrapping_add(1);
+                    self.store16(SCIPD, self.read16(SCIPD) | bit);
+                    scipd = true;
+                    if i == 0 {
+                        // Timer A also pends the main-CPU sound interrupt.
+                        self.store16(MCIPD, self.read16(MCIPD) | INT_TIMER_A);
+                        mcipd = true;
+                    }
                 }
             }
         }
@@ -1376,6 +1413,49 @@ mod tests {
         assert!(!ctrl.main_pending);
         ctrl.tick_timers(2);
         assert!(ctrl.main_pending, "MCIPD & MCIEB → main interrupt");
+    }
+
+    #[test]
+    fn timer_free_runs_at_period_256_not_auto_reload() {
+        // Mednafen model: `TIMx` loads the counter only on *write*; thereafter
+        // the 8-bit counter free-runs (interrupt at 0xFF, wrap to 0x00), so the
+        // steady-state period is **256** samples — NOT the `256 - reload` of an
+        // auto-reload timer (our old, wrong model). This is the difference that
+        // keeps the sound driver's timer-driven dividers in phase with the ref.
+        let mut ctrl = ScspCtrl::new();
+        ctrl.write16(SCILV0, INT_TIMER_A);
+        ctrl.write16(SCIEB, INT_TIMER_A);
+        ctrl.write16(TIMA, 0x00F0); // prescale 0, reload 0xF0
+        // First overflow: load 0xF0, then count 0xF0→0xFF = clock 16.
+        ctrl.tick_timers(15);
+        assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "not yet at 15 clocks");
+        ctrl.tick_timers(1);
+        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "first overflow at clock 16");
+        ctrl.write16(SCIRE, INT_TIMER_A); // acknowledge
+        // Second overflow: free-running 0xFF→0x00→…→0xFF = 256 clocks later, NOT
+        // 16 (which an auto-reload-to-0xF0 timer would give).
+        ctrl.tick_timers(255);
+        assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "free-run: not yet at 255");
+        ctrl.tick_timers(1);
+        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "second overflow at period 256");
+    }
+
+    #[test]
+    fn timer_prescale_is_phase_locked_to_the_global_sample_clock() {
+        // The `2^Control` prescale lands on samples where the global sample
+        // counter's low `Control` bits are 0 — independent of when `TIMx` was
+        // written (Mednafen `DoClock = !(SampleCounter & ((1<<Control)-1))`).
+        let mut ctrl = ScspCtrl::new();
+        ctrl.write16(SCILV0, INT_TIMER_A);
+        ctrl.write16(SCIEB, INT_TIMER_A);
+        // Advance the global sample clock by 3, *then* arm: prescale 2 (÷4) only
+        // clocks on samples 4,8,12,… so from sample 3 the first edge is at 4.
+        ctrl.tick_timers(3);
+        ctrl.write16(TIMA, 0x02FF); // prescale 2 (÷4), reload 0xFF → fires on its first clock
+        ctrl.tick_timers(1); // sample 3 → not a ÷4 edge
+        assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "sample 3 is not a ÷4 edge");
+        ctrl.tick_timers(1); // sample 4 → a ÷4 edge → load 0xFF → overflow
+        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "clocks on the global ÷4 edge");
     }
 
     // ---- slot (PCM) engine ----
