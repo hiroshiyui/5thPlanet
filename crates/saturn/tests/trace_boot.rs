@@ -2293,6 +2293,26 @@ fn bios_audio_probe() {
         sat.enable_master_pc_trace();
         sat.set_master_trace_freeze(0xFFFF_FFFE, 0xFFFF_FFFF); // never freeze (M11 default would)
     }
+    // SRAMWATCH: tally the master's Data reads of SCSP sound RAM
+    // (phys 0x05A0_0000..0x05B0_0000) by cache treatment, to test whether the
+    // master↔68k mailbox is read through cacheable addresses (staleness-prone
+    // `hit`) vs cache-through / cache-off (always fresh). The 68k writes sound
+    // RAM with no cache; the master holds a private write-through cache with no
+    // hardware coherency, so a cached `hit` could read a value stale of the
+    // 68k's latest write. An optional `SRAMWATCH_LO`/`SRAMWATCH_HI` narrows the
+    // range to the command mailbox.
+    let sramwatch = std::env::var("SRAMWATCH").is_ok();
+    if sramwatch {
+        let lo = std::env::var("SRAMWATCH_LO")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x05A0_0000);
+        let hi = std::env::var("SRAMWATCH_HI")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x05B0_0000);
+        sat.master_mut().enable_read_watch(lo, hi);
+    }
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2468,6 +2488,26 @@ fn bios_audio_probe() {
             "  VDP1 plots: {plots} begin_plot calls, avg duration={dur_avg} cy, max={dur_max} cy \
              (frame budget ~479151 cy)"
         );
+    }
+    if sramwatch && let Some(w) = sat.master().read_watch {
+        let cacheable = w.hit + w.miss + w.bypass;
+        let total = cacheable + w.through;
+        println!(
+            "  master sound-RAM[{:08X}..{:08X}] Data reads: {total} total | \
+             cache-through={} (fresh) | cacheable={cacheable} [hit={} STALE-PRONE, miss={}, bypass={}]",
+            w.lo, w.hi, w.through, w.hit, w.miss, w.bypass
+        );
+        if w.hit + w.miss == 0 {
+            println!(
+                "  ⇒ master never reads this region through the cache ⇒ cache staleness is NOT in play here"
+            );
+        } else {
+            println!(
+                "  ⇒ master DOES read this region cacheable ({} hit/miss) ⇒ staleness possible; \
+                 check whether a purge/invalidate is expected",
+                w.hit + w.miss
+            );
+        }
     }
     if masterhist {
         let pcs = sat.take_master_pc_trace();

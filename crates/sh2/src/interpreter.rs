@@ -35,6 +35,28 @@ const fn classify(addr: u32) -> (u32, bool) {
 /// `OnChip::owns` dispatch swallow it. (*SH7604 Hardware Manual* §8, CCR.)
 const CCR_ADDR: u32 = 0xFFFF_FE92;
 
+/// Debug-only tally of `Data` reads whose **physical** address lands in
+/// `[lo, hi)`, bucketed by how the cache treated them. Used to test whether a
+/// shared region (e.g. SCSP sound RAM, written by the 68k) is read by this
+/// SH-2 through **cacheable** addresses — where a stale resident line can hide
+/// the 68k's fresh value (`hit`) — versus **cache-through**/cache-off paths
+/// that always reach RAM (`through`/`bypass`). `miss` is a cacheable read that
+/// went to RAM this time but left the line resident for future (possibly
+/// stale) hits. Observer-only; never serialized.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadWatch {
+    pub lo: u32,
+    pub hi: u32,
+    /// Cache-through (`0x2000_0000` alias) — always fresh from RAM.
+    pub through: u64,
+    /// Served from a resident cache line — **staleness-prone**.
+    pub hit: u64,
+    /// Cacheable miss — fetched fresh now, but installs a line.
+    pub miss: u64,
+    /// Cacheable address but the cache was disabled — fresh from RAM.
+    pub bypass: u64,
+}
+
 /// One Hitachi SH-2 (SH7604) core.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -65,6 +87,10 @@ pub struct Cpu {
     /// compared against the external-memory word (a mismatch = stale I-cache).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub last_illegal_word: Option<u16>,
+    /// Debug only: when `Some`, tallies `Data` reads to a physical range by
+    /// cache treatment — see [`ReadWatch`]. Set via [`Cpu::enable_read_watch`].
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub read_watch: Option<ReadWatch>,
 }
 
 impl Default for Cpu {
@@ -85,6 +111,38 @@ impl Cpu {
             load_dest_pending: None,
             last_fault: None,
             last_illegal_word: None,
+            read_watch: None,
+        }
+    }
+
+    /// Debug: start tallying `Data` reads whose physical address is in
+    /// `[lo, hi)` by cache treatment (see [`ReadWatch`]). Resets the counters.
+    pub fn enable_read_watch(&mut self, lo: u32, hi: u32) {
+        self.read_watch = Some(ReadWatch {
+            lo,
+            hi,
+            ..Default::default()
+        });
+    }
+
+    /// Debug: record one watched read into the active [`ReadWatch`], if the
+    /// physical address is in range. `bucket` selects the counter (0 = through,
+    /// 1 = hit, 2 = miss, 3 = bypass).
+    #[inline]
+    fn note_watched_read(&mut self, phys: u32, kind: AccessKind, bucket: u8) {
+        if !matches!(kind, AccessKind::Data) {
+            return;
+        }
+        if let Some(w) = &mut self.read_watch
+            && phys >= w.lo
+            && phys < w.hi
+        {
+            match bucket {
+                0 => w.through += 1,
+                1 => w.hit += 1,
+                2 => w.miss += 1,
+                _ => w.bypass += 1,
+            }
         }
     }
 
@@ -1108,6 +1166,9 @@ impl Cpu {
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u8(&line, phys), stall);
         }
+        if !cacheable {
+            self.note_watched_read(phys, kind, 0);
+        }
         bus.read8(phys, kind)
     }
 
@@ -1125,6 +1186,9 @@ impl Cpu {
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u16(&line, phys), stall);
         }
+        if !cacheable {
+            self.note_watched_read(phys, kind, 0);
+        }
         bus.read16(phys, kind)
     }
 
@@ -1141,6 +1205,9 @@ impl Cpu {
         let (phys, cacheable) = classify(addr);
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u32(&line, phys), stall);
+        }
+        if !cacheable {
+            self.note_watched_read(phys, kind, 0);
         }
         bus.read32(phys, kind)
     }
@@ -1355,9 +1422,16 @@ impl Cpu {
             AccessKind::Data | AccessKind::Dma => self.cache.lookup_data(phys),
         };
         match lookup {
-            cache::Lookup::Hit(line) => Some((line, 0)),
-            cache::Lookup::Bypass => None,
+            cache::Lookup::Hit(line) => {
+                self.note_watched_read(phys, kind, 1);
+                Some((line, 0))
+            }
+            cache::Lookup::Bypass => {
+                self.note_watched_read(phys, kind, 3);
+                None
+            }
             cache::Lookup::Miss => {
+                self.note_watched_read(phys, kind, 2);
                 let base = phys & !0xF;
                 let mut line = [0u8; cache::LINE_BYTES];
                 let mut stall = 0u32;
