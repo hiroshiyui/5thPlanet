@@ -2313,6 +2313,12 @@ fn bios_audio_probe() {
             .unwrap_or(0x05B0_0000);
         sat.master_mut().enable_read_watch(lo, hi);
     }
+    // VDP1LOG: per-frame VDP1 command-count series (A6 — the command-list
+    // divergence vs Mednafen, the upstream cause of the early BGM trigger).
+    // Each entry is (frame, plots, max command_count, max pixels). VDP1_OUT=<f>
+    // additionally dumps the full series for a frame-by-frame diff.
+    let vdp1log = std::env::var("VDP1LOG").is_ok();
+    let mut vdp1_series: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2336,6 +2342,11 @@ fn bios_audio_probe() {
         sat.set_pad1(held);
 
         sat.run_frame(&mut fb);
+
+        if vdp1log {
+            let (plots, cmds, px) = sat.bus.vdp1.dbg_take_frame();
+            vdp1_series.push((f, plots, cmds, px));
+        }
 
         let active = (0..32).filter(|&i| sat.bus.scsp.slot_active(i)).count();
         if active > peak_slots {
@@ -2373,6 +2384,32 @@ fn bios_audio_probe() {
             .map(|f| f.to_string())
             .unwrap_or_else(|| "NEVER/not-in-startup".into())
     );
+    if vdp1log {
+        let drawn: Vec<&(u32, u32, u32, u32)> =
+            vdp1_series.iter().filter(|&&(_, p, _, _)| p > 0).collect();
+        let max_cmds = drawn.iter().map(|&&(_, _, c, _)| c).max().unwrap_or(0);
+        println!(
+            "  VDP1 per-frame: {} of {} frames drew; peak command_count={max_cmds}",
+            drawn.len(),
+            vdp1_series.len()
+        );
+        for tier in [16u32, 64, 128, 256, 371] {
+            match drawn.iter().find(|&&&(_, _, c, _)| c >= tier) {
+                Some(&&(f, _, c, _)) => {
+                    println!("    first frame with >= {tier} cmds: f{f} (cmds={c})")
+                }
+                None => println!("    never reached {tier} cmds"),
+            }
+        }
+        if let Ok(p) = std::env::var("VDP1_OUT") {
+            let s: String = vdp1_series
+                .iter()
+                .map(|(f, p, c, x)| format!("{f} {p} {c} {x}\n"))
+                .collect();
+            std::fs::write(&p, s).unwrap();
+            println!("    wrote {} per-frame VDP1 entries to {p}", vdp1_series.len());
+        }
+    }
     // Buzz diagnosis: every active slot at the end of the run — why didn't it free?
     for i in 0..32 {
         if sat.bus.scsp.slot_active(i) {

@@ -77,6 +77,12 @@ pub struct Vdp1 {
     /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
     #[serde(skip)]
     dbg_plots: (u32, u64, u64, u32, u32),
+    /// Debug-only: per-frame plot accumulator `(plots, max command_count,
+    /// max pixels)` since the last [`Self::dbg_take_frame`]. The audio-CD BGM
+    /// probe drains this once per `run_frame` to get a per-frame VDP1
+    /// command-count series (A6: the command-list divergence vs Mednafen).
+    #[serde(skip)]
+    dbg_frame: (u32, u32, u32),
 }
 
 impl Default for Vdp1 {
@@ -98,6 +104,7 @@ impl Vdp1 {
             last_rw_ts: 0,
             dbg_slowdown: (0, 0, 0, 0),
             dbg_plots: (0, 0, 0, 0, 0),
+            dbg_frame: (0, 0, 0),
         }
     }
 
@@ -352,6 +359,20 @@ impl Vdp1 {
         if r.pixels > self.dbg_plots.4 {
             self.dbg_plots.4 = r.pixels;
         }
+        self.dbg_frame.0 += 1;
+        if r.command_count > self.dbg_frame.1 {
+            self.dbg_frame.1 = r.command_count;
+        }
+        if r.pixels > self.dbg_frame.2 {
+            self.dbg_frame.2 = r.pixels;
+        }
+    }
+
+    /// Debug-only: drain the per-frame plot accumulator `(plots, max
+    /// command_count, max pixels)` and reset it. The BGM probe calls this once
+    /// per `run_frame` to build a per-frame VDP1 command-count series (A6).
+    pub fn dbg_take_frame(&mut self) -> (u32, u32, u32) {
+        core::mem::take(&mut self.dbg_frame)
     }
 
     /// Latch draw-end now (plot finished or force-terminated via ENDR).
