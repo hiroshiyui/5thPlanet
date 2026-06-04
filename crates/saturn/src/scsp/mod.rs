@@ -1067,6 +1067,16 @@ pub struct Scsp {
     /// Sub-SH-2-cycle accumulators for the 68k-clock and sample-clock rates.
     frac: u64,
     sample_frac: u64,
+    /// Carry of the 68k-cycle budget across batches. The 68k steps whole
+    /// instructions, so the last step of a batch overshoots `budget` by part of
+    /// an instruction; that overshoot (a negative leftover) is carried into the
+    /// next batch's budget so the 68k runs **exactly** 256 cycles per produced
+    /// sample on average — not ~270 (it would otherwise discard the overshoot
+    /// every tiny event-clamped batch and creep ~5.7% ahead of the audio/timer
+    /// clock, advancing the sound driver's sequence too early). Mednafen avoids
+    /// this by running the 68k to the exact sample edge; the carry is our
+    /// whole-instruction equivalent.
+    budget_carry: i64,
     /// Generated 44.1 kHz output, interleaved L,R. The frontend drains it each
     /// frame; capped so headless runs (which never drain) don't grow unbounded.
     out: Vec<i16>,
@@ -1148,6 +1158,7 @@ impl Scsp {
             running: false,
             frac: 0,
             sample_frac: 0,
+            budget_carry: 0,
             out: Vec::new(),
             pc_trace: None,
             pc_seen: None,
@@ -1341,7 +1352,9 @@ impl Scsp {
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
         self.frac += sh2_cycles.saturating_mul(SCSP_CLOCK_HZ);
-        let mut budget = (self.frac / SH2_CLOCK_HZ) as i64;
+        // Add back the previous batch's whole-instruction overshoot (a negative
+        // carry) so the 68k does not creep ahead of the sample/timer clock.
+        let mut budget = (self.frac / SH2_CLOCK_HZ) as i64 + self.budget_carry;
         self.frac %= SH2_CLOCK_HZ;
 
         // Per-sample interleave (Mednafen runs the sound 68k to each output-sample
@@ -1504,6 +1517,9 @@ impl Scsp {
                 out.push(r);
             }
         }
+        // Carry this batch's 68k-cycle overshoot (`budget` is now ≤ 0) into the
+        // next batch so the 68k tracks 256 cy/sample exactly over time.
+        self.budget_carry = budget;
     }
 }
 
