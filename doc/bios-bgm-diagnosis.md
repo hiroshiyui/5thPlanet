@@ -5,6 +5,30 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-04d) — cycle-exact 68k lockstep: found + fixed a real 68k
+> cycle bug, and DECISIVELY ruled the BGM trigger out of both the 68k-cycle and
+> the master/CD-state axes.** A cycle-exact 68k lockstep vs Mednafen (the new
+> `take_68k_itrace` cycle column + mednaref's `SS_ITRACE` 68k timestamp; tail-aligned
+> at the first enqueue `0x4B9A`) found ours' sound 68k charged **0 wait-states** on
+> sound-RAM/SCSP-register access where Mednafen charges **+2 cy/access**
+> (`SoundCPU_BusRead/Write`) — ours ran the 68k **~1.5× too fast** (matched window
+> 428 cy ours vs 688 cy Mednafen). **Fixed** (`729bfc3`, `SCSP_ACCESS_WAIT`; matched
+> window now 642 vs 688, the ~46-cy residual is the 68000 branch-prefetch), golden-safe.
+> **But the BGM seq-tick is UNCHANGED (4166→4165):** the fix proves the trigger is
+> **not 68k-cycle-gated.** And a whole-sound-RAM master write-watch
+> (`SAT_WWATCH=0x05A00000 WIN=0x80000`) shows the master writes sound RAM **only twice
+> in the whole boot, both at frame ~66** — *nothing* near the trigger (frame ~600).
+> So the panel BGM is driven **autonomously by the 68k driver**; the master/CD-state
+> is **not** the trigger gate either. ⇒ Both the cycle axis and the master axis are
+> **eliminated with evidence.** The remaining root is purely **68k-internal sequence
+> timing**: ours' driver reaches the first BGM note at Timer-B tick **4166** vs
+> Mednafen's **4497** (~331 ticks / ~40 frames early) on byte-identical sequence data
+> and an identical 88-samples/tick Timer-B rate — i.e. ours starts/advances the panel
+> BGM sequence too early. That is exactly the **per-voice timing-divider / delta-time
+> phase** divergence localized below — a 68k DATA/phase bug, **not** a cycle, master,
+> CD, or VDP1 bug. (The cycle-lockstep is now exhausted for the BGM; the next tool is
+> a *value* lockstep on the seq-engine's tempo/delta-time/divider state.)
+>
 > **Update (2026-06-04c) — the "VDP1 command-list divergence" (roadmap A6) is
 > REFUTED: the VDP1 lists MATCH Mednafen byte-for-byte.** A frame-aligned per-frame
 > VDP1 command-count diff settled the last suspect from the A6/M12-#6 thread. Ours
