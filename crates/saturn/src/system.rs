@@ -101,6 +101,99 @@ fn hblank_active(line_cycle: u64, h_res: u8, cycles_per_line: u64) -> bool {
 /// this sets the *phase resolution* of the periodic report, not its cadence.
 const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 
+// ---- SCU DMA execution (operates on `&mut SaturnBus`) ---------------------
+//
+// These were methods on `Saturn` (borrowing all of `self`); moving them onto
+// the bus lets them run both at the batch boundary (`run_for`) *and* from
+// inside the per-instruction `step_cpus` loop — the foundation for executing a
+// DMA at its trigger cycle and for the faithful cycle-stealing cost (M13 A1/A3).
+// Behaviour is unchanged: still a synchronous block transfer at the drain point.
+
+/// Run every DMA the SCU queued. Direct or indirect (table-driven) mode; a
+/// transfer sourced from the BIOS A-bus is illegal and moves nothing.
+fn drain_dma(bus: &mut SaturnBus) {
+    while let Some(req) = bus.scu.take_pending_dma() {
+        let bios_src = |a: u32| a & 0x07F0_0000 == 0;
+        let (final_src, final_dst) = if req.indirect {
+            // Indirect: `dst` points at {size, dst, src} longword triplets; the
+            // last has bit 31 of its source word set. Each triplet is a transfer.
+            let mut index = req.dst;
+            const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
+            let mut walked = 0u32;
+            loop {
+                let (size, _) = bus.read32(index, AccessKind::Dma);
+                let (idst, _) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
+                let (isrc_raw, _) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
+                let last = isrc_raw & 0x8000_0000 != 0;
+                let isrc = isrc_raw & 0x07FF_FFFF;
+                let idst = idst & 0x07FF_FFFF;
+                let count = dma_count(req.channel, size);
+                if !bios_src(isrc) {
+                    scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add);
+                }
+                index = index.wrapping_add(0xC);
+                walked += 1;
+                if last || walked >= MAX_INDIRECT_TRIPLETS {
+                    break;
+                }
+            }
+            (req.src, index) // indirect leaves the table index advanced
+        } else if bios_src(req.src) {
+            (req.src, req.dst)
+        } else {
+            let count = dma_count(req.channel, req.bytes);
+            scu_transfer(bus, req.src, req.dst, count, req.src_add, req.dst_add)
+        };
+        bus.scu.finish_dma(req.channel, final_src, final_dst);
+    }
+}
+
+/// SCU DMA byte count: a programmed 0 means the channel's maximum (1 MiB for
+/// level 0, 4 KiB for levels 1/2), per the SCU manual.
+fn dma_count(channel: usize, programmed: u32) -> u32 {
+    if programmed != 0 {
+        programmed
+    } else if channel == 0 {
+        0x0010_0000
+    } else {
+        0x0000_1000
+    }
+}
+
+/// One SCU DMA block transfer over the B-bus 16-bit data path, honouring the
+/// `D*AD` strides. Source read as 32-bit words split into big-endian 16-bit
+/// halves; the destination advances by `dst_add` (Work RAM H forces a 2-byte
+/// step). Returns the post-transfer `(src, dst)`.
+fn scu_transfer(
+    bus: &mut SaturnBus,
+    mut src: u32,
+    mut dst: u32,
+    bytes: u32,
+    src_add: u32,
+    dst_add: u32,
+) -> (u32, u32) {
+    let mut src_shift = ((src & 2) >> 1) ^ 1;
+    let mut i = 0u32;
+    while i < bytes {
+        let (word, _) = bus.read32(src & 0x07FF_FFFC, AccessKind::Dma);
+        let half = (word >> (src_shift * 16)) as u16;
+        bus.write16(dst & 0x07FF_FFFE, half, AccessKind::Dma);
+        src_shift ^= 1;
+        if src_shift != 0 {
+            src = src.wrapping_add(src_add);
+        }
+        // Work RAM H (0x0600_0000) forces a fixed 2-byte destination step.
+        let step = if dst & 0x0700_0000 == 0x0600_0000 {
+            2
+        } else {
+            dst_add
+        };
+        dst = dst.wrapping_add(step);
+        i += 2;
+    }
+    (src, dst)
+}
+
 /// One emulated SEGA Saturn — a Saturn-shaped memory map populated with
 /// a caller-supplied BIOS image, plus master and slave SH-2 cores wired
 /// into a shared event-driven scheduler.
@@ -442,7 +535,7 @@ impl Saturn {
         self.catch_up_cd_block();
         self.update_video_timing();
         self.drain_smpc();
-        self.drain_scu_dma();
+        drain_dma(&mut self.bus);
         self.drain_scu_dsp();
         self.drain_vdp1();
         self.drain_scsp();
@@ -592,7 +685,7 @@ impl Saturn {
     ///   H-blank dot count — clamping to it would lock in a *precise* divergence
     ///   from the reference and add ~526 stops/frame for no diff benefit. Add
     ///   only once the dot count is corrected and a divergence points at HBLANK.
-    /// - **SCU DMA**: synchronous/instant in our model (`drain_scu_dma` finishes
+    /// - **SCU DMA**: synchronous/instant in our model (`drain_dma` finishes
     ///   the whole transfer at the boundary) — there is no future completion
     ///   timestamp to clamp to. Making it a timed event is a later model change.
     fn cycles_to_next_event(&self, now: u64) -> u64 {
@@ -773,7 +866,7 @@ impl Saturn {
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
-            self.drain_scu_dma();
+            drain_dma(&mut self.bus);
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
@@ -808,7 +901,7 @@ impl Saturn {
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
-            self.drain_scu_dma();
+            drain_dma(&mut self.bus);
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
@@ -1045,107 +1138,6 @@ impl Saturn {
     /// startup). Length-clamped to the 32 KiB capacity.
     pub fn load_internal_backup(&mut self, bytes: &[u8]) {
         self.bus.backup.load(bytes);
-    }
-
-    /// Run any DMA transfers that the SCU queued during the last
-    /// scheduler batch. For M3 each transfer is synchronous: we move
-    /// the full byte count in 32-bit chunks (plus a byte tail) via
-    /// `self.bus`, then write back the post-transfer state. Cycle-
-    /// stealing accuracy and start factors other than "manual" are
-    /// out of M3 scope; whichever later milestone surfaces a game
-    /// that needs them will refine this.
-    fn drain_scu_dma(&mut self) {
-        while let Some(req) = self.bus.scu.take_pending_dma() {
-            // The SCU can't read its own bus segment (the BIOS A-bus); a DMA
-            // sourced from there is illegal and transfers nothing.
-            let bios_src = |a: u32| a & 0x07F0_0000 == 0;
-            let (final_src, final_dst) = if req.indirect {
-                // Indirect mode: `dst` points at a table of {size, dst, src}
-                // longword triplets; the last entry has bit 31 of its source
-                // word set. Each triplet is its own transfer.
-                let mut index = req.dst;
-                // The indirect table is terminated by bit 31 of a triplet's
-                // source word. Cap the walk so a stray/zeroed table (no
-                // terminator) can't spin the host forever — a real list is far
-                // shorter than this.
-                const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
-                let mut walked = 0u32;
-                loop {
-                    let (size, _) = self.bus.read32(index, AccessKind::Dma);
-                    let (idst, _) = self.bus.read32(index.wrapping_add(4), AccessKind::Dma);
-                    let (isrc_raw, _) = self.bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                    let last = isrc_raw & 0x8000_0000 != 0;
-                    let isrc = isrc_raw & 0x07FF_FFFF;
-                    let idst = idst & 0x07FF_FFFF;
-                    let count = self.dma_count(req.channel, size);
-                    if !bios_src(isrc) {
-                        self.scu_transfer(isrc, idst, count, req.src_add, req.dst_add);
-                    }
-                    index = index.wrapping_add(0xC);
-                    walked += 1;
-                    if last || walked >= MAX_INDIRECT_TRIPLETS {
-                        break;
-                    }
-                }
-                (req.src, index) // indirect leaves the table index advanced
-            } else if bios_src(req.src) {
-                (req.src, req.dst)
-            } else {
-                let count = self.dma_count(req.channel, req.bytes);
-                self.scu_transfer(req.src, req.dst, count, req.src_add, req.dst_add)
-            };
-            self.bus.scu.finish_dma(req.channel, final_src, final_dst);
-        }
-    }
-
-    /// SCU DMA byte count: a programmed 0 means the channel's maximum
-    /// (1 MiB for level 0, 4 KiB for levels 1/2), per the SCU manual.
-    fn dma_count(&self, channel: usize, programmed: u32) -> u32 {
-        if programmed != 0 {
-            programmed
-        } else if channel == 0 {
-            0x0010_0000
-        } else {
-            0x0000_1000
-        }
-    }
-
-    /// One SCU DMA block transfer over the B-bus 16-bit data path, honouring
-    /// the `D*AD` source/destination strides. The source is read as 32-bit
-    /// words and split into two big-endian 16-bit halves; each half is written
-    /// to the destination, which advances by `dst_add` (Work RAM H forces a
-    /// 2-byte step). The source advances by `src_add` once per 32-bit word
-    /// (`src_add` 0 = a fixed source, e.g. a FIFO register). Returns the
-    /// post-transfer `(src, dst)`. The rare unaligned-source data-rotation
-    /// case is not modelled.
-    fn scu_transfer(
-        &mut self,
-        mut src: u32,
-        mut dst: u32,
-        bytes: u32,
-        src_add: u32,
-        dst_add: u32,
-    ) -> (u32, u32) {
-        let mut src_shift = ((src & 2) >> 1) ^ 1;
-        let mut i = 0u32;
-        while i < bytes {
-            let (word, _) = self.bus.read32(src & 0x07FF_FFFC, AccessKind::Dma);
-            let half = (word >> (src_shift * 16)) as u16;
-            self.bus.write16(dst & 0x07FF_FFFE, half, AccessKind::Dma);
-            src_shift ^= 1;
-            if src_shift != 0 {
-                src = src.wrapping_add(src_add);
-            }
-            // Work RAM H (0x0600_0000) forces a fixed 2-byte destination step.
-            let step = if dst & 0x0700_0000 == 0x0600_0000 {
-                2
-            } else {
-                dst_add
-            };
-            dst = dst.wrapping_add(step);
-            i += 2;
-        }
-        (src, dst)
     }
 
     /// Run the SCU-DSP when host software has started it (PPAF EXF). Run at

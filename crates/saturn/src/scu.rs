@@ -228,7 +228,7 @@ pub struct Scu {
 }
 
 /// Snapshot of a queued DMA request handed to the bus drainer. The drainer
-/// (`system::drain_scu_dma`) performs the byte movement through the bus,
+/// (`system::drain_dma`) performs the byte movement through the bus,
 /// since the SCU itself can't reach it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[derive(serde::Serialize, serde::Deserialize)]
