@@ -2512,9 +2512,11 @@ fn bios_audio_probe() {
     }
     if let Some(p) = itrace_out {
         let t = sat.bus.scsp.take_68k_itrace();
+        // `pc cycle d4 d7` — cycle is the 68k accumulated clock for the
+        // tail-aligned cycle-exact lockstep vs mednaref (BGM-trigger root).
         let s: String = t
             .iter()
-            .map(|(pc, d4, d7)| format!("{pc:04X} {d4:08X} {d7:08X}\n"))
+            .map(|(pc, cyc, d4, d7)| format!("{pc:04X} {cyc} {d4:08X} {d7:08X}\n"))
             .collect();
         std::fs::write(&p, s).unwrap();
         let (n, s_first, s_trig) = sat.bus.scsp.take_68k_trigger_timing();

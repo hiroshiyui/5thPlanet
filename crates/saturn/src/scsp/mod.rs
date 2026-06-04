@@ -1043,13 +1043,16 @@ impl ScspCtrl {
 
 /// Frozen value-trace for the BGM interpreter diff:
 /// `(frozen, seq_ticks, sample_at_first_tick, sample_at_trigger, ring)`. Records
-/// the per-instruction `(pc, d4, d7)` ring across the driver until the first
-/// enqueue, then freezes. `seq_ticks` counts seq-tick entries (`0x40F2`) and the
-/// two sample-counter snapshots (at the first seq-tick and at the enqueue) give
-/// the Timer-B **period** `(s_trig − s_first)/(seq_ticks−1)` — a zero-point-
-/// independent rate to compare vs the reference, disambiguating a trigger-time
-/// gap from a seq-tick-rate gap (M12 task 2). See [`Scsp::enable_68k_itrace`].
-type ITrace = (bool, u32, u64, u64, std::collections::VecDeque<(u32, u32, u32)>);
+/// the per-instruction `(pc, cycle, d4, d7)` ring across the driver until the
+/// first enqueue, then freezes — `cycle` is the 68k's accumulated clock so a
+/// tail-aligned **cycle-exact** lockstep vs Mednafen finds the first instruction
+/// whose cost diverges (the m68k cycle-accounting root of the BGM-trigger lead).
+/// `seq_ticks` counts seq-tick entries (`0x40F2`) and the two sample-counter
+/// snapshots (at the first seq-tick and at the enqueue) give the Timer-B
+/// **period** `(s_trig − s_first)/(seq_ticks−1)` — a zero-point-independent rate
+/// to compare vs the reference, disambiguating a trigger-time gap from a
+/// seq-tick-rate gap (M12 task 2). See [`Scsp::enable_68k_itrace`].
+type ITrace = (bool, u32, u64, u64, std::collections::VecDeque<(u32, u64, u32, u32)>);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
@@ -1196,8 +1199,8 @@ impl Scsp {
         self.itrace = Some((false, 0, 0, 0, std::collections::VecDeque::new()));
     }
 
-    /// Snapshot the frozen `(pc, d4, d7)` ring (oldest→newest), if enabled.
-    pub fn take_68k_itrace(&mut self) -> Vec<(u32, u32, u32)> {
+    /// Snapshot the frozen `(pc, cycle, d4, d7)` ring (oldest→newest), if enabled.
+    pub fn take_68k_itrace(&mut self) -> Vec<(u32, u64, u32, u32)> {
         match &self.itrace {
             Some((.., v)) => v.iter().copied().collect(),
             None => Vec::new(),
@@ -1377,7 +1380,7 @@ impl Scsp {
                     // Per-instruction PC path across the whole driver (capped
                     // ring), to tail-align vs Mednafen and find where the paths
                     // into the first enqueue split.
-                    ring.push_back((pc, cpu.regs.d[4], cpu.regs.d[7]));
+                    ring.push_back((pc, cpu.cycles, cpu.regs.d[4], cpu.regs.d[7]));
                     if ring.len() > 6000 {
                         ring.pop_front();
                     }
