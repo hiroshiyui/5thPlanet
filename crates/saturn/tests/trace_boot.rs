@@ -2496,11 +2496,11 @@ fn bios_audio_probe() {
             "  VDP1 draw-slowdown: {calls} total accesses, {drawing} while-drawing, \
              {hits} stall hits, {cycles} stall cycles charged"
         );
-        let (plots, dur_sum, dur_max) = sat.bus.vdp1.dbg_plots();
+        let (plots, dur_sum, dur_max, max_cmds, max_px) = sat.bus.vdp1.dbg_plots();
         let dur_avg = if plots > 0 { dur_sum / plots as u64 } else { 0 };
         println!(
             "  VDP1 plots: {plots} begin_plot calls, avg duration={dur_avg} cy, max={dur_max} cy \
-             (frame budget ~479151 cy)"
+             (frame budget ~479151 cy); max command_count={max_cmds}, max pixels={max_px}"
         );
         println!(
             "  SH-2 associative purges: master={}, slave={}",

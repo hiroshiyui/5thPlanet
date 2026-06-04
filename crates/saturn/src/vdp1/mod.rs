@@ -76,7 +76,7 @@ pub struct Vdp1 {
     dbg_slowdown: (u32, u32, u32, u64),
     /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
     #[serde(skip)]
-    dbg_plots: (u32, u64, u64),
+    dbg_plots: (u32, u64, u64, u32, u32),
 }
 
 impl Default for Vdp1 {
@@ -97,7 +97,7 @@ impl Vdp1 {
             busy_until: None,
             last_rw_ts: 0,
             dbg_slowdown: (0, 0, 0, 0),
-            dbg_plots: (0, 0, 0),
+            dbg_plots: (0, 0, 0, 0, 0),
         }
     }
 
@@ -145,7 +145,7 @@ impl Vdp1 {
     }
 
     /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
-    pub fn dbg_plots(&self) -> (u32, u64, u64) {
+    pub fn dbg_plots(&self) -> (u32, u64, u64, u32, u32) {
         self.dbg_plots
     }
 
@@ -336,6 +336,12 @@ impl Vdp1 {
         self.dbg_plots.1 += duration;
         if duration > self.dbg_plots.2 {
             self.dbg_plots.2 = duration;
+        }
+        if r.command_count > self.dbg_plots.3 {
+            self.dbg_plots.3 = r.command_count;
+        }
+        if r.pixels > self.dbg_plots.4 {
+            self.dbg_plots.4 = r.pixels;
         }
     }
 
