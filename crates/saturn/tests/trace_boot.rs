@@ -2313,6 +2313,14 @@ fn bios_audio_probe() {
             .unwrap_or(8000);
         sat.bus.scsp.enable_scope(pc, channels, max);
     }
+    // WWATCH68=<sound-RAM addr>: log the 68k PC of every instruction that changes
+    // the watched byte — finds *who* writes a value the scope shows diverging.
+    let wwatch68 = std::env::var("WWATCH68")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+    if let Some(addr) = wwatch68 {
+        sat.bus.scsp.enable_wwatch68(addr);
+    }
     // MASTERHIST: histogram the master SH-2 PC ring at the end — what loop the
     // master is in near the BGM trigger (the master-side trigger gate, M12 #5).
     // Run with FRAMES set to just before the trigger (~594).
@@ -2554,6 +2562,18 @@ fn bios_audio_probe() {
                 println!("  SCOPE: wrote {} rows × {} channels to {p}", sc.rows.len(), sc.channels.len());
             }
             Err(_) => print!("{out}"),
+        }
+    }
+    if let Some(addr) = wwatch68 {
+        let log = sat.bus.scsp.take_wwatch68();
+        println!("  WWATCH68[{addr:05X}]: {} writes total", log.len());
+        let mut by_pc: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for (pc, _, _) in &log {
+            *by_pc.entry(*pc).or_default() += 1;
+        }
+        println!("    writers (pc: count): {by_pc:04X?}");
+        for (pc, old, new) in log.iter().take(16) {
+            println!("    @{pc:04X}: {old:02X} -> {new:02X}");
         }
     }
     if let Some(p) = itrace_out {

@@ -1117,6 +1117,12 @@ pub struct Scsp {
     /// of the one-off ENQLOG/itrace/gate probes. `#[serde(skip)]`.
     #[serde(skip)]
     scope: Option<ScopeCap>,
+    /// Debug-only 68k **write-watch**: `(addr, last byte, log of (pc, old, new))`.
+    /// After each 68k instruction, if the watched sound-RAM byte changed, the
+    /// PC of that instruction is logged — finds *who* writes a value the scope
+    /// shows diverging (the per-instruction complement of the scope). `#[serde(skip)]`.
+    #[serde(skip)]
+    wwatch68: Option<(u32, u8, Vec<(u32, u8, u8)>)>,
 }
 
 /// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
@@ -1165,9 +1171,22 @@ impl Scsp {
             enq_log: None,
             itrace: None,
             scope: None,
+            wwatch68: None,
             bp68: None,
             bp68_hit: None,
         }
+    }
+
+    /// Arm the 68k write-watch on sound-RAM byte `addr`: log `(pc, old, new)`
+    /// each time a 68k instruction changes it. Drain with [`Self::take_wwatch68`].
+    pub fn enable_wwatch68(&mut self, addr: u32) {
+        let last = self.ram.read8(addr);
+        self.wwatch68 = Some((addr, last, Vec::new()));
+    }
+
+    /// Take the 68k write-watch log `(pc, old, new)`, if armed.
+    pub fn take_wwatch68(&mut self) -> Vec<(u32, u8, u8)> {
+        self.wwatch68.take().map(|(_, _, v)| v).unwrap_or_default()
     }
 
     /// Arm the cross-emulator signal scope: at each 68k execution of
@@ -1378,6 +1397,7 @@ impl Scsp {
             enq_log,
             itrace,
             scope,
+            wwatch68,
             bp68,
             bp68_hit,
             ..
@@ -1489,12 +1509,23 @@ impl Scsp {
             }
             // Present the level-triggered SCSP IRQ line at each boundary.
             cpu.pending_irq = ctrl.asserted_level;
+            let pre_pc = cpu.regs.pc; // the instruction about to execute (for wwatch68)
             let mut bus = M68kView {
                 ram: &mut *ram,
                 ctrl: &mut *ctrl,
             };
             let cost = (cpu.step(&mut bus) as i64).max(1);
             budget -= cost;
+            // 68k write-watch: did this instruction change the watched byte?
+            if let Some((addr, last, log)) = wwatch68.as_mut() {
+                let nv = ram.read8(*addr);
+                if nv != *last {
+                    if log.len() < 4096 {
+                        log.push((pre_pc, *last, nv));
+                    }
+                    *last = nv;
+                }
+            }
             // Produce every output sample whose 256-cycle edge falls within this
             // 68k step — the timer ticks and the mixer run interleaved with the
             // 68k, not lumped before it.
