@@ -5,6 +5,33 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-04c) — the "VDP1 command-list divergence" (roadmap A6) is
+> REFUTED: the VDP1 lists MATCH Mednafen byte-for-byte.** A frame-aligned per-frame
+> VDP1 command-count diff settled the last suspect from the A6/M12-#6 thread. Ours
+> grew a `Vdp1::dbg_take_frame` accumulator drained once per `run_frame`
+> (`VDP1LOG`/`VDP1_OUT` in `bios_audio_probe`); mednaref grew a per-draw
+> `SS_VDP1DRAW f=<frame> cmds=<count>` hook (frame counter on the VBlank-in edge,
+> command counter at the command fetch in `DoDrawing`). Audio-CD + JAP BIOS on both.
+> **Result:** ours and Mednafen draw the **byte-for-byte same command-list
+> sequence** — the morphing-logo animation ramp matches value-for-value
+> (743→744→739→726→…→162→…→692), the `665×14` run matches, and the **11-cmd steady
+> CD-player panel is f373–579 (Mednafen) vs f375–591 (ours)**; a melody diff is
+> **113/115 phase transitions identical** (the 2 diffs are single-frame ramp
+> transients). The old "ours **≤11** vs Mednafen **~371** pre-trigger" claim was a
+> **measurement artifact** — it compared ours' *steady panel* (11) against
+> Mednafen's *animation ramp* (~371) at **different absolute frames**. Ours reaches
+> the 742-cmd logo at **f125** (the "ours builds the big list ~470 frames late"
+> premise is withdrawn). The only real difference is a **constant ~14-frame offset,
+> ours slightly *behind*** (set at recognition→animation; no per-frame drift).
+> **⇒ the BGM-trigger lead is NOT a VDP1 phenomenon and is decoupled from the
+> (matching) VDP1 timeline.** Ours' 68k seq-trigger fires at frame ~498 (seq-tick
+> 4166), ~110 frames into the *matched* 11-cmd panel — far before the panel→226
+> transition (~f613) where Mednafen's BGM key-on lands (~f591). So ours starts the
+> BGM sequence too early relative to the panel, then stalls on the per-voice-divider
+> phase (the [lockstep finding](#root-a-per-voice-timing-divider-phase-divergence)
+> below). The lever is the **68k seq-engine / polled-CD-state trigger**, exactly as
+> the 04b update localized — the VDP1 axis is now **closed**.
+>
 > **Update (2026-06-04b) — three suspects for the trigger-tick lead ruled out;
 > the lead is localized to *post-recognition* polled CD state.** Following the
 > lockstep diff below (root = ours triggers the BGM ~83 seq-ticks / ~10 frames
