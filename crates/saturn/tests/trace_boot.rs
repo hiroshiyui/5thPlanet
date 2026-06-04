@@ -2488,6 +2488,11 @@ fn bios_audio_probe() {
             "  VDP1 plots: {plots} begin_plot calls, avg duration={dur_avg} cy, max={dur_max} cy \
              (frame budget ~479151 cy)"
         );
+        println!(
+            "  SH-2 associative purges: master={}, slave={}",
+            sat.master().cache.dbg_assoc_purges(),
+            sat.slave().cache.dbg_assoc_purges()
+        );
     }
     if sramwatch && let Some(w) = sat.master().read_watch {
         let cacheable = w.hit + w.miss + w.bypass;

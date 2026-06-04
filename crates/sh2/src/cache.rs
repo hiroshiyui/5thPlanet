@@ -70,6 +70,11 @@ pub struct Cache {
     /// `WAYS-1` is the least-recently used (next eviction victim).
     #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
     lru: [[u8; WAYS]; SETS],
+    /// Debug only: lifetime count of [`Cache::assoc_purge`] invocations. Lets a
+    /// coherency investigation see whether software actually relies on the
+    /// associative purge. Observer-only; never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dbg_assoc_purges: u64,
 }
 
 impl Default for Cache {
@@ -104,7 +109,13 @@ impl Cache {
             ccr: 0,
             sets: [[Line::default(); WAYS]; SETS],
             lru,
+            dbg_assoc_purges: 0,
         }
+    }
+
+    /// Debug only: how many associative purges have been performed.
+    pub fn dbg_assoc_purges(&self) -> u64 {
+        self.dbg_assoc_purges
     }
 
     #[inline]
@@ -143,6 +154,29 @@ impl Cache {
     pub fn purge(&mut self) {
         for set in &mut self.sets {
             for line in set {
+                line.valid = false;
+            }
+        }
+    }
+
+    /// Associative purge — invalidate the single line whose tag matches `addr`,
+    /// across all ways of `addr`'s set. This is the SH7604 cache-purge space
+    /// (`0x4000_0000..0x5FFF_FFFF` / `0xA000_0000..0xBFFF_FFFF`): software writes
+    /// (or reads) there to drop one specific stale line *without knowing which
+    /// way holds it* — e.g. to force a coherent re-read of memory another bus
+    /// master (the other SH-2, the SCU DMA) has written, since the SH-2 caches
+    /// are not hardware-coherent. Mirrors Mednafen `Cache_AssocPurge`
+    /// (`sh7095.inc`): the set index is `addr[9:4]` and the tag is `addr[28:10]`
+    /// — the **region bits `[31:29]` are stripped** (Mednafen's `A & (0x7FFFF
+    /// << 10)`) so a purge issued through the `0x4xxx_xxxx` alias matches lines
+    /// that were installed from the cacheable `0x0xxx_xxxx` region. All four
+    /// ways are scanned regardless of two-way mode (matching the hardware).
+    /// (*SH7604 Hardware Manual* §8, "Cache Purge".)
+    pub fn assoc_purge(&mut self, addr: u32) {
+        self.dbg_assoc_purges += 1;
+        let (tag, set_idx) = decompose(addr & 0x1FFF_FFFF);
+        for line in &mut self.sets[set_idx] {
+            if line.valid && line.tag == tag {
                 line.valid = false;
             }
         }
@@ -392,6 +426,36 @@ mod tests {
         c.set_ccr(0x01 | 0x10); // CE + CP
         assert_eq!(c.ccr() & 0x10, 0, "CP reads back as 0");
         assert_eq!(c.lookup_data(addr), Lookup::Miss, "purge invalidated lines");
+    }
+
+    #[test]
+    fn assoc_purge_invalidates_only_the_matching_line() {
+        let mut c = Cache::new();
+        c.set_ccr(0x01); // CE
+        // Two resident lines from the cacheable region, different sets.
+        let a = 0x0600_1230;
+        let b = 0x0600_4560;
+        c.lookup_data(a);
+        c.install(a, line_with(0xAA));
+        c.lookup_data(b);
+        c.install(b, line_with(0xBB));
+        assert!(matches!(c.lookup_data(a), Lookup::Hit(_)));
+        assert!(matches!(c.lookup_data(b), Lookup::Hit(_)));
+
+        // Purge `a` via the region-2 alias (0x4000_0000 | a); the region bits
+        // must be masked off internally so the tag still matches the line
+        // installed from the cacheable region.
+        c.assoc_purge(0x4000_0000 | a);
+        assert_eq!(c.lookup_data(a), Lookup::Miss, "matching line invalidated");
+        assert!(
+            matches!(c.lookup_data(b), Lookup::Hit(_)),
+            "non-matching line untouched"
+        );
+
+        // A purge of an address with no resident line is a harmless no-op,
+        // and the region-5 alias (0xA000_0000) works identically.
+        c.assoc_purge(0xA000_0000 | 0x0600_9990);
+        assert!(matches!(c.lookup_data(b), Lookup::Hit(_)));
     }
 
     #[test]

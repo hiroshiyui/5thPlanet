@@ -29,6 +29,17 @@ const fn classify(addr: u32) -> (u32, bool) {
     }
 }
 
+/// True for the SH7604 **associative-purge** address space — regions 2 and 5
+/// (`0x4000_0000..0x5FFF_FFFF` and `0xA000_0000..0xBFFF_FFFF`). An access here
+/// invalidates the matching cache line by address ([`Cache::assoc_purge`]) and
+/// does **not** reach the external bus; reads return open bus (`!0`). This is
+/// how software drops a single stale line for cross-master coherency. (*SH7604
+/// Hardware Manual* §8; Mednafen `sh7095.inc` region 2/5.)
+#[inline]
+const fn is_assoc_purge(addr: u32) -> bool {
+    matches!(addr >> 29, 2 | 5)
+}
+
 /// SH7604 Cache Control Register. 8-bit, byte-accessed. It lives in the
 /// on-chip address window but controls [`Cache`], not [`OnChip`], so the
 /// memory path routes it here explicitly rather than letting the generic
@@ -1162,6 +1173,10 @@ impl Cpu {
         if OnChip::owns(addr) {
             return (self.onchip.read8(addr), 0);
         }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
+            return (!0, 0);
+        }
         let (phys, cacheable) = classify(addr);
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u8(&line, phys), stall);
@@ -1182,6 +1197,10 @@ impl Cpu {
         if OnChip::owns(addr) {
             return (self.onchip.read16(addr), 0);
         }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
+            return (!0, 0);
+        }
         let (phys, cacheable) = classify(addr);
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
             return (cache::extract_u16(&line, phys), stall);
@@ -1201,6 +1220,10 @@ impl Cpu {
     ) -> (u32, u32) {
         if OnChip::owns(addr) {
             return (self.onchip.read32(addr), 0);
+        }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
+            return (!0, 0);
         }
         let (phys, cacheable) = classify(addr);
         if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
@@ -1228,6 +1251,10 @@ impl Cpu {
             self.onchip.write8(addr, val);
             return 0;
         }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
+            return 0;
+        }
         let (phys, cacheable) = classify(addr);
         if cacheable {
             // Write-through: update the cached line if resident, then
@@ -1249,6 +1276,10 @@ impl Cpu {
             self.onchip.write16(addr, val);
             return 0;
         }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
+            return 0;
+        }
         let (phys, cacheable) = classify(addr);
         if cacheable {
             self.cache.write_through_u16(phys, val);
@@ -1266,6 +1297,10 @@ impl Cpu {
     ) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write32(addr, val);
+            return 0;
+        }
+        if is_assoc_purge(addr) {
+            self.cache.assoc_purge(addr);
             return 0;
         }
         let (phys, cacheable) = classify(addr);

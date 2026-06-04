@@ -157,6 +157,43 @@ fn cache_through_alias_bypasses_cache_entirely() {
 }
 
 #[test]
+fn associative_purge_drops_a_stale_line_for_cross_master_coherency() {
+    // MOV.L @R1,R2 ; MOV.L R3,@R4 ; MOV.L @R1,R2
+    //   R1 = 0x4000        (cacheable data address)
+    //   R4 = 0x4000_4000   (the region-2 associative-purge alias of 0x4000)
+    // Models the real use: this CPU caches 0x4000, another bus master (the
+    // other SH-2 / SCU DMA) overwrites it directly, and software issues an
+    // associative purge so the next read is coherent again.
+    let mut cpu;
+    let mut bus;
+    (cpu, bus) = make_cpu(&[0x6212, 0x2432, 0x6212]);
+    cpu.regs.r[1] = 0x4000;
+    cpu.regs.r[4] = 0x4000_4000; // associative-purge alias of 0x4000
+    cpu.regs.r[3] = 0; // the purge ignores the written value
+    bus.inner.write_u32(0x4000, 0x1111_1111);
+    cpu.cache.set_ccr(0x01);
+
+    cpu.step(&mut bus); // load → miss-fill, line now resident with 0x11111111
+    assert_eq!(cpu.regs.r[2], 0x1111_1111);
+
+    // Another bus master overwrites memory directly, bypassing this cache.
+    bus.inner.write_u32(0x4000, 0x2222_2222);
+
+    let before_purge = bus.reads32;
+    cpu.step(&mut bus); // MOV.L R3,@R4 → associative purge of 0x4000's line
+    assert_eq!(
+        bus.reads32, before_purge,
+        "associative purge does not touch the external bus"
+    );
+
+    cpu.step(&mut bus); // re-load → now a MISS → fetches the fresh value
+    assert_eq!(
+        cpu.regs.r[2], 0x2222_2222,
+        "purge forced a coherent re-read of external memory"
+    );
+}
+
+#[test]
 fn instruction_fetch_also_uses_cache() {
     // A tight 4-NOP loop runs entirely from cache after the first
     // line-fill. NOPs at PC0..PC0+6 all live on the same 16-byte line
