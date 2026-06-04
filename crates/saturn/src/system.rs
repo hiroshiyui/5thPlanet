@@ -603,6 +603,14 @@ impl Saturn {
         {
             next = next.min(t - now);
         }
+        // VDP1 sprite-draw-end: an in-flight plot completes at a known cycle, so
+        // make the batch land there exactly — the draw-end interrupt fires at the
+        // modelled cycle, not up to a batch late (M13 A1, incremental).
+        if let Some(t) = self.bus.vdp1.draw_end_cycle()
+            && t > now
+        {
+            next = next.min(t - now);
+        }
         next
     }
 

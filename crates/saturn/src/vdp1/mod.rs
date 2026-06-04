@@ -179,6 +179,15 @@ impl Vdp1 {
         self.busy_until.is_some()
     }
 
+    /// The global cycle an in-flight plot completes at (latches `EDSR.CEF` and
+    /// raises the SCU sprite-draw-end interrupt), or `None` when idle. The
+    /// Saturn aggregate feeds this into the run-loop's next-event edge so the
+    /// draw-end lands at its exact cycle rather than the next batch boundary
+    /// (event-driven scheduling, M13 A1).
+    pub fn draw_end_cycle(&self) -> Option<u64> {
+        self.busy_until
+    }
+
     /// `FBCR`/`PTMR`-driven frame-buffer change, called at the VBlank boundary
     /// with the current global cycle `now`.
     ///
@@ -390,6 +399,22 @@ mod tests {
         assert!(Vdp1::owns(REGS_END));
         assert!(!Vdp1::owns(VRAM_BASE - 1));
         assert!(!Vdp1::owns(0x05E0_0000)); // VDP2 VRAM, not VDP1
+    }
+
+    #[test]
+    fn draw_end_cycle_exposes_the_in_flight_plot_completion() {
+        let mut v = Vdp1::new();
+        assert_eq!(v.draw_end_cycle(), None, "idle drive has no draw-end");
+        // Kick a timed plot at cycle 1000 (empty list → minimal duration); the
+        // completion cycle is now visible to the run-loop's next-event edge.
+        v.tick(1000);
+        v.begin_plot();
+        let end = v.draw_end_cycle().expect("a plot is in flight");
+        assert!(end >= 1000, "draw-end is at/after the kick cycle");
+        // Settling at the completion cycle latches draw-end and clears it.
+        v.settle(end);
+        assert_eq!(v.draw_end_cycle(), None, "completed plot is no longer pending");
+        assert!(v.take_draw_end(), "the sprite-draw-end notification fired");
     }
 
     #[test]
