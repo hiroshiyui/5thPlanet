@@ -740,6 +740,22 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 
 **Tier A — Whole-system timing** (the cycle-accuracy frontier; extends M12)
 
+> **Status (2026-06-04) — Tier A push closed.** Landed: **A2** (SCSP per-sample
+> interleave), **A3** (SCU-DMA cycle-stealing), **A5** (real HBLANK dot count);
+> **A6** confirmed adequate; **A1** advanced (VDP1 draw-end + SCU Timer-0 + inter-CPU
+> FTI converted to exact events, DMA execution refactored onto the bus); **A4**
+> base VDP-VRAM access waits added and its *contention* framing **dropped** (the
+> Mednafen oracle has no VRAM-contention model). All verified golden-/rate-/
+> Doukyuusei-stable (the golden never needed a re-baseline). **Two foundational
+> remainders, deliberately not rushed** — both need a core change, not an
+> increment: A1's write-triggered SMPC/SCSP-interrupt side effects (need the
+> queue-and-drain borrow lifted, like the DMA foundation, then drop the 256-cy
+> poll cap), and A4's CPU↔CPU bus arbitration (needs **per-access** SH-2 cycle
+> timestamping; today's per-step model already step-approximates it via
+> master-leads-slave). The per-access SH-2 cycle model is the shared prerequisite
+> and warrants its own milestone. Throughout, the BGM/M12 lever stayed the VDP1
+> **command-list divergence** (A6) — orthogonal to every Tier-A item.
+
 | # | Gap | Notes |
 |---|-----|-------|
 | A1 | **Continuous event timeline (kill batch-drain jitter)** 🚧 incremental, 3 conversions done | Peripherals settle *between* batches at ≤256-cy granularity, not their exact cycle. Being converted **one peripheral at a time** from batch-drain to exact event, golden + BGM-rate verified at each step: **#1 VDP1 sprite-draw-end** (`347a341` — `draw_end_cycle` fed into `cycles_to_next_event`); **#2 SCU Timer-0 line compare** (`336029a` — batch lands at scanline T0C); **#3 inter-CPU FTI** (`b0e3356` — applied per-instruction in `step_cpus`, so the sibling sees the wake on its next instruction, not a batch late; Doukyuusei boot-trajectory-identical). **Remaining:** the write-triggered SMPC-command-start + SCU-DMA side effects (harder — they touch the aggregate, so they need the queue-and-drain borrow lifted, not just a flag), HBlank edges (status-only, low value), then raising/removing the `SMPC_POLL_QUANTUM` cap once everything is event-scheduled. The completions that already matter (VBlank, INTBACK, now draw-end/Timer-0/FTI) are exact. |
