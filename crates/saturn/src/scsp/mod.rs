@@ -26,6 +26,7 @@
 //! Still to come (M6): the mixer/DAC, SDL2 audio output, the SCSP DSP, MIDI.
 
 mod dsp;
+mod hle;
 
 use crate::memory::Ram;
 use m68k::bus::{AccessKind, Bus};
@@ -246,7 +247,11 @@ struct Timer {
 impl Default for Timer {
     fn default() -> Self {
         // Power-on: no reload pending (matches Mednafen `Reset`, `Reload = -1`).
-        Self { counter: 0, control: 0, reload: -1 }
+        Self {
+            counter: 0,
+            control: 0,
+            reload: -1,
+        }
     }
 }
 
@@ -636,10 +641,10 @@ impl ScspCtrl {
             0
         } else {
             let raw: u32 = match alfo_wave {
-                0 => (counter & !1) as u32, // saw
+                0 => (counter & !1) as u32,                                         // saw
                 1 => ((counter as i8 >> 7) as u8 & !1) as u32, // square (0x00 or 0xFE)
                 2 => (counter ^ (counter as i8 >> 7) as u8).wrapping_shl(1) as u32, // triangle
-                _ => (lfsr & !1) as u32,    // noise
+                _ => (lfsr & !1) as u32,                       // noise
             };
             (raw >> (7 - alfo_level)) as i32
         };
@@ -1052,7 +1057,13 @@ impl ScspCtrl {
 /// **period** `(s_trig − s_first)/(seq_ticks−1)` — a zero-point-independent rate
 /// to compare vs the reference, disambiguating a trigger-time gap from a
 /// seq-tick-rate gap (M12 task 2). See [`Scsp::enable_68k_itrace`].
-type ITrace = (bool, u32, u64, u64, std::collections::VecDeque<(u32, u64, u32, u32)>);
+type ITrace = (
+    bool,
+    u32,
+    u64,
+    u64,
+    std::collections::VecDeque<(u32, u64, u32, u32)>,
+);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
@@ -1140,6 +1151,12 @@ pub struct Scsp {
     /// value recession (ADR-0012). `#[serde(skip)]`.
     #[serde(skip)]
     pcstream: Option<Vec<(u32, u64)>>,
+    /// Opt-in native HLE of the 68k sound driver (ADR-0012). `None` (default) =
+    /// the LLE 68k driver runs as the oracle; `Some` replaces it with a native
+    /// sequencer (the SCSP *synthesis* is unchanged either way). `#[serde(skip)]`
+    /// so the default-LLE path's save-states + serialized layout are untouched.
+    #[serde(skip)]
+    hle: Option<hle::HleSoundDriver>,
 }
 
 /// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
@@ -1193,7 +1210,25 @@ impl Scsp {
             pcstream: None,
             bp68: None,
             bp68_hit: None,
+            hle: None,
         }
+    }
+
+    /// Enable the opt-in native HLE sound driver (ADR-0012): a native sequencer
+    /// replaces the LLE 68k driver, while the SCSP synthesis stays LLE. Idempotent.
+    /// The LLE 68k remains the default + the oracle, so this is opt-in only.
+    pub fn enable_hle_driver(&mut self) {
+        self.hle.get_or_insert_with(hle::HleSoundDriver::default);
+    }
+
+    /// Disable the HLE sound driver, returning to the LLE 68k oracle (the default).
+    pub fn disable_hle_driver(&mut self) {
+        self.hle = None;
+    }
+
+    /// Whether the opt-in HLE sound driver is active.
+    pub fn is_hle(&self) -> bool {
+        self.hle.is_some()
     }
 
     /// Arm the instruction-lockstep PC stream (every 68k PC, hard-capped in
@@ -1223,7 +1258,12 @@ impl Scsp {
     /// `trigger_pc`, sample each `(name, sound-RAM addr, width)` channel into a
     /// row (capped at `max` rows). Drain with [`Self::take_scope`].
     pub fn enable_scope(&mut self, trigger_pc: u32, channels: Vec<(String, u32, u8)>, max: usize) {
-        self.scope = Some(ScopeCap { trigger_pc, channels, rows: Vec::new(), max });
+        self.scope = Some(ScopeCap {
+            trigger_pc,
+            channels,
+            rows: Vec::new(),
+            max,
+        });
     }
 
     /// Take the captured signal-scope rows, if armed.
@@ -1407,6 +1447,38 @@ impl Scsp {
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
 
+        // Opt-in native HLE sound driver (ADR-0012): bypass the 68k entirely. We
+        // still produce every output sample (timer tick + mix) so audio + the
+        // MCIPD/Timer-A path to the SH-2 are unaffected; the native sequencer is
+        // driven on the Timer-B cadence inside `HleSoundDriver::tick`, and only
+        // while the (virtual) driver is released — pre-SNDON the BIOS has not
+        // staged the sequence yet, matching the LLE path. When `hle` is `None`
+        // (the default) this branch is never taken and every path below is
+        // byte-identical, so the `bios_boot` golden cannot move.
+        if self.hle.is_some() {
+            let active = self.running;
+            let Scsp {
+                ram,
+                ctrl,
+                out,
+                hle,
+                ..
+            } = &mut *self;
+            let hle = hle.as_mut().expect("hle.is_some() checked above");
+            for _ in 0..samples {
+                ctrl.tick_timers(1);
+                if active {
+                    hle.tick(ram, ctrl);
+                }
+                if out.len() < MAX_AUDIO_SAMPLES {
+                    let (l, r) = ctrl.mix(ram);
+                    out.push(l);
+                    out.push(r);
+                }
+            }
+            return;
+        }
+
         if !self.running {
             // 68k held in reset: still advance the sample/timer clock + mixer so
             // the timers and `sample_counter` stay phase-locked for when the 68k
@@ -1540,7 +1612,9 @@ impl Scsp {
                     // for a coarse work-area sweep: any change in the region
                     // shows, so the overlay's first-divergence row points at the
                     // earliest divergent block to then zoom into.
-                    0 => (0..0x100u32).fold(0u32, |s, k| s.wrapping_add(ram.read8(addr + k) as u32)),
+                    0 => {
+                        (0..0x100u32).fold(0u32, |s, k| s.wrapping_add(ram.read8(addr + k) as u32))
+                    }
                     1 => ram.read8(addr) as u32,
                     2 => ram.read16(addr) as u32,
                     _ => ram.read32(addr),
@@ -1661,7 +1735,11 @@ impl M68kView<'_> {
 
 impl Bus for M68kView<'_> {
     fn read8(&mut self, addr: u32, _: AccessKind) -> (u8, u32) {
-        let w = if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 };
+        let w = if Self::is_scsp(addr) {
+            SCSP_ACCESS_WAIT
+        } else {
+            0
+        };
         if Self::is_reg(addr) {
             (self.ctrl.read8(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
@@ -1671,7 +1749,11 @@ impl Bus for M68kView<'_> {
         }
     }
     fn read16(&mut self, addr: u32, _: AccessKind) -> (u16, u32) {
-        let w = if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 };
+        let w = if Self::is_scsp(addr) {
+            SCSP_ACCESS_WAIT
+        } else {
+            0
+        };
         if Self::is_reg(addr) {
             (self.ctrl.read16(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
@@ -1682,7 +1764,11 @@ impl Bus for M68kView<'_> {
     }
     fn read32(&mut self, addr: u32, _: AccessKind) -> (u32, u32) {
         // A long is two 16-bit bus cycles on the 68000 → two penalties.
-        let w = if Self::is_scsp(addr) { 2 * SCSP_ACCESS_WAIT } else { 0 };
+        let w = if Self::is_scsp(addr) {
+            2 * SCSP_ACCESS_WAIT
+        } else {
+            0
+        };
         if Self::is_reg(addr) {
             (self.ctrl.read32(addr - 0x10_0000), w)
         } else if addr < 0x10_0000 {
@@ -1697,7 +1783,11 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write8(addr, val);
         }
-        if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 }
+        if Self::is_scsp(addr) {
+            SCSP_ACCESS_WAIT
+        } else {
+            0
+        }
     }
     fn write16(&mut self, addr: u32, val: u16, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
@@ -1705,7 +1795,11 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write16(addr, val);
         }
-        if Self::is_scsp(addr) { SCSP_ACCESS_WAIT } else { 0 }
+        if Self::is_scsp(addr) {
+            SCSP_ACCESS_WAIT
+        } else {
+            0
+        }
     }
     fn write32(&mut self, addr: u32, val: u32, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
@@ -1713,7 +1807,11 @@ impl Bus for M68kView<'_> {
         } else if addr < 0x10_0000 {
             self.ram.write32(addr, val);
         }
-        if Self::is_scsp(addr) { 2 * SCSP_ACCESS_WAIT } else { 0 }
+        if Self::is_scsp(addr) {
+            2 * SCSP_ACCESS_WAIT
+        } else {
+            0
+        }
     }
 }
 
@@ -1815,14 +1913,26 @@ mod tests {
         ctrl.tick_timers(15);
         assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "not yet at 15 clocks");
         ctrl.tick_timers(1);
-        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "first overflow at clock 16");
+        assert_ne!(
+            ctrl.read16(SCIPD) & INT_TIMER_A,
+            0,
+            "first overflow at clock 16"
+        );
         ctrl.write16(SCIRE, INT_TIMER_A); // acknowledge
         // Second overflow: free-running 0xFF→0x00→…→0xFF = 256 clocks later, NOT
         // 16 (which an auto-reload-to-0xF0 timer would give).
         ctrl.tick_timers(255);
-        assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "free-run: not yet at 255");
+        assert_eq!(
+            ctrl.read16(SCIPD) & INT_TIMER_A,
+            0,
+            "free-run: not yet at 255"
+        );
         ctrl.tick_timers(1);
-        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "second overflow at period 256");
+        assert_ne!(
+            ctrl.read16(SCIPD) & INT_TIMER_A,
+            0,
+            "second overflow at period 256"
+        );
     }
 
     #[test]
@@ -1838,9 +1948,17 @@ mod tests {
         ctrl.tick_timers(3);
         ctrl.write16(TIMA, 0x02FF); // prescale 2 (÷4), reload 0xFF → fires on its first clock
         ctrl.tick_timers(1); // sample 3 → not a ÷4 edge
-        assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "sample 3 is not a ÷4 edge");
+        assert_eq!(
+            ctrl.read16(SCIPD) & INT_TIMER_A,
+            0,
+            "sample 3 is not a ÷4 edge"
+        );
         ctrl.tick_timers(1); // sample 4 → a ÷4 edge → load 0xFF → overflow
-        assert_ne!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "clocks on the global ÷4 edge");
+        assert_ne!(
+            ctrl.read16(SCIPD) & INT_TIMER_A,
+            0,
+            "clocks on the global ÷4 edge"
+        );
     }
 
     // ---- slot (PCM) engine ----
@@ -2101,6 +2219,64 @@ mod tests {
     }
 
     #[test]
+    fn hle_driver_keys_a_voice_and_produces_audio() {
+        // ADR-0012 M1: with the opt-in native HLE driver enabled, the sequence's
+        // first note-on keys a voice through the (LLE) synthesis → non-silent
+        // output — proving the HLE → synthesis boundary end-to-end, no 68k run.
+        let mut s = Scsp::new();
+        // Seed a non-zero PCM sample where the HLE keys it (the BGM sample SA),
+        // and a note-on at the sequence base (high nibble 0x4, then note + vel).
+        for i in 0..64u32 {
+            let ph = i as f64 / 64.0 * std::f64::consts::TAU;
+            s.ram
+                .write16(0x10740 + i * 2, (ph.sin() * 0x4000 as f64) as i16 as u16);
+        }
+        s.ram.write8(0x18200, 0x40); // note-on, channel 0
+        s.ram.write8(0x18201, 0x37); // note number
+        s.ram.write8(0x18202, 0x64); // velocity
+        s.enable_hle_driver();
+        assert!(s.is_hle());
+        s.start(); // SNDON → the HLE sequencer is released
+        s.run(2_000_000); // many SH-2 cycles → ticks + fills the audio buffer
+        let audio = s.take_audio();
+        assert!(!audio.is_empty(), "HLE produced audio samples");
+        assert!(
+            audio.iter().any(|&x| x != 0),
+            "HLE keyed a voice → non-silent"
+        );
+        assert_eq!(s.ctrl.dbg_keyon_counts().1, 1, "exactly one slot started");
+    }
+
+    #[test]
+    fn hle_enable_then_disable_is_a_noop_on_the_lle_path() {
+        // Golden-safety: enabling then disabling the HLE must leave the LLE 68k
+        // path byte-identical to one that never touched it (the default oracle).
+        let setup = |s: &mut Scsp| {
+            s.ram.write32(4, 0x2000);
+            s.ram.write16(0x2000, 0x60FE); // 68k BRA self
+            keyon_panned(s, 0, 0x2000, 7, 0x00);
+        };
+        let mut a = Scsp::new();
+        setup(&mut a);
+        a.start();
+        a.run(2_000_000);
+
+        let mut b = Scsp::new();
+        setup(&mut b);
+        b.enable_hle_driver();
+        b.disable_hle_driver();
+        assert!(!b.is_hle(), "HLE disabled → back to the LLE oracle");
+        b.start();
+        b.run(2_000_000);
+
+        assert_eq!(
+            a.take_audio(),
+            b.take_audio(),
+            "enable→disable HLE leaves the LLE output byte-identical"
+        );
+    }
+
+    #[test]
     fn keyon_is_edge_triggered_no_restart_of_a_playing_slot() {
         // A KYONEX strobe with KYONB still set must NOT restart an already-
         // playing slot (Mednafen's edge guard, `scsp.inc:1496`). The old code
@@ -2116,7 +2292,10 @@ mod tests {
         // Re-strobe KYONEX (bit 12) with KYONB (bit 11) still set: no restart.
         s.ctrl.write16(0, 0x1800);
         let (_, starts2) = s.ctrl.dbg_keyon_counts();
-        assert_eq!(starts2, 1, "re-strobe must not restart the already-playing slot");
+        assert_eq!(
+            starts2, 1,
+            "re-strobe must not restart the already-playing slot"
+        );
         // A genuine key-off (KYONB=0) still releases the slot.
         s.ctrl.write16(0, 0x1000); // KYONEX only, KYONB clear
         assert_eq!(

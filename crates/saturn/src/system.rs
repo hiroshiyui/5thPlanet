@@ -148,7 +148,15 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             (req.src, req.dst)
         } else {
             let count = dma_count(req.channel, req.bytes);
-            scu_transfer(bus, req.src, req.dst, count, req.src_add, req.dst_add, &mut cost)
+            scu_transfer(
+                bus,
+                req.src,
+                req.dst,
+                count,
+                req.src_add,
+                req.dst_add,
+                &mut cost,
+            )
         };
         bus.scu.finish_dma(req.channel, final_src, final_dst);
     }
@@ -592,7 +600,11 @@ impl Saturn {
         if vblank {
             tvstat |= 0x0008; // VBLANK
         }
-        if hblank_active(line_cycle, self.bus.vdp2.regs.h_resolution(), CYCLES_PER_LINE) {
+        if hblank_active(
+            line_cycle,
+            self.bus.vdp2.regs.h_resolution(),
+            CYCLES_PER_LINE,
+        ) {
             tvstat |= 0x0004; // HBLANK
         }
         if frame & 1 == 1 {
@@ -850,7 +862,12 @@ impl Saturn {
             // while the master is DMA-blocked.
             let dma_cost = drain_dma(bus);
             if dma_cost != 0 {
-                scheduler.entity_mut(*master_id).sh2_mut().cpu.pipeline.cycles += dma_cost;
+                scheduler
+                    .entity_mut(*master_id)
+                    .sh2_mut()
+                    .cpu
+                    .pipeline
+                    .cycles += dma_cost;
             }
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             // Slave catches up to the master's new timestamp.
@@ -863,7 +880,12 @@ impl Saturn {
                 // A slave-triggered DMA stalls the slave for the same reason.
                 let dma_cost = drain_dma(bus);
                 if dma_cost != 0 {
-                    scheduler.entity_mut(*slave_id).sh2_mut().cpu.pipeline.cycles += dma_cost;
+                    scheduler
+                        .entity_mut(*slave_id)
+                        .sh2_mut()
+                        .cpu
+                        .pipeline
+                        .cycles += dma_cost;
                 }
             }
         }
@@ -1116,6 +1138,18 @@ impl Saturn {
         self.bus.smpc.region = region;
     }
 
+    /// Enable the opt-in native HLE sound driver (ADR-0012): a native sequencer
+    /// replaces the LLE 68k sound driver, while the SCSP synthesis stays LLE. The
+    /// LLE 68k is the default + the oracle; this is opt-in (frontend `--hle-sound`).
+    pub fn enable_hle_sound(&mut self) {
+        self.bus.scsp.enable_hle_driver();
+    }
+
+    /// Whether the HLE sound driver is active (else the LLE 68k driver runs).
+    pub fn is_hle_sound(&self) -> bool {
+        self.bus.scsp.is_hle()
+    }
+
     /// Seed the RTC from the host clock (seconds since the Unix epoch). The
     /// frontend calls this at startup so the Saturn shows real wall-clock time
     /// like a console with a charged battery; the core otherwise runs from a
@@ -1345,7 +1379,10 @@ mod tests {
         // 320-family (HRESO LSB 0): 320 active dots of 427. Using cycles_per_line
         // = total dots makes the boundary land exactly at `active`.
         assert!(!hblank_active(319, 0, 427), "still in active display");
-        assert!(hblank_active(320, 0, 427), "HBLANK at the active-display edge");
+        assert!(
+            hblank_active(320, 0, 427),
+            "HBLANK at the active-display edge"
+        );
         assert!(hblank_active(426, 0, 427), "HBLANK through to line end");
         // 640 hi-res shares the 320 family (HRESO=2, LSB 0).
         assert!(!hblank_active(319, 2, 427));

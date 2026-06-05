@@ -2233,6 +2233,13 @@ fn bios_audio_probe() {
     sat.reset();
     sat.set_region(region);
     sat.set_rtc_unix(1_700_000_000);
+    // HLE_SOUND=1: swap the LLE 68k sound driver for the opt-in native HLE
+    // sequencer (ADR-0012) — the synthesis stays LLE. Lets this probe validate
+    // both drivers (slot_starts / key-on counts / AUDIO_OUT) with one harness.
+    if std::env::var("HLE_SOUND").is_ok() {
+        sat.enable_hle_sound();
+        println!("HLE sound driver enabled (ADR-0012)");
+    }
     // No disc by default (the bare BIOS menu); CUE=<name> inserts a disc from
     // roms/ — e.g. CUE=audiocd.cue to reach the CD-player panel WITH an audio
     // disc (the Mednafen oracle path, since Mednafen can't boot no-disc).
@@ -2274,9 +2281,9 @@ fn bios_audio_probe() {
     }
     // ENQLOG=<pc>: capture the 68k value regs at every hit of the BGM enqueue
     // PC (default 0x4B9A), to diff the event stream vs Mednafen's SS_SEQDUMP.
-    let enqlog: Option<u32> = std::env::var("ENQLOG").ok().map(|s| {
-        u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0x4B9A)
-    });
+    let enqlog: Option<u32> = std::env::var("ENQLOG")
+        .ok()
+        .map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0x4B9A));
     if let Some(pc) = enqlog {
         sat.bus.scsp.enable_enq_log(pc);
     }
@@ -2302,7 +2309,8 @@ fn bios_audio_probe() {
             .filter_map(|spec| {
                 let mut it = spec.split(':');
                 let name = it.next()?.to_string();
-                let addr = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                let addr =
+                    u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
                 let w = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(4u8);
                 Some((name, addr, w))
             })
@@ -2450,7 +2458,10 @@ fn bios_audio_probe() {
                 .map(|(f, p, c, x)| format!("{f} {p} {c} {x}\n"))
                 .collect();
             std::fs::write(&p, s).unwrap();
-            println!("    wrote {} per-frame VDP1 entries to {p}", vdp1_series.len());
+            println!(
+                "    wrote {} per-frame VDP1 entries to {p}",
+                vdp1_series.len()
+            );
         }
     }
     // Buzz diagnosis: every active slot at the end of the run — why didn't it free?
@@ -2542,12 +2553,21 @@ fn bios_audio_probe() {
             "  68k enqueue stream: {} events, cmd histogram (cmd0..7)={hist:?}",
             log.len()
         );
-        let evs: Vec<String> = log.iter().take(48).map(|r| format!("{:02X}", r[0] & 0xFF)).collect();
+        let evs: Vec<String> = log
+            .iter()
+            .take(48)
+            .map(|r| format!("{:02X}", r[0] & 0xFF))
+            .collect();
         println!("    first events (d0 low byte): {}", evs.join(" "));
         if let Ok(p) = std::env::var("ENQ_OUT") {
             let s: String = log
                 .iter()
-                .map(|r| format!("a6={:06X} d0={:08X} d1={:08X} d2={:08X} d3={:08X}\n", r[4], r[0], r[1], r[2], r[3]))
+                .map(|r| {
+                    format!(
+                        "a6={:06X} d0={:08X} d1={:08X} d2={:08X} d3={:08X}\n",
+                        r[4], r[0], r[1], r[2], r[3]
+                    )
+                })
                 .collect();
             std::fs::write(&p, s).unwrap();
             println!("    wrote {} enqueue events to {p}", log.len());
@@ -2558,7 +2578,12 @@ fn bios_audio_probe() {
         let names: Vec<&str> = std::iter::once("t68")
             .chain(sc.channels.iter().map(|(n, _, _)| n.as_str()))
             .collect();
-        let mut out = format!("# pc={:04X} timebase-hits={}\nrow {}\n", sc.trigger_pc, sc.rows.len(), names.join(" "));
+        let mut out = format!(
+            "# pc={:04X} timebase-hits={}\nrow {}\n",
+            sc.trigger_pc,
+            sc.rows.len(),
+            names.join(" ")
+        );
         for (i, row) in sc.rows.iter().enumerate() {
             let vals: Vec<String> = row.iter().map(|v| format!("{v:X}")).collect();
             out.push_str(&format!("{i} {}\n", vals.join(" ")));
@@ -2566,7 +2591,11 @@ fn bios_audio_probe() {
         match std::env::var("SCOPE_OUT") {
             Ok(p) => {
                 std::fs::write(&p, &out).unwrap();
-                println!("  SCOPE: wrote {} rows × {} channels to {p}", sc.rows.len(), sc.channels.len());
+                println!(
+                    "  SCOPE: wrote {} rows × {} channels to {p}",
+                    sc.rows.len(),
+                    sc.channels.len()
+                );
             }
             Err(_) => print!("{out}"),
         }

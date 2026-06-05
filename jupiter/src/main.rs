@@ -38,9 +38,12 @@ fn main() -> ExitCode {
     // Split flags (`--cart=…`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
+    let mut hle_sound = false;
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
+        } else if arg == "--hle-sound" {
+            hle_sound = true;
         } else {
             positionals.push(arg);
         }
@@ -59,6 +62,7 @@ fn main() -> ExitCode {
             eprintln!("  --cart=ram1m | ram4m   Extension DRAM cart (1 MiB / 4 MiB)");
             eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
             eprintln!("  --cart=rom:<path>      game ROM cart image");
+            eprintln!("  --hle-sound            opt-in native HLE sound driver (ADR-0012)");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -103,7 +107,7 @@ fn main() -> ExitCode {
     let save_base = std::path::PathBuf::from(&bios_path);
 
     let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region)
+    run(bios, disc_spec, cart, save_base, region, hle_sound)
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
@@ -206,6 +210,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    hle_sound: bool,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -225,6 +230,10 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
+    if hle_sound {
+        saturn.enable_hle_sound(); // ADR-0012 opt-in native sound driver
+        eprintln!("HLE sound driver enabled (ADR-0012; synthesis stays LLE)");
+    }
     // Insert the launched disc (image or live drive); keep its spec so the OSD
     // "Insert Disc" can re-insert it after an eject.
     if let Some(spec) = &disc_spec
@@ -540,6 +549,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    hle_sound: bool,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -557,6 +567,10 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
+    if hle_sound {
+        saturn.enable_hle_sound(); // ADR-0012 opt-in native sound driver
+        eprintln!("HLE sound driver enabled (ADR-0012; synthesis stays LLE)");
+    }
     if let Some(spec) = &disc_spec
         && let Err(e) = insert_from_spec(&mut saturn, spec)
     {
@@ -594,8 +608,18 @@ fn run(
         let s = saturn.slave();
         eprintln!(
             "loaded save state {path}\n  master: PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}\n  slave : PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}",
-            m.regs.pc, m.regs.pr, m.regs.sr.0, m.regs.gbr, m.regs.r[15], saturn.master_is_halted(),
-            s.regs.pc, s.regs.pr, s.regs.sr.0, s.regs.gbr, s.regs.r[15], saturn.slave_is_halted(),
+            m.regs.pc,
+            m.regs.pr,
+            m.regs.sr.0,
+            m.regs.gbr,
+            m.regs.r[15],
+            saturn.master_is_halted(),
+            s.regs.pc,
+            s.regs.pr,
+            s.regs.sr.0,
+            s.regs.gbr,
+            s.regs.r[15],
+            saturn.slave_is_halted(),
         );
     }
 
@@ -617,7 +641,11 @@ fn run(
         .unwrap_or(u32::MAX);
     let apply_scripted_pad = |saturn: &mut saturn::Saturn, f: u32| {
         if let Some(bits) = scripted_pad {
-            saturn.set_pad1(if (pad_from..pad_to).contains(&f) { bits } else { 0 });
+            saturn.set_pad1(if (pad_from..pad_to).contains(&f) {
+                bits
+            } else {
+                0
+            });
         }
     };
 
@@ -675,9 +703,17 @@ fn run(
         // Optional: keep scanning hits until register R<SAT_FBP_RREG> lands in
         // [SAT_FBP_RLO, SAT_FBP_RHI) — to find the specific call (e.g. the
         // memory-fill whose destination R3 overlaps the loaded program).
-        let rreg: Option<usize> = std::env::var("SAT_FBP_RREG").ok().and_then(|s| s.parse().ok());
-        let rlo = std::env::var("SAT_FBP_RLO").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-        let rhi = std::env::var("SAT_FBP_RHI").ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u32::MAX);
+        let rreg: Option<usize> = std::env::var("SAT_FBP_RREG")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let rlo = std::env::var("SAT_FBP_RLO")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        let rhi = std::env::var("SAT_FBP_RHI")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(u32::MAX);
         let mut hit = None;
         for f in 0..headless_frames {
             apply_scripted_pad(&mut saturn, f);
@@ -764,10 +800,7 @@ fn run(
             .and_then(|s| s.parse().ok())
             .unwrap_or(400);
         let head = std::env::var_os("SAT_INLOOP_HEAD").is_some();
-        eprintln!(
-            "in-loop trace: {} PCs, stop={triggered:?}",
-            trace.len()
-        );
+        eprintln!("in-loop trace: {} PCs, stop={triggered:?}", trace.len());
         if head {
             for pc in trace.iter().take(n) {
                 eprintln!("PC {pc:08X}");
