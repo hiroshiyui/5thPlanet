@@ -1123,6 +1123,14 @@ pub struct Scsp {
     /// shows diverging (the per-instruction complement of the scope). `#[serde(skip)]`.
     #[serde(skip)]
     wwatch68: Option<(u32, u8, Vec<(u32, u8, u8)>)>,
+    /// Debug-only **instruction-lockstep** PC stream: every 68k instruction PC
+    /// from the driver's first instruction (no dup-collapse, no range filter),
+    /// capped. Diffed line-for-line against a reference's PC trace (MAME
+    /// `audiocpu` `.tr`, or Mednafen) from the known-identical reset entry
+    /// (`0x1000`) to find the **first** execution divergence — the root of the
+    /// value recession (ADR-0012). `#[serde(skip)]`.
+    #[serde(skip)]
+    pcstream: Option<Vec<u32>>,
 }
 
 /// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
@@ -1172,9 +1180,21 @@ impl Scsp {
             itrace: None,
             scope: None,
             wwatch68: None,
+            pcstream: None,
             bp68: None,
             bp68_hit: None,
         }
+    }
+
+    /// Arm the instruction-lockstep PC stream (every 68k PC, hard-capped in
+    /// [`Self::run`]). Drain with [`Self::take_pcstream`].
+    pub fn enable_pcstream(&mut self) {
+        self.pcstream = Some(Vec::with_capacity(1 << 20));
+    }
+
+    /// Take the captured 68k PC stream, if armed.
+    pub fn take_pcstream(&mut self) -> Vec<u32> {
+        self.pcstream.take().unwrap_or_default()
     }
 
     /// Arm the 68k write-watch on sound-RAM byte `addr`: log `(pc, old, new)`
@@ -1398,6 +1418,7 @@ impl Scsp {
             itrace,
             scope,
             wwatch68,
+            pcstream,
             bp68,
             bp68_hit,
             ..
@@ -1456,6 +1477,14 @@ impl Scsp {
                         *frozen = true; // stop at the first enqueue
                     }
                 }
+            }
+            // Instruction-lockstep PC stream: every 68k PC, in order, for a
+            // line-for-line diff vs a reference trace from reset entry. Hard cap
+            // (≈32 MB) bounds a headless run that never drains.
+            if let Some(ps) = pcstream.as_mut()
+                && ps.len() < 8_000_000
+            {
+                ps.push(cpu.regs.pc);
             }
             // Signal scope: at the trigger PC, sample the configured sound-RAM
             // channels into a row (one row per timeframe).

@@ -2321,6 +2321,13 @@ fn bios_audio_probe() {
     if let Some(addr) = wwatch68 {
         sat.bus.scsp.enable_wwatch68(addr);
     }
+    // PCSTREAM=<file>: capture every 68k PC from the driver's first instruction,
+    // for a line-for-line instruction-lockstep diff vs MAME's audiocpu .tr (or
+    // Mednafen) from the reset entry 0x1000 (ADR-0012).
+    let pcstream = std::env::var("PCSTREAM").ok();
+    if pcstream.is_some() {
+        sat.bus.scsp.enable_pcstream();
+    }
     // MASTERHIST: histogram the master SH-2 PC ring at the end — what loop the
     // master is in near the BGM trigger (the master-side trigger gate, M12 #5).
     // Run with FRAMES set to just before the trigger (~594).
@@ -2563,6 +2570,16 @@ fn bios_audio_probe() {
             }
             Err(_) => print!("{out}"),
         }
+    }
+    if let Some(p) = pcstream {
+        let s = sat.bus.scsp.take_pcstream();
+        let out: String = s.iter().map(|pc| format!("{pc:06X}\n")).collect();
+        std::fs::write(&p, out).unwrap();
+        println!(
+            "  PCSTREAM: wrote {} 68k PCs to {p} (first={:06X})",
+            s.len(),
+            s.first().copied().unwrap_or(0)
+        );
     }
     if let Some(addr) = wwatch68 {
         let log = sat.bus.scsp.take_wwatch68();
