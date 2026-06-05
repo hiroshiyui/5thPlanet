@@ -2233,13 +2233,6 @@ fn bios_audio_probe() {
     sat.reset();
     sat.set_region(region);
     sat.set_rtc_unix(1_700_000_000);
-    // HLE_SOUND=1: swap the LLE 68k sound driver for the opt-in native HLE
-    // sequencer (ADR-0012) — the synthesis stays LLE. Lets this probe validate
-    // both drivers (slot_starts / key-on counts / AUDIO_OUT) with one harness.
-    if std::env::var("HLE_SOUND").is_ok() {
-        sat.enable_hle_sound();
-        println!("HLE sound driver enabled (ADR-0012)");
-    }
     // No disc by default (the bare BIOS menu); CUE=<name> inserts a disc from
     // roms/ — e.g. CUE=audiocd.cue to reach the CD-player panel WITH an audio
     // disc (the Mednafen oracle path, since Mednafen can't boot no-disc).
@@ -2331,7 +2324,7 @@ fn bios_audio_probe() {
     }
     // PCSTREAM=<file>: capture every 68k PC from the driver's first instruction,
     // for a line-for-line instruction-lockstep diff vs MAME's audiocpu .tr (or
-    // Mednafen) from the reset entry 0x1000 (ADR-0012).
+    // Mednafen) from the reset entry 0x1000.
     let pcstream = std::env::var("PCSTREAM").ok();
     if pcstream.is_some() {
         sat.bus.scsp.enable_pcstream();

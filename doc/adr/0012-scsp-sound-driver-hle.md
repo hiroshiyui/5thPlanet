@@ -1,23 +1,25 @@
 # 0012. SCSP sound-driver HLE — design study
 
-- **Status:** **Accepted — implementing** (2026-06-05). The accuracy-preserving
-  alternative below — a **full 68k instruction-lockstep** vs the Mednafen LLE
-  oracle — *was tried first* and banked a real **16× accuracy win** (per-instruction
-  m68k cycle penalties, `5bd7131`: the lockstep's first divergence moved from
-  instruction 14,509 to 230,967). But it did **not** fix the BGM in reasonable
-  effort: the residual is a deep sub-instruction-timer-granularity rework, and the
-  divergence sits ~frame 110, far before the BGM key-on at ~frame 592. That is
-  exactly the trigger condition this ADR set for the **HLE fallback**, so we now
-  implement it. Two go/no-go gates passed first: the **synthesis is LLE-correct**
-  (the sine test ROM matches Mednafen `SS_SINETEST` to 0.2 % / 0.99972 correlation
-  → synthesis *stays LLE*, the oracle), and the **68k-driven sine ROM proves our
-  hosted 68k can drive the SCSP** → the HLE boundary ("produce the slot-register
-  writes the LLE synthesis consumes") is viable. **M1 (opt-in scaffold + boundary
-  proof) landed `b8d9870`** — the native driver keys a voice from the sequence's
-  first note-on on the real audio-CD panel (avg amplitude 5792 where the LLE driver
-  was 0). The implementation plan + remaining milestones (M2 sequence player, M3
-  voice allocator, M4 CC/pitch, M5 instrument-bank RE vs `SS_KYONEX`) are the
-  approved plan; the scope (B vs C) gate is resolved at M5.
+- **Status:** **Rejected / Removed** (2026-06-05). The HLE was implemented
+  (opt-in `--hle-sound`, M1–M4: native sequencer + 4-operator FM voices + EG
+  calibration; `b8d9870`…`1aaea7e`) and *did* produce an audible BGM chord, but
+  the result was **not faithful** — it played the wrong notes/timing ("weird
+  sounds"), triggered the BGM far too early (~frame 68 vs the oracle's ~592), and
+  the native voice allocator collided with the LLE driver's own panel-SFX slots.
+  An earlier version that *replaced* the 68k entirely also **hung boot** (the 68k
+  is the master SH-2's boot-handshake responder; bypassing it wedged the master in
+  a sound-init spin loop). Per the user's call, the HLE driver was **removed
+  wholesale** — `hle.rs`, the `--hle-sound` flag, the `Scsp::run` tick layer, and
+  the HLE-specific tests/methods are gone. The SCSP sound path is **LLE-only**
+  again, consistent with the project's accuracy-first ethos (a sound HLE that
+  isn't faithful buys nothing the LLE doesn't, and masks the real bug).
+  **Retained** (independent LLE-path accuracy gains made during this work, *not*
+  part of the HLE): the **slot-to-slot FM phase modulation** (SoundStack + reg-7
+  modulation — real SCSP synthesis, `01d13c0`), the **m68k per-instruction cycle
+  penalties** (`5bd7131`), and the **SCSP free-running sample/timer clock**
+  (`360ee36`). The real remaining BGM work stays the **LLE 68k driver** (the
+  command-list / polled-CD-state divergence vs Mednafen). The design study below
+  is kept as the historical rationale.
 - **Date:** 2026-06-05
 
 ## Context

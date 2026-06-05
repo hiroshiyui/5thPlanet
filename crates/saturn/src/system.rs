@@ -1138,18 +1138,6 @@ impl Saturn {
         self.bus.smpc.region = region;
     }
 
-    /// Enable the opt-in native HLE sound driver (ADR-0012): a native sequencer
-    /// replaces the LLE 68k sound driver, while the SCSP synthesis stays LLE. The
-    /// LLE 68k is the default + the oracle; this is opt-in (frontend `--hle-sound`).
-    pub fn enable_hle_sound(&mut self) {
-        self.bus.scsp.enable_hle_driver();
-    }
-
-    /// Whether the HLE sound driver is active (else the LLE 68k driver runs).
-    pub fn is_hle_sound(&self) -> bool {
-        self.bus.scsp.is_hle()
-    }
-
     /// Seed the RTC from the host clock (seconds since the Unix epoch). The
     /// frontend calls this at startup so the Saturn shows real wall-clock time
     /// like a console with a charged battery; the core otherwise runs from a

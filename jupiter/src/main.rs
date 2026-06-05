@@ -38,12 +38,9 @@ fn main() -> ExitCode {
     // Split flags (`--cart=…`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
-    let mut hle_sound = false;
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
-        } else if arg == "--hle-sound" {
-            hle_sound = true;
         } else {
             positionals.push(arg);
         }
@@ -62,7 +59,6 @@ fn main() -> ExitCode {
             eprintln!("  --cart=ram1m | ram4m   Extension DRAM cart (1 MiB / 4 MiB)");
             eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
             eprintln!("  --cart=rom:<path>      game ROM cart image");
-            eprintln!("  --hle-sound            opt-in native HLE sound driver (ADR-0012)");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -107,7 +103,7 @@ fn main() -> ExitCode {
     let save_base = std::path::PathBuf::from(&bios_path);
 
     let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region, hle_sound)
+    run(bios, disc_spec, cart, save_base, region)
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
@@ -210,7 +206,6 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    hle_sound: bool,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -230,10 +225,6 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
-    if hle_sound {
-        saturn.enable_hle_sound(); // ADR-0012 opt-in native sound driver
-        eprintln!("HLE sound driver enabled (ADR-0012; synthesis stays LLE)");
-    }
     // Insert the launched disc (image or live drive); keep its spec so the OSD
     // "Insert Disc" can re-insert it after an eject.
     if let Some(spec) = &disc_spec
@@ -549,7 +540,6 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    hle_sound: bool,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -567,10 +557,6 @@ fn run(
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
-    if hle_sound {
-        saturn.enable_hle_sound(); // ADR-0012 opt-in native sound driver
-        eprintln!("HLE sound driver enabled (ADR-0012; synthesis stays LLE)");
-    }
     if let Some(spec) = &disc_spec
         && let Err(e) = insert_from_spec(&mut saturn, spec)
     {

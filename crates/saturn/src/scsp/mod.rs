@@ -26,7 +26,6 @@
 //! Still to come (M6): the mixer/DAC, SDL2 audio output, the SCSP DSP, MIDI.
 
 mod dsp;
-mod hle;
 
 use crate::memory::Ram;
 use m68k::bus::{AccessKind, Bus};
@@ -1246,15 +1245,9 @@ pub struct Scsp {
     /// capped. Diffed line-for-line against a reference's PC trace (MAME
     /// `audiocpu` `.tr`, or Mednafen) from the known-identical reset entry
     /// (`0x1000`) to find the **first** execution divergence — the root of the
-    /// value recession (ADR-0012). `#[serde(skip)]`.
+    /// value recession. `#[serde(skip)]`.
     #[serde(skip)]
     pcstream: Option<Vec<(u32, u64)>>,
-    /// Opt-in native HLE of the 68k sound driver (ADR-0012). `None` (default) =
-    /// the LLE 68k driver runs as the oracle; `Some` replaces it with a native
-    /// sequencer (the SCSP *synthesis* is unchanged either way). `#[serde(skip)]`
-    /// so the default-LLE path's save-states + serialized layout are untouched.
-    #[serde(skip)]
-    hle: Option<hle::HleSoundDriver>,
 }
 
 /// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
@@ -1308,25 +1301,7 @@ impl Scsp {
             pcstream: None,
             bp68: None,
             bp68_hit: None,
-            hle: None,
         }
-    }
-
-    /// Enable the opt-in native HLE sound driver (ADR-0012): a native sequencer
-    /// replaces the LLE 68k driver, while the SCSP synthesis stays LLE. Idempotent.
-    /// The LLE 68k remains the default + the oracle, so this is opt-in only.
-    pub fn enable_hle_driver(&mut self) {
-        self.hle.get_or_insert_with(hle::HleSoundDriver::default);
-    }
-
-    /// Disable the HLE sound driver, returning to the LLE 68k oracle (the default).
-    pub fn disable_hle_driver(&mut self) {
-        self.hle = None;
-    }
-
-    /// Whether the opt-in HLE sound driver is active.
-    pub fn is_hle(&self) -> bool {
-        self.hle.is_some()
     }
 
     /// Arm the instruction-lockstep PC stream (every 68k PC, hard-capped in
@@ -1544,38 +1519,6 @@ impl Scsp {
         self.sample_frac += sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ);
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
-
-        // Opt-in native HLE sound driver (ADR-0012): bypass the 68k entirely. We
-        // still produce every output sample (timer tick + mix) so audio + the
-        // MCIPD/Timer-A path to the SH-2 are unaffected; the native sequencer is
-        // driven on the Timer-B cadence inside `HleSoundDriver::tick`, and only
-        // while the (virtual) driver is released — pre-SNDON the BIOS has not
-        // staged the sequence yet, matching the LLE path. When `hle` is `None`
-        // (the default) this branch is never taken and every path below is
-        // byte-identical, so the `bios_boot` golden cannot move.
-        if self.hle.is_some() {
-            let active = self.running;
-            let Scsp {
-                ram,
-                ctrl,
-                out,
-                hle,
-                ..
-            } = &mut *self;
-            let hle = hle.as_mut().expect("hle.is_some() checked above");
-            for _ in 0..samples {
-                ctrl.tick_timers(1);
-                if active {
-                    hle.tick(ram, ctrl);
-                }
-                if out.len() < MAX_AUDIO_SAMPLES {
-                    let (l, r) = ctrl.mix(ram);
-                    out.push(l);
-                    out.push(r);
-                }
-            }
-            return;
-        }
 
         if !self.running {
             // 68k held in reset: still advance the sample/timer clock + mixer so
@@ -2317,79 +2260,12 @@ mod tests {
     }
 
     #[test]
-    fn hle_driver_keys_a_voice_and_produces_audio() {
-        // ADR-0012: with the opt-in native HLE driver enabled, a note-on in the
-        // sequence keys a 4-operator FM voice through the (LLE) synthesis →
-        // non-silent output, no 68k run. The carrier (slot 24) is audible; the
-        // three modulators (slots 0/8/16) feed it via the SoundStack.
-        let mut s = Scsp::new();
-        // Seed a non-zero PCM sample where the BGM voices read it.
-        for i in 0..64u32 {
-            let ph = i as f64 / 64.0 * std::f64::consts::TAU;
-            s.ram
-                .write16(0x10740 + i * 2, (ph.sin() * 0x4000 as f64) as i16 as u16);
-        }
-        // A minimal playback sequence at the start cursor: program-change 7, then
-        // a note-on (note 0x33) with a long trailing delta so the parser keys the
-        // one voice and then waits (rather than running into the uninitialised
-        // tail). status, note, velocity, gate, delta.
-        let seq = [0xC0, 0x07, 0x00, 0x40, 0x33, 0x6E, 0xE0, 0xFF];
-        for (k, &b) in seq.iter().enumerate() {
-            s.ram.write8(0x18226 + k as u32, b);
-        }
-        s.enable_hle_driver();
-        assert!(s.is_hle());
-        s.start(); // SNDON → the HLE sequencer is released
-        s.run(2_000_000); // many SH-2 cycles → ticks + fills the audio buffer
-        let audio = s.take_audio();
-        assert!(!audio.is_empty(), "HLE produced audio samples");
-        assert!(
-            audio.iter().any(|&x| x != 0),
-            "HLE keyed a voice → non-silent"
-        );
-        assert_eq!(
-            s.ctrl.dbg_keyon_counts().1,
-            4,
-            "the 4 FM operators of one voice started"
-        );
-    }
-
-    #[test]
-    fn hle_enable_then_disable_is_a_noop_on_the_lle_path() {
-        // Golden-safety: enabling then disabling the HLE must leave the LLE 68k
-        // path byte-identical to one that never touched it (the default oracle).
-        let setup = |s: &mut Scsp| {
-            s.ram.write32(4, 0x2000);
-            s.ram.write16(0x2000, 0x60FE); // 68k BRA self
-            keyon_panned(s, 0, 0x2000, 7, 0x00);
-        };
-        let mut a = Scsp::new();
-        setup(&mut a);
-        a.start();
-        a.run(2_000_000);
-
-        let mut b = Scsp::new();
-        setup(&mut b);
-        b.enable_hle_driver();
-        b.disable_hle_driver();
-        assert!(!b.is_hle(), "HLE disabled → back to the LLE oracle");
-        b.start();
-        b.run(2_000_000);
-
-        assert_eq!(
-            a.take_audio(),
-            b.take_audio(),
-            "enable→disable HLE leaves the LLE output byte-identical"
-        );
-    }
-
-    #[test]
     fn fm_modulation_changes_the_carrier_output() {
         // A slot whose reg-7 MDL>4 reads the SoundStack phase-modulates its sample
         // read; with the stack populated by another (directly-muted) slot, the
         // carrier's output must differ from the same slot with modulation off —
-        // proving the FM path (modalizer + SoundStack write) is wired (ADR-0012;
-        // Mednafen `scsp.inc`). The 4-operator version of this drives the BIOS BGM.
+        // proving the FM path (modalizer + SoundStack write) is wired (Mednafen
+        // `scsp.inc`). This slot-to-slot FM is real SCSP synthesis (LLE).
         fn render(mdl: u16) -> Vec<i16> {
             let mut c = ScspCtrl::new();
             let mut ram = Ram::new(SOUND_RAM_BYTES);
