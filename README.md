@@ -54,7 +54,11 @@ restart like a battery-backed console.
 
 **M10 adds CD-audio and live discs.** Games that stream Red Book CD-audio
 tracks as BGM (e.g. Romance of the Three Kingdoms V) now play their music —
-the CD-block decodes audio tracks and mixes them into the SCSP output. The
+the CD-block decodes audio tracks and mixes them into the SCSP output through
+a small pre-roll jitter buffer (the read pump fills in sector bursts; the host
+drains smoothly per frame), so playback is gap-free. Press **F8** in the
+SDL window to play a disc's CD-audio track live (an audio CD, or a game's
+CD-DA track). The
 CD-block also reads sectors through a `SectorSource` trait, so besides ripped
 images it can read an **original disc from a host optical drive**: build with
 `--features physical-disc` and pass `cdrom:<device>` (e.g. `cdrom:/dev/sr0`).
@@ -116,6 +120,7 @@ gamepad support are planned M9 phases.)
 | Open / close the on-screen menu   | Esc |
 | Quick save (to the quick slot)    | F5 |
 | Quick load (from the quick slot)  | F9 |
+| Play the disc's CD-audio track    | F8 |
 | Quit                              | Close the window, or Esc → **Quit** |
 
 ### On-screen menu (while it is open)
