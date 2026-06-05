@@ -1077,6 +1077,15 @@ pub struct Scsp {
     /// this by running the 68k to the exact sample edge; the carry is our
     /// whole-instruction equivalent.
     budget_carry: i64,
+    /// 68k cycles accumulated **since the last produced sample edge**, carried
+    /// **across batches**. Batches are clamped to arbitrary event edges, so if
+    /// this reset to 0 each batch the sample/timer/IRQ edges would re-phase to
+    /// every batch boundary instead of tracking the absolute sample clock — a
+    /// sub-sample phase error that shifts when the SCSP raises Timer-A/B SCIPD
+    /// to the 68k (the lockstep-found root: the driver polls SCIPD and our wrong
+    /// phase splits its control flow). Persisting it matches Mednafen's absolute
+    /// `next_scsp_time`.
+    sample_acc: i64,
     /// Generated 44.1 kHz output, interleaved L,R. The frontend drains it each
     /// frame; capped so headless runs (which never drain) don't grow unbounded.
     out: Vec<i16>,
@@ -1173,6 +1182,7 @@ impl Scsp {
             frac: 0,
             sample_frac: 0,
             budget_carry: 0,
+            sample_acc: 0,
             out: Vec::new(),
             pc_trace: None,
             pc_seen: None,
@@ -1380,16 +1390,42 @@ impl Scsp {
     /// Advance the timers and the 68k by the share of `sh2_cycles` the SCSP's
     /// clocks earn. No-op while the 68k is held in reset.
     pub fn run(&mut self, sh2_cycles: u64) {
-        if !self.running {
-            return;
-        }
-        // How many 44.1 kHz output samples this batch earns (sample clock), and
-        // how many 68k cycles (the 68k clock). The 68k clock is exactly 256× the
-        // sample clock (11.2896 MHz / 44100), so one sample falls due every 256
-        // 68k cycles.
+        // The SCSP sample/timer clock free-runs from power-on, *independent* of
+        // the 68k's reset state: Mednafen advances one output sample (timer tick
+        // + synthesis) per 256-cycle edge even while the SoundCPU is held halted
+        // (`SOUND_Update`'s `while(next_scsp_time < run_until) RunSCSP()` else
+        // branch). So compute this batch's 44.1 kHz sample quota *before* the
+        // 68k-running gate — `sample_counter`, and therefore the Timer-A/B
+        // prescale phase (`sc & ((1<<Control)-1)`), must track the **absolute**
+        // sample clock, not be re-zeroed at each SNDON. Gating the whole function
+        // on `running` (the old behaviour) froze the sample clock through the long
+        // pre-SNDON window (audio-CD boot releases the 68k ~60+ frames in), so the
+        // driver's Timer A overflowed at a mis-phased sample and its SCIPD-poll
+        // wait-loops diverged from the oracle — the root the 68k instruction-
+        // lockstep localised to the `move.w (0x420),d0; andi.w #0x40` poll.
         self.sample_frac += sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ);
         let samples = (self.sample_frac / SH2_CLOCK_HZ) as u32;
         self.sample_frac %= SH2_CLOCK_HZ;
+
+        if !self.running {
+            // 68k held in reset: still advance the sample/timer clock + mixer so
+            // the timers and `sample_counter` stay phase-locked for when the 68k
+            // is released (Mednafen runs the full `RunSample` while halted).
+            let Scsp { ram, ctrl, out, .. } = &mut *self;
+            for _ in 0..samples {
+                ctrl.tick_timers(1);
+                if out.len() < MAX_AUDIO_SAMPLES {
+                    let (l, r) = ctrl.mix(ram);
+                    out.push(l);
+                    out.push(r);
+                }
+            }
+            return;
+        }
+
+        // How many 68k cycles this batch earns (the 68k clock is exactly 256× the
+        // sample clock, 11.2896 MHz / 44100, so one sample falls due every 256
+        // 68k cycles).
         self.frac += sh2_cycles.saturating_mul(SCSP_CLOCK_HZ);
         // Add back the previous batch's whole-instruction overshoot (a negative
         // carry) so the 68k does not creep ahead of the sample/timer clock.
@@ -1405,7 +1441,7 @@ impl Scsp {
         // the sample/timer clock is corrected (M13 A2 / M12 #3).
         const CYCLES_PER_SAMPLE_68K: i64 = (SCSP_CLOCK_HZ / SCSP_SAMPLE_HZ) as i64; // 256
         let mut samples_left = samples;
-        let mut sample_acc: i64 = 0; // 68k cycles since the last sample edge
+        let mut sample_acc: i64 = self.sample_acc; // carried across batches
 
         let Scsp {
             ram,
@@ -1585,6 +1621,7 @@ impl Scsp {
         // Carry this batch's 68k-cycle overshoot (`budget` is now ≤ 0) into the
         // next batch so the 68k tracks 256 cy/sample exactly over time.
         self.budget_carry = budget;
+        self.sample_acc = sample_acc;
     }
 }
 
