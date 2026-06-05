@@ -2573,12 +2573,15 @@ fn bios_audio_probe() {
     }
     if let Some(p) = pcstream {
         let s = sat.bus.scsp.take_pcstream();
-        let out: String = s.iter().map(|pc| format!("{pc:06X}\n")).collect();
+        // "PC cycle" per line: cycle = pre-instruction 68k accumulated cycle, so a
+        // diff tool can compare cost-per-instruction (cycle deltas) vs Mednafen's
+        // SS_PCSTREAM (which logs PC + timestamp the same way).
+        let out: String = s.iter().map(|(pc, c)| format!("{pc:06X} {c}\n")).collect();
         std::fs::write(&p, out).unwrap();
         println!(
             "  PCSTREAM: wrote {} 68k PCs to {p} (first={:06X})",
             s.len(),
-            s.first().copied().unwrap_or(0)
+            s.first().map(|(pc, _)| *pc).unwrap_or(0)
         );
     }
     if let Some(addr) = wwatch68 {

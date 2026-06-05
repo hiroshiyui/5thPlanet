@@ -1139,7 +1139,7 @@ pub struct Scsp {
     /// (`0x1000`) to find the **first** execution divergence — the root of the
     /// value recession (ADR-0012). `#[serde(skip)]`.
     #[serde(skip)]
-    pcstream: Option<Vec<u32>>,
+    pcstream: Option<Vec<(u32, u64)>>,
 }
 
 /// One cross-emulator signal-scope capture (see [`Scsp::enable_scope`]). Each
@@ -1202,8 +1202,8 @@ impl Scsp {
         self.pcstream = Some(Vec::with_capacity(1 << 20));
     }
 
-    /// Take the captured 68k PC stream, if armed.
-    pub fn take_pcstream(&mut self) -> Vec<u32> {
+    /// Take the captured 68k PC stream (PC + pre-instruction 68k cycle), if armed.
+    pub fn take_pcstream(&mut self) -> Vec<(u32, u64)> {
         self.pcstream.take().unwrap_or_default()
     }
 
@@ -1520,7 +1520,9 @@ impl Scsp {
             if let Some(ps) = pcstream.as_mut()
                 && ps.len() < 8_000_000
             {
-                ps.push(cpu.regs.pc);
+                // PC + the pre-instruction 68k cycle, so the lockstep can compare
+                // cost-per-instruction (delta of consecutive cycles) vs the oracle.
+                ps.push((cpu.regs.pc, cpu.cycles));
             }
             // Signal scope: at the trigger PC, sample the configured sound-RAM
             // channels into a row (one row per timeframe).
