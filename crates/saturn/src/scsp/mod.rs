@@ -2311,20 +2311,25 @@ mod tests {
 
     #[test]
     fn hle_driver_keys_a_voice_and_produces_audio() {
-        // ADR-0012 M1: with the opt-in native HLE driver enabled, the sequence's
-        // first note-on keys a voice through the (LLE) synthesis → non-silent
-        // output — proving the HLE → synthesis boundary end-to-end, no 68k run.
+        // ADR-0012: with the opt-in native HLE driver enabled, a note-on in the
+        // sequence keys a 4-operator FM voice through the (LLE) synthesis →
+        // non-silent output, no 68k run. The carrier (slot 24) is audible; the
+        // three modulators (slots 0/8/16) feed it via the SoundStack.
         let mut s = Scsp::new();
-        // Seed a non-zero PCM sample where the HLE keys it (the BGM sample SA),
-        // and a note-on at the sequence base (high nibble 0x4, then note + vel).
+        // Seed a non-zero PCM sample where the BGM voices read it.
         for i in 0..64u32 {
             let ph = i as f64 / 64.0 * std::f64::consts::TAU;
             s.ram
                 .write16(0x10740 + i * 2, (ph.sin() * 0x4000 as f64) as i16 as u16);
         }
-        s.ram.write8(0x18200, 0x40); // note-on, channel 0
-        s.ram.write8(0x18201, 0x37); // note number
-        s.ram.write8(0x18202, 0x64); // velocity
+        // A minimal playback sequence at the start cursor: program-change 7, then
+        // a note-on (note 0x33) with a long trailing delta so the parser keys the
+        // one voice and then waits (rather than running into the uninitialised
+        // tail). status, note, velocity, gate, delta.
+        let seq = [0xC0, 0x07, 0x00, 0x40, 0x33, 0x6E, 0xE0, 0xFF];
+        for (k, &b) in seq.iter().enumerate() {
+            s.ram.write8(0x18226 + k as u32, b);
+        }
         s.enable_hle_driver();
         assert!(s.is_hle());
         s.start(); // SNDON → the HLE sequencer is released
@@ -2335,7 +2340,11 @@ mod tests {
             audio.iter().any(|&x| x != 0),
             "HLE keyed a voice → non-silent"
         );
-        assert_eq!(s.ctrl.dbg_keyon_counts().1, 1, "exactly one slot started");
+        assert_eq!(
+            s.ctrl.dbg_keyon_counts().1,
+            4,
+            "the 4 FM operators of one voice started"
+        );
     }
 
     #[test]
