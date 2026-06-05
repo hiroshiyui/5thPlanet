@@ -17,13 +17,21 @@
 //! illegal + line-A/F, privilege violation, STOP/RESET/RTE/RTR, and
 //! external-interrupt dispatch (autovector, `SR.imask`-gated, level-7 NMI).
 //! Still to come: address-error/bus-error stack frames (the 68000's longer
-//! group-0 frame), and precise long-operation (MUL/DIV/shift) timing tables.
+//! group-0 frame), and the exact MUL/DIV cycle-by-cycle timing tables.
 //!
 //! **Cycle model:** each memory word access costs the 68000's 4-clock bus
-//! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along
-//! with any host wait-states. REVIEW(magic): long-operation internal
-//! penalties and the exact per-instruction timing tables (M68000 User's
-//! Manual Appendix) are a later refinement — this counts bus traffic only.
+//! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along with
+//! any host wait-states, *plus* the per-instruction internal penalties ported
+//! from Mednafen's `hw_cpu/m68k` (the LLE oracle): taken-branch displacement
+//! prefetch + 2 (`Bcc`/`BRA`/`BSR`), `DBcc` (+2 branch / +6 expiry / +4 fall-
+//! through), `RTS`/`ANDI-CCR`-style trailing prefetch, `ADDA`/`ADD.L`-to-Dn
+//! operand penalties, the `-(An)` predecrement and `(d8,An/PC,Xn)` index +2,
+//! register shift/rotate `2 + 2n`, `JMP`/`JSR` target-mode +2/+4, and the
+//! `MOVEM`-to-regs trailing word read. Validated by a cycle-exact 68k
+//! instruction-lockstep against Mednafen on the SCSP sound driver (the SCSP
+//! timer phase the driver polls is a function of this count). Still to come:
+//! MUL/DIV exact cycle-by-cycle tables (currently a fixed estimate) and the
+//! 68000's longer group-0 (address/bus-error) stack frame.
 
 use crate::bus::{AccessKind, Bus};
 use crate::isa::{Cond, Size};
@@ -184,7 +192,10 @@ impl Cpu {
                 Ea::Mem(addr)
             }
             4 => {
-                // -(An)
+                // -(An): the predecrement costs +2 (Mednafen `calcea`
+                // `predec_penalty`) — the EA isn't ready until the address-unit
+                // decrement completes.
+                self.cycles += 2;
                 let addr = self.regs.a[r].wrapping_sub(self.inc_size(r, size));
                 self.regs.a[r] = addr;
                 Ea::Mem(addr)
@@ -228,6 +239,23 @@ impl Cpu {
         }
     }
 
+    /// JMP/JSR target-addressing penalty (Mednafen `m68k.cpp` `JMP`/`JSR`): +4
+    /// for `(An)` / `(d8,An,Xn)` / `(d8,PC,Xn)`, +2 for `(d16,An)` / `(d16,PC)` /
+    /// `(xxx).W`, and 0 for `(xxx).L`. The index modes' EA-calc +2 is charged
+    /// separately in [`Self::brief_index`], composing to the chip's +6 there.
+    fn jump_penalty(mode: u16, reg: u16) -> u64 {
+        match mode {
+            2 | 6 => 4,
+            5 => 2,
+            7 => match reg {
+                0 | 2 => 2,
+                3 => 4,
+                _ => 0, // (xxx).L
+            },
+            _ => 0,
+        }
+    }
+
     /// Post-inc/pre-dec step: byte access to A7 still moves by 2 to keep the
     /// stack word-aligned (M68000 manual §2.3).
     fn inc_size(&self, reg: usize, size: Size) -> u32 {
@@ -241,6 +269,10 @@ impl Cpu {
     /// Resolve a 68000 brief-format index word: `base + disp8 + Xn`, with the
     /// index taken as word (sign-extended) or long per the W/L bit.
     fn brief_index(&mut self, base: u32, bus: &mut impl Bus) -> u32 {
+        // Index addressing — (d8,An,Xn) / (d8,PC,Xn) — costs +2 over a plain
+        // displacement for the index-register add (Mednafen `calcea`, the
+        // `ADDR_REG_INDIR_INDX` / `PC_INDEX` `timestamp += 2`).
+        self.cycles += 2;
         let ext = self.fetch16(bus);
         let disp = (ext as i8) as i32;
         let ri = ((ext >> 12) & 7) as usize;
@@ -556,6 +588,11 @@ impl Cpu {
             0x4E75 => {
                 // RTS
                 self.regs.pc = self.pop32(bus);
+                // Mednafen `m68k.cpp` `RTS` prefetches the target word (then backs
+                // the PC up) — RTS is 24 cycles, not the 18 the bare long pop costs.
+                // Matched in the 68k cycle lockstep (the SCSP-timer-phase root).
+                self.fetch16(bus);
+                self.regs.pc = self.regs.pc.wrapping_sub(2);
                 return;
             }
             0x4E73 => {
@@ -730,6 +767,7 @@ impl Cpu {
             // JMP <ea> = 0100 1110 11 mmmrrr ; JSR = 0100 1110 10 mmmrrr
             0b111011 => {
                 if let Ea::Mem(addr) = self.resolve_ea(mode, reg, Size::Long, bus) {
+                    self.cycles += Self::jump_penalty(mode, reg);
                     self.regs.pc = addr;
                 }
             }
@@ -737,6 +775,7 @@ impl Cpu {
                 if let Ea::Mem(addr) = self.resolve_ea(mode, reg, Size::Long, bus) {
                     let ret = self.regs.pc;
                     self.push32(ret, bus);
+                    self.cycles += Self::jump_penalty(mode, reg);
                     self.regs.pc = addr;
                 }
             }
@@ -809,13 +848,20 @@ impl Cpu {
                 let reg = (op & 7) as usize;
                 let base = self.regs.pc;
                 let disp = self.fetch16(bus) as i16 as i32;
+                // Cycle model mirrors Mednafen `m68k.cpp` `DBcc`: condition true
+                // (loop terminates) is +4; condition false decrements and is +2
+                // when it branches, +6 (an extra +4) when the counter expires.
                 if self.cond(cond) {
+                    self.cycles += 4;
                     return; // condition true → loop terminates, no decrement
                 }
                 let counter = (self.regs.d[reg] as u16).wrapping_sub(1);
                 self.regs.d[reg] = (self.regs.d[reg] & 0xFFFF_0000) | counter as u32;
                 if counter != 0xFFFF {
+                    self.cycles += 2;
                     self.regs.pc = base.wrapping_add(disp as u32);
+                } else {
+                    self.cycles += 6;
                 }
             } else {
                 // Scc <ea> — byte set to 0xFF if true, else 0x00.
@@ -863,27 +909,40 @@ impl Cpu {
         let cond_bits = (op >> 8) & 0xF;
         // Displacement base is the PC after the opcode word.
         let base = self.regs.pc;
-        let disp = (op & 0xFF) as i8 as i32;
-        let disp = if disp == 0 {
-            self.fetch16(bus) as i16 as i32
-        } else {
-            disp
+        let byte_disp = (op & 0xFF) as i8 as i32;
+        let taken = match cond_bits {
+            0x0 | 0x1 => true, // BRA / BSR
+            _ => self.cond(Cond::from_bits(cond_bits)),
         };
-        let target = base.wrapping_add(disp as u32);
-
-        match cond_bits {
-            0x0 => self.regs.pc = target, // BRA
-            0x1 => {
-                // BSR
+        // Cycle model mirrors Mednafen `m68k.cpp` `Bxx`: the taken path *always*
+        // reads a displacement word (backing the PC up for a byte displacement —
+        // the real chip refills its prefetch from the branch target) and charges
+        // +2; the not-taken path reads the word only for a word displacement and
+        // charges +4. Without these ours' branches run several cycles cheap,
+        // drifting the SCSP-timer phase the sound 68k polls (found by the 68k
+        // cycle-exact lockstep vs Mednafen — the BGM Timer-A poll divergence).
+        if taken {
+            let word = self.fetch16(bus) as i16 as i32;
+            let disp = if byte_disp == 0 {
+                word
+            } else {
+                // Byte displacement: the prefetched word isn't the operand.
+                self.regs.pc = self.regs.pc.wrapping_sub(2);
+                byte_disp
+            };
+            let target = base.wrapping_add(disp as u32);
+            if cond_bits == 0x1 {
+                // BSR: push the return address (after the opcode/displacement).
                 let ret = self.regs.pc;
                 self.push32(ret, bus);
-                self.regs.pc = target;
             }
-            _ => {
-                if self.cond(Cond::from_bits(cond_bits)) {
-                    self.regs.pc = target;
-                }
+            self.cycles += 2;
+            self.regs.pc = target;
+        } else {
+            if byte_disp == 0 {
+                self.fetch16(bus);
             }
+            self.cycles += 4;
         }
     }
 
@@ -916,6 +975,16 @@ impl Cpu {
                 Size::Long
             };
             let ea = self.resolve_ea(mode, ea_reg, size, bus);
+            // ADDA/SUBA cycle penalty (Mednafen `m68k.cpp` `ADD`): +4 for a word
+            // source or a register/immediate long source; +2 for a long memory
+            // source (the ALU passes the long through in two halves only when it
+            // comes from a register/immediate). Matched in the 68k cycle lockstep.
+            let reg_or_imm = matches!(ea, Ea::DataReg(_) | Ea::AddrReg(_) | Ea::Imm(_));
+            self.cycles += if size == Size::Word || reg_or_imm {
+                4
+            } else {
+                2
+            };
             let raw = self.read_ea(ea, size, bus);
             // Word source is sign-extended to 32 bits; no flags affected.
             let src = size.sign_extend(raw) as u32;
@@ -944,6 +1013,13 @@ impl Cpu {
             };
             self.write_ea(ea, size, res, bus);
         } else {
+            // ADD.L/SUB.L to a data register: +4 for a register/immediate source,
+            // +2 for a memory source (Mednafen `m68k.cpp` `ADD`, `DATA_REG_DIR` +
+            // 32-bit dest). Byte/word and the to-memory direction have no penalty.
+            if size == Size::Long {
+                let reg_or_imm = matches!(ea, Ea::DataReg(_) | Ea::AddrReg(_) | Ea::Imm(_));
+                self.cycles += if reg_or_imm { 4 } else { 2 };
+            }
             let src = self.read_ea(ea, size, bus);
             let dst = self.regs.d[reg];
             let res = if is_add {
@@ -1029,6 +1105,9 @@ impl Cpu {
                 self.set_movem_reg(i, v);
                 addr = addr.wrapping_add(bytes);
             }
+            // MOVEM-to-regs reads one extra word past the loaded registers
+            // (Mednafen `MOVEM_to_REGS`'s trailing `Read<uint16>(ea)`) — +4 cy.
+            self.read_mem(addr, Size::Word, bus);
             self.regs.a[reg as usize] = addr;
             return;
         }
@@ -1049,6 +1128,10 @@ impl Cpu {
                 self.set_movem_reg(i, v);
             }
             addr = addr.wrapping_add(bytes);
+        }
+        if !to_mem {
+            // Trailing extra word read (Mednafen `MOVEM_to_REGS`) — +4 cy.
+            self.read_mem(addr, Size::Word, bus);
         }
     }
 
@@ -1135,6 +1218,15 @@ impl Cpu {
                     self.write_sr(nv);
                 }
                 Size::Long => {}
+            }
+            // ORI/ANDI/EORI to CCR/SR cost a fixed +8 internal plus a phantom
+            // prefetch word (Mednafen `ANDI_CCR`/`ORI_CCR`/…: `timestamp += 8;
+            // ReadOp(); PC -= 2`) — 26 cycles total, not the bare 12 of the two
+            // word fetches. Matched in the 68k cycle lockstep vs Mednafen.
+            if size != Size::Long {
+                self.cycles += 8;
+                self.fetch16(bus);
+                self.regs.pc = self.regs.pc.wrapping_sub(2);
             }
             return;
         }
@@ -1440,6 +1532,11 @@ impl Cpu {
             if c == 0 { 8 } else { c as u32 }
         };
         let _ = bus;
+        // Register shift/rotate timing (Mednafen `ShiftBase`): a base of +2
+        // (byte/word) or +4 (long), plus +2 per bit shifted. Ours charged nothing
+        // for the shift work, undercounting by 2 + 2n cycles — a sound-driver hot
+        // path (found by the 68k cycle lockstep vs Mednafen).
+        self.cycles += if size == Size::Long { 4 } else { 2 } + 2 * count as u64;
 
         let mask = size.mask();
         let msb = size.msb();
