@@ -127,6 +127,14 @@ impl Cpu {
         self.pending_irq = 0;
         self.take_exception(vector::AUTOVECTOR_BASE + level as u32, bus);
         self.regs.sr.imask = level;
+        // Interrupt-acknowledge + internal exception overhead, on top of the
+        // stack writes + vector read `take_exception` already charges. Matches
+        // Mednafen `m68k.cpp` `Exception(EXCEPTION_INT)`: `timestamp += 6` +
+        // `+= 4`, plus the autovector IACK bus cycle (`SoundCPU_BusIntAck`,
+        // `timestamp += 10`) = 20. Without it the sound 68k under-costs every
+        // Timer interrupt by 20 cycles and runs ~7% fast — the BGM-trigger phase
+        // lead, found by the 68k cost-per-instruction lockstep vs Mednafen.
+        self.cycles += 20;
         true
     }
 
