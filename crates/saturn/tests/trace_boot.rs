@@ -2703,6 +2703,217 @@ fn bios_audio_probe() {
     }
 }
 
+/// Verification (manual): is the BIOS BGM's **audio data** valid — the FM analog
+/// of the CD-DA grab? The BIOS sound driver loads the BGM instrument sample into
+/// sound RAM at `0x10740` (byte-identical to Mednafen per prior RE), but the 68k
+/// driver never issues the key-on, so we never *hear* it. Here we boot to load
+/// the sample, then synthesize it through a **clean SCSP** — key one slot looping
+/// the sample at a musical pitch, no 68k — and save the FM output to a RAW file.
+/// This isolates the *sample data + FM/PCM synth path* from the (broken) 68k
+/// trigger: if it produces a clean tone, the audio data is valid and the only
+/// thing missing is the trigger.  Dumps `/tmp/bios_bgm_sample.pcm`:
+///   aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_sample.pcm
+#[test]
+#[ignore = "manual: synthesize + save the BIOS BGM instrument sample (needs BIOS+disc)"]
+fn bios_bgm_sample_audible() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    // Boot with the audio CD so the BIOS reaches the player panel and its sound
+    // driver stages the BGM instrument sample into sound RAM.
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms/audiocd.cue"))
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |n| {
+            std::fs::read(root.join("roms").join(n)).ok()
+        })
+    {
+        sat.insert_disc(d);
+    }
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..600 {
+        sat.run_frame(&mut fb);
+        let _ = sat.take_audio();
+    }
+
+    // Grab the loaded instrument sample (SA=0x10740, up to LEA=0x152 samples).
+    const SA: u32 = 0x10740;
+    const LSA: u16 = 0x00A9;
+    const LEA: u16 = 0x0152;
+    let sample: Vec<u16> = (0..LEA as u32).map(|i| sat.bus.scsp.ram.read16(SA + i * 2)).collect();
+    let nonzero = sample.iter().filter(|&&w| w != 0).count();
+    println!("BGM instrument @0x{SA:05X}: {LEA} samples, {nonzero} non-zero");
+    assert!(nonzero > 0, "the BIOS loaded a non-zero BGM instrument sample");
+
+    // Synthesize it through a clean SCSP — no 68k, no trigger dependency.
+    let mut scsp = saturn::scsp::Scsp::new();
+    for (i, &w) in sample.iter().enumerate() {
+        scsp.ram.write16(SA + i as u32 * 2, w);
+    }
+    // Slot 0: forward-loop the sample at native rate, instant attack, full level,
+    // routed to the direct output (DISDL=7, centre pan).
+    scsp.ctrl.write16(0x02, (SA & 0xFFFF) as u16); // SA low
+    scsp.ctrl.write16(0x04, LSA); // LSA (loop start)
+    scsp.ctrl.write16(0x06, LEA); // LEA (loop end)
+    scsp.ctrl.write16(0x08, 0x001F); // AR = max (instant attack)
+    scsp.ctrl.write16(0x0C, 0x0000); // TL = 0 (full volume)
+    scsp.ctrl.write16(0x10, 0x0000); // OCT/FNS = 0 (native sample rate)
+    scsp.ctrl.write16(0x16, 0xE000); // DISDL=7 direct out, centre pan
+    // data[0]: KYONEX|KYONB (0x1800) | forward-loop (0x20) | SA high nibble.
+    scsp.ctrl.write16(0x00, 0x1800 | 0x20 | ((SA >> 16) & 0xF) as u16);
+
+    // ~2 s of synthesis into the SCSP output buffer, drained to a RAW file.
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut peak = 0i32;
+    while pcm.len() < 44_100 * 2 * 2 * 2 {
+        scsp.run(500_000);
+        for s in scsp.take_audio() {
+            peak = peak.max((s as i32).abs());
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+    println!("synthesized {} bytes, peak {peak}", pcm.len());
+    std::fs::write("/tmp/bios_bgm_sample.pcm", &pcm).unwrap();
+    println!(
+        "wrote /tmp/bios_bgm_sample.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_sample.pcm"
+    );
+    assert!(peak > 1000, "the BGM instrument synthesizes to real audio (peak {peak})");
+}
+
+/// Verification (manual): is the BIOS BGM **note-sequence data** valid? Renders
+/// the sequence at `0x18200` through the loaded instrument as a plain monophonic
+/// "music box" — no FM timbre, no 68k — so we can *hear* whether the data is a
+/// real melody/chord progression (vs garbage). Parses the driver's event dialect
+/// (note-on = `[status<0x80, note, vel, gate, delta]`; `0xCn` prog = 3B; `0xBn`
+/// CC = 4B; `0xEn` bend = 3B; `0x83` end-of-tick) and keys the instrument at each
+/// note's pitch (sample base note 55) for its gate. Dumps `/tmp/bios_bgm_seq.pcm`:
+///   aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_seq.pcm
+#[test]
+#[ignore = "manual: render the BIOS BGM note sequence (needs BIOS+disc)"]
+fn bios_bgm_sequence_audible() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms/audiocd.cue"))
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |n| {
+            std::fs::read(root.join("roms").join(n)).ok()
+        })
+    {
+        sat.insert_disc(d);
+    }
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..600 {
+        sat.run_frame(&mut fb);
+        let _ = sat.take_audio();
+    }
+
+    // The instrument sample + the note sequence, straight from sound RAM.
+    const SA: u32 = 0x10740;
+    const LSA: u16 = 0x00A9;
+    const LEA: u16 = 0x0152;
+    let sample: Vec<u16> = (0..LEA as u32).map(|i| sat.bus.scsp.ram.read16(SA + i * 2)).collect();
+    const SEQ: u32 = 0x18200;
+    let seq: Vec<u8> = (0..0x400u32).map(|i| sat.bus.scsp.ram.read8(SEQ + i)).collect();
+    print!("seq @0x{SEQ:05X}:");
+    for b in &seq[..48] {
+        print!(" {b:02X}");
+    }
+    println!();
+
+    // Heuristic note-on scan robust to tick/header alignment: a note-on is
+    // `[status 0x40-0x4F, note, vel, gate, delta]` with a note in a musical range
+    // and a non-zero velocity. Walk the whole sound-RAM sequence block; on a
+    // match record (note, gate, delta) and skip the event, else step one byte.
+    let big: Vec<u8> = (0..0x1000u32).map(|i| sat.bus.scsp.ram.read8(SEQ + i)).collect();
+    let mut events: Vec<(u8, u8, u8)> = Vec::new();
+    let mut p = 0usize;
+    while p + 4 < big.len() && events.len() < 256 {
+        let (st, note, vel, gate, delta) = (big[p], big[p + 1], big[p + 2], big[p + 3], big[p + 4]);
+        let is_note_on =
+            (0x40..=0x4F).contains(&st) && (0x24..=0x60).contains(&note) && (0x20..=0x7F).contains(&vel);
+        if is_note_on {
+            events.push((note, gate, delta));
+            p += 5;
+        } else {
+            p += 1;
+        }
+    }
+    let distinct: std::collections::BTreeSet<u8> = events.iter().map(|e| e.0).collect();
+    println!(
+        "scanned {} note-ons, {} distinct pitches {:?}",
+        events.len(),
+        distinct.len(),
+        distinct
+    );
+    println!(
+        "  notes (note,gate,delta): {:?}",
+        &events[..events.len().min(32)]
+    );
+    assert!(!events.is_empty(), "the sequence contains note-on events");
+
+    // Pitch: 2^((note-55)/12) → SCSP OCT/FNS.
+    fn note_to_octfns(note: i32) -> u16 {
+        let semis = note - 55;
+        let octave = semis.div_euclid(12).clamp(-8, 7);
+        let frac = 2f64.powf(semis.rem_euclid(12) as f64 / 12.0); // [1,2)
+        let fns = (((frac - 1.0) * 1024.0).round() as i32).clamp(0, 1023) as u16;
+        let oct_raw = (((octave + 8) ^ 8) & 0xF) as u16;
+        (oct_raw << 11) | fns
+    }
+
+    // Render monophonically through a clean SCSP: retrigger the instrument at each
+    // note's pitch for its gate (Timer-B ticks ≈ 117 samples), no 68k.
+    let mut scsp = saturn::scsp::Scsp::new();
+    for (i, &w) in sample.iter().enumerate() {
+        scsp.ram.write16(SA + i as u32 * 2, w);
+    }
+    scsp.ctrl.write16(0x02, (SA & 0xFFFF) as u16);
+    scsp.ctrl.write16(0x04, LSA);
+    scsp.ctrl.write16(0x06, LEA);
+    scsp.ctrl.write16(0x08, 0x001F); // AR max
+    scsp.ctrl.write16(0x0C, 0x0000); // TL full
+    scsp.ctrl.write16(0x16, 0xE000); // DISDL=7 direct, centre
+
+    let key_off = 0x1000u16; // KYONEX, KYONB=0 → release
+    let key_on = 0x1800 | 0x20 | ((SA >> 16) & 0xF) as u16; // KYONEX|KYONB|loop|SAhi
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut peak = 0i32;
+    // Play each note as a distinct pluck at an even tempo (~0.18 s) — a clear
+    // "music box" reading of the pitch sequence, ignoring the driver's real tick
+    // timing (which is the 68k's job). Key-off then key-on restarts the slot so
+    // every note is a fresh attack rather than one gliding tone.
+    const NOTE_SAMPLES: usize = 7938; // ~0.18 s of stereo frames
+    for (note, _gate, _delta) in events {
+        scsp.ctrl.write16(0x00, key_off); // release the previous note
+        scsp.ctrl.write16(0x10, note_to_octfns(note as i32)); // new pitch
+        scsp.ctrl.write16(0x00, key_on); // fresh attack
+        let target = pcm.len() + NOTE_SAMPLES * 4; // *2 stereo *2 bytes
+        while pcm.len() < target {
+            scsp.run(300_000);
+            for s in scsp.take_audio() {
+                peak = peak.max((s as i32).abs());
+                pcm.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+    }
+    println!("rendered {} bytes ({:.1}s), peak {peak}", pcm.len(), pcm.len() as f64 / 176_400.0);
+    std::fs::write("/tmp/bios_bgm_seq.pcm", &pcm).unwrap();
+    println!("wrote /tmp/bios_bgm_seq.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_seq.pcm");
+    assert!(peak > 1000, "the sequence rendered to real audio (peak {peak})");
+}
+
 /// Demonstration (manual): the **running emulator** plays a disc's CD-DA track.
 /// Boots the BIOS with the real Doukyuusei disc, then drives the CD drive to
 /// Play the Red Book audio track (Track 2 — the Saturn warning message) and
