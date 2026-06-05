@@ -1,14 +1,16 @@
 # 0012. SCSP sound-driver HLE — design study
 
-- **Status:** Accepted in principle (2026-06-05) — **we will HLE the SCSP 68k
-  sound driver** (the *synthesis stays LLE*) as a practical, deliberate
-  exception to accuracy-first, because **audio is essential for a game-console
-  emulator and the project cannot be blocked on the open-ended LLE sound-driver
-  debugging wall.** This is the **second** such exception, after the CD-block
-  (ADR / `CLAUDE.md`). The *scope* — one reusable HLE of the SEGA-standard driver
-  (Option B) vs the BIOS panel driver only (Option C) — is confirmed by the
-  feasibility check below before implementation. This started as a design study;
-  the boundary analysis and options are retained.
+- **Status:** Accepted in principle but **DEFERRED — fallback only** (2026-06-05).
+  After reading this study the user chose to first attempt the **accuracy-
+  preserving alternative** below: a **full 68k instruction-lockstep** of our sound
+  68k against **two** LLE oracles — **Mednafen *and* MAME** (the latter added as a
+  strong second sound-68k reference; two agreeing oracles make "the bug is ours"
+  unambiguous). The lockstep finds the *first* 68k-execution divergence directly,
+  stopping the value-by-value recession that motivated HLE, **with no accuracy
+  compromise.** **HLE-ing the sound driver (this ADR) is the fallback** if the
+  lockstep cannot localize/fix the divergence in reasonable effort. The *synthesis
+  stays LLE* either way. The boundary analysis + options below are retained for
+  the fallback; the scope (B vs C) gate still applies if we land here.
 - **Date:** 2026-06-05
 
 ## Context
@@ -166,9 +168,16 @@ option recorded.
 - **HLE the synthesis too** — rejected: there is no higher-level model of PCM/FM/
   DSP synthesis to high-level-emulate; it *is* the low level, and it already
   works.
-- **A full 68k instruction-lockstep** (LLE) over the command window — the
-  accuracy-pure alternative to HLE: build a tool that diffs every 68k instruction
-  ours-vs-Mednafen to catch the first control-flow divergence directly, instead
-  of the value-by-value recession. More faithful and reusable, but real tooling
-  work and still LLE-bounded. This is the Option-A "keep pushing" path's next
-  instrument.
+- **A full 68k instruction-lockstep** (LLE) — **CHOSEN to try first** (see
+  Status). The accuracy-pure alternative to HLE: trace `(pc, full registers)` per
+  68k instruction from a known-identical start point (SNDON / driver entry) on
+  ours **and on two oracles, Mednafen *and* MAME**, then find the **first
+  instruction where they diverge** — a different branch (PC mismatch ⇒ ours read
+  different data or has a flag bug) or a different result on a matching PC
+  (register mismatch ⇒ our m68k core miscomputes). That single instruction is the
+  root; everything downstream (the value recession) follows from it. Dual oracles:
+  if Mednafen and MAME agree and ours differs, the bug is unambiguously ours; if
+  the two oracles differ, that itself is informative. Real tooling work (extend
+  our itrace to full registers; extend Mednafen's `SS_ITRACE`; solve MAME headless
+  `audiocpu` tracing — the GPU-debugger blocker noted in the diagnosis doc), but
+  faithful, reusable, and it ends the recession.
