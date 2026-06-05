@@ -50,6 +50,7 @@ We use Michael Nygard's lightweight format — see
 | [0009](0009-physdisc-libcdio-ffi-crate.md) | Live physical-disc reads via a feature-gated libcdio FFI crate | Accepted |
 | [0010](0010-hle-direct-boot.md) | Optional HLE direct boot (load the 1st-read program, bypass the BIOS CD loader) | Superseded |
 | [0011](0011-hle-bios-syscalls.md) | HLE the BIOS system-call library for cold direct boot | Superseded |
+| [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Accepted in principle |
 
 ### Decisions worth recording (backlog)
 
