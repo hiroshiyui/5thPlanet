@@ -27,11 +27,11 @@
 
 use super::{Ram, SLOT_STRIDE, ScspCtrl};
 
-/// Timer-B sequence-tick period, in 44.1 kHz samples. The BIOS driver reloads
-/// `TIMB` so its sequence ISR fires at ~this rate (measured ~88 samples/tick); the
-/// HLE tracks the cadence itself, since the 68k driver that would reload `TIMB` no
-/// longer runs.
-const TIMER_B_PERIOD: u32 = 88;
+/// Timer-B sequence-tick period, in 44.1 kHz samples — the cadence the BIOS
+/// driver's sequence ISR runs at (the HLE tracks it itself, since the 68k driver
+/// that reloads `TIMB` no longer runs). Calibrated from the reference: a note's
+/// `gate` of 0xE0 = 224 ticks held the chord for ~26 200 samples → ~117/tick.
+const TIMER_B_PERIOD: u32 = 117;
 
 /// Sound-RAM byte offset where the BGM sequence's *playback* events begin (after
 /// the per-channel setup header), and the BGM voices' shared PCM sample.
@@ -132,6 +132,9 @@ pub(crate) struct HleSoundDriver {
     program: [u8; 16],
     /// Round-robin next voice index (0..8).
     next_voice: u8,
+    /// Per-voice Timer-B ticks remaining until note-off (0 = idle). Set from the
+    /// note's `gate` byte; when it elapses the voice's four operators are released.
+    gate_ticks: [u32; 8],
 }
 
 impl HleSoundDriver {
@@ -147,9 +150,21 @@ impl HleSoundDriver {
         self.seq_tick(ram, ctrl);
     }
 
-    /// One Timer-B tick: count down the delta-time, and when it elapses, process
-    /// the sequence's next run of (simultaneous) events.
+    /// One Timer-B tick: age the keyed voices toward their note-off, then (unless
+    /// the segment has ended) count down the delta-time and process the next run
+    /// of simultaneous events.
     fn seq_tick(&mut self, ram: &mut Ram, ctrl: &mut ScspCtrl) {
+        // Gate countdown → note-off. Runs every tick, including after the segment
+        // ends (`stopped`), so the sustained chord rings for its gated duration
+        // and then releases (the panel BGM is one held chord, not a loop).
+        for v in 0..8u32 {
+            if self.gate_ticks[v as usize] > 0 {
+                self.gate_ticks[v as usize] -= 1;
+                if self.gate_ticks[v as usize] == 0 {
+                    key_off_voice(ctrl, v);
+                }
+            }
+        }
         if self.stopped {
             return;
         }
@@ -162,20 +177,24 @@ impl HleSoundDriver {
             self.seq_pos = SEQ_START;
         }
         if self.delta > 0 {
+            // Wait out the delta-time; process this tick's events when it reaches 0.
             self.delta -= 1;
-            return;
+            if self.delta > 0 {
+                return;
+            }
         }
         // Process events until one carries a non-zero delta (advance time), the
-        // tick ends (0x83), or an unmodelled event is hit.
+        // segment ends (0x83), or an unmodelled event is hit.
         for _ in 0..64 {
             let status = ram.read8(self.seq_pos);
             if status < 0x80 {
                 // Note-on: status, note, velocity, gate, delta.
                 let chan = (status & 0x1F) as usize;
                 let note = ram.read8(self.seq_pos + 1) as i32;
+                let gate = ram.read8(self.seq_pos + 3) as u32;
                 let delta = ram.read8(self.seq_pos + 4) as u32;
                 self.seq_pos += 5;
-                self.key_voice(ctrl, chan, note);
+                self.key_voice(ctrl, chan, note, gate);
                 if delta > 0 {
                     self.delta = delta;
                     return;
@@ -206,35 +225,46 @@ impl HleSoundDriver {
                     self.delta = delta;
                     return;
                 }
-            } else if status == 0x83 {
-                // End-of-tick marker.
-                self.seq_pos += 1;
-                return;
             } else {
-                // An event the parser doesn't model yet — stop cleanly.
+                // 0x83 end-of-segment, or an event the parser doesn't model yet:
+                // stop reading the sequence. The keyed voices keep aging out via
+                // their gate countdown above.
                 self.stopped = true;
                 return;
             }
         }
     }
 
-    /// Key a 4-operator FM voice for `note` (the instrument is the channel's
-    /// program). Allocates the next round-robin voice and programs its four
-    /// operator slots `{v, v+8, v+16, v+24}`, keying them together.
-    fn key_voice(&mut self, ctrl: &mut ScspCtrl, _chan: usize, note: i32) {
+    /// Key a 4-operator FM voice for `note`, gated for `gate` Timer-B ticks. The
+    /// next round-robin voice owns slots `{v, v+8, v+16, v+24}`; any note it was
+    /// still playing is released first (key-on is edge-triggered, so a re-used
+    /// slot must be turned off before it can restart).
+    fn key_voice(&mut self, ctrl: &mut ScspCtrl, _chan: usize, note: i32, gate: u32) {
         let v = self.next_voice as u32;
         self.next_voice = (self.next_voice + 1) & 7;
-        let instr = &INSTRUMENT_PROG7; // the only RE'd instrument so far
-        for (op_i, op) in instr.iter().enumerate() {
-            let slot = v + op_i as u32 * 8;
-            program_operator(ctrl, slot, note, op);
+        key_off_voice(ctrl, v);
+        for (op_i, op) in INSTRUMENT_PROG7.iter().enumerate() {
+            program_operator(ctrl, v + op_i as u32 * 8, note, op);
         }
         // Strobe KYONEX on the carrier (slot v+24) — keys all four (they share
         // KYONB), edge-triggered across the slots.
-        let carrier = v + 24;
         let hi = ((BGM_SAMPLE_SA >> 16) & 0xF) as u16;
-        ctrl.write16(carrier * SLOT_STRIDE, 0x1800 | 0x0020 | hi);
+        ctrl.write16((v + 24) * SLOT_STRIDE, 0x1800 | 0x0020 | hi);
+        self.gate_ticks[v as usize] = gate.max(1);
     }
+}
+
+/// Release voice `v`'s four operator slots (note-off): clear each slot's KYONB,
+/// then strobe KYONEX once so the SCSP runs key-off across them (their envelopes
+/// enter release). A no-op for slots already off.
+fn key_off_voice(ctrl: &mut ScspCtrl, v: u32) {
+    for op_i in 0..4u32 {
+        let slot = v + op_i * 8;
+        let r0 = ctrl.slot_reg(slot as usize, 0);
+        ctrl.write16(slot * SLOT_STRIDE, r0 & !0x0800); // clear KYONB (no strobe)
+    }
+    let r0 = ctrl.slot_reg(v as usize, 0);
+    ctrl.write16(v * SLOT_STRIDE, r0 | 0x1000); // KYONEX → key-off the cleared slots
 }
 
 /// Convert a MIDI note to the SCSP reg-8 `OCT|FNS` pitch word, relative to the
