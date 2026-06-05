@@ -221,6 +221,11 @@ pub struct Saturn {
     master_id: EntityId,
     slave_id: EntityId,
     cd_id: EntityId,
+    /// Debug-only: per-instruction master-SH-2 PC + accumulated cycle stream, for
+    /// a cost-per-instruction lockstep vs Mednafen's `SS_MASTER_PCSTREAM` (the
+    /// master-side analog of the 68k `pcstream`). `#[serde(skip)]`.
+    #[serde(skip)]
+    master_pcstream: Option<Vec<(u32, u64)>>,
 }
 
 impl Saturn {
@@ -242,6 +247,7 @@ impl Saturn {
             master_id,
             slave_id,
             cd_id,
+            master_pcstream: None,
         }
     }
 
@@ -372,6 +378,18 @@ impl Saturn {
             .entity_mut(self.master_id)
             .sh2_mut()
             .take_pc_trace()
+    }
+
+    /// Debug-only: arm the per-instruction master-SH-2 PC+cycle stream (the
+    /// master-side `pcstream`; recorded in `step_cpus_hooked`, capped). Drain
+    /// with [`Self::take_master_pcstream`].
+    pub fn enable_master_pcstream(&mut self) {
+        self.master_pcstream.get_or_insert_with(Vec::new);
+    }
+
+    /// Debug-only: drain the master PC+cycle stream `(pc, accumulated_cycle)`.
+    pub fn take_master_pcstream(&mut self) -> Vec<(u32, u64)> {
+        self.master_pcstream.take().unwrap_or_default()
     }
 
     /// Debug-only: start / drain a full-speed *slave*-PC trace (M12 slave
@@ -789,6 +807,7 @@ impl Saturn {
             master_id,
             slave_id,
             cd_id,
+            master_pcstream,
             ..
         } = self;
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
@@ -853,6 +872,18 @@ impl Saturn {
             }
             // Master leads by one instruction.
             before_master(scheduler.entity(*master_id).sh2());
+            // Debug master PC+cycle stream (cost-lockstep vs Mednafen), capped.
+            // Skip delay-slot PCs so the stream is one entry per logical
+            // instruction, matching Mednafen's per-`Step` log (the delay slot's
+            // cost folds into the branch's cycle delta).
+            if let Some(ps) = master_pcstream.as_mut()
+                && ps.len() < 16_000_000
+            {
+                let e = scheduler.entity(*master_id).sh2();
+                if !e.cpu.next_is_delay_slot() {
+                    ps.push((e.cpu.regs.pc, e.cpu.pipeline.cycles));
+                }
+            }
             scheduler.entity_mut(*master_id).step(bus);
             apply_fti!(); // master may have pulsed the slave's (or its own) FTI
             // If the master's instruction triggered an SCU DMA, run it now and

@@ -2329,6 +2329,12 @@ fn bios_audio_probe() {
     if pcstream.is_some() {
         sat.bus.scsp.enable_pcstream();
     }
+    // MASTER_PCSTREAM=<file>: capture every master-SH-2 PC + accumulated cycle,
+    // for a cost-per-instruction lockstep vs Mednafen's SS_MASTER_PCSTREAM.
+    let master_pcstream = std::env::var("MASTER_PCSTREAM").ok();
+    if master_pcstream.is_some() {
+        sat.enable_master_pcstream();
+    }
     // MASTERHIST: histogram the master SH-2 PC ring at the end — what loop the
     // master is in near the BGM trigger (the master-side trigger gate, M12 #5).
     // Run with FRAMES set to just before the trigger (~594).
@@ -2605,6 +2611,16 @@ fn bios_audio_probe() {
             }
             Err(_) => print!("{out}"),
         }
+    }
+    if let Some(p) = master_pcstream {
+        let s = sat.take_master_pcstream();
+        let out: String = s.iter().map(|(pc, c)| format!("{pc:08X} {c}\n")).collect();
+        std::fs::write(&p, out).unwrap();
+        println!(
+            "  MASTER_PCSTREAM: wrote {} master PCs to {p} (first={:08X})",
+            s.len(),
+            s.first().map(|(pc, _)| *pc).unwrap_or(0)
+        );
     }
     if let Some(p) = pcstream {
         let s = sat.bus.scsp.take_pcstream();
