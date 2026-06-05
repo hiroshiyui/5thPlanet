@@ -294,7 +294,10 @@ fn program_operator(ctrl: &mut ScspCtrl, slot: u32, note: i32, op: &Operator) {
     ctrl.write16(base + 0x10, note_to_octfns(note + op.note_off)); // reg 8: pitch
     ctrl.write16(base + 0x12, 0x0000); // reg 9: LFO off
     ctrl.write16(base + 0x14, 0x0000); // reg 10: no DSP send
-    ctrl.write16(base + 0x16, if op.direct { 0xE000 } else { 0x0000 }); // reg 0xB: DISDL/pan
+    // reg 0xB: only the carrier sends to the direct output. Full level (DISDL=7)
+    // clips when three carriers sum; DISDL=6 (centre) keeps the chord loud and
+    // clean. Modulators send nowhere direct (they only feed the FM SoundStack).
+    ctrl.write16(base + 0x16, if op.direct { 0xC000 } else { 0x0000 });
     // reg 0: KYONB | forward-loop | SA-hi (no KYONEX — the carrier strobes it).
     let hi = ((BGM_SAMPLE_SA >> 16) & 0xF) as u16;
     ctrl.write16(base, 0x0800 | 0x0020 | hi);

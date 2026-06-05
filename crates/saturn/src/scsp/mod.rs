@@ -744,7 +744,14 @@ impl ScspCtrl {
         // exponential ramps over ~16 samples like the real SCSP / Mednafen.
         let ar_step = ar(reg4 & 0x1F, &t.ar);
         let lin_samples = ((0x280i64 << EG_SHIFT) / (ar_step as i64).max(1)).max(1) as u64;
-        let ar_shift = (lin_samples.ilog2() + 1).clamp(2, 15);
+        // The exponential rise (`volume += remaining >> ar_shift`) reaches
+        // perceptual full in ~2.3·2^ar_shift samples (it is within ~10% after
+        // ~ln(10) time-constants), *not* 2^ar_shift. The old `ilog2 + 1` treated
+        // `lin_samples` as 2^ar_shift directly, so it overshot the shift by ~3 and
+        // ran every attack ~8× too slow — inaudibly slow for intermediate rates
+        // like AR=8 (a ~4.8 s rise where the SCSP/Mednafen is ~0.55 s). Subtract
+        // the ~ln(range) offset so the rise matches the rate's actual duration.
+        let ar_shift = lin_samples.ilog2().saturating_sub(3).clamp(2, 15);
         Eg {
             state: EgState::Attack,
             volume: 0x17F << EG_SHIFT,
