@@ -390,6 +390,21 @@ fn run(
                     },
                     Err(e) => eprintln!("no state to load ({e})"),
                 },
+                // F8: play the disc's first CD-DA (Red Book audio) track through
+                // the live SCSP-mixed output. Lets an audio disc actually play in
+                // the window without the BIOS issuing Play (the LLE-68k trigger
+                // wall) — the CDDA→SCSP path is faithful; only the trigger is
+                // missing. A no-op (toast) if the disc has no audio track.
+                Event::KeyDown {
+                    keycode: Some(Keycode::F8),
+                    ..
+                } => {
+                    if saturn.dbg_play_first_audio_track() {
+                        osd.set_toast("Playing CD audio", 120);
+                    } else {
+                        osd.set_toast("No CD audio track", 120);
+                    }
+                }
                 _ => {}
             }
         }

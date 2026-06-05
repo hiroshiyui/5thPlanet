@@ -364,6 +364,12 @@ pub struct CdBlock {
     /// interleaved 16-bit stereo at 44.1 kHz. The read pump fills this while an
     /// **audio** track plays (M10); `Saturn::take_audio` drains and mixes it.
     cd_audio: VecDeque<i16>,
+    /// CD-DA jitter-buffer priming flag: the read pump fills [`Self::cd_audio`]
+    /// in sector bursts on the scheduler's batch cadence, but the host drains it
+    /// smoothly per audio frame. Stay un-primed (mix silence, keep buffering)
+    /// until a pre-roll cushion has built, then drain; re-arm on a dry buffer.
+    /// Without this the steady drain outruns the bursty fill and CDDA stutters.
+    cd_audio_primed: bool,
 
     // ---- buffer/filter/partition engine (M7 phase 2) ----
     /// Shared 200-block sector pool; free slots have `size < 0`.
@@ -570,6 +576,7 @@ impl CdBlock {
             xfer_done: 0,
             transfer_request: false,
             cd_audio: VecDeque::new(),
+            cd_audio_primed: false,
             blocks: vec![Block::free(); MAX_BLOCKS],
             free_blocks: MAX_BLOCKS as i32,
             buf_full: false,
@@ -1176,6 +1183,52 @@ impl CdBlock {
         self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
     }
 
+    /// Demo/debug hook: start CD-DA (Red Book) playback of `sectors` sectors
+    /// from FAD `fad`, exactly as a host **Play** command would (it calls the
+    /// same [`Self::start_seek`]) — the drive seeks, reaches [`DrivePhase::Play`],
+    /// and the periodic read pump streams the audio track to the CD-DA mixer that
+    /// [`crate::system::Saturn::take_audio`] sums into the output. This lets a
+    /// demo *drive the running machine* to play an audio disc without the BIOS
+    /// issuing Play itself (the LLE-68k trigger wall). Observer-only: it reuses
+    /// the real play path and adds no new core behaviour.
+    pub fn dbg_play_cdda(&mut self, fad: u32, sectors: u32) {
+        self.start_seek(0x80_0000 | fad, 0x80_0000 | (fad + sectors), 0, HIRQ_PEND);
+    }
+
+    /// Demo/debug: find the first Red Book **audio** track on the disc and start
+    /// playing it as CD-DA (see [`Self::dbg_play_cdda`]); returns whether one was
+    /// found. The frontend's "play CD audio" key calls this so an audio disc
+    /// plays through the live SCSP-mixed output without the BIOS issuing Play
+    /// (the LLE-68k trigger wall). Walks the tracks by FAD to the lead-out.
+    pub fn dbg_play_first_audio_track(&mut self) -> bool {
+        let found = {
+            let Some(disc) = self.disc.as_ref() else {
+                return false;
+            };
+            let lead_out = disc.lead_out_fad();
+            let mut fad = FAD_OFFSET;
+            let mut found = None;
+            while fad < lead_out {
+                let Some(t) = disc.track_at_fad(fad) else {
+                    break;
+                };
+                if t.is_audio {
+                    found = Some((t.start_fad, t.length));
+                    break;
+                }
+                fad = t.start_fad + t.length.max(1);
+            }
+            found
+        };
+        match found {
+            Some((start, len)) => {
+                self.dbg_play_cdda(start, len);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Park the drive: cancel any active play/seek and return the phase machine
     /// to idle (no read range). Called by Init / Abort File / Seek-stop / disc
     /// insert+eject so the host-visible state is consistent with those commands'
@@ -1453,8 +1506,12 @@ impl CdBlock {
     }
 
     /// Decode one Red Book audio sector at `fad` into the CD-DA FIFO: 2352 raw
-    /// bytes = 588 interleaved 16-bit little-endian stereo frames. Capped at ~1 s
-    /// so the buffer can't grow unbounded if the host stops draining audio.
+    /// bytes = 588 interleaved 16-bit little-endian stereo frames. Capped at a
+    /// few seconds so the buffer can't grow unbounded if the host stops draining
+    /// audio, while still absorbing the read pump's sector-burst fills (the
+    /// scheduler ticks the drive in batches, so several sectors can decode in one
+    /// step; a tight cap would drop them and the audio would gap — see
+    /// [`Self::take_cd_audio`]'s jitter buffer).
     fn read_cd_audio_sector(&mut self, fad: u32) -> bool {
         let Some(disc) = self.disc.as_ref() else {
             return false;
@@ -1467,21 +1524,50 @@ impl CdBlock {
             self.cd_audio
                 .push_back(i16::from_le_bytes([frame[0], frame[1]]));
         }
-        const CAP: usize = 44_100 * 2; // ~1 second of stereo samples
+        const CAP: usize = 44_100 * 2 * 5; // ~5 s of stereo samples
         while self.cd_audio.len() > CAP {
             self.cd_audio.pop_front();
         }
         true
     }
 
-    /// Drain up to `n` decoded CD-DA samples (interleaved stereo), padding with
-    /// silence if fewer are buffered. Called by `Saturn::take_audio` to mix CD
-    /// audio with the SCSP output.
+    /// Drain up to `n` decoded CD-DA samples (interleaved stereo) **raw** —
+    /// exactly what's buffered, padded with silence if short. The low-level
+    /// drain used by the decode tests and the byte-exact CDDA demo. Realtime
+    /// playback should use [`Self::take_cd_audio_buffered`] instead.
     pub fn take_cd_audio(&mut self, n: usize) -> Vec<i16> {
         let take = n.min(self.cd_audio.len());
         let mut v: Vec<i16> = self.cd_audio.drain(..take).collect();
         v.resize(n, 0);
         v
+    }
+
+    /// Drain `n` CD-DA samples for **realtime playback** (`Saturn::take_audio`),
+    /// through a **pre-roll jitter buffer**: the read pump fills [`Self::cd_audio`]
+    /// in sector bursts on the scheduler's batch cadence, but the host pulls a
+    /// smooth `n` every audio frame. Draining 1:1 from a near-empty buffer would
+    /// pad silence on every fill gap → audible stutter. Instead we hold off (mix
+    /// silence, keep buffering) until a ~0.5 s cushion exists, then drain.
+    ///
+    /// Re-priming happens **only when the buffer is fully drained** — a genuine
+    /// stall or end-of-track — not on a sub-frame near-miss. Re-priming on every
+    /// dip-below-`n` (the first cut) re-buffered a fresh half-second of silence
+    /// whenever the cushion was still settling against the seek startup + bursty
+    /// fill, which stuttered at the *start* of playback. A near-miss now just
+    /// pads the shortfall once; only a true empty re-arms the cushion.
+    pub fn take_cd_audio_buffered(&mut self, n: usize) -> Vec<i16> {
+        const PREROLL: usize = 44_100; // ~0.5 s of interleaved stereo
+        if !self.cd_audio_primed {
+            if self.cd_audio.len() < PREROLL.max(n) {
+                return vec![0i16; n];
+            }
+            self.cd_audio_primed = true;
+        }
+        let out = self.take_cd_audio(n);
+        if self.cd_audio.is_empty() {
+            self.cd_audio_primed = false; // fully drained → re-buffer before resuming
+        }
+        out
     }
 
     /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
@@ -2711,6 +2797,75 @@ mod tests {
     fn take_cd_audio_pads_with_silence_when_empty() {
         let mut c = CdBlock::new();
         assert_eq!(c.take_cd_audio(8), vec![0i16; 8]);
+    }
+
+    /// Demonstration (manual): our CD-block decodes the REAL Doukyuusei disc's
+    /// Track 2 (Red Book audio — the "this disc is a SEGA Saturn game" warning)
+    /// to the exact PCM you hear from
+    /// `aplay -f S16_LE -r 44100 -c 2 "…(Track 2).bin"`. This proves the
+    /// CDDA→SCSP path produces real, faithful sound **today** — the drive plays
+    /// the disc bit-for-bit; the only thing missing for the in-panel experience
+    /// is the BIOS issuing the Play command (the LLE-68k/trigger wall). Dumps our
+    /// own output to `/tmp/ours_track2.pcm` so it can be played back and compared:
+    ///   aplay -f S16_LE -r 44100 -c 2 /tmp/ours_track2.pcm
+    #[test]
+    #[ignore = "manual: decode the real disc's CD-DA track (needs roms/)"]
+    fn cdda_plays_real_disc_track2_audio() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cue_name = "Doukyuusei - if (Japan) (1M, 2M).cue";
+        let Ok(cue) = std::fs::read_to_string(root.join("roms").join(cue_name)) else {
+            println!("no roms/{cue_name}; skipped");
+            return;
+        };
+        let disc = Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+            .expect("parse the Doukyuusei cue");
+        let audio = disc
+            .tracks()
+            .iter()
+            .find(|t| matches!(t.mode, crate::disc::TrackMode::Audio))
+            .expect("the disc has a Red Book audio track");
+        let start_fad = audio.start_fad;
+        println!(
+            "audio track #{} at FAD {start_fad}, {} sectors",
+            audio.number, audio.length
+        );
+
+        // Decode the whole warning track (75 sectors ≈ 1 s each). Expected PCM
+        // straight off the disc image (the same bytes aplay played).
+        let sectors = audio.length;
+        let mut expect: Vec<i16> = Vec::with_capacity(sectors as usize * 1176);
+        for i in 0..sectors {
+            let sec = disc
+                .read_full_sector(start_fad + i)
+                .expect("audio sector present");
+            expect.extend(sec.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+        }
+
+        // Drive the CD-block's read pump exactly as a Play command would: one
+        // audio sector per `play_data`, draining each to our CD-DA mixer output
+        // as we go (so the ~1 s FIFO cap never drops a sector).
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        c.status = STAT_PLAY;
+        c.cd_curfad = start_fad;
+        c.fadstoplay = sectors as i64;
+        let mut pcm: Vec<i16> = Vec::with_capacity(sectors as usize * 1176);
+        for _ in 0..sectors {
+            c.play_data();
+            pcm.extend(c.take_cd_audio(1176));
+        }
+
+        let peak = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+        assert!(peak > 1000, "CD-DA output is real audio (peak {peak}), not silence");
+        assert_eq!(pcm, expect, "our CD-DA decode is byte-identical to the disc");
+
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let _ = std::fs::write("/tmp/ours_track2.pcm", &bytes);
+        println!(
+            "decoded {} CD-DA samples, peak {peak} — faithful. wrote /tmp/ours_track2.pcm\n  \
+             play it: aplay -f S16_LE -r 44100 -c 2 /tmp/ours_track2.pcm",
+            pcm.len()
+        );
     }
 
     #[test]

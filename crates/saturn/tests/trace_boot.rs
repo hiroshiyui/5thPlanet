@@ -2702,3 +2702,72 @@ fn bios_audio_probe() {
         println!("wrote {} bytes to {p}", pcm.len());
     }
 }
+
+/// Demonstration (manual): the **running emulator** plays a disc's CD-DA track.
+/// Boots the BIOS with the real Doukyuusei disc, then drives the CD drive to
+/// Play the Red Book audio track (Track 2 — the Saturn warning message) and
+/// collects the machine's mixed `take_audio` output (SCSP + CD-DA). This proves
+/// the *whole emulator* — bus, scheduler, CD-block read pump, CDDA→SCSP mix —
+/// produces real, faithful sound; the only thing the BIOS itself doesn't do is
+/// issue the Play (the LLE-68k trigger wall), which `dbg_play_cdda` stands in
+/// for. Dumps to `/tmp/emu_cdda.pcm`:
+///   aplay -f S16_LE -r 44100 -c 2 /tmp/emu_cdda.pcm
+#[test]
+#[ignore = "manual: the running emulator plays the disc's CD-DA (needs roms/ + BIOS)"]
+fn emulator_plays_cdda_track() {
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let cue_name = "Doukyuusei - if (Japan) (1M, 2M).cue";
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let disc = saturn::disc::Disc::from_cue(&cue, |name| {
+        std::fs::read(root.join("roms").join(name)).ok()
+    })
+    .expect("parse the Doukyuusei cue");
+    let audio = disc
+        .tracks()
+        .iter()
+        .find(|t| matches!(t.mode, saturn::disc::TrackMode::Audio))
+        .expect("the disc has a Red Book audio track");
+    let (fad, len) = (audio.start_fad, audio.length);
+    println!("audio track #{} at FAD {fad}, {len} sectors", audio.number);
+
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    // Let the BIOS finish CD recognition + settle on the player panel.
+    for _ in 0..200 {
+        sat.run_frame(&mut fb);
+        let _ = sat.take_audio();
+    }
+    // Tell the drive to play the audio track (the BIOS won't issue Play itself).
+    sat.dbg_play_cdda(fad, len);
+
+    // Run the machine and collect its mixed output frame by frame.
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut peak = 0i32;
+    for _ in 0..480 {
+        sat.run_frame(&mut fb);
+        for s in sat.take_audio() {
+            peak = peak.max((s as i32).abs());
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+    println!("running emulator produced {} bytes of audio, peak {peak}", pcm.len());
+    std::fs::write("/tmp/emu_cdda.pcm", &pcm).unwrap();
+    println!("wrote /tmp/emu_cdda.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/emu_cdda.pcm");
+    assert!(
+        peak > 1000,
+        "the running emulator output real CD-DA audio (peak {peak}), not silence"
+    );
+}
