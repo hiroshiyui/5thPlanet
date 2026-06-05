@@ -333,6 +333,17 @@ pub struct ScspCtrl {
     /// and the noise sound-source). Clocked once per slot-cycle (32×/output
     /// sample), matching Mednafen `LFSR`. Resets to 1.
     lfsr: u32,
+    /// Slot-to-slot **FM** state (Mednafen `SoundStack`): a 64-entry ring of the
+    /// recent per-slot post-envelope outputs, written delayed by 4 slots through
+    /// `ss_delayer` and indexed by `global_counter` (incremented once per slot per
+    /// output sample). A slot's sample-read position is phase-modulated by two of
+    /// these entries — selected by reg 7 `MDXSL`/`MDYSL`, summed and scaled by
+    /// `MDL` — which is how the BIOS CD-player BGM synthesises its voices (4-
+    /// operator FM). Empty (silent) for non-FM content, so no effect there.
+    #[serde(with = "BigArray")]
+    sound_stack: [i16; 64],
+    ss_delayer: [i16; 4],
+    global_counter: u32,
     /// The effect DSP (reverb/echo); fed by slot effect-sends, mixed back in.
     dsp: dsp::Dsp,
     /// Current 68k interrupt-line level (0 = none); level-triggered.
@@ -372,6 +383,9 @@ impl ScspCtrl {
             sample_counter: 0,
             slots: [Slot::default(); NUM_SLOTS],
             lfsr: 1,
+            sound_stack: [0; 64],
+            ss_delayer: [0; 4],
+            global_counter: 0,
             dsp: dsp::Dsp::new(),
             asserted_level: 0,
             main_pending: false,
@@ -889,6 +903,46 @@ impl ScspCtrl {
         t
     }
 
+    /// Slot `i`'s **FM modulation** value (Mednafen `scsp.inc`): sum the two
+    /// `SoundStack` entries selected by reg 7 `MDXSL`/`MDYSL` (indexed off the
+    /// `global_counter`), scaled by `MDL`. Returns 0 when `MDL <= 4` (the SCSP's
+    /// "no modulation" floor), so non-FM slots are unaffected. The result is added
+    /// to the slot's phase fraction in [`Self::slot_sample`], shifting its read
+    /// position — the SCSP's phase-modulation FM.
+    fn fm_modalizer(&self, i: usize) -> i32 {
+        let srv = self.slot_reg(i, 7); // MDL[15:12] | MDXSL[11:6] | MDYSL[5:0]
+        let mdl = ((srv >> 12) & 0xF) as i32;
+        if mdl <= 4 {
+            return 0;
+        }
+        let mdx = ((srv >> 6) & 0x3F) as u32;
+        let mdy = (srv & 0x3F) as u32;
+        let gc = self.global_counter;
+        let x = self.sound_stack[(gc.wrapping_add(mdx) & 0x3F) as usize] as i32;
+        let y = self.sound_stack[(gc.wrapping_add(mdy) & 0x3F) as usize] as i32;
+        (((x + y) << 6) >> (0x10 - mdl)) & !1
+    }
+
+    /// Push slot output `sample` into the FM `SoundStack` and advance the global
+    /// slot counter — called once per slot per output sample (active or not), so
+    /// the stack indexing stays aligned. The value is delayed by four slots
+    /// (`ss_delayer`) before it lands in the stack, matching the SCSP's FM
+    /// feedback latency (Mednafen `scsp.inc`); a slot whose `STWINH` (reg 6 bit 9)
+    /// is set inhibits its own write.
+    fn push_sound_stack(&mut self, sample: i16) {
+        let gc = self.global_counter;
+        let prev = gc.wrapping_sub(4);
+        let inhibit = self.slot_reg((prev & 0x1F) as usize, 6) & 0x0200 != 0;
+        if !inhibit {
+            self.sound_stack[(prev & 0x3F) as usize] = self.ss_delayer[3];
+        }
+        self.ss_delayer[3] = self.ss_delayer[2];
+        self.ss_delayer[2] = self.ss_delayer[1];
+        self.ss_delayer[1] = self.ss_delayer[0];
+        self.ss_delayer[0] = sample;
+        self.global_counter = gc.wrapping_add(1);
+    }
+
     /// Produce one output sample (signed 16-bit, pre-envelope) for slot `i`,
     /// advancing its phase and applying the loop mode. Reads waveform data
     /// from `ram` (the SCSP sound RAM). Returns 0 for an inactive slot.
@@ -903,26 +957,56 @@ impl ScspCtrl {
         let lsa = self.slot_reg(i, 2) as u32;
         let lea = self.slot_reg(i, 3) as u32;
 
+        let modalizer = self.fm_modalizer(i);
         let (cur, nxt) = (self.slots[i].cur, self.slots[i].nxt);
-        let frac = (cur & ((1 << PHASE_SHIFT) - 1)) as i32;
         let one = 1i32 << PHASE_SHIFT;
-        // Linearly interpolate the current and next waveform samples.
-        let (p1, p2) = if pcm8 {
-            let a1 = cur >> PHASE_SHIFT;
-            let a2 = nxt >> PHASE_SHIFT;
-            (
-                ((ram.read8((sa + a1) & SOUND_RAM_MASK) as i8 as i32) << 8),
-                ((ram.read8((sa + a2) & SOUND_RAM_MASK) as i8 as i32) << 8),
-            )
+        let sample = if modalizer != 0 {
+            // Phase-modulation FM (reg 7): the modulator outputs summed in
+            // `fm_modalizer` shift this slot's read position by an integer sample
+            // offset plus a 6-bit interpolation fraction (Mednafen `scsp.inc`'s
+            // `sia`/`modalizer_int`). This is how the BIOS CD-player BGM voices
+            // are synthesised. Non-FM slots (modalizer == 0) keep the plain
+            // 12-bit interpolation below, so they're unaffected.
+            let base = ((cur >> PHASE_SHIFT) & 0xFFFF) as i32; // CurrentAddr (16-bit)
+            let frac6 = ((cur >> (PHASE_SHIFT - 6)) & 0x3F) as i32;
+            let sia_full = modalizer + frac6;
+            let m11 = (sia_full >> 6) & 0x7FF;
+            let mod_int = (m11 ^ 0x400) - 0x400; // sign-extend the 11-bit offset
+            let sia = sia_full & 0x3F;
+            let off = base + mod_int;
+            let (s0, s1) = if pcm8 {
+                let a0 = sa.wrapping_add(off as u32) & SOUND_RAM_MASK;
+                let a1 = sa.wrapping_add((off + 1) as u32) & SOUND_RAM_MASK;
+                (
+                    (ram.read8(a0) as i8 as i32) << 8,
+                    (ram.read8(a1) as i8 as i32) << 8,
+                )
+            } else {
+                let a0 = sa.wrapping_add((off * 2) as u32) & SOUND_RAM_MASK;
+                let a1 = sa.wrapping_add(((off + 1) * 2) as u32) & SOUND_RAM_MASK;
+                (ram.read16(a0) as i16 as i32, ram.read16(a1) as i16 as i32)
+            };
+            (((s0 * (0x40 - sia)) + (s1 * sia)) >> 6) as i16
         } else {
-            let a1 = (cur >> (PHASE_SHIFT - 1)) & !1;
-            let a2 = (nxt >> (PHASE_SHIFT - 1)) & !1;
-            (
-                ram.read16((sa + a1) & SOUND_RAM_MASK) as i16 as i32,
-                ram.read16((sa + a2) & SOUND_RAM_MASK) as i16 as i32,
-            )
+            let frac = (cur & ((1 << PHASE_SHIFT) - 1)) as i32;
+            // Linearly interpolate the current and next waveform samples.
+            let (p1, p2) = if pcm8 {
+                let a1 = cur >> PHASE_SHIFT;
+                let a2 = nxt >> PHASE_SHIFT;
+                (
+                    ((ram.read8((sa + a1) & SOUND_RAM_MASK) as i8 as i32) << 8),
+                    ((ram.read8((sa + a2) & SOUND_RAM_MASK) as i8 as i32) << 8),
+                )
+            } else {
+                let a1 = (cur >> (PHASE_SHIFT - 1)) & !1;
+                let a2 = (nxt >> (PHASE_SHIFT - 1)) & !1;
+                (
+                    ram.read16((sa + a1) & SOUND_RAM_MASK) as i16 as i32,
+                    ram.read16((sa + a2) & SOUND_RAM_MASK) as i16 as i32,
+                )
+            };
+            ((p1 * (one - frac) + p2 * frac) >> PHASE_SHIFT) as i16
         };
-        let sample = ((p1 * (one - frac) + p2 * frac) >> PHASE_SHIFT) as i16;
 
         // Advance the phase and re-derive the next-sample address. `step_mod`
         // is this sample's PLFO (pitch-LFO) contribution — 0 unless the LFO is
@@ -996,6 +1080,9 @@ impl ScspCtrl {
             // 17-bit Galois step `(LFSR>>1) | (((LFSR>>5)^LFSR)&1)<<16`).
             self.lfsr = (self.lfsr >> 1) | ((((self.lfsr >> 5) ^ self.lfsr) & 1) << 16);
             if !self.slots[i].active {
+                // Inactive slots still record a 0 into the FM SoundStack and
+                // advance the global slot counter, so the stack stays aligned.
+                self.push_sound_stack(0);
                 continue;
             }
             // Advance the slot's LFO (sets this sample's PLFO phase delta + ALFO
@@ -1028,6 +1115,10 @@ impl ScspCtrl {
                     self.dsp.set_sample(voice << imxl, isel);
                 }
             }
+            // FM: record this slot's post-envelope output for any slot that
+            // modulates from it, and advance the global slot counter (Mednafen
+            // `scsp.inc` SoundStack). Inactive slots pushed 0 above.
+            self.push_sound_stack(voice.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
         if dsp_on {
             // Configure the delay ring from RBL/RBP (reg 0x402) and run the
@@ -2274,6 +2365,51 @@ mod tests {
             b.take_audio(),
             "enable→disable HLE leaves the LLE output byte-identical"
         );
+    }
+
+    #[test]
+    fn fm_modulation_changes_the_carrier_output() {
+        // A slot whose reg-7 MDL>4 reads the SoundStack phase-modulates its sample
+        // read; with the stack populated by another (directly-muted) slot, the
+        // carrier's output must differ from the same slot with modulation off —
+        // proving the FM path (modalizer + SoundStack write) is wired (ADR-0012;
+        // Mednafen `scsp.inc`). The 4-operator version of this drives the BIOS BGM.
+        fn render(mdl: u16) -> Vec<i16> {
+            let mut c = ScspCtrl::new();
+            let mut ram = Ram::new(SOUND_RAM_BYTES);
+            // A non-trivial 256-sample waveform so a shifted read is visible.
+            for k in 0..256u32 {
+                ram.write16(0x1000 + k * 2, (k.wrapping_mul(257) ^ 0x55AA) as u16);
+            }
+            // Program a slot: SA=0x1000, forward loop 0..255, instant attack, full
+            // level, native rate. `disdl` routes the direct output; `reg7` is the
+            // FM register (MDL|MDXSL|MDYSL).
+            let prog = |c: &mut ScspCtrl, slot: u32, disdl: u16, reg7: u16| {
+                let b = slot * SLOT_STRIDE;
+                c.write16(b + 0x02, 0x1000); // SA low
+                c.write16(b + 0x06, 0x00FF); // LEA = 255
+                c.write16(b + 0x08, 0x001F); // AR = max
+                c.write16(b + 0x0C, 0x0000); // TL = 0
+                c.write16(b + 0x0E, reg7); // MDL/MDXSL/MDYSL
+                c.write16(b + 0x16, disdl); // DISDL/DIPAN
+                c.write16(b, 0x1820); // KYONEX|KYONB|forward-loop
+            };
+            // Eight consecutive slots active, so the 64-entry SoundStack is
+            // densely populated (the FM read delay is 4 slots, so a sparse stack
+            // would land on a silent slot). Only slot 7 carries the modulation
+            // level `mdl`; slots 0-6 are identical in both renders, so any output
+            // difference is purely slot 7's phase modulation. MDXSL/MDYSL = 0x3B
+            // reads a recently-written (populated) entry.
+            for s in 0..7 {
+                prog(&mut c, s, 0xE000, 0x0000);
+            }
+            prog(&mut c, 7, 0xE000, (mdl << 12) | (0x3B << 6) | 0x3B);
+            (0..200).map(|_| c.mix(&mut ram).0).collect()
+        }
+        let off = render(0x0); // slot 7 modulation off (MDL=0)
+        let on = render(0xA); // slot 7 modulation on (MDL=0xA)
+        assert!(on.iter().any(|&x| x != 0), "the slots produced audio");
+        assert_ne!(off, on, "MDL>4 phase-modulates slot 7's read");
     }
 
     #[test]
