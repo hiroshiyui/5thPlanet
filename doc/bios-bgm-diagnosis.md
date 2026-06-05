@@ -5,6 +5,23 @@
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence
 in the sound 68k — a timing-accumulation bug, not a missing feature.
 
+> **Update (2026-06-05b) — corroborated the `a4=0x9800` sequence thread + ruled
+> out two false leads.** A fresh `SS_KYONEX` capture (with the new probe-side
+> `voice7034`/`req500` dump matching its format, in `trace_boot.rs`) shows
+> Mednafen fires **two** key-on paths: `0x1B44` (the COMMAND path, `voice7034`@`0x7034`)
+> and **`0x2E78`** (the SEQUENCE path) — both real. **The master's command values
+> match:** `req500 = 80 80 80 80 80 80 80 00` byte-identical in ours and Mednafen,
+> so this is **not** a wrong-command bug. Two earlier guesses are now **VOID:**
+> (a) a brief "channel-active gate at `0x7F00` never set" reading — wrong address;
+> the real BGM channels are at **`0x9900`** (`a4=0x9800`), and the RAM there *is*
+> non-zero (the struct IS set up), confirming this doc's `a4=0x9800` thread; and
+> (b) treating `0x2E76`/`0x2E78` as a red herring — it is a live sequence key-on
+> path. **The standing lead is unchanged:** the BGM is the sequence path (`0x40F2`
+> tick → channels `0x9900` → voices → `0x2E78`); ours sets up `0x9800` but never
+> reaches `0x2E78`, and the earliest divergence is the volume-fade target
+> **`[0x9809]` (ours 0x0F vs Mednafen 0x00)** written by `0x4924`. Next: who writes
+> `[0x9809]` and why ours = 0x0F.
+
 > **Update (2026-06-05) — the BGM sequence is a4=0x9800; the earliest BGM-struct
 > divergence is a VOLUME-FADE target, not a rate.** A scope **checksum sweep** (the
 > new width-0 channel, `1e99f34`) of the 68k work area localized the upstream
