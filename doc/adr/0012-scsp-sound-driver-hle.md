@@ -1,16 +1,23 @@
 # 0012. SCSP sound-driver HLE — design study
 
-- **Status:** Accepted in principle but **DEFERRED — fallback only** (2026-06-05).
-  After reading this study the user chose to first attempt the **accuracy-
-  preserving alternative** below: a **full 68k instruction-lockstep** of our sound
-  68k against **two** LLE oracles — **Mednafen *and* MAME** (the latter added as a
-  strong second sound-68k reference; two agreeing oracles make "the bug is ours"
-  unambiguous). The lockstep finds the *first* 68k-execution divergence directly,
-  stopping the value-by-value recession that motivated HLE, **with no accuracy
-  compromise.** **HLE-ing the sound driver (this ADR) is the fallback** if the
-  lockstep cannot localize/fix the divergence in reasonable effort. The *synthesis
-  stays LLE* either way. The boundary analysis + options below are retained for
-  the fallback; the scope (B vs C) gate still applies if we land here.
+- **Status:** **Accepted — implementing** (2026-06-05). The accuracy-preserving
+  alternative below — a **full 68k instruction-lockstep** vs the Mednafen LLE
+  oracle — *was tried first* and banked a real **16× accuracy win** (per-instruction
+  m68k cycle penalties, `5bd7131`: the lockstep's first divergence moved from
+  instruction 14,509 to 230,967). But it did **not** fix the BGM in reasonable
+  effort: the residual is a deep sub-instruction-timer-granularity rework, and the
+  divergence sits ~frame 110, far before the BGM key-on at ~frame 592. That is
+  exactly the trigger condition this ADR set for the **HLE fallback**, so we now
+  implement it. Two go/no-go gates passed first: the **synthesis is LLE-correct**
+  (the sine test ROM matches Mednafen `SS_SINETEST` to 0.2 % / 0.99972 correlation
+  → synthesis *stays LLE*, the oracle), and the **68k-driven sine ROM proves our
+  hosted 68k can drive the SCSP** → the HLE boundary ("produce the slot-register
+  writes the LLE synthesis consumes") is viable. **M1 (opt-in scaffold + boundary
+  proof) landed `b8d9870`** — the native driver keys a voice from the sequence's
+  first note-on on the real audio-CD panel (avg amplitude 5792 where the LLE driver
+  was 0). The implementation plan + remaining milestones (M2 sequence player, M3
+  voice allocator, M4 CC/pitch, M5 instrument-bank RE vs `SS_KYONEX`) are the
+  approved plan; the scope (B vs C) gate is resolved at M5.
 - **Date:** 2026-06-05
 
 ## Context
