@@ -302,6 +302,13 @@ fn waits_for(addr: u32, write: bool) -> u32 {
                 20
             }
         }
+        // A-bus CS2 (`0x05800000..=0x058FFFFF`): the CD-block host registers + its
+        // SCU-DMA data port. Mednafen `scu.inc` ABusRW_DB charges the SH-2 **+8**
+        // per access (read and write alike). The BIOS audio-CD player polls the
+        // CD HIRQ / CR1–4 status here every panel loop, so a 0-wait here let the
+        // master outrun the LLE reference (the BGM-trigger phase lead — the master
+        // reaches its BGM command ~43 Timer-B ticks early).
+        0x0580_0000..=0x058F_FFFF => 8,
         _ => STUB_WAITS,
     }
 }
