@@ -2508,6 +2508,19 @@ fn bios_audio_probe() {
             w(0x708),
             w(0x70C)
         );
+        // Match Mednafen's SS_KYONEX dump format for a direct diff: the high byte
+        // of the BE word (= what the 68k's move.b reads). voice7034 = the 8 voice
+        // KYONB flags (0x7034 + k*0x40); req500 = the 8 master requests (0x504 + k*8).
+        let hb = |o: u32| (ram.read16(o) >> 8) & 0xFF;
+        print!("  voice7034:");
+        for k in 0..8u32 {
+            print!(" {:02X}", hb(0x7034 + k * 0x40));
+        }
+        print!("  | req500:");
+        for k in 0..8u32 {
+            print!(" {:02X}", hb(0x504 + k * 8));
+        }
+        println!();
     }
     if trace68.is_some() {
         // Whole-run footprint: every distinct 68k PC executed, bucketed by 0x100
