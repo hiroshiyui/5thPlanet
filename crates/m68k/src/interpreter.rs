@@ -969,8 +969,14 @@ impl Cpu {
         let ea_reg = op & 7;
         let opmode = (op >> 6) & 7;
 
-        // ADDX/SUBX: bit 8 set with the addressing field (bits 5..4) zero.
-        if op & 0x0130 == 0x0100 {
+        // ADDX/SUBX: bit 8 set, addressing field (bits 5..4) zero, AND opmode
+        // (bits 7..6) not 0b11 — opmode 0b1ss = 100/101/110 is ADDX/SUBX, but
+        // 0b111 is ADDA.L/SUBA.L, which shares the bit-8 + bits-5..4==00 pattern
+        // when its source is Dn/−(An) and must fall through to the ADDA path.
+        // (Without the 0xC0 guard, `ADDA.L Dn,An` decoded as ADDX → the address
+        // never accumulated; this collapsed the BIOS sound driver's note-ring
+        // offset `adda.l d7,a2` to 0, silencing the BGM.)
+        if op & 0x0130 == 0x0100 && op & 0x00C0 != 0x00C0 {
             self.op_addx_subx(op, is_add, bus);
             return;
         }
