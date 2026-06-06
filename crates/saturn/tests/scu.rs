@@ -364,6 +364,36 @@ fn scu_dsp_dma_copies_work_ram_into_data_ram() {
     assert_eq!(sat.bus.scu.dsp.regs.ra0, ra0 + 2);
 }
 
+/// Regression (BIOS boot-animation BGM): WA0/RA0 carry the SH-2 cache-through
+/// region bit — the BIOS programs WA0 as e.g. `0x25A5_0000` (sound RAM
+/// `0x05A5_0000 | 0x2000_0000`). `exec_dsp_dma` must strip it to the physical
+/// A/B-bus space before the bus access; without the mask the bus matches no
+/// region, so the read is open bus (0) and the write is dropped. The boot
+/// jingle is staged into VDP1 VRAM and copied to sound RAM by exactly this
+/// DSP-RAM → cache-through-sound-RAM DMA, so an unmasked write left the keyed
+/// voice playing silence.
+#[test]
+fn scu_dsp_dma_to_cache_through_address_lands_at_the_physical_region() {
+    let mut sat = build();
+    // Two words to copy out of DSP data-RAM bank 0.
+    sat.bus.scu.dsp.data_ram[0][0] = 0x1234_5678;
+    sat.bus.scu.dsp.data_ram[0][1] = 0x9ABC_DEF0;
+    // WA0 = cache-through sound RAM 0x25A5_0000 (stored as a >>2 longword addr).
+    sat.bus.scu.dsp.regs.wa0 = 0x25A5_0000u32 >> 2;
+    // Microcode: DMA DSP-RAM bank 0 → A/B-bus via WA0 (from_dsp=bit 12), 2
+    // words, add_sel=1 (→4 bytes); ENDI.
+    let dma = (0b11u32 << 30) | (1 << 12) | (1 << 15) | 2;
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    for w in [dma, endi] {
+        sat.bus.write32(PPD, w, AccessKind::Data);
+    }
+    dsp_start_at_zero(&mut sat);
+    sat.run_for(2048);
+    // The data must land at the *physical* sound RAM address, not be dropped.
+    assert_eq!(sat.bus.read32(0x05A5_0000, AccessKind::Data).0, 0x1234_5678);
+    assert_eq!(sat.bus.read32(0x05A5_0004, AccessKind::Data).0, 0x9ABC_DEF0);
+}
+
 #[test]
 fn scu_timer0_fires_at_the_compare_line() {
     let mut sat = build();

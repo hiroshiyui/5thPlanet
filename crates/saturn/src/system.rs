@@ -1288,12 +1288,22 @@ impl Saturn {
     fn exec_dsp_dma(&mut self, dma: scu_dsp::DmaRequest) {
         let bank = (dma.dsp_bank & 3) as usize;
         let ct = self.bus.scu.dsp.regs.ct[bank];
+        // WA0/RA0 hold full SCU-bus addresses that include the SH-2 cache-through
+        // region bit (e.g. `0x25A5_0000` = sound RAM `0x05A5_0000 | 0x2000_0000`).
+        // `SaturnBus` only maps the physical `0x05xx_xxxx` regions, so strip the
+        // high bits to the 27-bit A/B-bus space before the access — otherwise the
+        // read returns open bus (0) and the write is dropped (matches
+        // [`scu_transfer`]'s `& 0x07FF_FFFC` masking). This was the BIOS
+        // boot-animation BGM root: the jingle sample is staged into VDP1 VRAM and
+        // copied into sound RAM `0x5_0000` by an SCU-DSP DMA, which silently moved
+        // zeros without the mask, so the keyed voice played silence.
+        const BUS_MASK: u32 = 0x07FF_FFFF;
         if dma.from_dsp {
             let mut dst = self.bus.scu.dsp.regs.wa0 << 2;
             for i in 0..dma.size {
                 let idx = (ct.wrapping_add(i as u8) & 0x3F) as usize;
                 let word = self.bus.scu.dsp.data_ram[bank][idx];
-                self.bus.write32(dst, word, AccessKind::Dma);
+                self.bus.write32(dst & BUS_MASK, word, AccessKind::Dma);
                 dst = dst.wrapping_add(dma.add);
             }
             if dma.update_addr {
@@ -1303,7 +1313,7 @@ impl Saturn {
         } else {
             let mut src = self.bus.scu.dsp.regs.ra0 << 2;
             for i in 0..dma.size {
-                let (word, _) = self.bus.read32(src, AccessKind::Dma);
+                let (word, _) = self.bus.read32(src & BUS_MASK, AccessKind::Dma);
                 let idx = (ct.wrapping_add(i as u8) & 0x3F) as usize;
                 self.bus.scu.dsp.data_ram[bank][idx] = word;
                 src = src.wrapping_add(dma.add);
