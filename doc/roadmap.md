@@ -842,6 +842,28 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 | F2 | **CD move/copy sector ops** ⏸ | Deferred from M7. |
 | F3 | **Cache address/data arrays** | The direct-access spaces `0x60000000` (address array) and `0xC0000000` (data array) fall through to open bus; rarely used outside cache-as-RAM mode. `sh2/interpreter.rs` `classify`. |
 
+## Performance optimization (future, opt-in "fast mode")
+
+**Accuracy stays the default and the trace-diff baseline.** These are an *opt-in*
+performance track for once the core is feature-complete — never replacing the
+cycle-faithful default, never a JIT/dynarec. They're cataloged from how the
+reference oracle **Mednafen achieves full speed while remaining LLE** (it runs
+real BIOS + game code; it is *not* a HLE/approximation — it's just engineered
+for speed and makes a few principled omissions). Today we run ~64% real-time at
+peak gameplay; this is the menu of levers to close that gap without abandoning
+fidelity.
+
+| # | Lever | What Mednafen does | What ours does today | Risk / caveat |
+|---|-------|--------------------|----------------------|---------------|
+| P1 | **Coarser cross-chip sync** | Runs each CPU in batches against a shared `SH7095_mem_timestamp` + an **event scheduler**; only re-syncs the siblings at the next scheduled *event* edge. | **Per-instruction** master-leads-slave interleave + per-instruction SCU sampling — re-syncs every instruction. | The single biggest cost. A "fast mode" could widen the sync quantum; must keep the per-instruction path for the accuracy default + trace-diff. |
+| P2 | **Optimized interpreter dispatch** | Template-specialized SH-2 core, tight computed dispatch, **fastmap** page table for memory access. | Younger, straightforwardly-written Rust interpreter (clear over micro-optimized). | Pure constant-factor win, accuracy-neutral. Profile first; a fastmap-style page table for the bus `match` is the obvious start. |
+| P3 | **Skip invisible models in fast mode** | Default **"CPU Cache Emulation Mode: Data only"** (skips full I-cache emulation); **no VDP2 VRAM-contention** model at all. | Models the I-cache + per-region wait-states + (M13) VDP-VRAM base access waits faithfully. | Accuracy-affecting → fast-mode only. NB: Mednafen's *lack* of VRAM contention is why we must **not** add it on the accuracy path (it would diverge the trace — see M13 notes). |
+| P4 | **Build & profile** | Native, mature, `-O2`, no test harness. | `--release` is optimized but unprofiled; most measurement happens via debug/test builds. | Free wins: PGO/LTO, a release-mode frontend default, and a perf-counter pass to find the real hot spots before hand-optimizing. |
+
+Sequencing note: **P2 + P4 are accuracy-neutral and can land anytime**; **P1 + P3
+change observable timing and must be gated behind an explicit opt-in** so the
+default build stays trace-faithful to Mednafen.
+
 ## Later milestones (queued)
 
 - **MPEG card** + CD move/copy sector ops (deferred from M7).
