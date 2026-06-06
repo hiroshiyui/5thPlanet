@@ -1118,7 +1118,13 @@ impl ScspCtrl {
                 let imxl = (reg_a & 7) as u32;
                 if imxl != 0 {
                     let isel = ((reg_a >> 3) & 0xF) as usize;
-                    self.dsp.set_sample(voice << imxl, isel);
+                    // Effect-send level (Mednafen `scsp.inc`): the int16 slot
+                    // output is scaled `<<4 >> (7 - IMXL)`, i.e. ×2^(IMXL-3) —
+                    // NOT `voice << IMXL` (which over-drove the DSP input by 8×
+                    // and self-oscillated the reverb into static noise).
+                    let s = voice.clamp(i16::MIN as i32, i16::MAX as i32) as u32;
+                    let send = ((s << 4) >> (7 - imxl)) as i32;
+                    self.dsp.set_sample(send, isel);
                 }
             }
             // FM: record this slot's post-envelope output for any slot that

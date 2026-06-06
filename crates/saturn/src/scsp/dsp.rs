@@ -153,12 +153,17 @@ impl Dsp {
         !self.stopped && self.last_step > 0
     }
 
-    /// Add a slot's effect-send into input-mix channel `sel`.
+    /// Add a slot's effect-send (already scaled by the caller) into input-mix
+    /// channel `sel`. `MIXS` accumulates **modulo 20 bits** (Mednafen `scsp.inc`
+    /// `DSP.MIXS[idx] = (... ) & 0xFFFFF`); without the wrap an over-range sum
+    /// feeds the DSP a value `inputs = MIXS << 4` sign-extends wrongly, which
+    /// saturates the reverb feedback into self-oscillation.
     pub fn set_sample(&mut self, sample: i32, sel: usize) {
-        self.mixs[sel & 0xF] += sample;
-        let a = self.mixs[sel & 0xF].abs();
-        if a > self.mixs_hw[sel & 0xF] {
-            self.mixs_hw[sel & 0xF] = a;
+        let sel = sel & 0xF;
+        self.mixs[sel] = self.mixs[sel].wrapping_add(sample) & 0xF_FFFF;
+        let a = self.mixs[sel].abs();
+        if a > self.mixs_hw[sel] {
+            self.mixs_hw[sel] = a;
         }
     }
 
@@ -385,5 +390,18 @@ mod tests {
         dsp.set_sample(0x10000, 0); // MIXS[0] (<<4 → 24-bit inside the step)
         dsp.step(&mut ram);
         assert_ne!(dsp.efreg[0], 0, "mix input reached the effect output");
+    }
+
+    #[test]
+    fn mixs_accumulates_modulo_20_bits() {
+        // Regression (boot-jingle reverb noise): the DSP input mix wraps at 20
+        // bits per accumulate (Mednafen `scsp.inc` `& 0xFFFFF`). Without the
+        // wrap (and with the caller's old `voice << IMXL` 8×-too-hot send) the
+        // reverb feedback saturated into self-oscillating static.
+        let mut dsp = Dsp::new();
+        dsp.set_sample(0x8_0000, 0);
+        assert_eq!(dsp.mixs[0], 0x8_0000);
+        dsp.set_sample(0x8_0000, 0); // 0x10_0000 wraps to 0
+        assert_eq!(dsp.mixs[0], 0, "MIXS accumulates modulo 20 bits");
     }
 }
