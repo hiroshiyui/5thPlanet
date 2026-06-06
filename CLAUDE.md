@@ -34,7 +34,14 @@ Run the binary with `cargo run -p jupiter -- <bios.bin>` — the SDL2 frontend (
 crates/sh2/        — M1 deliverable: standalone SH-2 (SH7604) core.
                      no_std + extern alloc. Library-shaped, no I/O.
 crates/m68k/       — M5 deliverable: MC68EC000 core (SCSP sound CPU).
-                     no_std + alloc, library-shaped like sh2.
+                     no_std + alloc, library-shaped like sh2. **Decode gotcha:
+                     the ADDX/SUBX dispatch in `op_addsub` must exclude opmode
+                     0b11 — `ADDA.L`/`SUBA.L Dn,An` share the bit-8 + bits-5..4==00
+                     pattern with ADDX/SUBX, so without `op & 0x00C0 != 0x00C0`
+                     they decode as ADDX (the address never accumulates). This was
+                     the BIOS-BGM-silence root: `adda.l d7,a2` mis-executed →
+                     the SCSP note-ring collapsed 9 entries → 2 → voices never
+                     keyed (fixed `32662f7`; regression `tests/ring_offset_repro.rs`).
 crates/scu_dsp/    — M3 deliverable: SCU's embedded 32-bit DSP.
 crates/saturn/     — M2+ deliverable: Saturn system glue (bus, scheduler,
                      SMPC, SCU + DMA + INTC, VDP1 full plotter, VDP2

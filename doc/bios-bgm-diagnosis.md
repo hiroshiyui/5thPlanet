@@ -1,5 +1,26 @@
 # BIOS boot BGM — diagnosis
 
+> # ✅ RESOLVED 2026-06-06 — the BGM plays.
+>
+> **Root: a `m68k` decode bug, not a timing divergence.** `ADDA.L`/`SUBA.L Dn,An`
+> (opmode `0b111`) was mis-decoded as `ADDX`/`SUBX` — the ADDX dispatch guard
+> `op & 0x0130 == 0x0100` did not exclude opmode `0b11`. So the sound driver's
+> note-ring enqueue `adda.l d7,a2` never accumulated the offset, collapsing a
+> 9-entry ring to 2; note-on records overwrote each other before the drain
+> (`0x2162`) consumed them, so the BGM voices never keyed. **Fix `32662f7`**
+> (`crates/m68k/src/interpreter.rs` `op_addsub`, add `&& op & 0x00C0 != 0x00C0`);
+> regression `crates/m68k/tests/ring_offset_repro.rs`. Result: audio-CD panel keys
+> **12 voices (was 1)**, avg \|amplitude\| 0→111.
+>
+> **Found by a cross-emulator note-ring slot diff** (mednaref `SS_SEQFIRE` hook):
+> Mednafen wrote 9 distinct ring slots (`0x7A00,04,08,…,20`), ours only 2
+> (`0x7A00,04`) — same code, same index, divergent byte offset → an `m68k` unit
+> test pinned the bad `adda.l`. **Everything below is the (long, partly mistaken)
+> hunt that preceded this** — the seq-tick-phase, WRAM-bus-timing, and 68k-control-
+> flow-fork hypotheses were all downstream symptoms of the collapsed ring, kept for
+> the record. The master phase-lead / per-access bus-timing work it surfaced is a
+> *real* cycle-accuracy item (roadmap M12 #8 / M13) but was **decoupled from the BGM**.
+
 **Date:** 2026-06-04 · **References:** MAME v0.287 (`mameref/saturn`, no-disc) +
 **Mednafen dev build** (`mednaref`, audio-CD, LLE oracle) · **Status:** animation
 **fixed**; BGM **root localized** to a per-voice timing-divider phase divergence

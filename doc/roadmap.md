@@ -689,6 +689,24 @@ timing-dependent behaviour diverges from the LLE reference (Mednafen) even when 
 game/driver **code and data are byte-identical**. This milestone closes the residual
 whole-system timing gaps so timing-gated behaviour matches the reference.
 
+> **★★★ BGM RESOLVED 2026-06-06 — the BIOS BGM plays. The root was NOT a timing
+> gap at all but a `m68k` decode bug (`32662f7`).** `ADDA.L`/`SUBA.L Dn,An` (opmode
+> `0b111`) with a register-direct source was mis-decoded as `ADDX`/`SUBX` — the ADDX
+> guard `op & 0x0130 == 0x0100` failed to exclude opmode `0b11`. So `adda.l d7,a2`
+> never accumulated the address, collapsing the BIOS sound driver's SCSP note-ring
+> enqueue offset: a 9-entry ring became 2 entries, so note-on records overwrote each
+> other before the drain (`0x2162`) read them and the BGM voices never keyed (dead
+> silent on the audio-CD panel and in games). Found by a **cross-emulator note-ring
+> slot diff vs Mednafen** (ours wrote 2 ring slots, Mednafen 9) → an `m68k` unit-test
+> repro (`crates/m68k/tests/ring_offset_repro.rs`). After the fix the audio-CD panel
+> keys **12 voices (was 1)**, avg \|amplitude\| 0→111. **This supersedes the seq-tick-
+> phase / WRAM-bus-timing / 68k-control-flow-fork hypotheses below** (tasks #5/#6/#8/
+> A7) — those were all downstream symptoms or red herrings of the silent BGM. The
+> master-SH-2 per-access bus-timing gap (task #8) is a *real* cycle-accuracy item on
+> its own merits but was confirmed **decoupled from the BGM** (closing the phase left
+> it silent; the decode bug was the cause). `bios_boot` golden unchanged (SH-2 path
+> untouched).
+
 Two concrete, quantified failing cases drive it:
 
 - **SCSP BGM trigger phase.** On the audio-CD BIOS CD-player, ours processes **4414
@@ -699,11 +717,13 @@ Two concrete, quantified failing cases drive it:
   68k→SCSP path, the sequence data, and the clocks are all proven correct (and the
   SCSP timer model was fixed to match Mednafen — task #1), so the gap is *when* the
   BGM is triggered: ours reaches the trigger ~1.8 % early. Full trace-down in
-  `doc/bios-bgm-diagnosis.md`. **★ Root resolved 2026-06-06 (see task #8):** the
-  "early trigger" is the **master SH-2 running ahead because ours under-charges its
-  external-bus (WRAM) access waits** — not a per-voice-divider or seq-tick-rate
-  issue (the seq-tick rate matches; the 68k's own under-cost was a separate IRQ-
-  entry bug, fixed `3347369`). The fix is the per-access SH-2 bus-timing model.
+  `doc/bios-bgm-diagnosis.md`. **★ ACTUAL root (2026-06-06): the `m68k` `ADDA.L`/
+  `SUBA.L` decode bug (`32662f7`, see the banner above) — the BGM was silent because
+  the note-ring collapsed to 2 entries, NOT because of trigger phase.** The phase
+  lead and the 68k IRQ-entry under-cost (`3347369`) were real, separately-fixed cycle
+  bugs, but the seq-tick "early trigger" was a symptom of the silent driver, not the
+  cause. The per-access SH-2 bus-timing model (task #8) stays a worthwhile accuracy
+  item but does not gate the BGM.
 - **VF2 intro demo-script engine** (M11 Phase 4). The intro stall is timing-gated —
   the stall point oscillates (FAD 2596 ↔ 7772) with each timing change, and the CD
   command/response stream is byte-identical to Mednafen; the job nibble's `3 → 0xA`

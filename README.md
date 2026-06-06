@@ -25,8 +25,9 @@ foundation stays solid.
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 | M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 Doukyuusei ~if~ boots to its title screen (640×224 hi-res); the disc-present boot animation now plays (CD recognition spin-up); VF2 on a CD-state wall |
+| M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
 
-Current test count: **535 workspace-wide, 0 failures.** Task-by-task
+Current test count: **548 workspace-wide, 0 failures.** Task-by-task
 status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
