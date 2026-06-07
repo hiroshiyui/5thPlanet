@@ -412,7 +412,36 @@ impl ScspCtrl {
     }
 
     pub fn read8(&self, o: u32) -> u8 {
-        self.raw[Self::idx(o)]
+        let idx = Self::idx(o);
+        // Register 0x408 (CA/SGC/EG on read, MSLC on write) is the live slot
+        // monitor — a computed value, not the backing byte.
+        if idx & !1 == 0x408 {
+            let m = self.slot_monitor();
+            return if idx & 1 == 0 { (m >> 8) as u8 } else { m as u8 };
+        }
+        self.raw[idx]
+    }
+
+    /// SCSP slot monitor (register 0x408, read): the MSLC-selected slot's
+    /// current-address nibble (CA, bits 7-10), envelope phase (SGC, bits 5-6)
+    /// and envelope level (EG, bits 0-4). Mednafen `SlotMonitorData` (`scsp.inc`:
+    /// `mdata = ((CurrentAddr >> 12) << 7) | (EnvPhase << 5) | (EnvLevel >> 5)`).
+    /// The BIOS boot-animation sound driver polls CA to pace its streamed
+    /// ring-buffer refill: without a live CA the streamed jingle never advances
+    /// past its first chunk and loops. MSLC is read from the raw register
+    /// (written there with bits 11-15); the slot's live phase/envelope come from
+    /// the per-sample playback state.
+    fn slot_monitor(&self) -> u16 {
+        let r408 =
+            u16::from_be_bytes([self.raw[Self::idx(0x408)], self.raw[Self::idx(0x409)]]);
+        let s = &self.slots[((r408 >> 11) & 0x1F) as usize];
+        // CA = top nibble of the 16-bit loop-relative current address.
+        let ca = (((s.cur >> PHASE_SHIFT) & 0xFFFF) >> 12) as u16;
+        let sgc = s.eg.state as u16; // ATK=0 / D1=1 / D2=2 / REL=3
+        // Our `eg.volume` is 0 (silent) .. 0x3FF (loud); the SCSP's EnvLevel is
+        // the inverse (0 loud .. 0x3FF silent) and the monitor returns EnvLevel>>5.
+        let env_level = 0x3FF - (s.eg.volume >> EG_SHIFT).clamp(0, 0x3FF) as u16;
+        (ca << 7) | (sgc << 5) | (env_level >> 5)
     }
     pub fn read16(&self, o: u32) -> u16 {
         u16::from_be_bytes([self.read8(o), self.read8(o + 1)])
@@ -2786,5 +2815,31 @@ mod tests {
         };
         assert!(mods_on.iter().any(|&x| x != 0), "8-bit FM produced audio");
         assert_ne!(mods_on, mods_off, "FM shifts the 8-bit read");
+    }
+
+    /// The slot monitor (register 0x408): reading it must return the
+    /// MSLC-selected slot's *live* current-address nibble (CA, bits 7-10), not a
+    /// static backing byte. The BIOS boot-animation sound driver polls CA to pace
+    /// its streamed ring-buffer refill — a static 0x408 froze the streamed jingle
+    /// to its first chunk (it looped). (M11 #6.)
+    #[test]
+    fn slot_monitor_reports_the_selected_slots_live_current_address() {
+        let mut c = ScspCtrl::new();
+        // Select slot 5 as the monitored slot (MSLC = bits 11-15 of 0x408).
+        c.write16(0x408, 5 << 11);
+        // CA is the top nibble of the 16-bit loop-relative address (cur >> 12),
+        // so cur = 0x3xxx << PHASE_SHIFT puts CA = 3.
+        c.slots[5].cur = 0x3456 << PHASE_SHIFT;
+        let m = c.read16(0x408);
+        assert_eq!((m >> 7) & 0xF, 0x3, "CA = (cur>>12) top nibble");
+        // Reading 0x408 returns the monitor (CA/SGC/EG), not MSLC — MSLC is
+        // write-only there (the read uses the stored select, proven below).
+        // Advancing the slot past a 0x1000-sample boundary moves CA.
+        c.slots[5].cur = 0xC000 << PHASE_SHIFT;
+        assert_eq!((c.read16(0x408) >> 7) & 0xF, 0xC, "CA tracks the address");
+        // A different monitored slot reads that slot's CA, independently.
+        c.write16(0x408, 6 << 11);
+        c.slots[6].cur = 0x1000 << PHASE_SHIFT;
+        assert_eq!((c.read16(0x408) >> 7) & 0xF, 0x1);
     }
 }
