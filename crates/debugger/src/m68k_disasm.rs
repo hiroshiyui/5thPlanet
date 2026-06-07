@@ -172,10 +172,10 @@ fn decode_immediate(op: u16, r: &mut Reader) -> String {
     // ORI/ANDI/EORI to CCR (#imm, byte, ea=0x3C) or SR (#imm, word, ea=0x7C).
     if matches!(kind, 0 | 1 | 5) {
         if op & 0x00ff == 0x003c {
-            return format!("{}i #{:#x},ccr", names[kind], r.w() & 0xff);
+            return format!("{} #{:#x},ccr", names[kind], r.w() & 0xff);
         }
         if op & 0x00ff == 0x007c {
-            return format!("{}i #{:#x},sr", names[kind], r.w());
+            return format!("{} #{:#x},sr", names[kind], r.w());
         }
     }
     let sz = ((op >> 6) & 3) as usize;
@@ -452,5 +452,201 @@ fn decode_shift(op: u16, r: &mut Reader) -> String {
     } else {
         let cnt = if cr == 0 { 8 } else { cr };
         format!("{kind}{dir}.{} #{cnt},d{reg}", SZ_BWL[sz])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disassemble a word stream starting at pc 0; missing words read as 0.
+    fn dis(words: &[u16]) -> (String, u32) {
+        let read = |a: u32| -> u16 { words.get((a / 2) as usize).copied().unwrap_or(0) };
+        let insn = disasm(&read, 0);
+        (insn.text, insn.len)
+    }
+
+    /// Assert the rendered text (length checked separately where it matters).
+    fn t(words: &[u16]) -> String {
+        dis(words).0
+    }
+
+    #[test]
+    fn immediate_group_ori_andi_subi_addi_eori_cmpi() {
+        assert_eq!(dis(&[0x0001, 0x0012]), ("ori.b #0x12,d1".into(), 4));
+        assert_eq!(t(&[0x0440, 0x1234]), "subi.w #0x1234,d0");
+        assert_eq!(dis(&[0x0680, 0x1234, 0x5678]), ("addi.l #0x12345678,d0".into(), 6));
+        assert_eq!(t(&[0x0c00, 0x0042]), "cmpi.b #0x42,d0");
+        assert_eq!(t(&[0x0a40, 0xbeef]), "eori.w #0xbeef,d0");
+    }
+
+    #[test]
+    fn immediate_to_ccr_and_sr() {
+        assert_eq!(t(&[0x023c, 0x00ff]), "andi #0xff,ccr");
+        assert_eq!(t(&[0x007c, 0x2700]), "ori #0x2700,sr");
+        assert_eq!(t(&[0x0a3c, 0x0010]), "eori #0x10,ccr");
+    }
+
+    #[test]
+    fn static_and_dynamic_bit_ops() {
+        assert_eq!(t(&[0x0800, 0x0005]), "btst #5,d0"); // bit number is decimal
+        assert_eq!(t(&[0x08c0, 0x0007]), "bset #7,d0");
+        assert_eq!(t(&[0x0100]), "btst d0,d0");
+        assert_eq!(t(&[0x0342]), "bchg d1,d2");
+    }
+
+    #[test]
+    fn immediate_dc_w_fallbacks() {
+        // size field == 3 → unsupported.
+        assert_eq!(t(&[0x00c0]), "dc.w 0x00c0");
+    }
+
+    #[test]
+    fn move_and_movea_all_sizes() {
+        assert_eq!(t(&[0x1200]), "move.b d0,d1");
+        assert_eq!(t(&[0x2210]), "move.l (a0),d1");
+        assert_eq!(t(&[0x3248]), "movea.w a0,a1");
+        assert_eq!(dis(&[0x303c, 0x1234]), ("move.w #0x1234,d0".into(), 4));
+        assert_eq!(t(&[0x22e0]), "move.l -(a0),(a1)+");
+    }
+
+    #[test]
+    fn effective_address_modes() {
+        assert_eq!(t(&[0x3028, 0x0010]), "move.w (0x10,a0),d0"); // (d16,An)
+        // Negative disp renders as the two's-complement hex (Rust LowerHex of i16).
+        assert_eq!(t(&[0x3028, 0xfff0]), "move.w (0xfff0,a0),d0");
+        assert_eq!(t(&[0x3030, 0x1004]), "move.w (0x4,a0,d1.w),d0"); // (d8,An,Xn)
+        assert_eq!(t(&[0x3030, 0x8804]), "move.w (0x4,a0,a0.l),d0"); // An index, .l
+        assert_eq!(t(&[0x3038, 0x1234]), "move.w (0x1234).w,d0"); // abs.w
+        assert_eq!(t(&[0x3039, 0x0012, 0x3456]), "move.w (0x00123456).l,d0"); // abs.l
+        assert_eq!(t(&[0x303a, 0x0010]), "move.w (0x10,pc),d0"); // (d16,PC)
+        assert_eq!(t(&[0x303b, 0x1004]), "move.w (0x4,pc,d1.w),d0"); // (d8,PC,Xn)
+    }
+
+    #[test]
+    fn branches_quick_and_conditional() {
+        assert_eq!(t(&[0x6004]), "bra 0x6"); // 8-bit
+        assert_eq!(t(&[0x6106]), "bsr 0x8");
+        assert_eq!(dis(&[0x6600, 0x0010]), ("bne 0x12".into(), 4)); // 16-bit
+        assert_eq!(dis(&[0x60ff, 0x0001, 0x0000]), ("bra 0x10002".into(), 6)); // 32-bit
+        assert_eq!(t(&[0x6f08]), "ble 0xa");
+    }
+
+    #[test]
+    fn moveq_addq_subq_scc_dbcc() {
+        assert_eq!(dis(&[0x7042]), ("moveq #0x42,d0".into(), 2));
+        assert_eq!(t(&[0x5200]), "addq.b #1,d0");
+        assert_eq!(t(&[0x5108]), "subq.b #8,a0"); // data 0 → 8
+        assert_eq!(t(&[0x54c0]), "scc d0"); // size==3, mode!=1 → Scc
+        assert_eq!(t(&[0x57c8, 0x0010]), "dbeq d0,0x12"); // Scc size + mode 1 → DBcc
+    }
+
+    #[test]
+    fn or_and_div_groups() {
+        assert_eq!(t(&[0x8250]), "or.w (a0),d1");
+        assert_eq!(t(&[0x8350]), "or.w d1,(a0)");
+        assert_eq!(t(&[0x82d0]), "divu (a0),d1");
+        assert_eq!(t(&[0x83d0]), "divs (a0),d1");
+    }
+
+    #[test]
+    fn and_mul_exg_groups() {
+        assert_eq!(t(&[0xc250]), "and.w (a0),d1");
+        assert_eq!(t(&[0xc350]), "and.w d1,(a0)");
+        assert_eq!(t(&[0xc2d0]), "mulu (a0),d1");
+        assert_eq!(t(&[0xc3d0]), "muls (a0),d1");
+        assert_eq!(t(&[0xc342]), "exg d1,d2");
+        assert_eq!(t(&[0xc34a]), "exg a1,a2");
+        assert_eq!(t(&[0xc38a]), "exg d1,a2");
+    }
+
+    #[test]
+    fn add_sub_adda_suba_addx_subx() {
+        assert_eq!(t(&[0x9250]), "sub.w (a0),d1");
+        assert_eq!(t(&[0x92c8]), "suba.w a0,a1");
+        assert_eq!(t(&[0x93c8]), "suba.l a0,a1");
+        assert_eq!(t(&[0x9300]), "subx.b d0,d1");
+        assert_eq!(t(&[0x9509]), "subx.b -(a1),-(a2)");
+        assert_eq!(t(&[0xd390]), "add.l d1,(a0)");
+        assert_eq!(t(&[0xd2c8]), "adda.w a0,a1");
+    }
+
+    #[test]
+    fn cmp_cmpa_cmpm_eor() {
+        assert_eq!(t(&[0xb250]), "cmp.w (a0),d1");
+        assert_eq!(t(&[0xb2c8]), "cmpa.w a0,a1");
+        assert_eq!(t(&[0xb3c8]), "cmpa.l a0,a1");
+        assert_eq!(t(&[0xb308]), "cmpm.b (a0)+,(a1)+");
+        assert_eq!(t(&[0xb342]), "eor.w d1,d2");
+    }
+
+    #[test]
+    fn shifts_and_rotates() {
+        assert_eq!(t(&[0xe242]), "asr.w #1,d2"); // immediate count
+        assert_eq!(t(&[0xe042]), "asr.w #8,d2"); // count 0 → 8
+        assert_eq!(t(&[0xe3aa]), "lsl.l d1,d2"); // register count
+        assert_eq!(t(&[0xe4d0]), "roxr (a0)"); // memory shift by one
+        assert_eq!(t(&[0xe7d0]), "rol (a0)");
+    }
+
+    #[test]
+    fn line4_fixed_single_word_ops() {
+        assert_eq!(t(&[0x4e70]), "reset");
+        assert_eq!(t(&[0x4e71]), "nop");
+        assert_eq!(dis(&[0x4e72, 0x2700]), ("stop #0x2700".into(), 4));
+        assert_eq!(t(&[0x4e73]), "rte");
+        assert_eq!(t(&[0x4e75]), "rts");
+        assert_eq!(t(&[0x4e76]), "trapv");
+        assert_eq!(t(&[0x4e77]), "rtr");
+        assert_eq!(t(&[0x4afc]), "illegal");
+    }
+
+    #[test]
+    fn line4_trap_link_unlk_usp() {
+        assert_eq!(t(&[0x4e45]), "trap #0x5");
+        assert_eq!(dis(&[0x4e50, 0x0010]), ("link a0,#0x10".into(), 4));
+        assert_eq!(t(&[0x4e59]), "unlk a1");
+        assert_eq!(t(&[0x4e62]), "move a2,usp");
+        assert_eq!(t(&[0x4e6b]), "move usp,a3");
+    }
+
+    #[test]
+    fn line4_jmp_jsr_lea_pea_move_ccr_sr() {
+        assert_eq!(t(&[0x4ed0]), "jmp (a0)");
+        assert_eq!(t(&[0x4e90]), "jsr (a0)");
+        assert_eq!(t(&[0x43d0]), "lea (a0),a1");
+        assert_eq!(t(&[0x4850]), "pea (a0)");
+        assert_eq!(t(&[0x44c0]), "move d0,ccr");
+        assert_eq!(t(&[0x46c0]), "move d0,sr");
+        assert_eq!(t(&[0x40c0]), "move sr,d0");
+    }
+
+    #[test]
+    fn line4_ext_tas_clr_neg_not_tst() {
+        assert_eq!(t(&[0x4880]), "ext.w d0");
+        assert_eq!(t(&[0x48c0]), "ext.l d0");
+        assert_eq!(t(&[0x4ad0]), "tas (a0)");
+        assert_eq!(t(&[0x4200]), "clr.b d0");
+        assert_eq!(t(&[0x4041]), "negx.w d1");
+        assert_eq!(t(&[0x4490]), "neg.l (a0)");
+        assert_eq!(t(&[0x4642]), "not.w d2");
+        assert_eq!(t(&[0x4a83]), "tst.l d3");
+        assert_eq!(t(&[0x4100]), "dc.w 0x4100"); // line-4 fallback
+    }
+
+    #[test]
+    fn movem_to_and_from_memory_with_reg_lists() {
+        // store d0-d1 to -(a2): predecrement bit order (d0 = bit 15).
+        assert_eq!(dis(&[0x48a2, 0xc000]), ("movem.w d0-d1,-(a2)".into(), 4));
+        // load (a0)+ into d0-d1: ascending bit order (d0 = bit 0).
+        assert_eq!(t(&[0x4cd8, 0x0003]), "movem.l (a0)+,d0-d1");
+        // mixed singles, ranges, and an address register.
+        assert_eq!(t(&[0x4cd0, 0x801d]), "movem.l (a0),d0/d2-d4/a7");
+    }
+
+    #[test]
+    fn top_level_dc_w_fallback() {
+        assert_eq!(t(&[0xa000]), "dc.w 0xa000");
+        assert_eq!(t(&[0xf000]), "dc.w 0xf000");
     }
 }
