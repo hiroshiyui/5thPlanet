@@ -224,10 +224,10 @@ fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
     assert_eq!(sr, 0x0F);
     // SCU's SMPC source is the path BIOS handlers wait on. The SCU resets with
-    // every source masked (IMS=0xBFFF), as the BIOS expects; unmask here to
-    // confirm INTBACK actually raised the SMPC source (the BIOS does the same
-    // unmask before relying on the interrupt).
-    sat.bus.scu.ims = 0;
+    // every source masked (IMS=0xBFFF), as the BIOS expects; unmask **only** the
+    // SMPC source here to confirm INTBACK raised it (HBlank-IN also fires across
+    // these scanlines and out-ranks it, so leave the rest masked to isolate it).
+    sat.bus.scu.ims = 0xFFFF & !(1 << saturn::ScuSource::Smpc.bit());
     let pending = sat.bus.scu.take_pending_interrupt(0);
     assert_eq!(pending.map(|(s, _)| s), Some(saturn::ScuSource::Smpc));
 }

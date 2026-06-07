@@ -479,3 +479,44 @@ fn scu_timer0_dormant_when_disabled() {
         "no Timer 0 interrupt while TENB is clear"
     );
 }
+
+#[test]
+fn scu_hblank_in_fires_on_the_hblank_edge() {
+    let mut sat = build();
+    // Mask all SCU interrupts so the master never acks and IST accumulates.
+    sat.bus.scu.ims = 0xFFFF;
+    // HBlank-IN is independent of the timer enable; a few scanlines suffice.
+    sat.run_for(40_000);
+    assert_ne!(
+        sat.bus.scu.ist & (1 << 2),
+        0,
+        "HBlank-IN raised on the HBLANK rising edge"
+    );
+}
+
+#[test]
+fn scu_timer1_fires_when_enabled() {
+    let mut sat = build();
+    sat.bus.scu.ims = 0xFFFF;
+    sat.bus.scu.t1md = 1; // TENB, mode 0 (every line)
+    sat.bus.scu.t1s = 50; // fire ~50 dots into the line
+    sat.run_for(40_000);
+    assert_ne!(
+        sat.bus.scu.ist & (1 << 4),
+        0,
+        "Timer 1 fires within the line when enabled"
+    );
+}
+
+#[test]
+fn scu_timer1_dormant_when_disabled() {
+    let mut sat = build();
+    sat.bus.scu.ims = 0xFFFF;
+    sat.bus.scu.t1s = 50; // T1MD left 0 → timer disabled
+    sat.run_for(40_000);
+    assert_eq!(
+        sat.bus.scu.ist & (1 << 4),
+        0,
+        "no Timer 1 interrupt while TENB is clear"
+    );
+}

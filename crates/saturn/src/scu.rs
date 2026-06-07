@@ -225,6 +225,19 @@ pub struct Scu {
     /// would re-fire on every per-sector HIRQ edge instead of once per ack.
     /// Serialized machine state.
     cd_prohibit: bool,
+    /// Timer 1 down-counter (pixel clocks within a scanline). Reloaded from
+    /// `t1s` at each HBLANK start, decremented by the dots elapsed per
+    /// [`Scu::tick_timers`] call (Mednafen `Timer1_Counter`, 9-bit).
+    timer1_counter: u32,
+    /// Sticky "Timer 1 fired this line" flag, cleared at the HBLANK reload
+    /// (Mednafen `Timer1_Met`).
+    timer1_met: bool,
+    /// Previous HBLANK level, for detecting the HBLANK rising edge (HB_Start).
+    hb_prev: bool,
+    /// Global cycle at the last [`Scu::tick_timers`] call, to derive the dots
+    /// elapsed. Updated every call (even while the timers are disabled) so the
+    /// first tick after software enables them sees a small delta.
+    timer_last_now: u64,
 }
 
 /// Snapshot of a queued DMA request handed to the bus drainer. The drainer
@@ -317,10 +330,17 @@ impl Scu {
                     self.cd_prohibit = false;
                 }
             }
-            0xB0 => self.asr0 = val,
-            0xB4 => self.asr1 = val,
-            0xB8 => self.aref = val,
-            0xC4 => self.rsel = val,
+            // A-bus set / refresh / SDRAM-select registers. Like the LLE oracle
+            // (Mednafen `scu.inc`), these are **stored, not applied** — the SCU
+            // wait-state / refresh / SRAM-vs-SDRAM behaviour they configure is
+            // not part of the reference's timing model, so applying them would
+            // diverge the trace (the M13 "don't add accuracy the oracle lacks"
+            // rule). Only the hardware write masks (reserved bits read 0) are
+            // modelled, matching Mednafen.
+            0xB0 => self.asr0 = val & 0xFFFD_FFFD,
+            0xB4 => self.asr1 = val & 0xF00D_FFFD,
+            0xB8 => self.aref = val & 0x1F,
+            0xC4 => self.rsel = val & 0x1,
             // 0xC8 VER is read-only.
             _ => {}
         }
@@ -578,6 +598,77 @@ impl Scu {
         let bit = 1 << source.bit();
         self.ist |= bit;
         self.fresh_assertions |= bit;
+    }
+
+    /// Timer enable (T1MD bit 0, "TENB"): gates both SCU timers.
+    #[inline]
+    pub fn timers_enabled(&self) -> bool {
+        self.t1md & 1 != 0
+    }
+
+    /// Advance the SCU sub-line timers and the HBLANK-IN interrupt from the
+    /// current raster state — a port of Mednafen `SCU_SetHBVB` (`scu.inc`).
+    ///
+    /// * `now` is the global cycle; `cycles_per_line`/`dots_per_line` convert
+    ///   the elapsed time into the pixel-clock delta the Timer-1 counter uses.
+    /// * `new_hb` is the live HBLANK level (its rising edge is "HB_Start").
+    /// * `timer0_met` is whether the current scanline matches T0C — Timer 1 in
+    ///   mode 1 (T1MD bit 8) only fires on the Timer-0 line.
+    ///
+    /// Raises **HBlank-IN** on the HBLANK rising edge and **Timer 1** when its
+    /// down-counter reaches zero (both gated by TENB). Timer 0 itself is raised
+    /// by [`system::Saturn::update_video_timing`](crate::system) on its line
+    /// compare; this only consumes `timer0_met` for Timer 1's mode gate.
+    ///
+    /// **Sub-line precision:** our raster runs at `update_video_timing`
+    /// granularity, so the Timer-1 H-position lands within ~that window of the
+    /// true dot (the dot-exact raster is deferred M12 work). The line selection,
+    /// mode, enable, and reload are exact.
+    pub fn tick_timers(
+        &mut self,
+        now: u64,
+        cycles_per_line: u64,
+        dots_per_line: u32,
+        new_hb: bool,
+        timer0_met: bool,
+    ) {
+        let pclocks = {
+            let delta = now.saturating_sub(self.timer_last_now);
+            (delta.saturating_mul(dots_per_line as u64) / cycles_per_line.max(1)) as u32
+        };
+        self.timer_last_now = now;
+        let hb_start = new_hb && !self.hb_prev;
+        self.hb_prev = new_hb;
+
+        if self.timers_enabled() {
+            // Count the down-counter toward the T1S H-position. Mednafen
+            // event-schedules the tick to land exactly on zero; we run at batch
+            // granularity, so we fire on the step that *crosses* zero (and clamp
+            // there) rather than requiring an exact-zero sample.
+            if pclocks > 0 && self.timer1_counter > 0 {
+                if self.timer1_counter <= pclocks {
+                    self.timer1_counter = 0;
+                    let mode1 = self.t1md & 0x100 != 0;
+                    if (!mode1 || timer0_met) && !self.timer1_met {
+                        self.timer1_met = true;
+                        self.raise(Source::Timer1);
+                    }
+                } else {
+                    self.timer1_counter -= pclocks;
+                }
+            }
+            // Reload from T1S at the start of each HBLANK for the next line.
+            if hb_start {
+                self.timer1_met = false;
+                self.timer1_counter = (self.t1s & 0x1FF).max(1);
+            }
+        }
+
+        // HBlank-IN fires on the HBLANK rising edge (Mednafen asserts it as a
+        // level; we raise the edge, as VBlank-IN/-OUT are handled).
+        if hb_start {
+            self.raise(Source::HBlankIn);
+        }
     }
 
     /// Pop the highest-priority freshly-asserted source whose IMS bit
@@ -1038,14 +1129,16 @@ mod tests {
     }
 
     #[test]
-    fn abus_config_registers_round_trip() {
+    fn abus_config_registers_round_trip_through_their_hardware_masks() {
         let mut s = Scu::new();
-        s.write32(0xB0, 0x1111_2222); // ASR0
-        s.write32(0xB4, 0x3333_4444); // ASR1
-        s.write32(0xB8, 0x0000_001F); // AREF
-        s.write32(0xC4, 0x0000_0001); // RSEL
-        assert_eq!(s.read32(0xB0), 0x1111_2222);
-        assert_eq!(s.read32(0xB4), 0x3333_4444);
+        // The A-bus config registers drop their reserved bits on write, matching
+        // Mednafen (ASR0 & 0xFFFDFFFD, ASR1 & 0xF00DFFFD, AREF & 0x1F, RSEL & 1).
+        s.write32(0xB0, 0xFFFF_FFFF);
+        s.write32(0xB4, 0xFFFF_FFFF);
+        s.write32(0xB8, 0xFFFF_FFFF);
+        s.write32(0xC4, 0xFFFF_FFFF);
+        assert_eq!(s.read32(0xB0), 0xFFFD_FFFD);
+        assert_eq!(s.read32(0xB4), 0xF00D_FFFD);
         assert_eq!(s.read32(0xB8), 0x0000_001F);
         assert_eq!(s.read32(0xC4), 0x0000_0001);
     }

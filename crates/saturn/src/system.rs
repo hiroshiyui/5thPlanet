@@ -146,6 +146,12 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             (req.src, index) // indirect leaves the table index advanced
         } else if bios_src(req.src) {
             (req.src, req.dst)
+        } else if scu_dma_illegal(req.src, req.dst) {
+            // A same-bus or unmapped SCU DMA is illegal: the transfer does not
+            // run and the DMA-illegal interrupt is raised (Mednafen
+            // `StartDMATransfer` → `SCU_INT_DMA_ILL`). M13 D5.
+            bus.scu.raise(crate::scu::Source::DmaIllegal);
+            (req.src, req.dst)
         } else {
             let count = dma_count(req.channel, req.bytes);
             scu_transfer(
@@ -161,6 +167,35 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
         bus.scu.finish_dma(req.channel, final_src, final_dst);
     }
     cost
+}
+
+/// Which of the three SCU DMA buses an address belongs to, or `None` if it maps
+/// to no DMA-reachable bus (Mednafen `AddressToBus`, `scu.inc`):
+/// `0` A-bus (CS0–CS2: cartridge + CD, `0x0200_0000..=0x058F_FFFF`),
+/// `1` B-bus (SCSP + VDP1/VDP2, `0x05A0_0000..=0x05FB_FFFF`),
+/// `2` C-bus (High Work RAM, `0x0600_0000..`).
+fn scu_dma_bus(addr: u32) -> Option<u8> {
+    match addr & 0x07FF_FFFF {
+        0x0200_0000..=0x058F_FFFF => Some(0),
+        0x05A0_0000..=0x05FB_FFFF => Some(1),
+        0x0600_0000..=0x07FF_FFFF => Some(2),
+        _ => None,
+    }
+}
+
+/// True iff an SCU DMA between `src` and `dst` is illegal because both endpoints
+/// sit on the **same** DMA bus — the SCU cannot transfer within one bus, and no
+/// game relies on it. Mednafen also marks an *unmapped* endpoint (notably Low
+/// Work RAM) illegal, but we **permit** those: our bus model treats LWRAM as
+/// ordinary RAM, and silently skipping a transfer a game depends on would
+/// corrupt data — far worse than not raising a dormant interrupt. So only the
+/// unambiguous same-mapped-bus case is enforced (Mednafen
+/// `StartDMATransfer` `rb == wb`, minus the `== -1` arms). M13 D5.
+fn scu_dma_illegal(src: u32, dst: u32) -> bool {
+    matches!(
+        (scu_dma_bus(src), scu_dma_bus(dst)),
+        (Some(rb), Some(wb)) if rb == wb
+    )
 }
 
 /// SCU DMA byte count: a programmed 0 means the channel's maximum (1 MiB for
@@ -618,11 +653,9 @@ impl Saturn {
         if vblank {
             tvstat |= 0x0008; // VBLANK
         }
-        if hblank_active(
-            line_cycle,
-            self.bus.vdp2.regs.h_resolution(),
-            CYCLES_PER_LINE,
-        ) {
+        let h_res = self.bus.vdp2.regs.h_resolution();
+        let hblank = hblank_active(line_cycle, h_res, CYCLES_PER_LINE);
+        if hblank {
             tvstat |= 0x0004; // HBLANK
         }
         if frame & 1 == 1 {
@@ -666,15 +699,23 @@ impl Saturn {
         // first reaches scanline T0C (a 10-bit value), letting games schedule a
         // mid-frame (raster-split) interrupt. Edge-detected against the previous
         // scanline so it fires once per frame. Dormant unless software sets
-        // TENB, so the BIOS boot path is unaffected. (Timer 1 — the sub-line
-        // H-position timer — needs dot-granular raster timing and is deferred;
-        // *SCU User's Manual*, T0C/T1MD.)
-        if self.bus.scu.t1md & 1 != 0 {
-            let t0c = (self.bus.scu.t0c & 0x3FF) as u16;
-            if line as u16 == t0c && prev_line != t0c {
-                self.bus.scu.raise(crate::scu::Source::Timer0);
-            }
+        // TENB, so the BIOS boot path is unaffected. (*SCU User's Manual*,
+        // T0C/T1MD.)
+        let t0c = (self.bus.scu.t0c & 0x3FF) as u16;
+        let timer0_met = line as u16 == t0c;
+        if self.bus.scu.timers_enabled() && timer0_met && prev_line != t0c {
+            self.bus.scu.raise(crate::scu::Source::Timer0);
         }
+
+        // Timer 1 (sub-line H-position) + the HBlank-IN interrupt, ported from
+        // Mednafen `SCU_SetHBVB`: the Timer-1 down-counter decrements by the dots
+        // elapsed and fires at H-position T1S (per line, or only on the Timer-0
+        // line in mode 1); HBlank-IN fires on the HBLANK rising edge. Both gated
+        // by TENB → dormant on the boot path. (M13 D5.)
+        let dots_per_line = if h_res & 1 == 1 { 455 } else { 427 };
+        self.bus
+            .scu
+            .tick_timers(now, CYCLES_PER_LINE, dots_per_line, hblank, timer0_met);
 
         // Complete any in-flight VDP1 plot whose draw duration has elapsed,
         // even between CPU accesses, so draw-end lands at the modelled cycle.
@@ -1423,7 +1464,7 @@ impl Saturn {
 mod tests {
     use super::{
         CYCLES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count, hblank_active, intback_busy_us,
-        us_to_cycles,
+        scu_dma_bus, scu_dma_illegal, us_to_cycles,
     };
 
     #[test]
@@ -1454,6 +1495,32 @@ mod tests {
         assert_eq!(dma_count(0, 0), 0x0010_0000);
         assert_eq!(dma_count(1, 0), 0x0000_1000);
         assert_eq!(dma_count(2, 0), 0x0000_1000);
+    }
+
+    #[test]
+    fn scu_dma_bus_classifies_the_three_buses() {
+        assert_eq!(scu_dma_bus(0x0200_0000), Some(0)); // cartridge (A-bus)
+        assert_eq!(scu_dma_bus(0x0589_0000), Some(0)); // CD-block (A-bus)
+        assert_eq!(scu_dma_bus(0x05E0_0000), Some(1)); // VDP2 VRAM (B-bus)
+        assert_eq!(scu_dma_bus(0x05A0_0000), Some(1)); // SCSP (B-bus)
+        assert_eq!(scu_dma_bus(0x0600_0000), Some(2)); // High Work RAM (C-bus)
+        assert_eq!(scu_dma_bus(0x0020_0000), None); // Low Work RAM — not DMA-reachable
+        assert_eq!(scu_dma_bus(0x0590_0000), None); // unmapped gap
+    }
+
+    #[test]
+    fn scu_dma_illegal_flags_same_bus_and_unmapped() {
+        // Cross-bus transfers (the normal case) are legal.
+        assert!(!scu_dma_illegal(0x05E0_0000, 0x0600_0000)); // VRAM → HWRAM
+        assert!(!scu_dma_illegal(0x0589_0000, 0x0600_0000)); // CD → HWRAM
+        // Same-mapped-bus transfers are illegal.
+        assert!(scu_dma_illegal(0x05C0_0000, 0x05E0_0000)); // B-bus → B-bus
+        assert!(scu_dma_illegal(0x0200_0000, 0x0589_0000)); // A-bus → A-bus
+        assert!(scu_dma_illegal(0x0600_0000, 0x0601_0000)); // C-bus → C-bus
+        // An unmapped endpoint (Low Work RAM) is permitted, not flagged — our
+        // model treats it as ordinary RAM and must not skip the transfer.
+        assert!(!scu_dma_illegal(0x0020_0000, 0x0600_0000)); // LWRAM → HWRAM
+        assert!(!scu_dma_illegal(0x0020_0000, 0x0020_1000)); // LWRAM → LWRAM
     }
 
     #[test]
