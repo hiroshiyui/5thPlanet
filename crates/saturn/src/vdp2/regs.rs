@@ -496,6 +496,35 @@ impl Vdp2Regs {
         )
     }
 
+    /// 8-bit fractional scroll `(x, y)` for NBG0/NBG1 (SCXDN/SCYDN, fraction in
+    /// the high byte). NBG2/3 have no fraction. Combined with [`Self::nbg_scroll`]
+    /// these give a 16.8 source position; the fraction only changes the sampled
+    /// pixel once whole-layer/line zoom advances the accumulator across a dot.
+    /// (Mednafen `XScrollF`/`YScrollF = (V >> 8) & 0xFF`.)
+    pub fn nbg_scroll_frac(&self, n: usize) -> (u8, u8) {
+        let (xo, yo) = if n == 0 { (0x072, 0x076) } else { (0x082, 0x086) };
+        (
+            ((self.read16(xo) >> 8) & 0xFF) as u8,
+            ((self.read16(yo) >> 8) & 0xFF) as u8,
+        )
+    }
+
+    /// Whole-layer per-dot coordinate increment `(x, y)` for NBG0/NBG1 as 16.16
+    /// fixed point (ZMXN/ZMYN reduction/zoom; `0x1_0000` = 1:1). The hardware
+    /// register is 3 integer bits (`ZMxIN`) + an 8-bit fraction (`ZMxDN`, high
+    /// byte) — Mednafen's 11-bit `XCoordInc`/`YCoordInc` (`.8`), here shifted to
+    /// `.16` to compose with the line-zoom table. A larger increment reduces the
+    /// layer (each screen dot steps more source pixels). Only NBG0/1 support it.
+    pub fn nbg_coord_inc(&self, n: usize) -> (u32, u32) {
+        let (xi, yi) = if n == 0 { (0x078, 0x07C) } else { (0x088, 0x08C) };
+        let inc = |int_off: u32, frac_off: u32| {
+            let int = (self.read16(int_off) & 0x7) as u32;
+            let frac = ((self.read16(frac_off) >> 8) & 0xFF) as u32;
+            (int << 16) | (frac << 8)
+        };
+        (inc(xi, xi + 2), inc(yi, yi + 2))
+    }
+
     // ---- Line scroll (NBG0/NBG1 only) ----
     //
     // SCRCTL (0x09A) enables per-line horizontal/vertical scroll and selects

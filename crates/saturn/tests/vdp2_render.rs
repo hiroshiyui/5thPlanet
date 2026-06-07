@@ -203,3 +203,59 @@ fn color_offset_disabled_leaves_dot_unchanged() {
     let px = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(&out[px..px + 4], &[132, 132, 132, 0xFF], "untouched grey dot");
 }
+
+#[test]
+fn nbg0_horizontal_reduction_halves_the_layer() {
+    // ZMXN0 = 2.0 reduces NBG0 by half: each screen dot steps two source
+    // pixels, so source x=100 lands at screen x=50.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // bitmap, 8bpp
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA.N0PRIN = 1
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red
+    sat.bus.write16(0x05F8_0078, 0x0002, AccessKind::Data); // ZMXIN0 = 2 (integer)
+    sat.bus.write16(0x05F8_007A, 0x0000, AccessKind::Data); // ZMXDN0 = 0 (fraction)
+    sat.bus.vdp2.vram.write8(60 * 512 + 100, 7); // source pixel (100, 60)
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(&out[px..px + 4], &[0xFF, 0, 0, 0xFF], "src x=100 maps to screen x=50");
+    // Neighbours sample even source columns (98, 102) — both empty → backdrop.
+    let left = (60 * FRAME_WIDTH + 49) * 4;
+    assert_eq!(&out[left..left + 4], &[0, 0, 0, 0xFF], "screen x=49 → src 98 (empty)");
+}
+
+#[test]
+fn nbg0_fractional_scroll_shifts_the_sampled_source_pixel() {
+    // With a non-integer reduction (ZMXN0 = 1.5) a +0.5 X scroll fraction tips
+    // the accumulator across a pixel boundary: screen x=1 samples source 2
+    // (red) instead of source 1 (green). This proves the 8-bit scroll fraction
+    // is wired (it is otherwise invisible under nearest sampling at 1:1).
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // bitmap, 8bpp
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA.N0PRIN = 1
+    sat.bus.vdp2.cram.write16(6 * 2, 0x03E0); // CRAM[6] = green (source col 1)
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red   (source col 2)
+    sat.bus.write16(0x05F8_0078, 0x0001, AccessKind::Data); // ZMXIN0 = 1
+    sat.bus.write16(0x05F8_007A, 0x8000, AccessKind::Data); // ZMXDN0 = 0.5 → inc 1.5
+    sat.bus.write16(0x05F8_0072, 0x8000, AccessKind::Data); // SCXDN0 = 0.5 scroll fraction
+    sat.bus.vdp2.vram.write8(30 * 512 + 1, 6); // source (1, 30) = green
+    sat.bus.vdp2.vram.write8(30 * 512 + 2, 7); // source (2, 30) = red
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let px = (30 * FRAME_WIDTH + 1) * 4;
+    assert_eq!(
+        &out[px..px + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "the +0.5 fraction makes screen x=1 sample source 2 (red), not source 1 (green)"
+    );
+}

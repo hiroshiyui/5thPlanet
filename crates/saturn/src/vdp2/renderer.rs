@@ -499,28 +499,49 @@ fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
 
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
 fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
-    let (mut scroll_x, mut scroll_y) = vdp2.regs.nbg_scroll(n);
-    // NBG0/NBG1 support per-line scroll + zoom and per-column vertical cell
-    // scroll on top of the whole-layer scroll.
-    let mut zoom_x: u32 = 1 << 16;
+    // Source position as 16.16 fixed point: whole-layer scroll (integer plus,
+    // for NBG0/1, an 8-bit fraction) walked by a per-dot coordinate increment
+    // that carries reduction/zoom. NBG2/3 are integer scroll — no fraction, no
+    // zoom — so their increment stays 1:1 and the maths collapses to the old
+    // `scroll + coord`.
+    let (sxi, syi) = vdp2.regs.nbg_scroll(n);
+    let mut base_x = sxi << 16;
+    let mut base_y = syi << 16;
+    let (mut xinc, mut yinc) = (1u32 << 16, 1u32 << 16);
     if n < 2 {
-        let (dx, dy, zoom) = line_scroll(vdp2, n, y);
-        // The scroll deltas are sign-extended (a negative offset is a large
-        // `u32`), so accumulate them modulo 2^32 like the vcell/zoom adds below.
-        scroll_x = scroll_x.wrapping_add(dx);
-        scroll_y = scroll_y.wrapping_add(dy);
-        zoom_x = zoom;
+        let (fxf, fyf) = vdp2.regs.nbg_scroll_frac(n);
+        base_x |= (fxf as u32) << 8;
+        base_y |= (fyf as u32) << 8;
+        // Whole-layer ZMXN/ZMYN reduction/zoom. A 0 register reads as "unset"
+        // → 1:1 (never a collapsed layer); real software always programs it
+        // before enabling the layer, so the guard only protects synthetic state.
+        let (zx, zy) = vdp2.regs.nbg_coord_inc(n);
+        if zx != 0 {
+            xinc = zx;
+        }
+        if zy != 0 {
+            yinc = zy;
+        }
+        // Per-line scroll deltas, plus per-line horizontal zoom — the latter,
+        // when enabled, replaces the whole-layer X increment for this line.
+        let (dx, dy, lzoom) = line_scroll(vdp2, n, y);
+        base_x = base_x.wrapping_add(dx << 16);
+        base_y = base_y.wrapping_add(dy << 16);
+        if vdp2.regs.nbg_line_zoom_x(n) {
+            xinc = lzoom;
+        }
+        // Per-column vertical cell scroll (signed; wraps in 16.16).
         if vdp2.regs.nbg_vcell_scroll(n) {
-            scroll_y = scroll_y.wrapping_add(vcell_scroll(vdp2, n, x) as u32);
+            base_y = base_y.wrapping_add((vcell_scroll(vdp2, n, x) as u32) << 16);
         }
     }
+    // Walk the source coordinate at `*inc` per screen dot and sample the integer
+    // part. The coord is masked to the plane size downstream, so a wrapped
+    // (negative-scroll) accumulator is fine.
+    let step = |inc: u32, coord: u32| (coord as u64 * inc as u64) as u32;
+    let sx = base_x.wrapping_add(step(xinc, x)) >> 16;
+    let sy = base_y.wrapping_add(step(yinc, y)) >> 16;
     let depth = vdp2.regs.nbg_color_mode(n);
-    // Horizontal line zoom scales the per-dot source step (1.0 = no zoom).
-    let sx = scroll_x.wrapping_add(((x as u64 * zoom_x as u64) >> 16) as u32);
-    // `scroll_y` may be a sign-extended negative (line/vcell scroll up), so wrap
-    // rather than panic on overflow in debug builds; the source coord is masked
-    // to the plane size downstream.
-    let sy = y.wrapping_add(scroll_y);
     if vdp2.regs.nbg_bitmap_enabled(n) {
         sample_bitmap(vdp2, n, depth, sx, sy)
     } else {
