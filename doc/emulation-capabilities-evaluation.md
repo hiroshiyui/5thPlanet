@@ -97,7 +97,7 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
 | # | Feature | Mednafen | Ours | Impact | Effort |
 |---|---|---|---|---|---|
 | 1 | **Colour offset** (CLOFEN/CLOFSL, COAR/COAG/COAB, COBR/…) — per-layer RGB add/subtract | `MixIt` `vdp2_render.cpp:2581-2600`; enable/sel `:2954-2988` | ✅ **implemented 2026-06-08** | **High** | **Low** |
-| 2 | **NBG0/1 reduction + fractional scroll** (ZMXN/ZMYN, XScrollF) | fixed-point `CurXCoordInc`/`CurXScrollIF` per dot (`:110`, `:114`, `:1590-1592`) | integer scroll only; whole-layer zoom unimplemented | **High** | Med |
+| 2 | **NBG0/1 reduction + fractional scroll** (ZMXN/ZMYN, XScrollF) | fixed-point `CurXCoordInc`/`CurXScrollIF` per dot (`:110`, `:114`, `:1590-1592`) | ✅ **implemented 2026-06-08** | **High** | Med |
 | 3 | **Special priority / special colour-calc per-dot** (SFPRMD/SFCCMD/SFCODE/SFSEL) | templated `priomode`/`ccmode` `:3065`; SFCODE LUT | registers decoded, per-dot application **deferred** (`regs.rs:323-347`) | Med | Med |
 | 4 | **Extended colour calc — 3/4-layer blending** | `MIXIT_SPECIAL_EXCC_*` `:2491-2549` | top-two only | Med | Med-High |
 | 5 | **Dual rotation parameter selection** (RPMD 2/3: per-pixel coeff-MSB + rotation-param window) | `EffRPMD` `:1862`, `rotabsel[x]` `:1977-2004`, `GetWinRotAB` | fixed RBG0=A / RBG1=B; RPMD ignored; coeff mode 3 (Xp) deferred | Med (rotation games) | Med-High |
@@ -164,8 +164,14 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
    the brushed-metal logo layer, which we previously ignored. Applying it is a
    correctness fix (matches Mednafen's `MixIt`); the `bios_splash` golden moved
    `0x2C379F92CE1B63F7` → `0x0B1BA6E5180766F7` accordingly.
-2. **Reduction + fractional scroll (#2)** — game-common (scaling/parallax),
-   verifiable; touches the sampling coordinate math in `sample_nbg`/`sample_tile`.
+2. ✅ **Reduction + fractional scroll (#2)** — DONE 2026-06-08. `sample_nbg`
+   reworked to walk the source coordinate as 16.16 fixed point: whole-layer
+   ZMXN/ZMYN reduction (new `nbg_coord_inc`) + the NBG0/1 8-bit scroll fraction
+   (new `nbg_scroll_frac`), composed with the existing per-line scroll/zoom and
+   vertical cell scroll. NBG2/3 stay 1:1 (no fraction/zoom), so the path
+   collapses to the old `scroll + coord` and the splash golden is unchanged.
+   Tests: `nbg0_horizontal_reduction_halves_the_layer`,
+   `nbg0_fractional_scroll_shifts_the_sampled_source_pixel`.
 3. **Special priority/CC (#3)** then **dual rotation params (#5)** — medium
    impact; registers for #3 already decoded.
 4. **Extended colour calc (#4)** — medium impact, more involved.
