@@ -1118,13 +1118,9 @@ impl ScspCtrl {
                 let imxl = (reg_a & 7) as u32;
                 if imxl != 0 {
                     let isel = ((reg_a >> 3) & 0xF) as usize;
-                    // Effect-send level (Mednafen `scsp.inc`): the int16 slot
-                    // output is scaled `<<4 >> (7 - IMXL)`, i.e. ×2^(IMXL-3) —
-                    // NOT `voice << IMXL` (which over-drove the DSP input by 8×
-                    // and self-oscillated the reverb into static noise).
-                    let s = voice.clamp(i16::MIN as i32, i16::MAX as i32) as u32;
-                    let send = ((s << 4) >> (7 - imxl)) as i32;
-                    self.dsp.set_sample(send, isel);
+                    // Effect-send level (Mednafen `scsp.inc`): scale the slot
+                    // output by ×2^(IMXL-3) — see [`effect_send_level`].
+                    self.dsp.set_sample(effect_send_level(voice, imxl), isel);
                 }
             }
             // FM: record this slot's post-envelope output for any slot that
@@ -1167,6 +1163,24 @@ type ITrace = (
     u64,
     std::collections::VecDeque<(u32, u64, u32, u32)>,
 );
+
+/// One 68k write-watch hit: `(pc, old byte, new byte)`.
+type Wwatch68Entry = (u32, u8, u8);
+/// 68k write-watch state: `(watched addr, last byte, log of hits)`.
+type Wwatch68 = (u32, u8, Vec<Wwatch68Entry>);
+
+/// Scale a slot's output into its DSP effect-send (input-mix) contribution at
+/// level `imxl` (1..=7): the int16 slot output is `<<4 >> (7 - IMXL)`, i.e.
+/// ×2^(IMXL-3) — Mednafen `scsp.inc`. The clamp matches the slot's 16-bit
+/// output stage; the shift is signed so the sign survives directly
+/// (`[i16::MIN, i16::MAX] << 4` fits `i32`, so there is no overflow). NOT
+/// `voice << IMXL`, which over-drives the DSP input by 8× and self-oscillates
+/// the reverb into static noise. `imxl == 0` (no send) is handled by the caller.
+#[inline]
+fn effect_send_level(voice: i32, imxl: u32) -> i32 {
+    let s = voice.clamp(i16::MIN as i32, i16::MAX as i32);
+    (s << 4) >> (7 - imxl)
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
@@ -1245,7 +1259,7 @@ pub struct Scsp {
     /// PC of that instruction is logged — finds *who* writes a value the scope
     /// shows diverging (the per-instruction complement of the scope). `#[serde(skip)]`.
     #[serde(skip)]
-    wwatch68: Option<(u32, u8, Vec<(u32, u8, u8)>)>,
+    wwatch68: Option<Wwatch68>,
     /// Debug-only **instruction-lockstep** PC stream: every 68k instruction PC
     /// from the driver's first instruction (no dup-collapse, no range filter),
     /// capped. Diffed line-for-line against a reference's PC trace (MAME
@@ -1329,7 +1343,7 @@ impl Scsp {
     }
 
     /// Take the 68k write-watch log `(pc, old, new)`, if armed.
-    pub fn take_wwatch68(&mut self) -> Vec<(u32, u8, u8)> {
+    pub fn take_wwatch68(&mut self) -> Vec<Wwatch68Entry> {
         self.wwatch68.take().map(|(_, _, v)| v).unwrap_or_default()
     }
 
@@ -1865,6 +1879,53 @@ impl Bus for M68kView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference scaling per Mednafen `scsp.inc`: `(int16)voice << 4 >> (7-IMXL)`
+    /// with a *signed* (arithmetic) shift. Computed in `i64` to avoid any doubt.
+    fn ref_send(voice: i32, imxl: u32) -> i32 {
+        let s = voice.clamp(i16::MIN as i32, i16::MAX as i32) as i64;
+        ((s << 4) >> (7 - imxl as i64)) as i32
+    }
+
+    #[test]
+    fn effect_send_matches_mednafen_scaling_across_levels_and_signs() {
+        // The boot jingle only exercised IMXL=7 (shift 0), which round-trips even
+        // with an unsigned shift; this sweeps every level and both signs to lock
+        // in the *signed* arithmetic shift (the A1 regression).
+        for imxl in 1..=7u32 {
+            for &voice in &[
+                0,
+                1,
+                -1,
+                100,
+                -100,
+                32767,
+                -32768,
+                // out-of-range: must clamp to int16 first, like the slot stage.
+                40_000,
+                -40_000,
+                i32::MAX,
+                i32::MIN,
+            ] {
+                assert_eq!(
+                    effect_send_level(voice, imxl),
+                    ref_send(voice, imxl),
+                    "voice={voice} imxl={imxl}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effect_send_preserves_sign_for_sub_max_levels() {
+        // The concrete A1 case: a negative sample at IMXL<7 must stay negative
+        // (an unsigned `>>` would flip it to a large positive value).
+        assert!(effect_send_level(-100, 4) < 0);
+        assert_eq!(effect_send_level(-100, 4), (-100 << 4) >> 3);
+        assert_eq!(effect_send_level(100, 4), (100 << 4) >> 3);
+        // IMXL=7 is the identity-shift case the boot jingle used.
+        assert_eq!(effect_send_level(-12345, 7), -12345 << 4);
+    }
 
     #[test]
     fn registers_round_trip_and_mirror() {

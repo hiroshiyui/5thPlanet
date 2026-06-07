@@ -404,4 +404,41 @@ mod tests {
         dsp.set_sample(0x8_0000, 0); // 0x10_0000 wraps to 0
         assert_eq!(dsp.mixs[0], 0, "MIXS accumulates modulo 20 bits");
     }
+
+    #[test]
+    fn mixs_masks_negative_sends_into_the_20_bit_field() {
+        // A negative effect-send is stored as its low-20-bit pattern (bit 19 = the
+        // input's sign), which the step recovers via `sext(MIXS << 4, 24)`. The
+        // mask must never leave a negative `i32` in `mixs` (that would mis-feed
+        // the `<<4`).
+        let mut dsp = Dsp::new();
+        dsp.set_sample(-0x1_0000, 5);
+        assert_eq!(dsp.mixs[5], (-0x1_0000i32) & 0xF_FFFF);
+        assert!(dsp.mixs[5] >= 0, "MIXS holds the unsigned 20-bit field");
+        assert_ne!(dsp.mixs[5] & 0x8_0000, 0, "bit 19 (the sign) is set");
+    }
+
+    #[test]
+    fn negative_mix_input_stays_negative_through_the_step() {
+        // End-to-end sign check for the effect-send path: a negative MIXS input
+        // must reach the effect output negative (the `sext(inputs_reg, 24)` at
+        // consumption recovers the sign the 20-bit mask folded away). Same
+        // pass-through microprogram as `passes_a_mix_input_through_...`.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16; // Y = +0xFFF
+        let s0_ip1 = (1 << 15) | (1 << 13) | (0x20 << 6);
+        let s0_ip2 = (3 << 4) | (1 << 1);
+        let s1_ip2 = (1 << 12) | (3 << 4) | (1 << 1);
+        dsp.mpro[0..4].copy_from_slice(&[0, s0_ip1, s0_ip2, 0]);
+        dsp.mpro[4..8].copy_from_slice(&[0, 0, s1_ip2, 0]);
+        dsp.start();
+        dsp.set_sample(-0x1_0000, 0); // negative MIXS[0]
+        dsp.step(&mut ram);
+        assert!(
+            dsp.efreg[0] < 0,
+            "negative effect-send must stay negative (efreg={})",
+            dsp.efreg[0]
+        );
+    }
 }

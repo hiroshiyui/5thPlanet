@@ -1292,15 +1292,13 @@ fn dump_framebuffer() {
     sat.reset();
     sat.set_region(region);
     sat.set_rtc_unix(1_700_000_000);
-    if let Ok(cue_name) = std::env::var("CUE") {
-        if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) {
-            if let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
-                std::fs::read(root.join("roms").join(name)).ok()
-            }) {
-                sat.insert_disc(d);
-                println!("inserted disc roms/{cue_name}");
-            }
-        }
+    if let Ok(cue_name) = std::env::var("CUE")
+        && let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+        println!("inserted disc roms/{cue_name}");
     }
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let mut dims = (320usize, 224usize);

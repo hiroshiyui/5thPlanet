@@ -394,6 +394,61 @@ fn scu_dsp_dma_to_cache_through_address_lands_at_the_physical_region() {
     assert_eq!(sat.bus.read32(0x05A5_0004, AccessKind::Data).0, 0x9ABC_DEF0);
 }
 
+/// The *read* direction (A/B-bus → DSP data RAM) must strip the cache-through
+/// bit too — the sibling of the write-direction regression above. Without the
+/// mask the read matches no region and returns open bus (0).
+#[test]
+fn scu_dsp_dma_read_from_cache_through_address_reads_the_physical_region() {
+    let mut sat = build();
+    // Seed the physical sound RAM that the cache-through alias points at.
+    sat.bus.write32(0x05A6_0000, 0x0BAD_F00D, AccessKind::Data);
+    sat.bus.write32(0x05A6_0004, 0xFEED_BEEF, AccessKind::Data);
+    // RA0 = cache-through sound RAM 0x25A6_0000 (stored as a >>2 longword addr).
+    sat.bus.scu.dsp.regs.ra0 = 0x25A6_0000u32 >> 2;
+    // DMA 2 words A/B-bus → data RAM bank 0 (dir 0), add_sel=1 (→4 bytes); ENDI.
+    let dma = (0b11u32 << 30) | (1 << 15) | 2;
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    for w in [dma, endi] {
+        sat.bus.write32(PPD, w, AccessKind::Data);
+    }
+    dsp_start_at_zero(&mut sat);
+    sat.run_for(2048);
+    // The read must hit the physical region, not return open bus (0).
+    assert_eq!(sat.bus.scu.dsp.data_ram[0][0], 0x0BAD_F00D);
+    assert_eq!(sat.bus.scu.dsp.data_ram[0][1], 0xFEED_BEEF);
+}
+
+/// The address mask is applied only at the bus access — the `update_addr`
+/// write-back advances the *register*, which keeps its full cache-through
+/// address so a subsequent DMA still aliases correctly.
+#[test]
+fn scu_dsp_dma_writeback_preserves_the_cache_through_bits_in_wa0() {
+    let mut sat = build();
+    sat.bus.scu.dsp.data_ram[0][0] = 0x1111_1111;
+    sat.bus.scu.dsp.data_ram[0][1] = 0x2222_2222;
+    let wa0 = 0x25A7_0000u32 >> 2; // cache-through sound RAM, >>2 longword addr
+    sat.bus.scu.dsp.regs.wa0 = wa0;
+    // DMA DSP-RAM bank 0 → A/B-bus via WA0 (from_dsp=bit 12), 2 words; ENDI.
+    let dma = (0b11u32 << 30) | (1 << 12) | (1 << 15) | 2;
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    for w in [dma, endi] {
+        sat.bus.write32(PPD, w, AccessKind::Data);
+    }
+    dsp_start_at_zero(&mut sat);
+    sat.run_for(2048);
+    // WA0 advances by 2 longwords yet retains its cache-through high bit
+    // (0x2000_0000 >> 2 = 0x0800_0000).
+    assert_eq!(sat.bus.scu.dsp.regs.wa0, wa0 + 2);
+    assert_ne!(
+        sat.bus.scu.dsp.regs.wa0 & 0x0800_0000,
+        0,
+        "cache-through bit retained in the register"
+    );
+    // And the data still landed at the physical region.
+    assert_eq!(sat.bus.read32(0x05A7_0000, AccessKind::Data).0, 0x1111_1111);
+    assert_eq!(sat.bus.read32(0x05A7_0004, AccessKind::Data).0, 0x2222_2222);
+}
+
 #[test]
 fn scu_timer0_fires_at_the_compare_line() {
     let mut sat = build();

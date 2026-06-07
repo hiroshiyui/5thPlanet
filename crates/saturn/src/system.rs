@@ -1292,11 +1292,15 @@ impl Saturn {
         // region bit (e.g. `0x25A5_0000` = sound RAM `0x05A5_0000 | 0x2000_0000`).
         // `SaturnBus` only maps the physical `0x05xx_xxxx` regions, so strip the
         // high bits to the 27-bit A/B-bus space before the access — otherwise the
-        // read returns open bus (0) and the write is dropped (matches
-        // [`scu_transfer`]'s `& 0x07FF_FFFC` masking). This was the BIOS
+        // read returns open bus (0) and the write is dropped. The sibling
+        // [`scu_transfer`] strips the same region bits and additionally forces
+        // longword alignment (`& 0x07FF_FFFC`); here `wa0`/`ra0 << 2` are already
+        // 4-aligned, so only the region mask is applied. This was the BIOS
         // boot-animation BGM root: the jingle sample is staged into VDP1 VRAM and
         // copied into sound RAM `0x5_0000` by an SCU-DSP DMA, which silently moved
-        // zeros without the mask, so the keyed voice played silence.
+        // zeros without the mask, so the keyed voice played silence. The mask is
+        // applied only at the bus access; `wa0`/`ra0` keep their full
+        // cache-through addresses for the `update_addr` writeback below.
         const BUS_MASK: u32 = 0x07FF_FFFF;
         if dma.from_dsp {
             let mut dst = self.bus.scu.dsp.regs.wa0 << 2;
