@@ -316,6 +316,36 @@ impl Vdp2Regs {
         self.read16(0x0E2) & (1 << screen_bit) != 0
     }
 
+    /// Per-screen colour-offset enable (CLOFEN, 0x110, bits 0..6): 0 NBG0/RBG1,
+    /// 1 NBG1, 2 NBG2, 3 NBG3, 4 RBG0, 5 sprite, 6 back screen. When a screen's
+    /// bit is set its final colour gets the selected RGB offset added — this is
+    /// how games do fade-to-black / fade-to-white / tint transitions. (Mednafen
+    /// `ColorOffsEn = V & 0x7F`; VDP2 manual §colour offset, CLOFEN.)
+    pub fn color_offset_enable(&self) -> u8 {
+        (self.read16(0x110) & 0x7F) as u8
+    }
+
+    /// Per-screen colour-offset select (CLOFSL, 0x112): same bit layout as
+    /// CLOFEN; 0 picks offset set A (COAR/COAG/COAB), 1 picks set B
+    /// (COBR/COBG/COBB). (Mednafen `ColorOffsSel = V & 0x7F`.)
+    pub fn color_offset_select(&self) -> u8 {
+        (self.read16(0x112) & 0x7F) as u8
+    }
+
+    /// The signed per-channel colour offset for set `ab` (0 = A, 1 = B) as
+    /// `(r, g, b)`, each a 9-bit two's-complement value in -256..=255 added to
+    /// the 8-bit RGB channel (then clamped 0..=255). Set A = COAR/COAG/COAB
+    /// (0x114/0x116/0x118), set B = COBR/COBG/COBB (0x11A/0x11C/0x11E).
+    /// (Mednafen `ColorOffs`, `sign_x_to_s32(9, V)`.)
+    pub fn color_offset(&self, ab: usize) -> (i32, i32, i32) {
+        let base = if ab == 0 { 0x114 } else { 0x11A };
+        let sx9 = |off: u32| {
+            let v = (self.read16(off) & 0x1FF) as i32;
+            if v & 0x100 != 0 { v - 0x200 } else { v }
+        };
+        (sx9(base), sx9(base + 2), sx9(base + 4))
+    }
+
     // ---- Special function: priority / colour-calc (C4 — registers modelled) ----
     //
     // The special-function machinery lets a layer raise/lower a *per-dot* effect

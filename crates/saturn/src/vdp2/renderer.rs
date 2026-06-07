@@ -163,6 +163,11 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
                 },
                 None => backdrop,
             };
+            // Colour offset (CLOFEN/CLOFSL + COAR..COBB): add the per-screen
+            // signed RGB offset to the final dot, keyed on the front screen
+            // (back screen when nothing is on top) — applied after colour calc,
+            // before sprite-shadow halving, matching Mednafen's MixIt order.
+            rgb = apply_color_offset(vdp2, top, rgb);
             // An MSB-shadow sprite darkens the screen beneath it by half — but
             // only screens whose SDCTL shadow-receive bit is set (NBG/RBG via
             // Layer::screen_bit, the back screen via bit 5). C2: previously every
@@ -276,6 +281,23 @@ fn insert_dot(top: &mut Option<Dot>, second: &mut Option<Dot>, cand: Option<Dot>
         }
         None => *top = Some(d),
     }
+}
+
+/// Apply the VDP2 colour-offset function to the final dot. The enable bit and
+/// A/B set are taken from the front (top) screen — the back screen (bit 6) when
+/// no layer is on top — matching Mednafen, which carries each layer's COE/COSEL
+/// flags on the winning pixel and adds the signed per-channel offset (clamped
+/// 0..=255) after colour calculation. A no-op when the front screen's CLOFEN
+/// bit is clear (the common case), so it's free when unused.
+fn apply_color_offset(vdp2: &Vdp2, top: Option<Dot>, rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    let bit = top.map_or(6, |t| t.layer.screen_bit());
+    if vdp2.regs.color_offset_enable() & (1 << bit) == 0 {
+        return rgb;
+    }
+    let sel = ((vdp2.regs.color_offset_select() >> bit) & 1) as usize;
+    let (or, og, ob) = vdp2.regs.color_offset(sel);
+    let clamp = |c: u8, o: i32| (c as i32 + o).clamp(0, 255) as u8;
+    (clamp(rgb.0, or), clamp(rgb.1, og), clamp(rgb.2, ob))
 }
 
 /// Blend front colour `t` over `b`. Ratio mode (CCMD=0) weights the front by

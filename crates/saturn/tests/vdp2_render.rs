@@ -144,3 +144,62 @@ fn line_colour_screen_is_the_colour_calc_partner_of_an_enabled_layer() {
         "line colour is the colour-calc partner of the NBG0 dot"
     );
 }
+
+#[test]
+fn color_offset_adds_signed_per_channel_offset_keyed_on_front_screen() {
+    // VDP2 colour-offset function (CLOFEN/CLOFSL + COAR..COBB): the front
+    // screen's selected RGB offset is added to the final dot (clamped 0..=255).
+    // This is how games do fade-to-black / fade-to-white / tint transitions.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+
+    // NBG0 bitmap, 8bpp, priority 1 (same scene wiring as the synthetic-scene test).
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data);
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // N0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA.N0PRIN = 1
+    // CRAM[7] = mid grey (R=G=B=16 → 132 each), so one offset can darken (R),
+    // brighten (G), and clamp-high (B) in a single dot.
+    sat.bus.vdp2.cram.write16(7 * 2, 0x4210);
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 7);
+
+    // Colour offset for NBG0 (CLOFEN bit 0), set A (CLOFSL bit 0 = 0):
+    // R = -64 (9-bit two's-complement 0x1C0), G = +32, B = +200 (clamps).
+    sat.bus.write16(0x05F8_0110, 0x0001, AccessKind::Data); // CLOFEN: NBG0
+    sat.bus.write16(0x05F8_0112, 0x0000, AccessKind::Data); // CLOFSL: set A
+    sat.bus.write16(0x05F8_0114, 0x01C0, AccessKind::Data); // COAR = -64
+    sat.bus.write16(0x05F8_0116, 0x0020, AccessKind::Data); // COAG = +32
+    sat.bus.write16(0x05F8_0118, 0x00C8, AccessKind::Data); // COAB = +200
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(
+        &out[px..px + 4],
+        &[132 - 64, 132 + 32, 255, 0xFF],
+        "grey dot offset by (-64, +32, +200-clamped)"
+    );
+}
+
+#[test]
+fn color_offset_disabled_leaves_dot_unchanged() {
+    // CLOFEN clear for the front screen → no offset, even with COAR..COBB set.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data);
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data);
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data);
+    sat.bus.vdp2.cram.write16(7 * 2, 0x4210); // mid grey (132,132,132)
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 7);
+    // Offsets present but NBG0's enable bit (0) is clear.
+    sat.bus.write16(0x05F8_0110, 0x0002, AccessKind::Data); // CLOFEN: NBG1 only
+    sat.bus.write16(0x05F8_0114, 0x01C0, AccessKind::Data); // COAR = -64
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(&out[px..px + 4], &[132, 132, 132, 0xFF], "untouched grey dot");
+}
