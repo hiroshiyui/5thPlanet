@@ -3325,4 +3325,496 @@ mod tests {
         assert_eq!(x.num, 3, "0xFFFF count = avail (5) - offset (2)");
         assert!(c.cr1 & STAT_TRANS != 0, "transfer-pending status set");
     }
+
+    // ===== Seek disc (0x11) — all three branches =====
+
+    #[test]
+    fn seek_disc_fad_form_positions_the_head_and_pauses() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Idle; // skip the recognition spin-up
+        // CR1 bit 0x80 set + a real FAD (0x000200): seek to that FAD, status PAUSE.
+        cmd(&mut c, 0x1180, 0x0200, 0x0000, 0x0000);
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "FAD seek pauses");
+        assert_eq!(c.cd_curfad, 0x0200, "head positioned at the requested FAD");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+    }
+
+    #[test]
+    fn seek_disc_fad_ffffff_is_pause_in_place() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Idle;
+        c.cd_curfad = 0x0345; // an existing head position to be preserved
+        // CR1 bit 0x80, FAD = 0xFFFFFF: pause in place — head FAD unchanged.
+        cmd(&mut c, 0x11FF, 0xFFFF, 0x0000, 0x0000);
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "pause in place");
+        assert_eq!(c.cd_curfad, 0x0345, "head position preserved (no re-seek)");
+    }
+
+    #[test]
+    fn seek_disc_track_form_sets_track_and_pauses() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Idle;
+        // CR1 bit 0x80 clear, CR2 high byte = track 5: track seek → PAUSE.
+        cmd(&mut c, 0x1100, 0x0500, 0x0000, 0x0000);
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "track seek pauses");
+        assert_eq!(c.track, 5, "track set from CR2 high byte");
+    }
+
+    #[test]
+    fn seek_disc_stop_form_goes_standby_with_stopped_geometry() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Idle;
+        // CR1 bit 0x80 clear, CR2 = 0 (track 0): Stop → STANDBY with the
+        // "no position" sentinels (Mednafen STOP geometry, cdb.cpp:2846).
+        cmd(&mut c, 0x1100, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.status & !STAT_PERI, STAT_STANDBY, "Stop → STANDBY");
+        assert_eq!(c.cd_curfad, 0xFFFF_FFFF, "head FAD sentinel");
+        assert_eq!(c.track, 0xFF);
+        assert_eq!(c.ctrladdr, 0xFF);
+        assert_eq!(c.index, 0xFF);
+        assert_eq!(c.repcnt, 0x7F);
+        // The status report carries the stopped geometry (CR2/3/4 = 0xFF…).
+        assert_eq!(c.read16(0x001C), 0xFFFF, "CR2 ctrl/track sentinel");
+        assert_eq!(c.read16(0x0020), 0xFFFF, "CR3 index/FAD-hi sentinel");
+        assert_eq!(c.read16(0x0024), 0xFFFF, "CR4 FAD-lo sentinel");
+    }
+
+    // ===== Get last buffer destination (0x32) =====
+
+    #[test]
+    fn get_last_buffer_destination_reports_the_last_routed_partition() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        // A play routes sectors through filter 0 → partition 0, latching
+        // `last_buffer` to that partition.
+        play(&mut c, 150, 1);
+        pump(&mut c);
+        assert_eq!(c.last_buffer, 0, "filtered sector latched partition 0");
+        // Get Last Buffer Destination (0x32): partition # in CR3 high byte.
+        cmd(&mut c, 0x3200, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x0020) >> 8, 0, "last buffer in CR3 high byte");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+    }
+
+    // ===== Set filter connection (0x46) =====
+
+    #[test]
+    fn set_filter_connection_sets_true_and_false_conditions() {
+        let mut c = CdBlock::new();
+        // CR1 bit0 = set true cond, bit1 = set false cond. CR2 high = true
+        // partition (7), CR2 low = false partition (9), filter # = CR3 high (2).
+        cmd(&mut c, 0x4603, 0x0709, 0x0200, 0x0000);
+        assert_eq!(c.filters[2].condtrue, 7, "true connector set");
+        assert_eq!(c.filters[2].condfalse, 9, "false connector set");
+        assert_eq!(c.hirq & HIRQ_ESEL, HIRQ_ESEL);
+        // Bit0 only: update the true connector, leave the false one alone.
+        cmd(&mut c, 0x4601, 0x1100, 0x0200, 0x0000);
+        assert_eq!(c.filters[2].condtrue, 0x11, "true connector updated");
+        assert_eq!(c.filters[2].condfalse, 9, "false connector untouched");
+        // Bit1 only: update the false connector, leave the true one alone.
+        cmd(&mut c, 0x4602, 0x0022, 0x0200, 0x0000);
+        assert_eq!(c.filters[2].condtrue, 0x11, "true connector untouched");
+        assert_eq!(c.filters[2].condfalse, 0x22, "false connector updated");
+    }
+
+    // ===== Get buffer partition sector number (0x51) =====
+
+    #[test]
+    fn get_buffer_partition_sector_number_reports_block_count() {
+        let mut c = CdBlock::new();
+        c.partitions[3].blocks = vec![0, 1, 2, 3]; // 4 blocks in partition 3
+        // Get Buffer Partition Sector Number (0x51): partition = CR3 high byte.
+        cmd(&mut c, 0x5100, 0x0000, 0x0300, 0x0000);
+        assert_eq!(c.read16(0x0024), 4, "CR4 = partition block count");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+        // An out-of-range partition reports 0.
+        cmd(&mut c, 0x5100, 0x0000, 0xFF00, 0x0000);
+        assert_eq!(c.read16(0x0024), 0, "invalid partition → 0 count");
+    }
+
+    // ===== Calculate (0x52) + Get (0x53) actual data size =====
+
+    #[test]
+    fn calculate_and_get_actual_data_size_sums_block_sizes_in_words() {
+        let mut c = CdBlock::new();
+        // Three blocks of known byte sizes in partition 1.
+        c.blocks[10].size = 2048;
+        c.blocks[11].size = 2048;
+        c.blocks[12].size = 1024;
+        c.partitions[1].blocks = vec![10, 11, 12];
+        // Calculate Actual Data Size (0x52): partition = CR3 high (1),
+        // offset = CR2 (0), count = CR4 (3). Result is in 16-bit words.
+        cmd(&mut c, 0x5200, 0x0000, 0x0100, 0x0003);
+        // (2048 + 2048 + 1024) / 2 = 2560 words.
+        assert_eq!(c.calcsize, 2560);
+        assert_eq!(c.hirq & HIRQ_ESEL, HIRQ_ESEL);
+        // Get Actual Data Size (0x53): the word count splits CR1(MSB)/CR2(low).
+        cmd(&mut c, 0x5300, 0x0000, 0x0000, 0x0000);
+        // 2560 words fits in 16 bits, so the size-hi byte (CR1 low) is 0.
+        assert_eq!(c.read16(0x0018) & 0xFF, 0, "CR1 size hi");
+        assert_eq!(c.read16(0x001C), 2560, "CR2 size lo (words)");
+        // A sub-range (offset 1, count 1) sums just that one block.
+        cmd(&mut c, 0x5200, 0x0001, 0x0100, 0x0001);
+        assert_eq!(c.calcsize, 1024, "block 11 only = 2048/2 words");
+    }
+
+    // ===== Get copy/move error (0x67) =====
+
+    #[test]
+    fn get_copy_move_error_reports_no_error() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        // Even with real disc geometry present, Get Copy/Move Error (0x67)
+        // returns "no error": CR2..CR4 all zero (Mednafen 0x0100,0,0,0).
+        cmd(&mut c, 0x6700, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x001C), 0x0000, "CR2 = 0 (no error)");
+        assert_eq!(c.read16(0x0020), 0x0000, "CR3 = 0");
+        assert_eq!(c.read16(0x0024), 0x0000, "CR4 = 0");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+    }
+
+    // ===== Read directory (0x71) =====
+
+    #[test]
+    fn read_directory_connects_the_filter_and_rejects_invalid() {
+        let mut c = CdBlock::new();
+        // Read Directory (0x71): connect the read filter from CR3 high byte (5).
+        cmd(&mut c, 0x7100, 0x0000, 0x0500, 0x0000);
+        assert_eq!(c.cd_device_filter, 5, "filter connected for the dir read");
+        assert_eq!(c.hirq & HIRQ_EFLS, HIRQ_EFLS);
+        // An out-of-range filter index → disconnected (NO_FILTER).
+        cmd(&mut c, 0x7100, 0x0000, 0xFF00, 0x0000);
+        assert_eq!(c.cd_device_filter, NO_FILTER, "invalid filter → disconnected");
+    }
+
+    // ===== Abort file (0x75) — with and without a disc =====
+
+    #[test]
+    fn abort_file_with_disc_pauses_and_clears_xfer() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        // Arm a 32-bit transfer so we can confirm Abort File clears it.
+        cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0002); // Get Sector Data
+        assert!(c.xfer32.is_some(), "transfer armed before abort");
+        cmd(&mut c, 0x7500, 0x0000, 0x0000, 0x0000); // Abort File
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "disc present → PAUSE");
+        assert!(c.xfer32.is_none(), "xfer32 cleared by Abort File");
+        assert_eq!(c.fadstoplay, -1, "play range parked (drive idle)");
+        assert_eq!(c.hirq & HIRQ_EFLS, HIRQ_EFLS);
+    }
+
+    #[test]
+    fn abort_file_without_disc_keeps_nodisc() {
+        let mut c = CdBlock::new();
+        // No disc: Abort File must NOT fabricate a disc-present PAUSE status —
+        // it is a buffer/transfer abort, not a physical drive op.
+        cmd(&mut c, 0x7500, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.status & !STAT_PERI, STAT_NODISC, "no disc → NODISC kept");
+        assert!(c.xfer32.is_none());
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_EFLS), HIRQ_CMOK | HIRQ_EFLS);
+    }
+
+    // ===== Default arm — unimplemented command =====
+
+    #[test]
+    fn unimplemented_command_returns_a_status_report_and_cmok() {
+        let mut c = CdBlock::new();
+        c.hirq = 0;
+        // 0x20 is not handled → the default arm: a plain status report + CMOK.
+        cmd(&mut c, 0x2000, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK, "default arm sets CMOK");
+        // No disc → the report is the NODISC status, zero geometry.
+        assert_eq!(c.read16(0x0018), 0x0700, "CR1 = NODISC status report");
+        assert_eq!(c.read16(0x001C), 0x0000);
+        assert_eq!(c.read16(0x0020), 0x0000);
+        assert_eq!(c.read16(0x0024), 0x0000);
+    }
+
+    // ===== Play (0x10) variants =====
+
+    #[test]
+    fn play_with_repeat_mode_arms_the_repeat_count() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        // Play FAD 150, 2 sectors, play-mode = 0x03 (repeat 3, top bits 0) in
+        // CR3 high byte. start/end both FAD (bit 0x80 in CR1/CR3 low byte).
+        // CR1 = 0x10 | 0x80 (FAD), CR2 = 150; CR3 = (0x03<<8)|0x80, CR4 = 2.
+        cmd(&mut c, 0x1080, 150, 0x0380, 0x0002);
+        assert_eq!(c.cur_play_repeat, 0x03, "repeat field decoded from play-mode");
+        // The end field is start + count when both are FAD-addressed.
+        assert_eq!(c.cur_play_end & 0x7F_FFFF, 150 + 2, "end = start + count");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+    }
+
+    #[test]
+    fn play_ffffff_reuses_the_prior_play_position() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        // First Play sets a range.
+        cmd(&mut c, 0x1080, 150, 0x0080, 0x0002); // start 150, +2 sectors
+        let prior_start = c.cur_play_start;
+        let prior_end = c.cur_play_end;
+        // A lone 0xFFFFFF start/end reuses the prior position (cdb.cpp:2813).
+        cmd(&mut c, 0x10FF, 0xFFFF, 0x00FF, 0xFFFF);
+        assert_eq!(c.cur_play_start, prior_start, "start reused");
+        assert_eq!(c.cur_play_end, prior_end, "end reused");
+    }
+
+    // ===== File-system error/edge branches (0x70 / 0x73 / 0x74) =====
+
+    #[test]
+    fn get_file_info_whole_directory_form() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
+        // Get File Info (0x73) with id 0xFFFFFF = whole-directory form: CR2 is
+        // the all-entries word count (0x5F4), TRANS set, no per-file FAD staged.
+        cmd(&mut c, 0x7300, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.read16(0x001C), 0x05F4, "whole-directory word count");
+        assert!(c.transfer_request, "transfer pending");
+        assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY);
+    }
+
+    #[test]
+    fn get_file_info_for_a_valid_id_stages_a_12_byte_record() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
+        // Get File Info for id 2 (the file "X" at FAD 170, length 2048).
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002);
+        assert_eq!(c.read16(0x001C), 6, "CR2 = 6 words for a single file");
+        // The 12-byte record streams big-endian through the FIFO: FAD, length,
+        // gap/unit, id, flags.
+        assert_eq!(c.read16(0x8000), 0x0000, "FAD hi");
+        assert_eq!(c.read16(0x8000), 0x00AA, "FAD lo = 170");
+        assert_eq!(c.read16(0x8000), 0x0000, "length hi");
+        assert_eq!(c.read16(0x8000), 0x0800, "length lo = 2048");
+        let _gap_unit = c.read16(0x8000); // gap/unit size bytes
+        assert_eq!(c.read16(0x8000) >> 8, 2, "id byte = 2");
+    }
+
+    #[test]
+    fn read_file_with_invalid_id_just_reports_status() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        c.drive_phase = DrivePhase::Idle;
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root (3 entries)
+        // Read File (0x74) with id 99 (out of range): the else branch just
+        // emits a status report and does NOT start a read (no seek armed).
+        cmd(&mut c, 0x7400, 0x0000, 0x0000, 0x0063);
+        assert_eq!(c.fadstoplay, -1, "no read range armed for an invalid id");
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_EHST), HIRQ_CMOK | HIRQ_EHST);
+    }
+
+    // ===== 16-bit data FIFO read path (read_fifo16) =====
+
+    #[test]
+    fn data_fifo_streams_a_staged_transfer_word_by_word_big_endian() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
+        // Stage the 12-byte Get-File-Info record for file id 2.
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002);
+        // The first staged byte pair is the big-endian FAD high half = 0x0000,
+        // then the low half 0x00AA. Verify the 16-bit FIFO returns each pair
+        // MSB-first (vs. the 32-bit data-port path tested elsewhere).
+        assert_eq!(c.read16(0x8000), 0x0000); // bytes 0..1 (FAD hi)
+        assert_eq!(c.read16(0x8000), 0x00AA); // bytes 2..3 (FAD lo = 170)
+        // The byte cursor advances by two per read; xfer_done tracks it.
+        assert_eq!(c.xfer_pos, 4, "two 16-bit reads consumed four bytes");
+        assert_eq!(c.xfer_done, 4);
+        // Reads past the staged buffer return 0 and don't run off the end.
+        for _ in 0..20 {
+            let _ = c.read16(0x8000);
+        }
+        assert_eq!(c.xfer_pos, c.xfer.len(), "cursor clamps at the buffer end");
+        assert_eq!(c.read16(0x8000), 0x0000, "past-end reads return 0");
+    }
+
+    // ===== take_cd_audio_buffered pre-roll path =====
+
+    #[test]
+    fn take_cd_audio_buffered_holds_silence_until_preroll_then_drains() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        // Decode several audio sectors directly into the CD-DA FIFO (one sector
+        // = 1176 samples; the pre-roll cushion is 44_100 samples ≈ 38 sectors).
+        c.status = STAT_PLAY;
+        c.cd_curfad = FAD_OFFSET;
+        // Each play_data reads one sector and advances; loop the 2-sector disc.
+        for _ in 0..50 {
+            c.cd_curfad = FAD_OFFSET; // re-read sector 0 each time to fill
+            c.fadstoplay = 1;
+            c.status = STAT_PLAY;
+            c.play_data();
+        }
+        assert!(
+            c.cd_audio.len() >= 44_100,
+            "buffered past the pre-roll cushion"
+        );
+        // Before priming, the very first buffered drain must already pass the
+        // cushion (we filled > PREROLL), so it returns real samples, not silence.
+        let out = c.take_cd_audio_buffered(1176);
+        assert!(c.cd_audio_primed, "primed once the cushion was reached");
+        assert!(out.iter().any(|&s| s != 0), "drained real PCM, not silence");
+    }
+
+    #[test]
+    fn take_cd_audio_buffered_returns_silence_below_preroll() {
+        let mut c = CdBlock::new();
+        // An empty (or barely-filled) FIFO stays un-primed and pads silence.
+        let out = c.take_cd_audio_buffered(64);
+        assert_eq!(out, vec![0i16; 64], "no cushion yet → silence");
+        assert!(!c.cd_audio_primed, "still un-primed below the pre-roll");
+    }
+
+    // ===== dbg_play_cdda / dbg_play_first_audio_track debug hooks =====
+
+    #[test]
+    fn dbg_play_cdda_arms_a_play_over_the_given_range() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        // dbg_play_cdda(fad, sectors): drives the real start_seek Play machinery.
+        c.dbg_play_cdda(FAD_OFFSET, 2);
+        assert_eq!(
+            c.cur_play_start, 0x80_0000 | FAD_OFFSET,
+            "play start armed (FAD-addressed)"
+        );
+        assert_eq!(c.cur_play_end, 0x80_0000 | (FAD_OFFSET + 2), "play end armed");
+        assert_eq!(c.play_end_irq, HIRQ_PEND, "PEND at range end");
+        assert_eq!(c.drive_phase, DrivePhase::SeekStart, "seek started");
+    }
+
+    #[test]
+    fn dbg_play_first_audio_track_finds_and_plays_the_audio_track() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        assert!(c.dbg_play_first_audio_track(), "found the audio track");
+        // It armed a Play over track 1 (FAD 150, 2 sectors) via dbg_play_cdda.
+        assert_eq!(c.cur_play_start, 0x80_0000 | FAD_OFFSET);
+        assert_eq!(c.drive_phase, DrivePhase::SeekStart, "seek started");
+        // Running the drive past seek streams CDDA into the audio FIFO.
+        pump(&mut c);
+        assert!(!c.cd_audio.is_empty(), "CDDA decoded to the audio FIFO");
+        // A data-only disc has no audio track → returns false, arms nothing.
+        let mut d = CdBlock::new();
+        d.insert_disc(iso_disc());
+        assert!(!d.dbg_play_first_audio_track(), "no audio track on a data disc");
+    }
+
+    // ===== reset_selector variants =====
+
+    #[test]
+    fn reset_selector_single_partition_clears_just_that_buffer() {
+        let mut c = CdBlock::new();
+        // Two partitions hold blocks; CR1 low == 0 clears the one in CR3 high.
+        c.blocks[5].size = 2048;
+        c.blocks[6].size = 2048;
+        c.partitions[2].blocks = vec![5];
+        c.partitions[3].blocks = vec![6];
+        c.free_blocks = MAX_BLOCKS as i32 - 2;
+        // Reset Selector (0x48), CR1 low = 0 → clear partition CR3 high = 2.
+        cmd(&mut c, 0x4800, 0x0000, 0x0200, 0x0000);
+        assert!(c.partitions[2].blocks.is_empty(), "partition 2 cleared");
+        assert_eq!(c.partitions[3].blocks, vec![6], "partition 3 untouched");
+        assert_eq!(c.free_blocks, MAX_BLOCKS as i32 - 1, "one block freed");
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_ESEL), HIRQ_CMOK | HIRQ_ESEL);
+    }
+
+    #[test]
+    fn reset_selector_all_partitions_and_connectors() {
+        let mut c = CdBlock::new();
+        c.filters[0].condtrue = 7;
+        c.filters[0].condfalse = 9;
+        c.blocks[1].size = 2048;
+        c.partitions[0].blocks = vec![1];
+        c.free_blocks = MAX_BLOCKS as i32 - 1;
+        // CR1 bit 0x80 (false conds) | 0x40 (true conds) | 0x04 (all partitions).
+        cmd(&mut c, 0x48C4, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.filters[0].condtrue, 0, "true connector reset");
+        assert_eq!(c.filters[0].condfalse, 0, "false connector reset");
+        assert!(c.partitions[0].blocks.is_empty(), "all partitions cleared");
+        assert_eq!(c.free_blocks, MAX_BLOCKS as i32, "all blocks freed");
+        assert!(!c.buf_full, "buffer-full latch cleared");
+    }
+
+    // ===== Get Sector Data / Delete reject branches (invalid buffer) =====
+
+    #[test]
+    fn get_sector_data_rejects_an_invalid_buffer_number() {
+        let mut c = CdBlock::new();
+        c.hirq = 0;
+        // Buffer 0xFF >= MAX_FILTERS → reject, no transfer armed.
+        cmd(&mut c, 0x6100, 0x0000, 0xFF00, 0x0001);
+        assert_eq!(c.cr1, STAT_REJECT, "invalid buffer rejected");
+        assert!(c.xfer32.is_none(), "no transfer armed");
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_EHST), HIRQ_CMOK | HIRQ_EHST);
+    }
+
+    #[test]
+    fn delete_sector_data_rejects_an_empty_or_invalid_partition() {
+        let mut c = CdBlock::new();
+        c.hirq = 0;
+        // Delete (0x62) on an empty partition (avail == 0) → reject.
+        cmd(&mut c, 0x6200, 0x0000, 0x0000, 0x0001);
+        assert_eq!(c.cr1, STAT_REJECT, "empty partition rejected");
+        // A valid range frees the requested blocks.
+        c.blocks[2].size = 2048;
+        c.blocks[3].size = 2048;
+        c.partitions[1].blocks = vec![2, 3];
+        c.free_blocks = MAX_BLOCKS as i32 - 2;
+        cmd(&mut c, 0x6200, 0x0000, 0x0100, 0x0001); // delete 1 from offset 0
+        assert_eq!(c.partitions[1].blocks, vec![3], "one block deleted");
+        assert_eq!(c.free_blocks, MAX_BLOCKS as i32 - 1, "freed one block");
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_EHST), HIRQ_CMOK | HIRQ_EHST);
+    }
+
+    // ===== byte-access (read8/write8) paths + HIRQ-mask register =====
+
+    #[test]
+    fn byte_access_aliases_the_even_and_odd_halves_of_a_register() {
+        let mut c = CdBlock::new();
+        // Power-on CR2 = "DB" → high byte 'D' (offset 0x1C), low byte 'B' (0x1D).
+        assert_eq!(c.read8(0x001C), b'D');
+        assert_eq!(c.read8(0x001D), b'B');
+        // write8 composes the two halves of a 16-bit register write. Write the
+        // HIRQ-mask register (0x0C) one byte at a time and read it back.
+        c.write8(0x000C, 0x12); // high byte
+        c.write8(0x000D, 0x34); // low byte
+        assert_eq!(c.hirq_mask, 0x1234, "byte writes compose the 16-bit value");
+        assert_eq!(c.read8(0x000C), 0x12);
+        assert_eq!(c.read8(0x000D), 0x34);
+    }
+
+    #[test]
+    fn hirq_mask_register_round_trips_and_gates_irq_active() {
+        let mut c = CdBlock::new();
+        c.hirq = HIRQ_CMOK;
+        // The HIRQ-mask register at 0x0C is a plain read/write latch.
+        c.write16(0x000C, 0x0001); // unmask only CMOK
+        assert_eq!(c.read16(0x000C), 0x0001);
+        assert!(c.irq_active(), "(hirq & mask) != 0 with CMOK unmasked");
+        c.write16(0x000C, 0x0000); // mask everything
+        assert!(!c.irq_active(), "masking all bits drops the IRQ level");
+    }
+
+    // ===== read8 of CR4 consumes the command response =====
+
+    #[test]
+    fn read8_of_cr4_consumes_the_pending_command_response() {
+        let mut c = CdBlock::new();
+        // Issue Get Status; the response sits pending until CR4 is read.
+        cmd(&mut c, 0x0000, 0x0000, 0x0000, 0x0000);
+        assert!(c.command_pending, "response pending after a command");
+        // A byte read of either half of the CR4 slot routes through read16 and
+        // clears command_pending (consumes the response).
+        let _ = c.read8(0x0024);
+        assert!(!c.command_pending, "reading CR4 consumed the response");
+    }
 }
