@@ -1284,6 +1284,22 @@ mod tests {
 
     /// Write an identity rotation parameter set (dx = dyst = A = E = kx = ky =
     /// 1.0) for parameter A (which=0, base 0) or B (which=1, base 0x80).
+    /// Identity rotation parameters (dx = dyst = A = E = kx = ky = 1.0) written
+    /// at an explicit table byte `base` — for tests that need the parameter
+    /// table off VRAM offset 0 to avoid colliding with a pattern-name table.
+    fn setup_rot_param_at(v: &mut Vdp2, base: u32) {
+        for (k, val) in [
+            (4u32, 1 << 16),
+            (5, 1 << 16),
+            (7, 1 << 16),
+            (11, 1 << 16),
+            (19, 1 << 16),
+            (20, 1 << 16),
+        ] {
+            v.vram.write32(base + k * 4, val);
+        }
+    }
+
     fn setup_rot_identity(v: &mut Vdp2, which: usize) {
         let base = if which == 0 { 0 } else { 0x80 };
         for (k, val) in [
@@ -1695,5 +1711,378 @@ mod tests {
             [0, 0xFF, 0, 0xFF],
             "outside the narrow line-0 window"
         );
+    }
+
+    /// 4bpp paletted bitmap: each byte holds two pixels (high nibble = even
+    /// column). The nibble indexes the low palette directly (BMPNA bank not
+    /// applied), with nibble 0 transparent.
+    #[test]
+    fn bitmap_4bpp_packs_two_pixels_per_byte() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0002); // N0BMEN, N0CHCN = 0 → 4bpp
+        v.cram.write16(0xA * 2, 0x001F); // palette index 0xA = red
+        v.cram.write16(0xB * 2, 0x7C00); // palette index 0xB = blue
+        // Byte at bitmap (px 0/1, row 0): high nibble = col 0 = 0xA, low = 0xB.
+        v.vram.write8(0, 0xAB);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "even column → high nibble");
+        assert_eq!(pixel(&buf, 1, 0), [0, 0, 0xFF, 0xFF], "odd column → low nibble");
+    }
+
+    /// `tpon` (BGON.NxTPON) makes palette code 0 the *solid* backdrop colour
+    /// `CRAM[offset]` instead of transparent — what the BIOS splash relies on.
+    #[test]
+    fn transparent_pen_solid_draws_palette_zero_as_a_colour() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0101); // BGON: NBG0 on (bit0) + N0TPON (bit8)
+        v.regs.write16(0x028, 0x0012); // 8bpp bitmap
+        v.regs.write16(0x0F8, 0x0001); // priority 1
+        v.cram.write16(0, 0x001F); // CRAM[0] = red — the "solid pen-0" colour
+        // VRAM bitmap is all zero → every dot is palette code 0.
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 5, 5), [0xFF, 0, 0, 0xFF], "pen 0 solid → red");
+    }
+
+    /// Window logic bit (WCTL 0x80) ORs W0 and W1 instead of ANDing them, and a
+    /// window with area=outside passes *outside* its rectangle. Exercises both
+    /// the OR branch in `window_allows` and the `!inside` branch in `win_pixel`.
+    #[test]
+    fn window_or_logic_and_outside_area() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // bitmap, 8bpp
+        v.cram.write16(0, 0x1F << 5); // backdrop green
+        v.cram.write16(2, 0x001F); // index 1 red
+        for y in 0..4u32 {
+            for x in 0..8u32 {
+                v.vram.write8(y * 512 + x, 1);
+            }
+        }
+        // NBG0 WCTL = OR (0x80) | W1 enable+area-inside (0x0C) | W0 enable +
+        // area-OUTSIDE (0x02, area bit clear). Pass = outside-W0 OR inside-W1.
+        v.regs.write16(0x0D0, 0x008E);
+        // W0 rect x∈[0,1] (so "outside W0" = x≥2); WPSX/WPEX are half-dot.
+        v.regs.write16(0x0C0, 0); // WPSX0 → 0
+        v.regs.write16(0x0C4, 2); // WPEX0 → 1
+        v.regs.write16(0x0C2, 0); // WPSY0
+        v.regs.write16(0x0C6, 0x3FF); // WPEY0 (whole height)
+        // W1 rect x∈[0,0] (inside-W1 = x==0).
+        v.regs.write16(0x0C8, 0); // WPSX1 → 0
+        v.regs.write16(0x0CC, 0); // WPEX1 → 0
+        v.regs.write16(0x0CA, 0); // WPSY1
+        v.regs.write16(0x0CE, 0x3FF); // WPEY1
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // x=0: outside-W0 false, but inside-W1 true → OR passes → red.
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "inside W1 passes via OR");
+        // x=1: outside-W0 false AND inside-W1 false → suppressed → backdrop.
+        assert_eq!(pixel(&buf, 1, 0), [0, 0xFF, 0, 0xFF], "neither window passes");
+        // x=3: outside-W0 true → OR passes → red.
+        assert_eq!(pixel(&buf, 3, 0), [0xFF, 0, 0, 0xFF], "outside W0 passes via OR");
+    }
+
+    /// Per-column vertical cell scroll with BOTH NBG0 and NBG1 enabled: the
+    /// VCSTA table interleaves their longwords (NBG0 = even, NBG1 = odd), so
+    /// each layer reads its own per-column scroll from the shared table.
+    #[test]
+    fn vcell_scroll_interleaves_both_layers() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0003); // NBG0 + NBG1
+        v.regs.write16(0x028, 0x1212); // both 8bpp bitmap
+        v.regs.write16(0x0F8, 0x0205); // N0 top (pri 5), N1 pri 2
+        v.regs.write16(0x03C, 0x0010); // NBG1 bitmap base 0x20000
+        v.regs.write16(0x09A, 0x0101); // SCRCTL: N0VCSC (bit0) + N1VCSC (bit8)
+        v.regs.write16(0x09E, 0x0200); // VCSTAL → table byte 0x400
+        // Interleaved longwords for column 0: NBG0 (even) = +5, NBG1 (odd) = +7.
+        v.vram.write32(0x400, 5 << 16); // NBG0 column 0 scroll +5
+        v.vram.write32(0x404, 7 << 16); // NBG1 column 0 scroll +7
+        v.cram.write16(2, 0x001F); // NBG0 index 1 red
+        v.cram.write16(4, 0x7C00); // NBG1 index 2 blue
+        // NBG0 dot at (0,5): screen (0,0) + scroll +5 samples it.
+        v.vram.write8(5 * 512, 1);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // NBG0 (front) column 0 scrolled +5 → screen (0,0) samples (0,5) → red.
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "NBG0 +5 (even longword)");
+        // Now make NBG0 transparent at (0,0) and place an NBG1 dot at (0,7),
+        // which NBG1's +7 column scroll brings to screen (0,0) → blue shows.
+        v.vram.write8(5 * 512, 0); // clear NBG0 dot
+        v.vram.write8(7 * 512 + 0x2_0000, 2); // NBG1 dot at (0,7)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 +7 (odd longword)");
+    }
+
+    /// Sprite colour calculation: SPCCEN + the SPCCCS/SPCCN priority condition
+    /// gate a blend of the sprite over the layer below, with the ratio from
+    /// CCRSx selected by the type's CCR bits.
+    #[test]
+    fn sprite_colour_calc_blends_when_condition_met() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0001); // NBG0 on (the layer below)
+        v.regs.write16(0x028, 0x0012); // NBG0 8bpp bitmap
+        v.regs.write16(0x0F8, 0x0002); // NBG0 priority 2
+        v.regs.write16(0x0F0, 0x0005); // sprite S0 priority 5 (front)
+        // SPCTL: type 0, SPCCN=5 (bits10..8), SPCCCS mode 2 (≥). 0x2500.
+        v.regs.write16(0x0E0, 0x2500);
+        v.regs.write16(0x0EC, 0x0040); // CCCTL.SPCCEN, CCMD=0 (ratio)
+        v.regs.write16(0x100, 0x000F); // CCRSA ratio 0 = 15
+        v.cram.write16(0x12 * 2, 0x001F); // sprite code 0x12 = red (front)
+        v.cram.write16(2, 0x7C00); // NBG0 index 1 = blue (below)
+        v.vram.write8(0, 1); // NBG0 dot at (0,0)
+        // Sprite type 0: priority bits 15..14 → S0 (5), CCR bits 13..11 → idx 0,
+        // colour code low bits = 0x12. pix = 0x12 keeps prio=0 → use 0x4012 to
+        // put priority field at S0 index 1? Keep prio index 0: pix bits 15..14=0.
+        let fb = sprite_fb_with(0, 0, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        // sprite pri 5 ≥ SPCCN 5 → cc on; alpha=(31-15)*255/31=131.
+        // red·131 over blue·124 = (131,0,124).
+        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF], "sprite cc ratio blend");
+    }
+
+    /// When the SPCCCS condition is NOT met (mode 1, ==, and priorities differ)
+    /// the sprite draws opaque — no blend.
+    #[test]
+    fn sprite_colour_calc_skipped_when_condition_unmet() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.regs.write16(0x020, 0x0001);
+        v.regs.write16(0x028, 0x0012);
+        v.regs.write16(0x0F8, 0x0002); // NBG0 pri 2
+        v.regs.write16(0x0F0, 0x0005); // sprite pri 5
+        // SPCCN=3, mode 1 (==): sprite pri 5 != 3 → cc off. SPCCCS=1 (0x1300).
+        v.regs.write16(0x0E0, 0x1300);
+        v.regs.write16(0x0EC, 0x0040); // SPCCEN on (but condition gates it off)
+        v.regs.write16(0x100, 0x000F);
+        v.cram.write16(0x12 * 2, 0x001F); // red
+        v.cram.write16(2, 0x7C00); // blue below
+        v.vram.write8(0, 1);
+        let fb = sprite_fb_with(0, 0, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "no blend → opaque red");
+    }
+
+    /// Rotation coefficient table in WORD size, mode 1 (kx only): the 15-bit
+    /// entry (<<6 → 16.16) overrides kx while ky keeps the parameter table's.
+    #[test]
+    fn rbg_word_size_coefficient_overrides_kx_only() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x1200); // RBG0 8bpp bitmap
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x03E, 0x0001); // bitmap base 0x20000
+        // KTCTL: RAKTE (bit0) + word size (bit1) + mode 1 (bits3..2 = 01).
+        v.regs.write16(0x0B4, 0x0007);
+        v.regs.write16(0x0B6, 0x0001); // KTAOF: word bank → 0x20000
+        setup_rot_identity(&mut v, 0);
+        // dkast = 1.0/line so line y picks coeff entry y.
+        v.vram.write32(22 * 4, 0x0001_0000);
+        // Word entry 0 = 0x0080 → v=0x80, <<6 = 0x2000 = 0.125 in 16.16? No:
+        // we need kx = 2.0 = 0x2_0000 in 16.16; word v<<6 = 0x2_0000 → v=0x800.
+        v.vram.write16(0x2_0000, 0x0800); // kx = 2.0 for line 0
+        v.cram.write16(2, 0x001F); // index 1 red
+        v.vram.write8(0x20000 + 2, 1); // bitmap dot at plane (2,0)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // mode 1 overrides kx=2 (ky stays 1): screen (1,0) samples plane (2,0).
+        assert_eq!(pixel(&buf, 1, 0), [0xFF, 0, 0, 0xFF], "word-size kx=2 override");
+    }
+
+    /// Rotation bitmap at 16bpp RGB direct colour, and the R0BMSZ=1 (512×512)
+    /// height: with ky=2 the sampled plane row exceeds 256, so a dot at row 400
+    /// is only reachable when the bitmap is 512 tall (size 1), not 256 (size 0).
+    #[test]
+    fn rbg_bitmap_16bpp_and_512x512_size() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        // CHCTLB: R0BMEN (bit9) + R0BMSZ (bit10, → 512×512) + R0CHCN=3 (16bpp).
+        v.regs.write16(0x02A, 0x3600);
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x03E, 0x0001); // base 0x20000
+        setup_rot_identity(&mut v, 0);
+        v.vram.write32(20 * 4, 2 << 16); // ky = 2.0 → plane row = 2·screen y
+        // 16bpp RGB555 blue dot at plane (40, 400) — row 400 needs h=512.
+        v.vram.write16(0x20000 + (400 * 512 + 40) * 2, 0x7C00);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Screen (40,200) → plane (40, 400) → blue (only because size=512×512).
+        assert_eq!(pixel(&buf, 40, 200), [0, 0, 0xFF, 0xFF], "16bpp at row 400 (h=512)");
+        // With size 0 (512×256) the same plane row 400 wraps to 144 → empty.
+        v.regs.write16(0x02A, 0x3200); // clear R0BMSZ
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 40, 200), [0, 0, 0, 0xFF], "h=256 wraps → no dot");
+    }
+
+    /// Rotation bitmap screen-over mode 2: transparent outside the 512×(256|512)
+    /// bitmap (distinct from mode 3's 512×512 area used in another test).
+    #[test]
+    fn rbg_bitmap_screen_over_mode2_is_transparent_outside() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x1200); // 8bpp bitmap, size 0 → 512×256
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x03E, 0x0001); // base 0x20000
+        v.regs.write16(0x03A, 0x0800); // PLSZ RAOVR = 2 (bits 11..10 = 10)
+        setup_rot_identity(&mut v, 0);
+        // ky shifts the sampled plane Y past the 256-row bitmap height.
+        v.vram.write32(20 * 4, 2 << 16); // ky = 2.0 → screen y maps to 2·y
+        v.cram.write16(2, 0x001F); // red
+        v.vram.write8(0x20000, 1); // dot at plane (0,0)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Screen (0,0) → plane y 0 → the dot → red.
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "in-bounds dot");
+        // Screen (0,200) → plane y 400 ≥ 256 → outside → transparent → backdrop.
+        assert_eq!(pixel(&buf, 0, 200), [0, 0, 0, 0xFF], "mode-2 outside → backdrop");
+    }
+
+    /// Rotation tile background with 16×16 (2×2) characters: the 4-cell stepping
+    /// of the rotation tile path (shared `sample_pattern_cell`) is exercised.
+    #[test]
+    fn rbg_tile_16x16_characters() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x0100); // CHCTLB: R0CHSZ (bit8) → 16×16, tile 4bpp
+        v.regs.write16(0x038, 0x8000); // PNCR: 1-word
+        v.regs.write16(0x03A, 0x0000); // RA plane size 1×1
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x050, 0x0000); // MPABRA: plane A map 0 → PN table at 0
+        // Move the rotation parameter table off VRAM 0 (RPTAL → addr 0x8000) so
+        // it doesn't collide with plane A's pattern-name table at 0.
+        v.regs.write16(0x0BE, 0x4000); // RPTAL → table at (0x4000)<<1 = 0x8000
+        setup_rot_param_at(&mut v, 0x8000);
+        // PN[0] → char 8; 16×16 char addresses in 4-cell units: 8·4 = 32 (TL).
+        v.vram.write16(0, 8);
+        // Screen (1,2) → plane (1,2), subcell 0 (TL) = cell 32; px=1, py=2;
+        // 4bpp byte cell·32 + py·4 + px/2 (px odd → low nibble).
+        v.vram.write8(32 * 32 + 2 * 4, 0x07);
+        v.cram.write16(7 * 2, 0x001F); // palette 0 index 7 → red
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 1, 2), [0xFF, 0, 0, 0xFF], "rot 16×16 TL subcell");
+    }
+
+    /// Bitmap size code 2 = 1024×256: the row pitch becomes 1024, so a dot at
+    /// (300, 1) lives at byte offset 1·1024 + 300.
+    #[test]
+    fn bitmap_size_1024_wide_changes_the_row_pitch() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        // N0BMEN + 8bpp + N0BMSZ = 2 (bits 3..2 = 10 → 0x08).
+        v.regs.write16(0x028, 0x001A);
+        v.cram.write16(2, 0x001F); // index 1 red
+        v.vram.write8(1024 + 300, 1); // row 1 at pitch 1024 → (300,1)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 300, 1), [0xFF, 0, 0, 0xFF], "1024-wide pitch");
+    }
+
+    /// Three overlapping opaque NBG layers: the top-two-by-priority bookkeeping
+    /// keeps the front two (NBG1 pri 6 over NBG2 pri 4), and a lower-priority
+    /// NBG0 (pri 2) is displaced into neither slot — it never shows.
+    #[test]
+    fn three_layers_keep_only_the_top_two_by_priority() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0007); // NBG0 + NBG1 + NBG2
+        v.regs.write16(0x028, 0x1212); // NBG0/1 8bpp bitmap
+        // NBG2 is tile-only; give it priority but it will be covered. Use NBG0
+        // (pri 2) as the bottom that must NOT show, NBG1 (pri 6) front,
+        // colour-calc on NBG1 to blend with the second slot (NBG2 here absent →
+        // backdrop). Keep it simple: assert the highest-priority opaque wins.
+        v.regs.write16(0x0F8, 0x0602); // N0PRIN=2, N1PRIN=6
+        v.regs.write16(0x03C, 0x0010); // NBG1 bitmap base 0x20000
+        v.cram.write16(2, 0x001F); // NBG0 index 1 red (low priority)
+        v.cram.write16(4, 0x7C00); // NBG1 index 2 blue (high priority)
+        v.vram.write8(0, 1); // NBG0 dot
+        v.vram.write8(0x2_0000, 2); // NBG1 dot
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 (pri 6) wins over NBG0");
+    }
+
+    /// Sprite colour-calc condition mode 0 (priority ≤ SPCCN) enables the blend
+    /// for a low-priority sprite.
+    #[test]
+    fn sprite_colour_calc_mode0_le_condition() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.regs.write16(0x020, 0x0001);
+        v.regs.write16(0x028, 0x0012);
+        v.regs.write16(0x0F8, 0x0002); // NBG0 pri 2 (below)
+        v.regs.write16(0x0F0, 0x0003); // sprite pri 3
+        // SPCCN=5, mode 0 (≤): sprite pri 3 ≤ 5 → cc on. SPCCCS=0 (0x0500).
+        v.regs.write16(0x0E0, 0x0500);
+        v.regs.write16(0x0EC, 0x0040); // SPCCEN, ratio mode
+        v.regs.write16(0x100, 0x000F); // ratio 0 = 15
+        v.cram.write16(0x12 * 2, 0x001F); // sprite red
+        v.cram.write16(2, 0x7C00); // NBG0 blue below
+        v.vram.write8(0, 1);
+        let fb = sprite_fb_with(0, 0, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF], "mode-0 ≤ → blend");
+    }
+
+    /// Rotation TILE screen-over mode 2: transparent outside the 4×4-plane
+    /// field (distinct from the bitmap mode-2 path and the tile-repeat path).
+    #[test]
+    fn rbg_tile_screen_over_mode2_is_transparent_outside_the_field() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x0000); // RBG0 tile 4bpp 8×8
+        v.regs.write16(0x038, 0x8000); // PNCR 1-word
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        // PLSZ: RA plane size 1×1 (bits 9..8 = 0), RAOVR = 2 (bits 11..10 = 10).
+        v.regs.write16(0x03A, 0x0800);
+        v.regs.write16(0x050, 0x0000); // MPABRA plane A map 0
+        v.regs.write16(0x0BE, 0x4000); // RPTAL → param table at 0x8000 (off PN)
+        setup_rot_param_at(&mut v, 0x8000);
+        // Plane A PN[0] → char 1; char 1 pixel (0,0) nibble 5 → red.
+        v.vram.write16(0, 0x0001);
+        v.vram.write8(32, 0x50); // char 1 byte base = 1·0x20
+        v.cram.write16(5 * 2, 0x001F);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // Screen (0,0) → plane (0,0) inside the field → red.
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "inside field → tile");
+        // The 4×4 field of 1×1-page planes is 4·512 = 2048 wide. Push the start
+        // X past 2048 so screen (0,0) lands outside → transparent.
+        v.vram.write32(0x8000, 0x0900_0000); // Xst = 2304.0 (> 2048)
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "outside field → backdrop");
+    }
+
+    /// 1-word pattern names with CNSM set (12-bit char, no flip) for an NBG
+    /// layer — the `decode_pattern` cnsm branch (8×8 form).
+    #[test]
+    fn tile_one_word_cnsm_12bit_char() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0000); // tile 4bpp
+        // PNCN0: 1-word (bit15) + CNSM (bit14). SPCN supplies the top char bits.
+        v.regs.write16(0x030, 0xC000);
+        // SPCN (bits 4..0) = 0; char field is 12 bits → char 0x111.
+        v.vram.write16(0, 0x0111);
+        v.vram.write8(0x111 * 32 + 1, 0x07); // pixel (3,0): byte +1 low nibble
+        v.cram.write16(7 * 2, 0x001F); // palette 0 index 7 red
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 3, 0), [0xFF, 0, 0, 0xFF], "cnsm 12-bit char");
     }
 }

@@ -232,6 +232,78 @@ mod tests {
     }
 
     #[test]
+    fn owns_rejects_addresses_in_the_gaps_between_windows() {
+        // The three windows are non-contiguous; addresses between them are not
+        // VDP2's.
+        assert!(!Vdp2::owns(CRAM_BASE - 1), "just below CRAM (VRAM gap)");
+        assert!(!Vdp2::owns(CRAM_END + 1), "just above CRAM");
+        assert!(!Vdp2::owns(REGS_BASE - 1), "just below the register window");
+        assert!(!Vdp2::owns(REGS_END + 1), "just above the register window");
+        assert!(Vdp2::owns(CRAM_END));
+        assert!(Vdp2::owns(REGS_END));
+    }
+
+    #[test]
+    fn byte_and_32bit_access_route_to_vram_and_cram() {
+        let mut v = Vdp2::new();
+        // VRAM byte access.
+        v.write8(VRAM_BASE + 0x40, 0x5A);
+        assert_eq!(v.read8(VRAM_BASE + 0x40), 0x5A);
+        assert_eq!(v.vram.read8(0x40), 0x5A);
+        // CRAM 32-bit access.
+        v.write32(CRAM_BASE + 0x20, 0x1234_5678);
+        assert_eq!(v.read32(CRAM_BASE + 0x20), 0x1234_5678);
+        assert_eq!(v.cram.read32(0x20), 0x1234_5678);
+        // CRAM byte read.
+        assert_eq!(v.read8(CRAM_BASE + 0x20), 0x12);
+    }
+
+    #[test]
+    fn access_outside_any_window_reads_zero_and_drops_writes() {
+        let mut v = Vdp2::new();
+        // 0x0500_0000 is not VDP2 territory.
+        v.write32(0x0500_0000, 0xDEAD_BEEF);
+        assert_eq!(v.read32(0x0500_0000), 0);
+        assert_eq!(v.read16(0x0500_0000), 0);
+        assert_eq!(v.read8(0x0500_0000), 0);
+    }
+
+    #[test]
+    fn byte_writes_to_readonly_status_bytes_are_ignored() {
+        let mut v = Vdp2::new();
+        v.write16(REGS_BASE, 0x8000); // display on
+        v.regs.write16(0x00A, 0xABCD); // seed VCNT as update_video_timing would
+        // Byte writes into the VCNT pair (0x00A/0x00B) must not stick.
+        v.write8(REGS_BASE + 0x00A, 0x00);
+        v.write8(REGS_BASE + 0x00B, 0x00);
+        assert_eq!(v.regs.read16(0x00A), 0xABCD, "VCNT preserved against byte writes");
+        // But a writable register byte does take the write (TVMD low byte).
+        v.write8(REGS_BASE + 0x001, 0xC3);
+        assert_eq!(v.regs.read8(0x001), 0xC3, "writable register byte takes the write");
+    }
+
+    #[test]
+    fn read_only_register_classification_is_exact() {
+        // Exactly TVSTAT/HCNT/VCNT byte offsets are read-only; neighbours are not.
+        for off in [0x004, 0x005, 0x008, 0x009, 0x00A, 0x00B] {
+            assert!(Vdp2::reg_readonly(off), "{off:#x} is read-only");
+        }
+        for off in [0x000, 0x003, 0x006, 0x007, 0x00C] {
+            assert!(!Vdp2::reg_readonly(off), "{off:#x} is writable");
+        }
+    }
+
+    #[test]
+    fn tvstat_vblank_override_does_not_touch_other_status_bits() {
+        let mut v = Vdp2::new();
+        v.write16(REGS_BASE, 0x0000); // display off → VBLANK override active
+        // Seed a non-zero TVSTAT (e.g. ODD/PAL bits) via the backdoor.
+        v.regs.write16(0x004, 0x0001);
+        // The bus read OR's in only VBLANK (bit 3), preserving the rest.
+        assert_eq!(v.read16(REGS_BASE + 0x004), 0x0009, "0x0001 | VBLANK(0x0008)");
+    }
+
+    #[test]
     fn aggregate_dispatch_routes_each_window_correctly() {
         let mut v = Vdp2::new();
         v.write32(VRAM_BASE + 0x100, 0xDEAD_BEEF);

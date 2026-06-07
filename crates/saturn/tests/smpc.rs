@@ -265,6 +265,116 @@ fn intback_peripheral_continuation_reports_the_digital_pad() {
 }
 
 #[test]
+fn setsmem_writes_smem_echoed_by_intback_oreg12_15() {
+    let mut sat = build();
+    // SETSMEM takes the four bytes from IREG0..3.
+    sat.bus.write8(0x0010_0001, 0xDE, AccessKind::Data); // IREG0
+    sat.bus.write8(0x0010_0003, 0xAD, AccessKind::Data); // IREG1
+    sat.bus.write8(0x0010_0005, 0xBE, AccessKind::Data); // IREG2
+    sat.bus.write8(0x0010_0007, 0xEF, AccessKind::Data); // IREG3
+    sat.bus.write8(COMREG, 0x17, AccessKind::Data); // SETSMEM
+    sat.run_for(512);
+    assert_eq!(sat.bus.smpc.smem, [0xDE, 0xAD, 0xBE, 0xEF], "SETSMEM stored SMEM");
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF drops after SETSMEM");
+
+    // INTBACK status echoes SMEM in OREG12..15.
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x00, AccessKind::Data); // IREG1: status only
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(16_000);
+    assert_eq!(&sat.bus.smpc.oreg[12..16], &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn sndon_releases_the_sound_cpu_and_sndoff_re_holds_it() {
+    let mut sat = build();
+    assert!(!sat.bus.scsp.running, "sound CPU held at reset");
+    sat.bus.write8(COMREG, 0x06, AccessKind::Data); // SNDON
+    sat.run_for(512);
+    assert!(sat.bus.scsp.running, "SNDON released the SCSP 68k");
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF drops after SNDON");
+
+    sat.bus.write8(COMREG, 0x07, AccessKind::Data); // SNDOFF
+    sat.run_for(512);
+    assert!(!sat.bus.scsp.running, "SNDOFF re-held the SCSP 68k");
+}
+
+#[test]
+fn ckchg_halts_the_slave_and_nmis_the_master() {
+    let mut sat = build();
+    // Pin the master in a tight BRA-self with an NMI handler installed, so the
+    // CKCHG NMI is the only thing that pushes a stack frame (same setup as the
+    // NMIREQ test).
+    sat.bus.low_wram.write16(0x1000, 0xAFFE); // BRA -2
+    sat.bus.low_wram.write16(0x1002, 0x0009); // NOP slot
+    sat.master_mut().regs.pc = 0x0020_1000;
+    sat.master_mut().regs.vbr = 0x0020_4000;
+    let handler = 0x0020_5000;
+    sat.bus
+        .write32(0x0020_4000 + 11 * 4, handler, AccessKind::Data);
+    sat.bus.write16(handler, 0xAFFE, AccessKind::Data);
+    sat.bus.write16(handler + 2, 0x0009, AccessKind::Data);
+
+    sat.release_slave();
+    sat.run_for(256);
+    assert!(!sat.slave_is_halted(), "slave running before CKCHG");
+    let sp_before = sat.master().regs.r[15];
+
+    // CKCHG320 reproduces the observable handshake: slave off + master NMI.
+    sat.bus.write8(COMREG, 0x0F, AccessKind::Data); // CKCHG320
+    sat.run_for(512);
+    assert!(sat.slave_is_halted(), "CKCHG halts the slave");
+    // The NMI pushed SR + PC = 8 bytes onto the master stack.
+    assert_eq!(
+        sp_before.wrapping_sub(sat.master().regs.r[15]),
+        8,
+        "CKCHG NMI'd the master (pushed SR+PC)"
+    );
+    assert!(
+        sat.master().regs.pc == handler || sat.master().regs.pc == handler + 2,
+        "master vectored into the NMI handler"
+    );
+    assert!(
+        sat.bus.smpc.last_unknown_command.is_none(),
+        "0x0F is CKCHG320, a known command"
+    );
+}
+
+#[test]
+fn intback_break_ends_the_peripheral_sequence() {
+    let mut sat = build();
+    sat.set_pad1(saturn::smpc::pad::A);
+    // Status + peripheral request.
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr, 0x2F, "status SR signals peripheral data pending");
+    assert_ne!(sat.bus.smpc.intback_stage, 0, "a peripheral sequence is in progress");
+    // Host BREAKs (IREG0 bit 0x40) instead of CONTINUE — the sequence ends.
+    sat.bus.write8(0x0010_0001, 0x40, AccessKind::Data);
+    assert_eq!(sat.bus.smpc.intback_stage, 0, "BREAK ended the sequence");
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr & 0xF0, 0x00, "BREAK acked the high SR nibble");
+}
+
+#[test]
+fn resenab_command_0x19_is_recognised_and_drops_sf() {
+    let mut sat = build();
+    sat.bus.write8(COMREG, 0x19, AccessKind::Data); // RESENAB
+    sat.run_for(512);
+    assert!(
+        sat.bus.smpc.last_unknown_command.is_none(),
+        "0x19 is RESENAB (reset-button enable) — a known command"
+    );
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF drops after processing");
+}
+
+#[test]
 fn resdisa_command_0x1a_is_recognised_and_drops_sf() {
     let mut sat = build();
     sat.bus.write8(COMREG, 0x1A, AccessKind::Data); // RESDISA

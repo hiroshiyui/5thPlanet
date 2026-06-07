@@ -271,3 +271,184 @@ impl StubRegisterBank {
     pub fn write16(&mut self, _offset: u32, _val: u16) {}
     pub fn write32(&mut self, _offset: u32, _val: u32) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- BiosRom ---------------------------------------------------------
+
+    #[test]
+    fn bios_reads_big_endian_and_mirrors_modulo_len() {
+        // A 4-byte image. Bytes are returned MSB-first (SH-2 big-endian).
+        let rom = BiosRom::new(vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(rom.len(), 4);
+        assert!(!rom.is_empty());
+        assert_eq!(rom.read8(0), 0x11);
+        assert_eq!(rom.read16(0), 0x1122);
+        assert_eq!(rom.read32(0), 0x1122_3344);
+        // Offset past the image folds modulo len(): offset 4 == offset 0.
+        assert_eq!(rom.read8(4), 0x11, "4 % 4 == 0 mirrors to the start");
+        assert_eq!(rom.read8(5), 0x22);
+        // A 32-bit read straddling the wrap reads byte 3 then wraps to 0,1,2.
+        assert_eq!(rom.read32(3), 0x4411_2233);
+    }
+
+    #[test]
+    fn bios_writes_are_ignored() {
+        // ROM is read-only; write_ignored is a no-op (compiles + does nothing).
+        let rom = BiosRom::new(vec![0xAB, 0xCD]);
+        rom.write_ignored();
+        assert_eq!(rom.read16(0), 0xABCD);
+        assert_eq!(rom.image(), &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BIOS image must be non-empty")]
+    fn bios_rejects_empty_image() {
+        let _ = BiosRom::new(Vec::new());
+    }
+
+    // ---- Ram -------------------------------------------------------------
+
+    #[test]
+    fn ram_round_trip_big_endian_all_widths() {
+        let mut ram = Ram::new(16);
+        assert_eq!(ram.len(), 16);
+        assert!(!ram.is_empty());
+        ram.write32(0, 0xDE_AD_BE_EF);
+        // Big-endian byte layout: MSB at the lowest address.
+        assert_eq!(ram.read8(0), 0xDE);
+        assert_eq!(ram.read8(1), 0xAD);
+        assert_eq!(ram.read8(2), 0xBE);
+        assert_eq!(ram.read8(3), 0xEF);
+        assert_eq!(ram.read16(0), 0xDEAD);
+        assert_eq!(ram.read16(2), 0xBEEF);
+        assert_eq!(ram.read32(0), 0xDEAD_BEEF);
+        // write16 round-trips too.
+        ram.write16(8, 0x1234);
+        assert_eq!(ram.read16(8), 0x1234);
+        ram.write8(8, 0x99);
+        assert_eq!(ram.read8(8), 0x99);
+    }
+
+    #[test]
+    fn ram_folds_offsets_modulo_size() {
+        // A 4-byte RAM mirrors across the address space.
+        let mut ram = Ram::new(4);
+        ram.write8(1, 0x5A);
+        assert_eq!(ram.read8(1 + 4), 0x5A, "(1+4) % 4 == 1");
+        assert_eq!(ram.read8(1 + 8), 0x5A);
+        // write32 at the very top wraps its trailing bytes back to index 0.
+        ram.write32(3, 0xAA_BB_CC_DD); // index 3, then 0, 1, 2
+        assert_eq!(ram.read8(3), 0xAA);
+        assert_eq!(ram.read8(0), 0xBB);
+        assert_eq!(ram.read8(1), 0xCC);
+        assert_eq!(ram.read8(2), 0xDD);
+    }
+
+    #[test]
+    fn ram_as_slice_exposes_backing_bytes() {
+        let mut ram = Ram::new(4);
+        ram.as_mut_slice()[2] = 0x42;
+        assert_eq!(ram.as_slice(), &[0x00, 0x00, 0x42, 0x00]);
+    }
+
+    // ---- BackupRam (odd-byte packing) ------------------------------------
+
+    #[test]
+    fn backup_ram_is_preformatted_with_signature() {
+        // nvram_init writes the 16-byte "BackUpRam Format" tag four times.
+        let bram = BackupRam::new();
+        assert_eq!(bram.bytes().len(), INTERNAL_BACKUP_BYTES);
+        let tag = b"BackUpRam Format";
+        for n in 0..4 {
+            assert_eq!(&bram.bytes()[n * 16..n * 16 + 16], tag);
+        }
+        // The tag is *data* bytes, surfaced on odd byte addresses: data byte 0
+        // ('B') lives at byte address 1.
+        assert_eq!(bram.read8(1), b'B');
+        assert_eq!(bram.read8(3), b'a');
+        assert_eq!(bram.read8(5), b'c');
+    }
+
+    #[test]
+    fn backup_ram_odd_byte_packing() {
+        // Data byte n lives at byte address 2n+1; even addresses read 0 and
+        // drop writes (the high half of each 16-bit word is wired to 0).
+        let mut bram = BackupRam::new();
+        bram.write8(1, 0x7E); // odd → data[0]
+        bram.write8(0, 0xFF); // even → dropped
+        assert_eq!(bram.read8(1), 0x7E);
+        assert_eq!(bram.read8(0), 0x00, "even lane is wired to 0");
+        // data[0] is the underlying storage for byte address 1.
+        assert_eq!(bram.bytes()[0], 0x7E);
+        // A different odd address maps to a different data index.
+        bram.write8(3, 0x5C); // → data[1]
+        assert_eq!(bram.bytes()[1], 0x5C);
+        assert_eq!(bram.read8(3), 0x5C);
+    }
+
+    #[test]
+    fn backup_ram_wide_access_packs_into_odd_lanes() {
+        let mut bram = BackupRam::new();
+        // write16 splits MSB→addr, LSB→addr+1; only the odd lane survives.
+        bram.write16(0, 0x1234); // addr0 (even, dropped), addr1 (odd) <- 0x34
+        assert_eq!(bram.read8(0), 0x00);
+        assert_eq!(bram.read8(1), 0x34);
+        assert_eq!(bram.read16(0), 0x0034, "even byte reads 0, odd reads data");
+        // write32 over addresses 4..7: only the two odd lanes (5, 7) store.
+        bram.write32(4, 0xAA_BB_CC_DD);
+        assert_eq!(bram.read8(4), 0x00);
+        assert_eq!(bram.read8(5), 0xBB);
+        assert_eq!(bram.read8(6), 0x00);
+        assert_eq!(bram.read8(7), 0xDD);
+        assert_eq!(bram.read32(4), 0x00BB_00DD);
+    }
+
+    #[test]
+    fn backup_ram_folds_modulo_data_size() {
+        // The data index is (off >> 1) % 32 KiB, so the window mirrors.
+        let mut bram = BackupRam::new();
+        bram.write8(1, 0x42); // data[0]
+        // off = (INTERNAL_BACKUP_BYTES * 2) + 1 → index (>>1) % len == 0.
+        let mirror_off = (INTERNAL_BACKUP_BYTES as u32 * 2) + 1;
+        assert_eq!(bram.read8(mirror_off), 0x42, "data mirrors past 64 KiB");
+    }
+
+    #[test]
+    fn backup_ram_load_clamps_to_capacity() {
+        let mut bram = BackupRam::new();
+        // A short image only overwrites its prefix data bytes.
+        bram.load(&[0xC0, 0xC1, 0xC2]);
+        assert_eq!(bram.bytes()[0], 0xC0);
+        assert_eq!(bram.bytes()[1], 0xC1);
+        assert_eq!(bram.bytes()[2], 0xC2);
+        // Data byte 0 surfaces on odd byte address 1.
+        assert_eq!(bram.read8(1), 0xC0);
+        // An over-long image is clamped to the 32 KiB capacity (no panic).
+        let big = vec![0x9Au8; INTERNAL_BACKUP_BYTES + 100];
+        bram.load(&big);
+        assert_eq!(bram.bytes().len(), INTERNAL_BACKUP_BYTES);
+        assert!(bram.bytes().iter().all(|&b| b == 0x9A));
+    }
+
+    #[test]
+    fn backup_ram_default_matches_new() {
+        assert_eq!(BackupRam::default().bytes(), BackupRam::new().bytes());
+    }
+
+    // ---- StubRegisterBank ------------------------------------------------
+
+    #[test]
+    fn stub_reads_zero_and_drops_writes() {
+        let mut stub = StubRegisterBank::new("TEST");
+        assert_eq!(stub.name(), "TEST");
+        stub.write8(0x10, 0xFF);
+        stub.write16(0x10, 0xFFFF);
+        stub.write32(0x10, 0xFFFF_FFFF);
+        assert_eq!(stub.read8(0x10), 0);
+        assert_eq!(stub.read16(0x10), 0);
+        assert_eq!(stub.read32(0x10), 0);
+    }
+}

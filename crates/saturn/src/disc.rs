@@ -667,7 +667,278 @@ PLBA=0
         assert_eq!(mmss_ff_to_frames("00:02:00"), Some(150));
         assert_eq!(mmss_ff_to_frames("01:00:00"), Some(4500));
         assert_eq!(parse_int("0xa1"), Some(0xA1));
+        assert_eq!(parse_int("0XFF"), Some(0xFF), "uppercase 0X prefix");
         assert_eq!(parse_int("4350"), Some(4350));
         assert_eq!(parse_int("-150"), Some(-150));
+        assert_eq!(parse_int("  12 "), Some(12), "surrounding whitespace trimmed");
+        assert_eq!(parse_int("zz"), None, "non-numeric → None");
+        assert_eq!(mmss_ff_to_frames("01:02"), None, "missing frame field → None");
+        assert_eq!(mmss_ff_to_frames("xx:02:00"), None, "non-numeric minutes → None");
+    }
+
+    #[test]
+    fn iso_ignores_trailing_partial_sector() {
+        // 2.5 sectors of bytes → only 2 whole sectors are addressable.
+        let d = Disc::from_iso(vec![0u8; SECTOR_USER * 2 + 100]);
+        assert_eq!(d.tracks()[0].length, 2);
+        assert_eq!(d.lead_out_fad(), FAD_OFFSET + 2);
+        assert!(d.read_sector(150).is_some());
+        assert!(d.read_sector(151).is_some());
+        assert!(d.read_sector(152).is_none(), "the partial sector is not addressable");
+    }
+
+    #[test]
+    fn mode1_2048_cooked_user_payload_has_no_header() {
+        // MODE1/2048 sectors are already cooked — the user byte sits at offset 0.
+        let mut bin = vec![0u8; 2048 * 2];
+        bin[0] = 0x11;
+        bin[2048] = 0x22;
+        let cue = "FILE \"c.bin\" BINARY\n  TRACK 01 MODE1/2048\n    INDEX 01 00:00:00\n";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.tracks()[0].mode, TrackMode::Mode1);
+        assert_eq!(d.read_sector(150).unwrap()[0], 0x11);
+        assert_eq!(d.read_sector(151).unwrap()[0], 0x22);
+        // A cooked track has no subheader to filter on.
+        assert_eq!(d.subheader(150), None);
+    }
+
+    #[test]
+    fn mode2_subheader_is_read_only_for_mode2_marked_raw_sectors() {
+        // A MODE2/2352 sector: header mode byte (offset 15) = 2, subheader at 16..20.
+        let mut bin = vec![0u8; 2352];
+        bin[15] = 2; // header: Mode 2
+        bin[16] = 0xC1; // fnum
+        bin[17] = 0x07; // chan
+        bin[18] = 0x88; // subm
+        bin[19] = 0x44; // cinf
+        bin[24] = 0xAA; // user[0] (after sync+header+subheader)
+        let cue = "FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.tracks()[0].mode, TrackMode::Mode2);
+        // user payload skips the 24-byte sync+header+subheader.
+        assert_eq!(d.read_sector(150).unwrap()[0], 0xAA);
+        // subheader = (chan, fnum, subm, cinf) = (raw[17], raw[16], raw[18], raw[19]).
+        assert_eq!(d.subheader(150), Some((0x07, 0xC1, 0x88, 0x44)));
+    }
+
+    #[test]
+    fn mode2_subheader_none_when_header_mode_byte_is_not_two() {
+        let mut bin = vec![0u8; 2352];
+        bin[15] = 1; // header: Mode 1, not Mode 2
+        let cue = "FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.subheader(150), None, "non-Mode-2 sector has no subheader");
+        // Outside any track there is no subheader either.
+        assert_eq!(d.subheader(149), None);
+    }
+
+    #[test]
+    fn cue_multiple_files_concatenate_into_one_image() {
+        // Two FILEs, one track each; the second track's FAD follows the first.
+        let mut a = vec![0u8; 2352];
+        a[16] = 0xA0; // MODE1/2352 user payload starts at offset 16
+        let mut b = vec![0u8; 2352 * 2];
+        b[0] = 0xB0; // AUDIO user payload starts at offset 0
+        let cue = "\
+FILE \"a.bin\" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+FILE \"b.bin\" BINARY
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+";
+        let d = Disc::from_cue(cue, |n| match n {
+            "a.bin" => Some(a.clone()),
+            "b.bin" => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(d.tracks().len(), 2);
+        assert_eq!(d.tracks()[0].start_fad, 150);
+        assert_eq!(d.tracks()[0].length, 1);
+        // Track 2 starts one sector after track 1, in the second FILE.
+        assert_eq!(d.tracks()[1].start_fad, 151);
+        assert_eq!(d.tracks()[1].length, 2);
+        assert_eq!(d.tracks()[1].mode, TrackMode::Audio);
+        assert_eq!(d.read_sector(150).unwrap()[0], 0xA0);
+        assert_eq!(d.read_sector(151).unwrap()[0], 0xB0);
+        assert_eq!(d.lead_out_fad(), 153);
+    }
+
+    #[test]
+    fn cue_pregap_index00_does_not_move_index01_start() {
+        // INDEX 00 (pregap) is ignored; only INDEX 01 sets the track start.
+        let bin = vec![0u8; 2352 * 4];
+        let cue = "\
+FILE \"g.bin\" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 00 00:00:01
+    INDEX 01 00:00:03
+";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        // Track 2 starts at frame 3 (INDEX 01), not frame 1 (INDEX 00).
+        assert_eq!(d.tracks()[1].start_fad, 153);
+        assert_eq!(d.tracks()[0].length, 3, "track 1 runs up to track 2's INDEX 01");
+    }
+
+    #[test]
+    fn cue_errors_on_malformed_input() {
+        let load = |_: &str| Some(vec![0u8; 2352]);
+        // FILE without a quoted name.
+        assert!(Disc::from_cue("FILE game.bin BINARY\n", load).is_err());
+        // A missing FILE the loader can't resolve.
+        assert!(
+            Disc::from_cue("FILE \"missing.bin\" BINARY\n", |_| None).is_err()
+        );
+        // TRACK before any FILE.
+        assert!(Disc::from_cue("TRACK 01 MODE1/2352\n", load).is_err());
+        // No tracks at all.
+        assert!(Disc::from_cue("REM just a comment\n", load).is_err());
+        // Unsupported TRACK type.
+        assert!(
+            Disc::from_cue(
+                "FILE \"g.bin\" BINARY\n  TRACK 01 MODE9/9999\n",
+                load
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_track_type_covers_every_supported_token() {
+        assert_eq!(parse_track_type("AUDIO").unwrap(), (TrackMode::Audio, 2352));
+        assert_eq!(parse_track_type("MODE1/2048").unwrap(), (TrackMode::Mode1, 2048));
+        assert_eq!(parse_track_type("MODE1/2352").unwrap(), (TrackMode::Mode1, 2352));
+        assert_eq!(parse_track_type("MODE2/2336").unwrap(), (TrackMode::Mode2, 2336));
+        assert_eq!(parse_track_type("MODE2/2352").unwrap(), (TrackMode::Mode2, 2352));
+        // Case-insensitive.
+        assert_eq!(parse_track_type("audio").unwrap(), (TrackMode::Audio, 2352));
+        assert!(parse_track_type("CDG").is_err());
+    }
+
+    #[test]
+    fn ccd_audio_track_when_control_bit_2_is_clear() {
+        // Control without bit 2 (0x04) → audio track; with it → data.
+        let ccd = "\
+[Entry 0]
+Point=0xa1
+Control=0x00
+PMin=2
+PLBA=0
+[Entry 1]
+Point=0xa2
+Control=0x00
+PLBA=8
+[Entry 2]
+Point=0x01
+Control=0x00
+PLBA=0
+[Entry 3]
+Point=0x02
+Control=0x04
+PLBA=4
+";
+        let img = vec![0u8; 2352 * 8];
+        let d = Disc::from_ccd(ccd, img).unwrap();
+        assert_eq!(d.last_track(), 2);
+        assert_eq!(d.tracks()[0].mode, TrackMode::Audio, "control bit 2 clear → audio");
+        assert_eq!(d.tracks()[0].ctrl_addr(), 0x01);
+        assert_eq!(d.tracks()[1].mode, TrackMode::Mode1, "control bit 2 set → data");
+        assert_eq!(d.tracks()[1].start_fad, 154); // LBA 4 + 150
+        assert_eq!(d.lead_out_fad(), 158); // LBA 8 + 150
+    }
+
+    #[test]
+    fn ccd_errors_when_required_points_are_missing() {
+        // No 0xA1 (last track) point.
+        let no_a1 = "[Entry 0]\nPoint=0x01\nControl=0x04\nPLBA=0\n";
+        assert!(Disc::from_ccd(no_a1, vec![0u8; 2352]).is_err());
+        // 0xA1 says 2 tracks but track 2's point is absent.
+        let missing_track = "\
+[Entry 0]
+Point=0xa1
+Control=0x04
+PMin=2
+PLBA=0
+[Entry 1]
+Point=0x01
+Control=0x04
+PLBA=0
+";
+        assert!(Disc::from_ccd(missing_track, vec![0u8; 2352 * 4]).is_err());
+    }
+
+    #[test]
+    fn read_full_sector_returns_the_on_disc_size() {
+        // Raw 2352 track → full sector is 2352 bytes; cooked ISO → 2048.
+        let raw = Disc::from_cue(
+            "FILE \"g.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n",
+            |_| Some(vec![0u8; 2352 * 2]),
+        )
+        .unwrap();
+        assert_eq!(raw.read_full_sector(150).unwrap().len(), 2352);
+        assert!(raw.read_full_sector(149).is_none(), "lead-in has no sector");
+
+        let cooked = Disc::from_iso(vec![0u8; SECTOR_USER * 2]);
+        assert_eq!(cooked.read_full_sector(150).unwrap().len(), SECTOR_USER);
+    }
+
+    #[test]
+    fn track_at_fad_spans_only_the_track_range() {
+        let d = Disc::from_iso(vec![0u8; SECTOR_USER * 3]); // FAD 150..153
+        assert!(d.track_at_fad(149).is_none(), "before first track");
+        assert_eq!(d.track_at_fad(150).unwrap().number, 1);
+        assert_eq!(d.track_at_fad(152).unwrap().number, 1);
+        assert!(d.track_at_fad(153).is_none(), "lead-out is past the last track");
+    }
+
+    #[test]
+    fn empty_disc_defaults_for_track_accessors() {
+        // A zero-length ISO yields a single zero-length track; the accessors
+        // still report sensible defaults rather than panicking.
+        let d = Disc::from_iso(Vec::new());
+        assert_eq!(d.tracks()[0].length, 0);
+        assert_eq!(d.first_track(), 1);
+        assert_eq!(d.last_track(), 1);
+        assert_eq!(d.lead_out_fad(), FAD_OFFSET);
+        assert!(d.read_sector(150).is_none());
+    }
+
+    #[test]
+    fn sector_source_trait_matches_the_inherent_methods() {
+        // The SectorSource impl must agree with the concrete Disc methods.
+        let mut bin = vec![0u8; 2352 * 2];
+        bin[16] = 0x5A;
+        let d = Disc::from_cue(
+            "FILE \"g.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .unwrap();
+        assert_eq!(SectorSource::toc(&d), Disc::toc(&d));
+        assert_eq!(SectorSource::first_track(&d), 1);
+        assert_eq!(SectorSource::last_track(&d), 1);
+        assert_eq!(SectorSource::lead_out_fad(&d), d.lead_out_fad());
+        let info = SectorSource::track_at_fad(&d, 150).unwrap();
+        assert_eq!(info.number, 1);
+        assert_eq!(info.ctrl_addr, 0x41);
+        assert!(!info.is_audio);
+        assert_eq!(info.start_fad, 150);
+
+        let mut user = [0u8; SECTOR_USER];
+        assert!(SectorSource::read_sector(&d, 150, &mut user), "2048 bytes read");
+        assert_eq!(user[0], 0x5A);
+        assert!(!SectorSource::read_sector(&d, 149, &mut user), "no lead-in sector");
+
+        let mut full = [0u8; 2352];
+        assert_eq!(SectorSource::read_full_sector(&d, 150, &mut full), 2352);
+        assert_eq!(SectorSource::read_full_sector(&d, 149, &mut full), 0);
+
+        // Fingerprint is stable for the same image and differs for another.
+        let fp = SectorSource::fingerprint(&d);
+        assert_eq!(fp, SectorSource::fingerprint(&d));
+        let other = Disc::from_iso(vec![0xFF; SECTOR_USER]);
+        assert_ne!(fp, SectorSource::fingerprint(&other));
     }
 }

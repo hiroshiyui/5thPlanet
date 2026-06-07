@@ -153,3 +153,122 @@ fn sh2_entity_coscheduled_via_real_bus() {
     let diff = m.abs_diff(v);
     assert!(diff < 50, "drift {diff} too large; scheduler not fair");
 }
+
+#[test]
+fn now_is_zero_on_empty_scheduler() {
+    // An empty scheduler reports it's "at" cycle 0 (min over an empty set).
+    let s: Scheduler<Counter> = Scheduler::new();
+    assert_eq!(s.now(), 0);
+}
+
+#[test]
+fn add_returns_sequential_handles_and_entity_accessors_work() {
+    let mut s = Scheduler::new();
+    let a = s.add(Counter::new(2));
+    let b = s.add(Counter::new(7));
+    // EntityId handles are distinct and resolve to the right entity.
+    assert_ne!(a, b);
+    assert_eq!(s.entity(a).rate, 2);
+    assert_eq!(s.entity(b).rate, 7);
+    assert_eq!(s.entities().len(), 2);
+    // entity_mut gives mutable access.
+    s.entity_mut(a).cycles = 99;
+    assert_eq!(s.entity(a).cycles, 99);
+}
+
+/// Entity that records the *global* step order into a shared `Vec` (its
+/// Context), so a test can assert the exact interleave the scheduler chose.
+#[derive(Clone)]
+struct Ordered {
+    id: u64,
+    cycles: u64,
+    rate: u64,
+}
+
+impl SchedEntity for Ordered {
+    type Context = Vec<u64>;
+    fn next_deadline(&self) -> u64 {
+        self.cycles
+    }
+    fn step(&mut self, order: &mut Vec<u64>) {
+        order.push(self.id);
+        self.cycles += self.rate;
+    }
+}
+
+#[test]
+fn pick_behind_breaks_ties_by_insertion_order() {
+    // Three entities all at deadline 0 with equal rate. The determinism
+    // contract says the most-behind pick resolves ties to the lowest insertion
+    // order, so the first full round of steps must go A, B, C in that order.
+    let mut s = Scheduler::new();
+    s.add(Ordered { id: 0, cycles: 0, rate: 5 });
+    s.add(Ordered { id: 1, cycles: 0, rate: 5 });
+    s.add(Ordered { id: 2, cycles: 0, rate: 5 });
+    let mut order = Vec::new();
+    // Advancing to 5 takes exactly one round (each goes 0 → 5).
+    s.run_for(5, &mut order);
+    assert_eq!(order, [0, 1, 2], "ties resolve to insertion order, in turn");
+}
+
+#[test]
+fn pick_behind_selects_strictly_smallest_deadline() {
+    // B is genuinely behind (smaller deadline), so it is picked regardless of
+    // insertion order — only true ties fall back to insertion order.
+    let mut s = Scheduler::new();
+    let a = s.add(Counter::new(10));
+    let b = s.add(Counter::new(1));
+    // Advance A once so the deadlines differ: A at 10, B at 0.
+    s.entity_mut(a).cycles = 10;
+    s.run_for(1, &mut ());
+    // now() was 0 (B's deadline); target is 1; only B (the behind one) steps.
+    assert!(s.entity(a).log.is_empty(), "ahead entity is not stepped");
+    assert_eq!(s.entity(b).log, [0]);
+}
+
+/// A halted entity: reports `u64::MAX` so the most-behind rule skips it,
+/// mirroring `Sh2Entity`'s halted slave.
+#[derive(Clone)]
+struct Haltable {
+    cycles: u64,
+    halted: bool,
+    steps: u64,
+}
+
+impl SchedEntity for Haltable {
+    type Context = ();
+    fn next_deadline(&self) -> u64 {
+        if self.halted { u64::MAX } else { self.cycles }
+    }
+    fn step(&mut self, _: &mut ()) {
+        self.steps += 1;
+        self.cycles += 1;
+    }
+}
+
+#[test]
+fn halted_entity_with_max_deadline_is_never_stepped() {
+    // The halted entity reports u64::MAX, so the runnable one is always the
+    // most-behind and the halted one accumulates zero steps — the scheduler
+    // skips it without any special-casing (the Sh2Entity halted-slave model).
+    let mut s = Scheduler::new();
+    let live = s.add(Haltable { cycles: 0, halted: false, steps: 0 });
+    let dead = s.add(Haltable { cycles: 0, halted: true, steps: 0 });
+    s.run_for(8, &mut ());
+    assert_eq!(s.entity(live).steps, 8, "live entity advances to horizon");
+    assert_eq!(s.entity(dead).steps, 0, "halted entity is skipped entirely");
+    // now() is driven by the live entity (the halted one is at u64::MAX).
+    assert_eq!(s.now(), 8);
+}
+
+#[test]
+fn run_for_advances_until_target_deadline() {
+    // run_for(N) steps until now() >= start + N. A single entity stepping by 3
+    // overshoots from 0 → 3 → 6 → 9 to first reach/pass the target 7.
+    let mut s = Scheduler::new();
+    let a = s.add(Counter::new(3));
+    s.run_for(7, &mut ());
+    assert!(s.now() >= 7);
+    assert_eq!(s.entity(a).cycles, 9, "smallest multiple of 3 that is >= 7");
+    assert_eq!(s.entity(a).log, [0, 3, 6]);
+}

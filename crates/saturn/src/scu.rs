@@ -921,6 +921,219 @@ mod tests {
     }
 
     #[test]
+    fn dma_request_carries_stride_and_mode_flags() {
+        let mut s = Scu::new();
+        s.write32(0x00, 0x0600_0000); // D0R
+        s.write32(0x04, 0x0020_0000); // D0W
+        s.write32(0x08, 0x40); // D0C
+        // D0AD: src +4 (bit 8), dst code 2 → 1<<2 = 4 bytes.
+        s.write32(0x0C, 0x100 | 0x2);
+        // D0MD: manual (7) + indirect (bit24) + RUP (bit16) + WUP (bit8).
+        s.write32(0x14, (1 << 24) | (1 << 16) | (1 << 8) | 7);
+        s.write32(0x10, DGO_BIT); // trigger (indirect ignores the count guard)
+        let req = s.take_pending_dma().expect("queued");
+        assert_eq!(req.src_add, 4, "D*AD bit 8 → +4 source stride");
+        assert_eq!(req.dst_add, 4, "D*AD code 2 → 2^2 = 4 byte dest stride");
+        assert!(req.indirect);
+        assert!(req.read_update);
+        assert!(req.write_update);
+    }
+
+    #[test]
+    fn dma_stride_zero_codes_mean_fixed_addresses() {
+        let mut s = Scu::new();
+        s.write32(0x08, 0x10);
+        // D0AD: src bit 8 clear → fixed source; dst code 0 → 2^0 = 1 → fixed.
+        s.write32(0x0C, 0x000);
+        s.write32(0x14, 7); // manual
+        s.write32(0x10, DGO_BIT);
+        let req = s.take_pending_dma().expect("queued");
+        assert_eq!(req.src_add, 0, "fixed source (e.g. a FIFO register)");
+        assert_eq!(req.dst_add, 0, "code 0 → fixed destination");
+    }
+
+    #[test]
+    fn dst_stride_doubles_per_code() {
+        // D*AD destination code 0..7 → 2^code bytes, with code 0 meaning fixed.
+        let mut s = Scu::new();
+        for (code, expected) in [(0u32, 0u32), (1, 2), (2, 4), (3, 8), (7, 128)] {
+            s.channels[0].add_value = code;
+            assert_eq!(s.channels[0].dst_add(), expected, "code {code}");
+        }
+    }
+
+    #[test]
+    fn indirect_channel_triggers_even_with_zero_count() {
+        // The count guard only applies to direct transfers — indirect takes its
+        // size from the table, so a zero programmed count must still fire.
+        let mut s = Scu::new();
+        s.write32(0x08, 0); // count 0
+        s.write32(0x14, (1 << 24) | 7); // indirect + manual
+        s.write32(0x10, DGO_BIT);
+        assert!(s.take_pending_dma().is_some(), "indirect fires with count 0");
+    }
+
+    #[test]
+    fn hardware_start_factor_only_fires_on_the_matching_event() {
+        let mut s = Scu::new();
+        // Arm channel 0 for start factor 0 (VBlank-IN); enabling must not fire.
+        s.write32(0x14, 0); // D0MD: factor 0
+        s.write32(0x08, 0x10);
+        s.write32(0x10, DGO_BIT); // armed
+        assert!(s.take_pending_dma().is_none(), "factor-0 channel waits for the event");
+        // A non-matching event leaves it armed.
+        s.trigger_dma_factor(3); // Timer0 — wrong factor
+        assert!(s.take_pending_dma().is_none());
+        // The matching event triggers it; the channel stays armed for re-fire.
+        s.trigger_dma_factor(0); // VBlank-IN
+        assert!(s.take_pending_dma().is_some());
+        s.trigger_dma_factor(0);
+        assert!(s.take_pending_dma().is_some(), "armed channel re-fires on the next event");
+    }
+
+    #[test]
+    fn unarmed_channel_ignores_hardware_factor_events() {
+        let mut s = Scu::new();
+        s.write32(0x14, 2); // factor 2 (HBlank), but not armed (D*EN bit 8 clear)
+        s.trigger_dma_factor(2);
+        assert!(s.take_pending_dma().is_none(), "unarmed channel never triggers");
+    }
+
+    #[test]
+    fn byte_writes_to_channel_registers_patch_without_triggering() {
+        let mut s = Scu::new();
+        // Build D0R = 0x0600_1000 byte-by-byte (big-endian) and check no trigger.
+        s.write32(0x08, 0x10); // non-zero count
+        s.write32(0x14, 7); // manual factor
+        s.write8(0x00, 0x06);
+        s.write8(0x01, 0x00);
+        s.write8(0x02, 0x10);
+        s.write8(0x03, 0x00);
+        assert_eq!(s.channels[0].read_addr, 0x0600_1000, "byte writes assemble the word");
+        // A byte write to D0EN's DGO byte must NOT trigger.
+        s.write8(0x12, 0x01); // bit 8 of the big-endian enable word
+        assert!(s.take_pending_dma().is_none(), "byte writes never fire DMA");
+    }
+
+    #[test]
+    fn byte_writes_to_count_honour_the_per_channel_mask() {
+        let mut s = Scu::new();
+        // Channel 1 carries a 12-bit count; a wider byte-assembled value clips.
+        s.write8(0x28, 0xFF);
+        s.write8(0x29, 0xFF);
+        s.write8(0x2A, 0xFF);
+        s.write8(0x2B, 0xFF);
+        assert_eq!(s.channels[1].transfer_count, 0x0000_0FFF, "ch1 count masked to 12 bits");
+    }
+
+    #[test]
+    fn read8_and_read16_slice_the_register_word_big_endian() {
+        let mut s = Scu::new();
+        s.write32(0x90, 0x1234_5678); // T0C
+        assert_eq!(s.read8(0x90), 0x12);
+        assert_eq!(s.read8(0x91), 0x34);
+        assert_eq!(s.read8(0x93), 0x78);
+        assert_eq!(s.read16(0x90), 0x1234);
+        assert_eq!(s.read16(0x92), 0x5678);
+    }
+
+    #[test]
+    fn abus_config_registers_round_trip() {
+        let mut s = Scu::new();
+        s.write32(0xB0, 0x1111_2222); // ASR0
+        s.write32(0xB4, 0x3333_4444); // ASR1
+        s.write32(0xB8, 0x0000_001F); // AREF
+        s.write32(0xC4, 0x0000_0001); // RSEL
+        assert_eq!(s.read32(0xB0), 0x1111_2222);
+        assert_eq!(s.read32(0xB4), 0x3333_4444);
+        assert_eq!(s.read32(0xB8), 0x0000_001F);
+        assert_eq!(s.read32(0xC4), 0x0000_0001);
+    }
+
+    #[test]
+    fn dstp_and_dsta_round_trip() {
+        let mut s = Scu::new();
+        s.write32(0x60, 0x0000_0001); // DSTP — force stop
+        s.write32(0x7C, 0xDEAD_BEEF); // DSTA — status (modelled as storage)
+        assert_eq!(s.read32(0x60), 0x0000_0001);
+        assert_eq!(s.read32(0x7C), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn aiack_write_without_bit0_does_not_clear_the_cd_prohibit_latch() {
+        let mut s = Scu::new();
+        s.write32(0xA0, 0x0000); // unmask externals
+        s.set_cd_int(true);
+        assert!(s.take_pending_interrupt(0).is_some());
+        // Writing AIACK with bit 0 *clear* leaves the prohibit latch set.
+        s.write32(0xA8, 0x0000_0002);
+        s.set_cd_int(true);
+        assert!(s.take_pending_interrupt(0).is_none(), "bit 0 clear → latch unchanged");
+        assert_eq!(s.read32(0xA8), 0x0000_0002, "AIACK stored");
+    }
+
+    #[test]
+    fn ims_write_masks_bit14_off() {
+        let mut s = Scu::new();
+        s.write32(0xA0, 0xFFFF_FFFF);
+        assert_eq!(s.read32(0xA0), 0x0000_BFFF, "IMS is 16-bit with bit 14 unused");
+    }
+
+    #[test]
+    fn out_of_range_channel_offset_reads_zero_and_drops_writes() {
+        let mut s = Scu::new();
+        // Offset 0x5C is channel 2's reserved tail (in_ch 0x1C) → reads 0.
+        assert_eq!(s.read32(0x5C), 0);
+        s.write32(0x5C, 0xDEAD_BEEF); // dropped, no panic
+        assert_eq!(s.read32(0x5C), 0);
+        // An unmapped offset above the version register reads 0.
+        assert_eq!(s.read32(0xF0), 0);
+    }
+
+    #[test]
+    fn dsp_ppaf_read_reports_flags_and_clears_v_and_end() {
+        let mut s = Scu::new();
+        s.dsp.regs.pc = 0x0A;
+        s.dsp.regs.flags.exec = true;
+        s.dsp.regs.flags.end = true;
+        s.dsp.regs.flags.v = true;
+        s.dsp.regs.flags.z = true;
+        let v = s.read32(0x80);
+        // Low byte = (PC + 1) & 0xFF.
+        assert_eq!(v & 0xFF, 0x0B);
+        // Flag bits per dsp_flags_bits: EXF=16, EF=18, ZF=21.
+        assert_ne!(v & (1 << 16), 0, "EXF reported");
+        assert_ne!(v & (1 << 18), 0, "EF reported");
+        assert_ne!(v & (1 << 19), 0, "VF reported");
+        assert_ne!(v & (1 << 21), 0, "ZF reported");
+        // Reading clears VF and EF (read-to-acknowledge).
+        let v2 = s.read32(0x80);
+        assert_eq!(v2 & (1 << 19), 0, "VF cleared by the previous read");
+        assert_eq!(v2 & (1 << 18), 0, "EF cleared by the previous read");
+    }
+
+    #[test]
+    fn dsp_ppaf_write_loads_pc_and_zf_sf_without_starting() {
+        let mut s = Scu::new();
+        // LEF (bit15) loads PC; ZF (bit21) / SF (bit22) are writable; no EXF.
+        s.write32(0x80, (1 << 15) | (1 << 21) | (1 << 22) | 0x07);
+        assert_eq!(s.dsp.regs.pc, 0x07, "LEF loaded the PC");
+        assert!(s.dsp.regs.flags.z, "ZF writable");
+        assert!(s.dsp.regs.flags.s, "SF writable");
+        assert!(!s.take_dsp_run(), "no EXF → no run request");
+    }
+
+    #[test]
+    fn dsp_pdd_addresses_the_right_bank_via_ra() {
+        let mut s = Scu::new();
+        // RA top 2 bits select the bank; low 6 the word. RA = 0x80 → bank 2, word 0.
+        s.write32(0x88, 0x80); // PDA sets RA
+        s.write32(0x8C, 0xC0DE_0000); // PDD writes, RA auto-increments
+        assert_eq!(s.dsp.data_ram[2][0], 0xC0DE_0000);
+        assert_eq!(s.dsp.regs.ra, 0x81, "RA auto-incremented past the write");
+    }
+
+    #[test]
     fn ist_writes_are_write_one_to_clear() {
         let mut s = Scu::new();
         s.raise(Source::Timer0);

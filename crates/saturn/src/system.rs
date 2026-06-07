@@ -1421,7 +1421,59 @@ impl Saturn {
 
 #[cfg(test)]
 mod tests {
-    use super::hblank_active;
+    use super::{
+        CYCLES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count, hblank_active, intback_busy_us,
+        us_to_cycles,
+    };
+
+    #[test]
+    fn us_to_cycles_uses_the_full_precision_master_clock() {
+        // 1 s of µs → ~one second of master cycles (28.636360 MHz).
+        assert_eq!(us_to_cycles(1_000_000), SH2_CLOCK_HZ);
+        // 261 µs (a status INTBACK) → 261 × clock / 1e6.
+        assert_eq!(us_to_cycles(261), 261 * SH2_CLOCK_HZ / 1_000_000);
+    }
+
+    #[test]
+    fn intback_busy_time_matches_the_mednafen_smpc_clock_model() {
+        // No status, no peripheral → just the 92-clock dispatch (÷4 → 23 µs).
+        assert_eq!(intback_busy_us(0, 0), 23);
+        // Status phase requested (IREG0 low nibble) → (92 + 952)/4 = 261 µs.
+        assert_eq!(intback_busy_us(0x01, 0), 261);
+        // Peripheral phase (IREG1 bit 3) adds the +700 µs lump.
+        assert_eq!(intback_busy_us(0x01, 0x08), 261 + 700);
+        assert_eq!(intback_busy_us(0x00, 0x08), 23 + 700);
+    }
+
+    #[test]
+    fn dma_count_zero_means_the_channel_maximum() {
+        // A non-zero programmed count passes through unchanged.
+        assert_eq!(dma_count(0, 0x40), 0x40);
+        assert_eq!(dma_count(1, 0x10), 0x10);
+        // 0 → channel max: 1 MiB for level 0, 4 KiB for levels 1/2.
+        assert_eq!(dma_count(0, 0), 0x0010_0000);
+        assert_eq!(dma_count(1, 0), 0x0000_1000);
+        assert_eq!(dma_count(2, 0), 0x0000_1000);
+    }
+
+    #[test]
+    fn vblank_edge_helpers_partition_the_frame() {
+        // From frame start, the next VBlank-IN is exactly VBLANK_IN_CYCLE away,
+        // and the next VBlank-OUT is a full frame away.
+        assert_eq!(
+            Saturn::cycles_to_next_vblank_in(0),
+            Saturn::VBLANK_IN_CYCLE
+        );
+        assert_eq!(Saturn::cycles_to_next_vblank_out(0), CYCLES_PER_FRAME);
+        // Just past VBlank-IN, the next one is in the following frame.
+        let past = Saturn::VBLANK_IN_CYCLE + 10;
+        assert_eq!(
+            Saturn::cycles_to_next_vblank_in(past),
+            CYCLES_PER_FRAME - past + Saturn::VBLANK_IN_CYCLE
+        );
+        // VBlank-OUT counts down to the frame boundary.
+        assert_eq!(Saturn::cycles_to_next_vblank_out(past), CYCLES_PER_FRAME - past);
+    }
 
     #[test]
     fn hblank_asserts_past_the_active_display_width() {

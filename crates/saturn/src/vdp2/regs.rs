@@ -845,6 +845,243 @@ mod tests {
     }
 
     #[test]
+    fn screen_dims_decode_every_resolution_code() {
+        let mut r = Vdp2Regs::new();
+        // HRESO (bits 2..0): only the low 2 bits select the width family.
+        for (hres, w) in [(0u16, 320usize), (1, 352), (2, 640), (3, 704)] {
+            r.write16(0x000, hres);
+            assert_eq!(r.screen_dims().0, w, "HRESO {hres} → width {w}");
+        }
+        // HRESO bit 2 (the 31 kHz "exclusive monitor" variants) keeps the same
+        // pixel width as the low 2 bits select.
+        r.write16(0x000, 0b100); // hres 4 → low 2 bits = 0 → 320
+        assert_eq!(r.screen_dims().0, 320);
+        r.write16(0x000, 0b110); // hres 6 → low 2 bits = 2 → 640
+        assert_eq!(r.screen_dims().0, 640);
+
+        // VRESO (bits 5..4): 224 / 240 / 256 (code 3 also 256).
+        for (vres, h) in [(0u16, 224usize), (1, 240), (2, 256), (3, 256)] {
+            r.write16(0x000, vres << 4);
+            assert_eq!(r.screen_dims().1, h, "VRESO {vres} → height {h}");
+        }
+    }
+
+    #[test]
+    fn screen_dims_double_density_interlace_doubles_height() {
+        let mut r = Vdp2Regs::new();
+        // LSMD (bits 7..6) == 3 → double-density interlace doubles the line count.
+        r.write16(0x000, 0b11 << 6); // interlace (LSMD=3), vres 224
+        assert_eq!(r.screen_dims(), (320, 448), "224 → 448 in double-density");
+        // Doukyuusei ~if~: 640×224 hi-res, non-interlaced.
+        r.write16(0x000, 0x8000 | 0b010); // DISP + hres 640
+        assert_eq!(r.screen_dims(), (640, 224));
+    }
+
+    #[test]
+    fn cram_offset_selects_the_bank_per_layer() {
+        let mut r = Vdp2Regs::new();
+        // CRAOFA (0x0E4): 3 bits per layer, N0..N3 at bits 2:0/6:4/10:8/14:12.
+        r.write16(0x0E4, (1 << 0) | (3 << 4) | (5 << 8) | (7 << 12));
+        assert_eq!(r.nbg_color_ram_offset(0), 1 << 8, "N0 offset 1 → CRAM 0x100");
+        assert_eq!(r.nbg_color_ram_offset(1), 3 << 8, "N1 offset 3 → CRAM 0x300");
+        assert_eq!(r.nbg_color_ram_offset(2), 5 << 8);
+        assert_eq!(r.nbg_color_ram_offset(3), 7 << 8);
+        // CRAOFB (0x0E6): RBG0 at bits 2:0; RBG1 reuses NBG0's offset.
+        r.write16(0x0E6, 2);
+        assert_eq!(r.rbg_color_ram_offset(0), 2 << 8, "RBG0 offset 2 → CRAM 0x200");
+        assert_eq!(r.rbg_color_ram_offset(1), 1 << 8, "RBG1 shares NBG0's offset");
+    }
+
+    #[test]
+    fn transparent_pen_solid_bits_decode() {
+        let mut r = Vdp2Regs::new();
+        // BGON NxTPON bits 8..11 — code-0 dots drawn solid rather than transparent.
+        r.write16(0x020, (1 << 8) | (1 << 11)); // N0TPON + N3TPON
+        assert!(r.nbg_transparent_pen_solid(0));
+        assert!(!r.nbg_transparent_pen_solid(1));
+        assert!(!r.nbg_transparent_pen_solid(2));
+        assert!(r.nbg_transparent_pen_solid(3));
+        // R0TPON is bit 12; RBG1 falls back to bit 8 (N0TPON).
+        r.write16(0x020, (1 << 12) | (1 << 8));
+        assert!(r.rbg_transparent_pen_solid(0), "R0TPON bit 12");
+        assert!(r.rbg_transparent_pen_solid(1), "RBG1 reuses N0TPON bit 8");
+    }
+
+    #[test]
+    fn nbg_color_mode_decodes_per_layer_widths() {
+        let mut r = Vdp2Regs::new();
+        // CHCTLA: N0CHCN bits 6..4 (3 bits), N1CHCN bits 13..12 (2 bits).
+        r.write16(0x028, (0b100 << 4) | (0b10 << 12)); // N0 = 4 (16M RGB), N1 = 2
+        assert_eq!(r.nbg_color_mode(0), 4);
+        assert_eq!(r.nbg_color_mode(1), 2);
+        // CHCTLB: N2CHCN bit 1, N3CHCN bit 5 (each a single 16/256 bit).
+        r.write16(0x02A, (1 << 1) | (1 << 5));
+        assert_eq!(r.nbg_color_mode(2), 1);
+        assert_eq!(r.nbg_color_mode(3), 1);
+    }
+
+    #[test]
+    fn nbg_priority_decode_per_layer() {
+        let mut r = Vdp2Regs::new();
+        // PRINA (0x0F8): N0 bits 2..0, N1 bits 10..8. PRINB (0x0FA): N2, N3.
+        r.write16(0x0F8, 3 | (5 << 8));
+        r.write16(0x0FA, 2 | (7 << 8));
+        assert_eq!(r.nbg_priority(0), 3);
+        assert_eq!(r.nbg_priority(1), 5);
+        assert_eq!(r.nbg_priority(2), 2);
+        assert_eq!(r.nbg_priority(3), 7);
+    }
+
+    #[test]
+    fn nbg_char_size_and_bitmap_size_decode() {
+        let mut r = Vdp2Regs::new();
+        // CHCTLA: N0CHSZ bit 0, N1CHSZ bit 8. CHCTLB: N2CHSZ bit 0, N3CHSZ bit 4.
+        r.write16(0x028, 0x0001 | 0x0100);
+        r.write16(0x02A, 0x0001 | 0x0010);
+        assert!(r.nbg_char_size_2x2(0));
+        assert!(r.nbg_char_size_2x2(1));
+        assert!(r.nbg_char_size_2x2(2));
+        assert!(r.nbg_char_size_2x2(3));
+        // NBG1 bitmap enable (bit 9) + size (bits 11..10).
+        r.write16(0x028, 0x0200 | (0b10 << 10));
+        assert!(r.nbg_bitmap_enabled(1));
+        assert_eq!(r.nbg_bitmap_size(1), 2);
+        // NBG2/3 are cell-only → never bitmap.
+        assert!(!r.nbg_bitmap_enabled(2));
+        assert_eq!(r.nbg_bitmap_size(2), 0);
+    }
+
+    #[test]
+    fn pattern_name_control_fields_decode() {
+        let mut r = Vdp2Regs::new();
+        // PNCN0 at 0x030: PNB bit 15, CNSM bit 14, SPLT bits 7..5, SPCN bits 4..0.
+        r.write16(0x030, 0x8000 | 0x4000 | (0b101 << 5) | 0b10011);
+        assert!(r.nbg_pn_one_word(0), "PNB → 1-word entries");
+        assert!(r.nbg_pn_cnsm(0));
+        assert_eq!(r.nbg_pn_splt(0), 0b101);
+        assert_eq!(r.nbg_pn_spcn(0), 0b10011);
+    }
+
+    #[test]
+    fn plane_size_and_plane_page_compose() {
+        let mut r = Vdp2Regs::new();
+        // PLSZ (0x03A): NBG0 in bits 1..0.
+        r.write16(0x03A, 0b11); // 2×2
+        assert_eq!(r.nbg_plane_size(0), 0b11);
+        // MPOFN N0MP = 2; MPCDN0 plane C (low byte of 0x042) = 9.
+        r.write16(0x03C, 0x0002); // map offset 2
+        r.write16(0x042, 9); // MPCDN0: plane C in low byte
+        // plane page = (map_offset << 6) | MPxx = (2 << 6) | 9 = 137.
+        assert_eq!(r.nbg_plane_page(0, 2), (2 << 6) | 9);
+    }
+
+    #[test]
+    fn sprite_control_fields_decode() {
+        let mut r = Vdp2Regs::new();
+        // SPCTL (0x0E0): SPTYPE bits 3..0, SPCLMD bit 5, SPCCN bits 10..8,
+        // SPCCCS bits 13..12.
+        r.write16(0x0E0, 0x0007 | 0x0020 | (0b101 << 8) | (0b10 << 12));
+        assert_eq!(r.sprite_type(), 7);
+        assert!(r.sprite_rgb_mode());
+        assert_eq!(r.sprite_cc_condition(), 0b101);
+        assert_eq!(r.sprite_cc_mode(), 0b10);
+        // Sprite priority registers PRISA..PRISD (0x0F0..) two 3-bit fields each.
+        r.write16(0x0F0, 4 | (6 << 8)); // S0 = 4, S1 = 6
+        assert_eq!(r.sprite_priority(0), 4);
+        assert_eq!(r.sprite_priority(1), 6);
+        // CCRSA (0x100) — colour-calc ratios, 5-bit fields.
+        r.write16(0x100, 0x1F | (0x0A << 8));
+        assert_eq!(r.sprite_color_calc_ratio(0), 0x1F);
+        assert_eq!(r.sprite_color_calc_ratio(1), 0x0A);
+    }
+
+    #[test]
+    fn color_calc_descriptor_keys_on_ccctl_enable_bits() {
+        let mut r = Vdp2Regs::new();
+        // CCCTL (0x0EC): per-NBG enable bits 0..3, CCMD (additive) bit 8.
+        r.write16(0x0EC, 0x0001 | 0x0100); // enable N0, additive mode
+        r.write16(0x108, 0x000C); // CCRNA: N0 ratio = 12
+        assert!(r.color_calc_add_mode());
+        assert_eq!(r.nbg_color_calc_ratio(0), 12);
+        assert_eq!(r.nbg_color_calc(0), Some((12, true)), "enabled → (ratio, add)");
+        assert_eq!(r.nbg_color_calc(1), None, "N1 disabled → None");
+        // RBG0 uses CCCTL bit 4 + CCRR (0x10C).
+        r.write16(0x0EC, 0x0010 | 0x0100);
+        r.write16(0x10C, 0x0007);
+        assert_eq!(r.rbg_color_calc(0), Some((7, true)));
+    }
+
+    #[test]
+    fn window_rect_and_line_table_decode() {
+        let mut r = Vdp2Regs::new();
+        // W0: WPSX0 0x0C0 (>>1), WPSY0 0x0C2, WPEX0 0x0C4 (>>1), WPEY0 0x0C6.
+        r.write16(0x0C0, 0x0040); // sx raw 0x40 → 0x20
+        r.write16(0x0C2, 0x0030); // sy
+        r.write16(0x0C4, 0x0280); // ex raw 0x280 → 0x140
+        r.write16(0x0C6, 0x00E0); // ey
+        assert_eq!(r.window_rect(0), (0x20, 0x140, 0x30, 0xE0));
+        // LWTA0 (0x0D8): line-window enable bit 15 + table address (word units).
+        r.write16(0x0D8, 0x8000 | 0x0002);
+        r.write16(0x0DA, 0x0000);
+        assert!(r.window_line_enabled(0));
+        // address = ((hi & 7) << 16 | (lo & 0xFFFE)) << 1 = (0x2_0000) << 1.
+        assert_eq!(r.window_line_table(0), 0x2_0000 << 1);
+    }
+
+    #[test]
+    fn rotation_fields_decode() {
+        let mut r = Vdp2Regs::new();
+        // BGON: R0ON bit 4, R1ON bit 5.
+        r.write16(0x020, (1 << 4) | (1 << 5));
+        assert!(r.rbg_enabled(0));
+        assert!(r.rbg_enabled(1));
+        // MPOFR (0x03E): RA bits 1..0, RB bits 5..4.
+        r.write16(0x03E, 0x0001 | (0x2 << 4));
+        assert_eq!(r.rbg_map_offset(0), 1);
+        assert_eq!(r.rbg_map_offset(1), 2);
+        assert_eq!(r.rbg_bitmap_base(0), 0x2_0000);
+        // CHCTLB: R0CHCN bits 14..12, R0BMEN bit 9, R0CHSZ bit 8.
+        r.write16(0x02A, (0b011 << 12) | (1 << 9) | (1 << 8));
+        assert_eq!(r.rbg_color_mode(), 3);
+        assert!(r.rbg_bitmap_enabled());
+        assert!(r.rbg_char_size_2x2());
+        // PRIR (0x0FC): RBG0 priority bits 2..0.
+        r.write16(0x0FC, 6);
+        assert_eq!(r.rbg_priority(0), 6);
+    }
+
+    #[test]
+    fn rotation_coeff_and_plane_size_decode() {
+        let mut r = Vdp2Regs::new();
+        // KTCTL (0x0B4): RAKTE bit 0, RAKDBS bit 1, RAKMD bits 3..2.
+        r.write16(0x0B4, 0x0001 | 0x0002 | (0b10 << 2));
+        assert!(r.rbg_coeff_enabled(0));
+        assert!(r.rbg_coeff_size_word(0));
+        assert_eq!(r.rbg_coeff_mode(0), 0b10);
+        // PLSZ rotation: RA bits 9..8, screen-over RAOVR bits 11..10.
+        r.write16(0x03A, (0b11 << 8) | (0b10 << 10));
+        assert_eq!(r.rbg_plane_size(0), 0b11);
+        assert_eq!(r.rbg_screen_over(0), 0b10);
+    }
+
+    #[test]
+    fn line_scroll_control_decode() {
+        let mut r = Vdp2Regs::new();
+        // SCRCTL (0x09A): N0 in bits 5..0 — VCSC bit0, LSCX bit1, LSCY bit2,
+        // LZMX bit3, LSS bits 5..4.
+        r.write16(0x09A, 0b101111); // VCSC|LSCX|LSCY|LZMX, LSS=0b10 → 4 lines
+        assert!(r.nbg_vcell_scroll(0));
+        assert!(r.nbg_line_scroll_x(0));
+        assert!(r.nbg_line_scroll_y(0));
+        assert!(r.nbg_line_zoom_x(0));
+        assert_eq!(r.nbg_line_scroll_interval(0), 4);
+        // Line-scroll table address (word units, <<1 to bytes).
+        r.write16(0x0A0, 0x0001); // hi
+        r.write16(0x0A2, 0x0000); // lo
+        assert_eq!(r.nbg_line_scroll_table(0), 0x1_0000 << 1);
+    }
+
+    #[test]
     fn scroll_integer_parts_decode() {
         let mut r = Vdp2Regs::new();
         r.write16(0x070, 0x0040); // SCXIN0 = 64

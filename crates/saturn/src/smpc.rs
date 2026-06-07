@@ -530,11 +530,198 @@ mod tests {
     }
 
     #[test]
+    fn default_region_is_north_america() {
+        let s = Smpc::new();
+        assert_eq!(s.region, region::NORTH_AMERICA);
+    }
+
+    #[test]
+    fn default_clock_is_1996_01_01() {
+        // new() seeds a deterministic 1996-01-01 00:00:00 base.
+        let s = Smpc::new();
+        let b = s.rtc_oreg(0, 1000);
+        assert_eq!([b[0], b[1]], [0x19, 0x96], "year 1996 BCD");
+        assert_eq!(b[2] & 0x0F, 0x01, "month 1");
+        assert_eq!(b[3], 0x01, "day 1");
+        assert_eq!([b[4], b[5], b[6]], [0x00, 0x00, 0x00], "midnight");
+    }
+
+    #[test]
+    fn settime_clamps_nonsense_dates_instead_of_overflowing() {
+        // An all-zero IREG decodes to year 0 / month 0 / day 0; the clamp keeps
+        // the day count non-negative rather than panicking on the conversion.
+        let mut s = Smpc::new();
+        s.set_rtc_bcd([0, 0, 0, 0, 0, 0, 0], 0);
+        // The resulting time is well-defined (day 0 → 1970-01-01) and readable.
+        let b = s.rtc_oreg(0, 1000);
+        assert_eq!([b[0], b[1]], [0x19, 0x70], "clamped to the 1970 epoch");
+    }
+
+    #[test]
+    fn rtc_oreg_tolerates_zero_cycles_per_second() {
+        // cycles_per_second is `.max(1)`'d, so a 0 argument doesn't divide by
+        // zero: it treats one cycle as one second instead of panicking. With
+        // `now == rtc_set_cycle` there is no elapsed time, so the base shows.
+        let mut s = Smpc::new();
+        s.set_rtc_unix(0, 0);
+        let b = s.rtc_oreg(0, 0); // now == set_cycle → 0 elapsed
+        assert_eq!([b[0], b[1]], [0x19, 0x70], "base 1970 epoch, no panic");
+        assert_eq!(b[6], 0x00);
+    }
+
+    #[test]
+    fn intback_break_request_ends_the_sequence() {
+        // Simulate being mid-peripheral-sequence (stage non-zero), then BREAK.
+        let mut s = Smpc::new();
+        s.intback_stage = 1;
+        s.sr = 0xC1; // "more data" SR
+        s.write8(0x01, 0x40); // IREG0 BREAK bit
+        assert_eq!(s.intback_stage, 0, "BREAK ends the sequence");
+        assert_eq!(s.sr & 0xF0, 0x00, "BREAK acks the high SR nibble");
+        assert!(!s.take_intback_continue(), "BREAK is not a CONTINUE");
+    }
+
+    #[test]
+    fn intback_continue_request_sets_sf_and_the_continue_flag() {
+        let mut s = Smpc::new();
+        s.intback_stage = 1;
+        s.write8(0x01, 0x80); // IREG0 CONTINUE bit
+        assert_eq!(s.sf, 1, "CONTINUE goes busy until the phase completes");
+        assert!(s.take_intback_continue(), "CONTINUE request latched");
+        assert!(!s.take_intback_continue(), "the continue flag is one-shot");
+    }
+
+    #[test]
+    fn ireg0_write_outside_a_sequence_does_not_trigger_continue_or_break() {
+        // When no INTBACK sequence is active, IREG0 is plain storage.
+        let mut s = Smpc::new();
+        assert_eq!(s.intback_stage, 0);
+        s.write8(0x01, 0x80 | 0x40); // both bits set, but stage == 0
+        assert_eq!(s.ireg[0], 0xC0, "still stored");
+        assert!(!s.take_intback_continue(), "no CONTINUE outside a sequence");
+        assert_eq!(s.sf, 0, "SF untouched outside a sequence");
+    }
+
+    #[test]
+    fn settle_intback_drops_sf_only_after_the_completion_cycle() {
+        let mut s = Smpc::new();
+        s.sf = 1;
+        s.intback_complete_at = Some(1000);
+        s.settle_intback(999);
+        assert_eq!(s.sf, 1, "before completion: still busy");
+        assert!(s.intback_complete_at.is_some());
+        s.settle_intback(1000);
+        assert_eq!(s.sf, 0, "at completion: SF drops");
+        assert!(s.intback_complete_at.is_none(), "completion consumed");
+        // A subsequent settle with no pending INTBACK is a no-op.
+        s.sf = 1;
+        s.settle_intback(2000);
+        assert_eq!(s.sf, 1, "no pending INTBACK → settle leaves SF alone");
+    }
+
+    #[test]
+    fn settime_command_queues_setsmem_decodes_too() {
+        // SETSMEM (0x17) and SETTIME (0x16) both decode and queue.
+        let mut s = Smpc::new();
+        s.write8(0x1F, 0x17); // SETSMEM
+        assert_eq!(s.take_pending(), Some(Command::SetSMem));
+        s.write8(0x1F, 0x16); // SETTIME
+        assert_eq!(s.take_pending(), Some(Command::SetTime));
+    }
+
+    #[test]
+    fn smem_field_round_trips() {
+        // SETSMEM's effect (writing smem) is applied in `system`, but the field
+        // itself is plain serialized storage echoed in INTBACK OREG12..15.
+        let mut s = Smpc::new();
+        s.smem = [0xDE, 0xAD, 0xBE, 0xEF];
+        assert_eq!(s.smem, [0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn read16_and_read32_assemble_big_endian_from_odd_registers() {
+        let mut s = Smpc::new();
+        // OREG0..3 at odd offsets 0x21/0x23/0x25/0x27.
+        s.write8(0x21, 0x12);
+        s.write8(0x23, 0x34);
+        s.write8(0x25, 0x56);
+        s.write8(0x27, 0x78);
+        // read16 spans an odd register and the reserved even byte after it.
+        assert_eq!(s.read16(0x21), 0x1200, "OREG0 high, reserved low");
+        // read32 covers 0x21(OREG0)/0x22(reserved)/0x23(OREG1)/0x24(reserved):
+        // the odd bytes carry data, the even ones read 0.
+        assert_eq!(s.read32(0x21), 0x1200_3400);
+    }
+
+    #[test]
+    fn write16_and_write32_split_into_consecutive_bytes() {
+        let mut s = Smpc::new();
+        // Writing a word across 0x21/0x22 lands the high byte in OREG0; the
+        // even byte 0x22 is reserved and drops its write.
+        s.write16(0x21, 0xABCD);
+        assert_eq!(s.oreg[0], 0xAB, "high byte → OREG0");
+        // 0x23 is OREG1.
+        s.write32(0x21, 0x1122_3344);
+        assert_eq!(s.oreg[0], 0x11);
+        assert_eq!(s.oreg[1], 0x33, "0x23 = OREG1 from byte 2 of the word");
+    }
+
+    #[test]
+    fn port_data_and_direction_registers_round_trip() {
+        let mut s = Smpc::new();
+        for (off, expect) in [
+            (0x75u32, "pdr1"),
+            (0x77, "pdr2"),
+            (0x79, "ddr1"),
+            (0x7B, "ddr2"),
+            (0x7D, "iosel"),
+            (0x7F, "exle"),
+        ] {
+            s.write8(off, 0xA5);
+            assert_eq!(s.read8(off), 0xA5, "{expect} round-trips");
+        }
+    }
+
+    #[test]
+    fn reserved_even_offsets_read_zero() {
+        let s = Smpc::new();
+        assert_eq!(s.read8(0x00), 0, "even IREG slot reserved");
+        assert_eq!(s.read8(0x20), 0, "even OREG slot reserved");
+        assert_eq!(s.read8(0x62), 0, "even byte by SR reserved");
+        assert_eq!(s.read8(0xFF), 0, "unmapped offset reads 0");
+    }
+
+    #[test]
+    fn pad_bit_constants_match_the_wire_order() {
+        // First data byte (high) MSB→LSB: Right/Left/Down/Up/Start/A/C/B.
+        assert_eq!(pad::RIGHT, 1 << 15);
+        assert_eq!(pad::B, 1 << 8);
+        // Second data byte (low) bits 7..3: R/X/Y/Z/L.
+        assert_eq!(pad::R, 1 << 7);
+        assert_eq!(pad::L, 1 << 3);
+    }
+
+    #[test]
+    fn region_constants_match_the_smpc_area_table() {
+        assert_eq!(region::JAPAN, 0x01);
+        assert_eq!(region::ASIA_NTSC, 0x02);
+        assert_eq!(region::NORTH_AMERICA, 0x04);
+        assert_eq!(region::EUROPE_PAL, 0x0C);
+    }
+
+    #[test]
     fn command_decode_covers_all_m3_codes() {
         let cases = [
             (0x00, Command::MshOn),
             (0x02, Command::SshOn),
             (0x03, Command::SshOff),
+            (0x06, Command::SndOn),
+            (0x07, Command::SndOff),
+            (0x08, Command::CdOn),
+            (0x09, Command::CdOff),
+            (0x0D, Command::SysRes),
+            (0x0E, Command::CkChg352),
+            (0x0F, Command::CkChg320),
             (0x10, Command::IntBack),
             (0x16, Command::SetTime),
             (0x17, Command::SetSMem),
@@ -544,7 +731,12 @@ mod tests {
         ];
         for (raw, expected) in cases {
             assert_eq!(Command::from_raw(raw), Some(expected));
+            // Discriminants match the hardware byte (`cmd as u8` round-trips).
+            assert_eq!(expected as u8, raw);
         }
+        // Gaps and unknown codes don't decode.
+        assert_eq!(Command::from_raw(0x01), None, "0x01 is not an M3 command");
+        assert_eq!(Command::from_raw(0x11), None);
         assert_eq!(Command::from_raw(0xFF), None);
     }
 }
