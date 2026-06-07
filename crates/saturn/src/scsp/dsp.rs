@@ -441,4 +441,313 @@ mod tests {
             dsp.efreg[0]
         );
     }
+
+    // --- microprogram instruction-word field helpers (mirror `step`'s decode) ---
+
+    /// ip0: TRA(14:8) | TWT(7) | TWA(6:0)
+    fn ip0(tra: u16, twt: u16, twa: u16) -> u16 {
+        (tra << 8) | (twt << 7) | twa
+    }
+    /// ip1: XSEL(15) | YSEL(14:13) | IRA(11:6) | IWT(5) | IWA(4:0)
+    fn ip1(xsel: u16, ysel: u16, ira: u16, iwt: u16, iwa: u16) -> u16 {
+        (xsel << 15) | (ysel << 13) | (ira << 6) | (iwt << 5) | iwa
+    }
+    /// ip2: TABLE(15) MWT(14) MRT(13) EWT(12) EWA(11:8) ADRL(7) FRCL(6) SHFT1(5)
+    /// SHFT0(4) YRL(3) NEGB(2) ZERO(1) BSEL(0)
+    #[allow(clippy::too_many_arguments)]
+    fn ip2(
+        mwt: u16,
+        mrt: u16,
+        ewt: u16,
+        ewa: u16,
+        adrl: u16,
+        frcl: u16,
+        shft1: u16,
+        shft0: u16,
+        yrl: u16,
+        zero: u16,
+        bsel: u16,
+    ) -> u16 {
+        (mwt << 14)
+            | (mrt << 13)
+            | (ewt << 12)
+            | (ewa << 8)
+            | (adrl << 7)
+            | (frcl << 6)
+            | (shft1 << 5)
+            | (shft0 << 4)
+            | (yrl << 3)
+            | (zero << 1)
+            | bsel
+    }
+    /// ip3: NOFL(15) | CRA(14:9) | MASA(6:2) | ADRGB(1) | NXADDR(0)
+    fn ip3(nofl: u16, cra: u16, masa: u16, nxaddr: u16) -> u16 {
+        (nofl << 15) | (cra << 9) | (masa << 2) | nxaddr
+    }
+
+    fn load(dsp: &mut Dsp, prog: &[[u16; 4]]) {
+        for (i, w) in prog.iter().enumerate() {
+            dsp.mpro[i * 4..i * 4 + 4].copy_from_slice(w);
+        }
+        dsp.start();
+    }
+
+    #[test]
+    fn temp_write_then_read_round_trips_through_the_ring() {
+        // Step 0: ACC = MIXS[0]·COEF[0]; SHIFT=3, write the shifter to TEMP[5]
+        //   (the shifter holds the *previous* ACC, which is 0 on step 0 — so first
+        //   prime ACC, then on step 1 store it to TEMP).
+        // Plan: s0 compute ACC. s1 SHIFT ACC→TEMP[5] (TWT). s2 read TEMP[5] as X
+        //   (XSEL=0, TRA=5), Y=COEF (=+0xFFF) → new ACC. s3 SHIFT→EFREG[0].
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16; // Y = +0xFFF
+        // dec starts at 0, and the address offset `(addr + dec) & 0x7F` uses dec;
+        // dec is the same for every step within one pass, so TWA==TRA addresses
+        // the same TEMP cell.
+        let prog = [
+            // s0: X=MIXS[0], Y=COEF[0], ZERO B, SHIFT3 → ACC = MIXS·Y
+            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            // s1: SHIFT3 (shifts the s0 ACC), TWT→TEMP[5], ZERO keeps ACC sane
+            [
+                ip0(0, 1, 5),
+                0,
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
+            // s2: X=TEMP[5] (XSEL=0, TRA=5), Y=COEF[0], ZERO B, SHIFT3 → ACC
+            [ip0(5, 0, 0), ip1(0, 1, 0, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            // s3: SHIFT3, EWT→EFREG[0]
+            [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+        ];
+        load(&mut dsp, &prog);
+        dsp.set_sample(0x4000, 0);
+        dsp.step(&mut ram);
+        // TEMP[5] must have captured the shifter; EFREG[0] is the value read back
+        // out of TEMP and shifted — non-zero proves the TEMP write+read both ran.
+        assert_ne!(dsp.temp[5], 0, "TEMP cell was written");
+        assert_ne!(dsp.efreg[0], 0, "value read back out of TEMP reached EFREG");
+    }
+
+    #[test]
+    fn delay_ram_write_then_read_round_trips_via_madrs() {
+        // MWT stores the shifter into delay RAM at MADRS[masa]; a later MRT reads
+        // it back into read_value, and IWT latches read_value into MEMS. NOFL=1
+        // uses the raw 16-bit (no dsp-float) path so the value is exact.
+        // The write/read have one step of latency (the access resolves on the next
+        // step), so interleave NOPs.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16;
+        dsp.madrs[0] = 0x40; // delay-RAM word address (×2 for the byte address)
+        dsp.rbl = 0x2000;
+        dsp.rbp = 0;
+        // Make `table=1` (absolute addressing, mask 0xFFFF) so dec doesn't shift
+        // the address between the write step and the read step. table is ip2 bit
+        // 15 — add it directly.
+        let table = 1u16 << 15;
+        let prog = [
+            // s0: ACC = MIXS[0]·Y (a known non-zero shifter source next step)
+            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            // s1: SHIFT3 → shifter, MWT (NOFL raw) to MADRS[0], table absolute
+            [
+                0,
+                0,
+                ip2(1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0) | table,
+                ip3(1, 0, 0, 0),
+            ],
+            // s2: resolve the pending write (NOP body), keep ZERO
+            [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            // s3: MRT (NOFL raw) from MADRS[0], table absolute
+            [
+                0,
+                0,
+                ip2(0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0) | table,
+                ip3(1, 0, 0, 0),
+            ],
+            // s4: resolve the pending read → read_value (the IWT/MEMS latch and
+            //   the read resolution both run this step, but IWT runs *before* the
+            //   resolution block, so MEMS only sees read_value next step).
+            [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            // s5: IWT → MEMS[2] now sees the resolved read_value.
+            [0, ip1(0, 0, 0, 1, 2), ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+        ];
+        load(&mut dsp, &prog);
+        dsp.set_sample(0x6000, 0);
+        dsp.step(&mut ram);
+        // The raw 16-bit shifter byte ((shifter>>8) as u16) was written to delay
+        // RAM and read back; MEMS[2] holds the sign-extended-<<8 read value.
+        let stored = ram.read16((dsp.madrs[0] as u32) << 1);
+        assert_ne!(stored, 0, "delay RAM received the write");
+        assert_eq!(
+            dsp.mems[2],
+            ((stored as i32) << 8) & 0xFF_FFFF,
+            "MRT(NOFL) read-back: raw 16-bit << 8, masked to 24 bits, into MEMS[2]"
+        );
+    }
+
+    #[test]
+    fn dspfloat_delay_path_round_trips_through_delay_ram() {
+        // The default (NOFL=0) delay path compresses the shifter to the 16-bit
+        // dsp-float on write and expands it on read — within the float's relative
+        // error. Same plan as the raw path but NOFL=0.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16;
+        dsp.madrs[0] = 0x80;
+        dsp.rbl = 0x2000;
+        let table = 1u16 << 15;
+        let prog = [
+            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            [0, 0, ip2(1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0) | table, ip3(0, 0, 0, 0)],
+            [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            [0, 0, ip2(0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0) | table, ip3(0, 0, 0, 0)],
+            // resolve the read (IWT runs before the resolution block, so MEMS
+            // only sees read_value on the following step).
+            [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            [0, ip1(0, 0, 0, 1, 0), ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+        ];
+        load(&mut dsp, &prog);
+        dsp.set_sample(0x6000, 0);
+        dsp.step(&mut ram);
+        let raw = ram.read16((dsp.madrs[0] as u32) << 1);
+        // The stored word decodes (via dspfloat_to_int) to MEMS[0].
+        assert_eq!(
+            dsp.mems[0],
+            dspfloat_to_int(raw),
+            "MRT(dsp-float) read-back matches the decoded delay word"
+        );
+        assert_ne!(dsp.mems[0], 0, "the dsp-float path carried a non-zero value");
+    }
+
+    #[test]
+    fn exts_input_reaches_the_effect_output() {
+        // IRA 0x30/0x31 select the external inputs EXTS[0]/EXTS[1] (`<<8`); used
+        // for the CD/external audio into the DSP. Route EXTS[0] through to EFREG.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16; // Y = +0xFFF
+        dsp.exts[0] = 0x1234;
+        let prog = [
+            // s0: X = EXTS[0] (IRA 0x30, XSEL=1), Y=COEF[0], ZERO, SHIFT3
+            [0, ip1(1, 1, 0x30, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            // s1: SHIFT3, EWT→EFREG[0]
+            [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+        ];
+        load(&mut dsp, &prog);
+        dsp.step(&mut ram);
+        assert_ne!(dsp.efreg[0], 0, "EXTS[0] external input reached EFREG[0]");
+    }
+
+    #[test]
+    fn mems_input_feeds_the_mac() {
+        // IRA 0x00-0x1F select MEMS[ira] directly as the INPUTS latch. Pre-seed
+        // MEMS[7] and route it through.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.coef[0] = 0x7FF8u16 as i16;
+        dsp.mems[7] = 0x20_0000; // a 24-bit-domain value
+        let prog = [
+            // s0: X = MEMS[7] (IRA 7, XSEL=1), Y=COEF[0], ZERO, SHIFT3
+            [0, ip1(1, 1, 7, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            // s1: SHIFT3, EWT→EFREG[0]
+            [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+        ];
+        load(&mut dsp, &prog);
+        dsp.step(&mut ram);
+        assert_ne!(dsp.efreg[0], 0, "MEMS input reached the effect output");
+    }
+
+    #[test]
+    fn bsel_accumulates_onto_the_running_accumulator() {
+        // BSEL=1 selects the accumulator (sft_reg) as the MAC's B addend, so two
+        // identical product steps accumulate to ~2× one step (vs ZERO/BSEL=0
+        // which replaces B). Compare EFREG with BSEL on vs off.
+        fn run(bsel: u16) -> i16 {
+            let mut dsp = Dsp::new();
+            let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+            dsp.coef[0] = 0x4000u16 as i16; // Y = +0x800
+            let macc = |b: u16| ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, b); // SHIFT3, BSEL=b
+            let prog = [
+                // s0: ACC = X·Y (ZERO B to start clean)
+                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+                // s1: ACC = X·Y + (BSEL? ACC : TEMP[0]==0)
+                [0, ip1(1, 1, 0x20, 0, 0), macc(bsel), 0],
+                // s2: SHIFT3, EWT→EFREG[0]
+                [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            ];
+            load(&mut dsp, &prog);
+            dsp.set_sample(0x2000, 0);
+            dsp.step(&mut ram);
+            dsp.efreg[0]
+        }
+        let with = run(1);
+        let without = run(0);
+        assert_ne!(with, without, "BSEL changes the accumulation");
+        // With BSEL the second step adds the first product again → roughly double.
+        assert!(
+            with.unsigned_abs() > without.unsigned_abs(),
+            "BSEL accumulates (|{with}| > |{without}|)"
+        );
+    }
+
+    #[test]
+    fn negb_negates_the_b_operand() {
+        // NEGB negates the B addend; with B = accumulator and a positive product,
+        // the result flips sign relative to the non-negated case.
+        fn run(negb: u16) -> i16 {
+            let mut dsp = Dsp::new();
+            let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+            dsp.coef[0] = 0x4000u16 as i16;
+            // ip2 with NEGB needs the bit-2 field; ip2() takes `zero` at bit1 and
+            // `bsel` at bit0 but not negb — add it manually.
+            let negb_bit = (negb & 1) << 2;
+            let prog = [
+                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+                // s1: ACC = X·Y + (NEGB? -ACC : +ACC), BSEL=1
+                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1) | negb_bit, 0],
+                [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            ];
+            load(&mut dsp, &prog);
+            dsp.set_sample(0x2000, 0);
+            dsp.step(&mut ram);
+            dsp.efreg[0]
+        }
+        let plus = run(0);
+        let minus = run(1);
+        // +ACC accumulates (≈2× product); -ACC subtracts (≈0). They differ.
+        assert_ne!(plus, minus, "NEGB changes the B-operand sign");
+        assert!(
+            minus.unsigned_abs() < plus.unsigned_abs(),
+            "negated B cancels the running accumulator (|{minus}| < |{plus}|)"
+        );
+    }
+
+    #[test]
+    fn mdec_ct_counter_advances_the_ring_each_sample() {
+        // MDEC_CT (`dec`) counts down once per sample pass, wrapping at RBL — it
+        // offsets ring-relative TEMP/delay addresses so the delay line scrolls.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.rbl = 16;
+        // One non-empty step so the DSP runs.
+        load(&mut dsp, &[[0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0]]);
+        // dec starts 0; after the first step it wraps to rbl then decrements.
+        dsp.step(&mut ram);
+        assert_eq!(dsp.dec, dsp.rbl - 1, "dec wrapped to RBL then counted down");
+        dsp.step(&mut ram);
+        assert_eq!(dsp.dec, dsp.rbl - 2, "dec decrements each sample");
+    }
+
+    #[test]
+    fn empty_microprogram_clears_pending_mix_input() {
+        // The early-out path (stopped/last_step==0) still drains MIXS so a send
+        // doesn't carry stale into a later (running) sample.
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.set_sample(0x1234, 3);
+        assert_eq!(dsp.mixs[3], 0x1234);
+        dsp.step(&mut ram); // no program loaded
+        assert_eq!(dsp.mixs[3], 0, "MIXS cleared even with no program");
+    }
 }

@@ -2423,4 +2423,368 @@ mod tests {
         s.run(200_000);
         assert_eq!(s.cpu.regs.d[5], 0x55, "68k serviced the timer interrupt");
     }
+
+    // ---- register access (8/16/32-bit folding + mirror) ----
+
+    #[test]
+    fn register_byte_and_long_access_compose_consistently() {
+        let mut c = ScspCtrl::new();
+        // A 32-bit write splits into two 16-bit stores (big-endian).
+        c.write32(0x010, 0xDEAD_BEEF);
+        assert_eq!(c.read32(0x010), 0xDEAD_BEEF);
+        assert_eq!(c.read16(0x010), 0xDEAD);
+        assert_eq!(c.read16(0x012), 0xBEEF);
+        // read8 picks the addressed byte out of the big-endian word.
+        assert_eq!(c.read8(0x010), 0xDE);
+        assert_eq!(c.read8(0x011), 0xAD);
+        // A byte write folds into the containing 16-bit register (even byte = hi).
+        c.write8(0x014, 0x12);
+        c.write8(0x015, 0x34);
+        assert_eq!(c.read16(0x014), 0x1234);
+        // Odd byte only updates the low half, leaving the high half intact.
+        c.write8(0x015, 0xFF);
+        assert_eq!(c.read16(0x014), 0x12FF);
+    }
+
+    #[test]
+    fn register_space_mirrors_modulo_0x1000() {
+        let mut c = ScspCtrl::new();
+        c.write16(0x100, 0xA5A5);
+        // Reads fold the offset modulo REG_BYTES (0x1000).
+        assert_eq!(c.read16(0x100 + 0x1000), 0xA5A5);
+        assert_eq!(c.read16(0x100 + 0x2000), 0xA5A5);
+    }
+
+    // ---- timers B and C, and the multi-source IRQ-level decode ----
+
+    #[test]
+    fn timer_b_and_c_route_to_their_own_interrupt_levels() {
+        let mut c = ScspCtrl::new();
+        // Timer B (bit 7) → level 2 (010b): SCILV1 bit 7.
+        // Timer C (bit 8) → level 5 (101b): SCILV0 + SCILV2 bit 8.
+        c.write16(SCILV1, INT_TIMER_B);
+        c.write16(SCILV0, INT_TIMER_C);
+        c.write16(SCILV2, INT_TIMER_C);
+        c.write16(SCIEB, INT_TIMER_B | INT_TIMER_C);
+        // Prescale 0, reload 0xFF → both overflow on their first clock.
+        c.write16(TIMB, 0x00FF);
+        c.write16(TIMC, 0x00FF);
+        c.tick_timers(2);
+        assert_eq!(c.read16(SCIPD) & INT_TIMER_B, INT_TIMER_B, "B pending");
+        assert_eq!(c.read16(SCIPD) & INT_TIMER_C, INT_TIMER_C, "C pending");
+        // recompute_irq picks the highest-priority active source: A > B > C, so
+        // with only B and C pending it asserts B's level (2).
+        assert_eq!(c.asserted_level, 2, "B has priority over C");
+        // Acknowledge B; the line falls to C's level (5).
+        c.write16(SCIRE, INT_TIMER_B);
+        assert_eq!(c.asserted_level, 5, "after B ack, C's level shows");
+    }
+
+    #[test]
+    fn decode_sci_assembles_the_three_level_bits() {
+        let mut c = ScspCtrl::new();
+        // For the MIDI source (bit 3) set level 7 (111b): all three SCILV bits.
+        c.write16(SCILV0, INT_MIDI);
+        c.write16(SCILV1, INT_MIDI);
+        c.write16(SCILV2, INT_MIDI);
+        assert_eq!(c.decode_sci(3), 7);
+        // Timer A (bit 6) is left 0 in every SCILV → level 0.
+        assert_eq!(c.decode_sci(6), 0);
+    }
+
+    #[test]
+    fn midi_pending_asserts_when_no_timer_is_active() {
+        let mut c = ScspCtrl::new();
+        c.write16(SCILV0, INT_MIDI); // MIDI → level 1
+        c.write16(SCIEB, INT_MIDI);
+        // Software pends MIDI by writing the bit into SCIPD directly.
+        c.write16(SCIPD, INT_MIDI);
+        assert_eq!(c.asserted_level, 1, "MIDI source asserts its level");
+    }
+
+    #[test]
+    fn mcire_clears_the_main_cpu_pending_interrupt() {
+        let mut c = ScspCtrl::new();
+        c.write16(MCIEB, INT_TIMER_A);
+        c.write16(TIMA, 0x00FF);
+        c.tick_timers(2);
+        assert!(c.main_pending, "main interrupt pending after overflow");
+        c.write16(MCIRE, INT_TIMER_A); // acknowledge the main-CPU interrupt
+        assert_eq!(c.read16(MCIPD) & INT_TIMER_A, 0, "MCIPD cleared");
+        assert!(!c.main_pending, "main interrupt dropped");
+    }
+
+    #[test]
+    fn irq_state_and_keyon_debug_counters_report_live_state() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(SCIEB, INT_TIMER_A);
+        s.ctrl.write16(SCILV0, INT_TIMER_A);
+        s.ctrl.write16(TIMA, 0x00FF);
+        s.ctrl.tick_timers(2);
+        let (lvl, eb, pd) = s.ctrl.irq_state();
+        assert_eq!(lvl, 1);
+        assert_eq!(eb, INT_TIMER_A);
+        assert_eq!(pd & INT_TIMER_A, INT_TIMER_A);
+        // Key-on counters: one strobe → one start.
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
+        let (execs, starts) = s.ctrl.dbg_keyon_counts();
+        assert_eq!((execs, starts), (1, 1));
+        // Timer overflow + tick bookkeeping is exposed for debugging.
+        let (of, calls, samples) = s.ctrl.dbg_timer_counts();
+        assert_eq!(of[0], 1, "one Timer-A overflow");
+        assert!(calls >= 1 && samples >= 2);
+    }
+
+    // ---- pitch / phase step ----
+
+    #[test]
+    fn slot_step_follows_the_oct_fns_pitch_formula() {
+        let mut c = ScspCtrl::new();
+        // OCT = 0, FNS = 0 → (0x400) << (0 + 12 - 10) = 0x400 << 2 = 0x1000
+        // (exactly one sample per output, 12.12 phase).
+        c.write16(0x08 + 0x10, 0); // slot 0 word 8 is at offset 0x10
+        c.write16(0x10, 0);
+        assert_eq!(c.slot_step(0), 0x1000);
+        // OCT = +1 doubles the step.
+        c.write16(0x10, 1 << 11);
+        assert_eq!(c.slot_step(0), 0x2000);
+        // OCT = -1 (raw 0xF, since the field is `oct ^ 8`) halves the step
+        // (negative-octave shift path).
+        c.write16(0x10, 0xF << 11);
+        assert_eq!(c.slot_step(0), 0x0800);
+        // FNS adds inside the shift: OCT 0, FNS 0x200 → (0x600) << 2 = 0x1800.
+        c.write16(0x10, 0x200);
+        assert_eq!(c.slot_step(0), 0x1800);
+    }
+
+    // ---- loop modes: reverse + ping-pong ----
+
+    #[test]
+    fn reverse_loop_plays_the_region_backwards() {
+        // LPCTL = 2: once the read passes LSA it flips to backwards and walks
+        // back down toward LSA, replaying the region in reverse (Mednafen reverse
+        // loop). We watch the sample-index direction reverse.
+        let mut s = Scsp::new();
+        for k in 0..8u32 {
+            s.ram.write16(0x100 + k * 2, 0x1000 + k as u16 * 0x10);
+        }
+        // LSA=1, LEA=5, reverse loop.
+        keyon_slot0(&mut s, 0x0040, 0x100, 1, 5, 0); // LPCTL=2 (bits 6:5 = 10)
+        let mut idxs = Vec::new();
+        for _ in 0..12 {
+            s.slot_sample(0);
+            idxs.push(s.ctrl.slots[0].cur >> PHASE_SHIFT);
+        }
+        // The slot must turn backwards at some point (the `backwards` flag set).
+        assert!(s.ctrl.slots[0].backwards, "reverse loop set the backwards flag");
+        // And the index must have decreased on at least one step.
+        assert!(
+            idxs.windows(2).any(|w| w[1] < w[0]),
+            "read position moves backwards in the reverse loop: {idxs:?}"
+        );
+    }
+
+    #[test]
+    fn ping_pong_loop_alternates_direction() {
+        // LPCTL = 3: at LEA flip backwards; at LSA flip forwards again — the read
+        // bounces between LSA and LEA.
+        let mut s = Scsp::new();
+        for k in 0..8u32 {
+            s.ram.write16(0x100 + k * 2, (k as u16).wrapping_mul(0x1111));
+        }
+        keyon_slot0(&mut s, 0x0060, 0x100, 1, 4, 0); // LPCTL=3 (bits 6:5 = 11)
+        let mut turned_back = false;
+        let mut turned_forward_again = false;
+        for _ in 0..32 {
+            let was_back = s.ctrl.slots[0].backwards;
+            s.slot_sample(0);
+            let now_back = s.ctrl.slots[0].backwards;
+            if !was_back && now_back {
+                turned_back = true;
+            }
+            if was_back && !now_back {
+                turned_forward_again = true;
+            }
+        }
+        assert!(turned_back, "ping-pong flips to backwards at LEA");
+        assert!(
+            turned_forward_again,
+            "ping-pong flips back to forwards at LSA"
+        );
+        assert!(s.slot_active(0), "ping-pong loop never deactivates");
+    }
+
+    // ---- envelope: decay1 → decay2 at the decay level ----
+
+    #[test]
+    fn decay1_transitions_to_decay2_at_the_decay_level() {
+        let mut s = Scsp::new();
+        // data[4]: AR=31 (instant attack), D1R (bits 10:6) moderate, EGHOLD off.
+        s.ctrl.write16(0x08, (10 << 6) | 0x1F);
+        // data[5]: DL (bits 9:5) = 8 → decay level threshold; RR low.
+        s.ctrl.write16(0x0A, 8 << 5);
+        keyon_slot0(&mut s, 0, 0x100, 0, 0x100, 0);
+        // Attack is near-instant; first advance moves into a decay phase.
+        s.eg_advance(0);
+        // Step until Decay2 is reached.
+        let mut reached_d2 = false;
+        for _ in 0..100_000 {
+            s.eg_advance(0);
+            if s.ctrl.slots[0].eg.state == EgState::Decay2 {
+                reached_d2 = true;
+                break;
+            }
+            if !s.slot_active(0) {
+                break;
+            }
+        }
+        assert!(reached_d2, "Decay1 falls to the decay level then enters Decay2");
+    }
+
+    #[test]
+    fn inactive_slot_eg_and_sample_are_zero() {
+        let mut s = Scsp::new();
+        assert_eq!(s.eg_advance(0), 0, "inactive slot has zero EG output");
+        assert_eq!(s.slot_sample(0), 0, "inactive slot is silent");
+    }
+
+    // ---- debug snapshots ----
+
+    #[test]
+    fn slot_debug_decodes_the_register_fields() {
+        let mut s = Scsp::new();
+        // data[0]: SA-hi nibble = 0xA, PCM8B, LPCTL=1.
+        s.ctrl.write16(0x00, (0xA) | 0x0010 | (1 << 5));
+        s.ctrl.write16(0x02, 0x1234); // SA low
+        s.ctrl.write16(0x04, 0x0010); // LSA
+        s.ctrl.write16(0x06, 0x0040); // LEA
+        s.ctrl.write16(0x0C, 0x0055); // TL
+        // data[8]: OCT = -1 (raw 0xF, the field is `oct ^ 8`), FNS = 0x123.
+        s.ctrl.write16(0x10, (0xF << 11) | 0x123);
+        // data[0xA]: ISEL=5 (bits 6:3), IMXL=3 (bits 2:0).
+        s.ctrl.write16(0x14, (5 << 3) | 3);
+        // data[0xB]: DISDL=6, DIPAN=0x11, EFSDL=2, EFPAN=7.
+        s.ctrl.write16(0x16, (6 << 13) | (0x11 << 8) | (2 << 5) | 7);
+        let d = s.slot_debug(0);
+        assert_eq!(d.sa, (0xA << 16) | 0x1234);
+        assert!(d.pcm8);
+        assert_eq!(d.lpctl, 1);
+        assert_eq!(d.lsa, 0x0010);
+        assert_eq!(d.lea, 0x0040);
+        assert_eq!(d.oct, -1);
+        assert_eq!(d.fns, 0x123);
+        assert_eq!(d.tl, 0x55);
+        assert_eq!(d.isel, 5);
+        assert_eq!(d.imxl, 3);
+        assert_eq!(d.disdl, 6);
+        assert_eq!(d.dipan, 0x11);
+        assert_eq!(d.efsdl, 2);
+        assert_eq!(d.efpan, 7);
+        assert_eq!(d.eg_state, "REL", "a never-keyed slot defaults to Release");
+    }
+
+    #[test]
+    fn dsp_ewt_targets_lists_the_microprogram_output_slots() {
+        let mut s = Scsp::new();
+        // Two DSP steps each with EWT set (ip2 bit 12) writing EFREG[3] and
+        // EFREG[1] (EWA = ip2 bits 11:8). MPRO lives at reg offset 0x800, four
+        // 16-bit words per step.
+        let ewt_to = |ewa: u16| (1u16 << 12) | (ewa << 8);
+        s.ctrl.write16(0x800 + 2 * 2, ewt_to(3)); // step 0, ip2
+        s.ctrl.write16(0x800 + 4 * 2 + 2 * 2, ewt_to(1)); // step 1, ip2
+        let targets = s.dsp_ewt_targets();
+        assert_eq!(targets, vec![1, 3], "sorted distinct EWT targets");
+    }
+
+    // ---- effect-return path (DSP on) ----
+
+    #[test]
+    fn effect_return_mixes_the_dsp_output_into_the_dac() {
+        // With the DSP running and a slot's direct output muted (DISDL=0) but its
+        // effect-return enabled (EFSDL>0), the slot's EFREG entry reaches the DAC.
+        // We pre-load EFREG[0] via a one-step pass-through microprogram, then mix.
+        let mut s = Scsp::new();
+        // Build a DSP program: step 0 X=MIXS[0], Y=COEF[0], B=0, SHIFT=3;
+        // step 1 SHIFT=3, EWT→EFREG[0]. (Same shape as the dsp.rs unit test.)
+        s.ctrl.dsp.coef[0] = 0x7FF8u16 as i16; // Y = +0xFFF
+        let s0_ip1 = (1u16 << 15) | (1u16 << 13) | (0x20 << 6);
+        let s0_ip2 = (3u16 << 4) | (1u16 << 1);
+        let s1_ip2 = (1u16 << 12) | (3u16 << 4) | (1u16 << 1);
+        s.ctrl.dsp.mpro[0..4].copy_from_slice(&[0, s0_ip1, s0_ip2, 0]);
+        s.ctrl.dsp.mpro[4..8].copy_from_slice(&[0, 0, s1_ip2, 0]);
+        s.ctrl.dsp.start();
+        // Force a non-zero EFREG[0] so the *return* path (which reads the snapshot
+        // EFREG before this sample's sends) has something to mix.
+        s.ctrl.dsp.efreg[0] = 0x4000;
+        // Slot 0: direct output muted (DISDL=0), effect return at EFSDL=7 centre.
+        let value = 0x2000u16;
+        for n in 0..8u32 {
+            s.ram.write16(0x1000 + n * 2, value);
+        }
+        s.ctrl.write16(0x02, 0x1000); // SA low
+        s.ctrl.write16(0x06, 0x100); // LEA
+        s.ctrl.write16(0x08, 0x20); // EGHOLD → full level
+        // data[0xB]: DISDL=0, EFSDL=7 (bits 7:5), EFPAN=0 (centre).
+        s.ctrl.write16(0x16, 7 << 5);
+        s.ctrl.write16(0x10, 0); // OCT/FNS
+        s.ctrl.write16(0x00, 0x1800); // key on
+        let (l, r) = s.next_sample();
+        assert!(l != 0 && r != 0, "effect return reached the DAC (l={l} r={r})");
+        assert_eq!(l, r, "centre EFPAN is symmetric");
+    }
+
+    #[test]
+    fn dsp_state_reports_running_and_outputs() {
+        let mut s = Scsp::new();
+        let (running, _, _, _) = s.dsp_state();
+        assert!(!running, "no program loaded → DSP not running");
+        // Load a single non-zero step → running.
+        s.ctrl.write16(0x800, 0x0001);
+        let (running, efreg, _, _) = s.dsp_state();
+        assert!(running, "non-empty microprogram → DSP running");
+        assert_eq!(efreg, [0i16; 16], "EFREG starts cleared");
+    }
+
+    // ---- 8-bit PCM under FM modulation ----
+
+    #[test]
+    fn fm_modulation_reads_8bit_pcm() {
+        // The FM read path has a separate 8-bit branch; exercise it so a shifted
+        // FM read of 8-bit samples is covered. Slot 0 supplies the modulator;
+        // slot 7 is an FM carrier reading 8-bit PCM.
+        let mut c = ScspCtrl::new();
+        let mut ram = Ram::new(SOUND_RAM_BYTES);
+        for k in 0..256u32 {
+            ram.write8(0x1000 + k, (k.wrapping_mul(7) ^ 0x3C) as u8);
+        }
+        let prog = |c: &mut ScspCtrl, slot: u32, reg7: u16| {
+            let b = slot * SLOT_STRIDE;
+            c.write16(b, 0x0010); // PCM8B in data[0] (set before key-on)
+            c.write16(b + 0x02, 0x1000); // SA low
+            c.write16(b + 0x06, 0x00FF); // LEA
+            c.write16(b + 0x08, 0x001F); // AR max
+            c.write16(b + 0x0C, 0x0000); // TL 0
+            c.write16(b + 0x0E, reg7); // MDL/MDXSL/MDYSL
+            c.write16(b + 0x16, 0xE000); // DISDL=7
+            c.write16(b, 0x1810 | 0x0020); // KYONEX|KYONB|PCM8B|forward-loop
+        };
+        for sl in 0..7 {
+            prog(&mut c, sl, 0x0000);
+        }
+        let mods_on: Vec<i16> = {
+            prog(&mut c, 7, (0xA << 12) | (0x3B << 6) | 0x3B);
+            (0..100).map(|_| c.mix(&mut ram).0).collect()
+        };
+        // A fresh control with FM off on slot 7 for comparison.
+        let mut c2 = ScspCtrl::new();
+        for sl in 0..7 {
+            prog(&mut c2, sl, 0x0000);
+        }
+        let mods_off: Vec<i16> = {
+            prog(&mut c2, 7, 0x0000);
+            (0..100).map(|_| c2.mix(&mut ram).0).collect()
+        };
+        assert!(mods_on.iter().any(|&x| x != 0), "8-bit FM produced audio");
+        assert_ne!(mods_on, mods_off, "FM shifts the 8-bit read");
+    }
 }

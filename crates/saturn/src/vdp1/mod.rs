@@ -488,6 +488,45 @@ mod tests {
     }
 
     #[test]
+    fn erase_honours_the_ewlr_upper_left_origin() {
+        // EWLR carries the upper-left corner: X in 8-pixel units (bits 14-9),
+        // Y in lines (bits 8-0). With X1=1 (=8px), the erase rectangle starts
+        // at column 8, leaving column 0..7 untouched.
+        let mut v = Vdp1::new();
+        v.fb.set_pixel(0, 0, 0x7FFF); // outside (x < 8)
+        v.fb.set_pixel(8, 0, 0x7FFF); // inside the erase rect
+        v.regs.write16(0x06, 0x1234); // EWDR fill colour
+        v.regs.write16(0x08, 1 << 9); // EWLR: X1=1 (→8px), Y1=0
+        v.regs.write16(0x0A, (4 << 9) | 3); // EWRR: X3=4 (→32px), Y3=3
+        v.erase_framebuffer();
+        assert_eq!(v.fb.pixel(0, 0), 0x7FFF, "left of the erase X-origin kept");
+        assert_eq!(v.fb.pixel(8, 0), 0x1234, "inside the erase rect filled");
+        assert_eq!(v.fb.pixel(31, 3), 0x1234, "far corner of erase rect filled");
+    }
+
+    #[test]
+    fn ptmr_byte_write_kicks_a_one_shot_plot() {
+        // A byte write to PTMR (0x04) must still drive the plot trigger: write8
+        // re-aligns the offset (& 0xFE) when calling after_reg_write.
+        let mut v = Vdp1::new();
+        v.write8(REGS_BASE + 0x05, 0x01); // low byte of PTMR = PTM 0b01
+        assert!(v.is_drawing(), "byte PTMR write kicked the one-shot plot");
+    }
+
+    #[test]
+    fn endr_force_terminates_an_in_flight_draw() {
+        // ENDR (0x0C) completes the current draw immediately — CEF latches and
+        // the drive is no longer busy without waiting out the duration.
+        let mut v = Vdp1::new();
+        v.write16(REGS_BASE + 0x04, 0x0001); // PTMR one-shot → in flight
+        assert!(v.is_drawing());
+        assert_eq!(v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF, 0, "CEF not yet set");
+        v.write16(REGS_BASE + 0x0C, 0x0001); // ENDR
+        assert!(!v.is_drawing(), "ENDR finished the draw");
+        assert_eq!(v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF, regs::EDSR_CEF, "CEF latched");
+    }
+
+    #[test]
     fn automatic_draw_redraws_at_frame_change_not_on_ptmr_write() {
         // PTM = 0b10 (automatic draw): the BIOS splash mode. A write to PTMR
         // must NOT kick a plot — VDP1 re-renders the list at each frame change

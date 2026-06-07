@@ -197,4 +197,45 @@ mod tests {
         let r = Vdp1Regs::new();
         assert_eq!(r.read16(0x16), 0x1000);
     }
+
+    #[test]
+    fn byte_writes_compose_into_a_halfword() {
+        let mut r = Vdp1Regs::new();
+        // EWDR (0x06) built one byte at a time: high byte then low byte.
+        r.write8(0x06, 0xAB);
+        r.write8(0x07, 0xCD);
+        assert_eq!(r.read16(0x06), 0xABCD);
+        assert_eq!(r.read8(0x06), 0xAB, "high byte read-back");
+        assert_eq!(r.read8(0x07), 0xCD, "low byte read-back");
+    }
+
+    #[test]
+    fn word_access_spans_two_registers() {
+        let mut r = Vdp1Regs::new();
+        // A 32-bit write to EWLR (0x08) lands EWLR (hi) and EWRR (lo).
+        r.write32(0x08, 0x0123_4567);
+        assert_eq!(r.read16(0x08), 0x0123, "EWLR = high halfword");
+        assert_eq!(r.read16(0x0A), 0x4567, "EWRR = low halfword");
+        assert_eq!(r.read32(0x08), 0x0123_4567, "32-bit read-back");
+    }
+
+    #[test]
+    fn read32_synthesizes_the_status_window() {
+        let mut r = Vdp1Regs::new();
+        r.cef_set();
+        r.set_command_addrs(0x0040, 0x0080);
+        // EDSR (0x10) | LOPR (0x12) as one 32-bit read.
+        assert_eq!(r.read32(0x10), (EDSR_CEF as u32) << 16 | 0x0040);
+        // COPR (0x14) | MODR (0x16).
+        assert_eq!(r.read32(0x14), 0x0080 << 16 | 0x1000);
+    }
+
+    #[test]
+    fn status_window_byte_writes_are_ignored() {
+        let mut r = Vdp1Regs::new();
+        r.cef_set(); // EDSR.CEF set
+        r.write8(0x10, 0xFF); // EDSR is read-only — write must not stick
+        r.write8(0x11, 0xFF);
+        assert_eq!(r.read16(0x10), EDSR_CEF, "EDSR unchanged by byte writes");
+    }
 }
