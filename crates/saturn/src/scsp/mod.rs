@@ -419,6 +419,15 @@ impl ScspCtrl {
             let m = self.slot_monitor();
             return if idx & 1 == 0 { (m >> 8) as u8 } else { m as u8 };
         }
+        // Register 0x404 (MIDI input + status flags, read) — no MIDI device is
+        // attached, so the input stays empty and the output ready: high byte =
+        // Flags = INPUT_EMPTY (0x01) | OUTPUT_EMPTY (0x08) = 0x09, low byte = no
+        // input data (Mednafen `MIDI.Flags << 8 | MIDI_ReadInput()`). A game
+        // polling MIDI status thus sees "nothing to read, ready to send" rather
+        // than garbage. MOBUF writes (0x406) are accepted + discarded (no port).
+        if idx & !1 == 0x404 {
+            return if idx & 1 == 0 { 0x09 } else { 0x00 };
+        }
         self.raw[idx]
     }
 
@@ -1166,11 +1175,30 @@ impl ScspCtrl {
             self.dsp.rbl = 0x2000u32 << ((rbc >> 7) & 3);
             self.dsp.step(ram);
         }
-        // The pan gains carry ×4 headroom (FIX(4·…)); undo it and clamp.
+        // The pan gains carry ×4 headroom (FIX(4·…)); undo it, scale by the
+        // master volume (MVOL), and clamp.
+        let mv = self.master_volume();
         (
-            (l >> 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            (r >> 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (((l >> 2) * mv) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (((r >> 2) * mv) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         )
+    }
+
+    /// Master-volume scale (1.8 fixed, applied to the final DAC mix) decoded from
+    /// MVOL (register 0x400 bits 0..3), per Mednafen `scsp.inc`: `mv =
+    /// 0x2 << (MVOL >> 1)`, reduced 25 % when MVOL is even, and 0 when MVOL is 0;
+    /// MVOL = 0xF → 0x100 (unity). The output is `mix * mv >> 8`. The BIOS
+    /// programs MVOL before playing sound (a fresh-reset SCSP is silent).
+    fn master_volume(&self) -> i32 {
+        let mvol = (self.read16(0x400) & 0xF) as i32;
+        if mvol == 0 {
+            return 0;
+        }
+        let mut mv = 0x2 << (mvol >> 1);
+        if mvol & 1 == 0 {
+            mv -= mv >> 2;
+        }
+        mv
     }
 }
 
@@ -2286,6 +2314,7 @@ mod tests {
     /// Key on slot `idx` with a constant 16-bit sample, EGHOLD (full level),
     /// and the given DISDL/DIPAN pan word.
     fn keyon_panned(s: &mut Scsp, idx: usize, value: u16, disdl: u16, dipan: u16) {
+        s.ctrl.write16(0x400, 0x000F); // MVOL = max (unity master volume)
         let base = idx as u32 * 0x20;
         // Fill a few words of the slot's waveform at SA = 0x1000 + idx*0x40.
         let sa = 0x1000 + idx as u32 * 0x40;
@@ -2336,6 +2365,32 @@ mod tests {
     }
 
     #[test]
+    fn master_volume_scales_the_final_dac_mix() {
+        // Render the same centred slot at three MVOL settings (B3).
+        let sample_at = |mvol: u16| -> i32 {
+            let mut s = Scsp::new();
+            keyon_panned(&mut s, 0, 0x2000, 7, 0x00); // sets MVOL = 0xF (unity)
+            s.ctrl.write16(0x400, mvol);
+            s.next_sample().0 as i32
+        };
+        let unity = sample_at(0x000F);
+        assert!(unity > 0, "MVOL 0xF is unity → audible");
+        assert_eq!(sample_at(0x0000), 0, "MVOL 0 silences the DAC");
+        // MVOL 0xE → mv 0xC0 (0.75); MVOL 0xF → mv 0x100. So 0xE attenuates.
+        let attenuated = sample_at(0x000E);
+        assert!(attenuated > 0 && attenuated < unity, "even MVOL attenuates ({attenuated} < {unity})");
+        assert_eq!(attenuated, (unity * 0xC0) >> 8, "MVOL 0xE = unity × 0xC0/0x100");
+    }
+
+    #[test]
+    fn midi_status_reports_empty_with_no_device() {
+        // 0x404 read: high byte = Flags = INPUT_EMPTY|OUTPUT_EMPTY (0x09), low
+        // byte = no input → a game polls "nothing to read, ready to send".
+        let s = Scsp::new();
+        assert_eq!(s.ctrl.read16(0x404), 0x0900);
+    }
+
+    #[test]
     fn silence_when_no_slot_is_active() {
         let mut s = Scsp::new();
         assert_eq!(s.next_sample(), (0, 0));
@@ -2364,6 +2419,7 @@ mod tests {
         // `scsp.inc`). This slot-to-slot FM is real SCSP synthesis (LLE).
         fn render(mdl: u16) -> Vec<i16> {
             let mut c = ScspCtrl::new();
+            c.write16(0x400, 0x000F); // MVOL = max (unity)
             let mut ram = Ram::new(SOUND_RAM_BYTES);
             // A non-trivial 256-sample waveform so a shifted read is visible.
             for k in 0..256u32 {
@@ -2733,6 +2789,7 @@ mod tests {
         // effect-return enabled (EFSDL>0), the slot's EFREG entry reaches the DAC.
         // We pre-load EFREG[0] via a one-step pass-through microprogram, then mix.
         let mut s = Scsp::new();
+        s.ctrl.write16(0x400, 0x000F); // MVOL = max (unity)
         // Build a DSP program: step 0 X=MIXS[0], Y=COEF[0], B=0, SHIFT=3;
         // step 1 SHIFT=3, EWT→EFREG[0]. (Same shape as the dsp.rs unit test.)
         s.ctrl.dsp.coef[0] = 0x7FF8u16 as i16; // Y = +0xFFF
@@ -2782,6 +2839,7 @@ mod tests {
         // FM read of 8-bit samples is covered. Slot 0 supplies the modulator;
         // slot 7 is an FM carrier reading 8-bit PCM.
         let mut c = ScspCtrl::new();
+        c.write16(0x400, 0x000F); // MVOL = max (unity)
         let mut ram = Ram::new(SOUND_RAM_BYTES);
         for k in 0..256u32 {
             ram.write8(0x1000 + k, (k.wrapping_mul(7) ^ 0x3C) as u8);
