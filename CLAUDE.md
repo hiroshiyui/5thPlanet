@@ -22,9 +22,12 @@ cargo test  -p sh2                         # just the SH-2 core
 cargo test  -p saturn                      # just the Saturn system layer
 cargo test  -p sh2 --test opcodes_basic    # one integration test file
 cargo test  -p sh2 -- decoder::tests::decodes_branches   # single test by path
-cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
+cargo llvm-cov --workspace --summary-only  # coverage (~85% line; re-report
+                                           # from cache: cargo llvm-cov report …)
 ```
+
+**Formatting:** the codebase is a deliberate compact hand-style — **do NOT run `cargo fmt --all`** (under edition 2024 rustfmt explodes ~60 files; there is no `rustfmt.toml` and no CI fmt gate). Format only the lines you add/change, by hand, matching the surrounding code. `cargo clippy --workspace --all-targets -- -D warnings` *is* the enforceable gate and must stay clean. (See the `code-review` skill for the full rationale.)
 
 Run the binary with `cargo run -p jupiter -- <bios.bin>` — the SDL2 frontend (default-on `sdl2-frontend` feature) opens a window and runs the BIOS; `--no-default-features` runs headless.
 
