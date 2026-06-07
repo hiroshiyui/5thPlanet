@@ -98,7 +98,7 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
 |---|---|---|---|---|---|
 | 1 | **Colour offset** (CLOFEN/CLOFSL, COAR/COAG/COAB, COBR/…) — per-layer RGB add/subtract | `MixIt` `vdp2_render.cpp:2581-2600`; enable/sel `:2954-2988` | ✅ **implemented 2026-06-08** | **High** | **Low** |
 | 2 | **NBG0/1 reduction + fractional scroll** (ZMXN/ZMYN, XScrollF) | fixed-point `CurXCoordInc`/`CurXScrollIF` per dot (`:110`, `:114`, `:1590-1592`) | ✅ **implemented 2026-06-08** | **High** | Med |
-| 3 | **Special priority / special colour-calc per-dot** (SFPRMD/SFCCMD/SFCODE/SFSEL) | templated `priomode`/`ccmode` `:3065`; SFCODE LUT | registers decoded, per-dot application **deferred** (`regs.rs:323-347`) | Med | Med |
+| 3 | **Special priority / special colour-calc per-dot** (SFPRMD/SFCCMD/SFCODE/SFSEL) | templated `priomode`/`ccmode` `:3065`; SFCODE LUT | ✅ **implemented 2026-06-08** | Med | Med |
 | 4 | **Extended colour calc — 3/4-layer blending** | `MIXIT_SPECIAL_EXCC_*` `:2491-2549` | top-two only | Med | Med-High |
 | 5 | **Dual rotation parameter selection** (RPMD 2/3: per-pixel coeff-MSB + rotation-param window) | `EffRPMD` `:1862`, `rotabsel[x]` `:1977-2004`, `GetWinRotAB` | fixed RBG0=A / RBG1=B; RPMD ignored; coeff mode 3 (Xp) deferred | Med (rotation games) | Med-High |
 | 6 | **VRAM access cycle patterns** (CYCA0-CYCB1 / VCP) — bandwidth gating of fetches + reduction limits | full `VCPRegs` model `:71`, `:1399-1454` | not modelled | Low visual / High edge-case | **High** |
@@ -172,8 +172,13 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
    collapses to the old `scroll + coord` and the splash golden is unchanged.
    Tests: `nbg0_horizontal_reduction_halves_the_layer`,
    `nbg0_fractional_scroll_shifts_the_sampled_source_pixel`.
-3. **Special priority/CC (#3)** then **dual rotation params (#5)** — medium
-   impact; registers for #3 already decoded.
+3. ✅ **Special priority/CC (#3)** — DONE 2026-06-08 (full faithful port). The
+   samplers return a `Sample` (rgb + palette code + spr/scc + is_rgb + CRAM-MSB);
+   `resolve_special` ports Mednafen's `MakeSFCodeLUT` + `MakeNBGRBGPix` across all
+   four SFPRMD priority modes and four SFCCMD colour-calc modes for NBG0–3 +
+   RBG0/1. Golden-safe (collapses to prior behaviour when special modes are 0).
+   Validated by unit tests vs the oracle algorithm — no game exercises it yet.
+   Then **dual rotation params (#5)** — medium impact.
 4. **Extended colour calc (#4)** — medium impact, more involved.
 5. **VCP cycle patterns (#6)** — last; complex, mostly edge-case correctness.
 
