@@ -544,6 +544,13 @@ impl Vdp2Regs {
     pub fn sprite_rgb_mode(&self) -> bool {
         self.spctl() & 0x20 != 0
     }
+    /// SPWINEN (SPCTL bit 4): when set, bit 15 of each VDP1 framebuffer pixel is
+    /// the **sprite-window** flag (rather than the shadow / RGB-mode bit), which
+    /// gates layers whose WCTL enables the sprite window. (Mednafen `SpriteWinEn
+    /// = SPCTL & 0x10`; the window bit `sd = (src >> 15) & 1`.)
+    pub fn sprite_window_enabled(&self) -> bool {
+        self.spctl() & 0x10 != 0
+    }
     /// Sprite priority register `i` (0..7) — PRISA/PRISB/PRISC/PRISD at
     /// 0x0F0/0x0F2/0x0F4/0x0F6, two 3-bit fields each (even = bits 2..0,
     /// odd = bits 10..8). Priority 0 means the sprite dot is not shown.

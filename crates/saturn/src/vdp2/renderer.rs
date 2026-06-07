@@ -62,11 +62,12 @@
 //! Rotation **screen-over** (RAOVR/RBOVR) is honoured: outside the plane field
 //! the layer either repeats (wrap) or is transparent (modes 2/3).
 //!
-//! Deferred to later increments: dual-parameter window selection, the
-//! coefficient mode-3 (Xp) override and CRAM-resident coefficient tables, and
-//! the screen-over pattern (mode 1). The **sprite window** (WCTL SWE/SWA) is
-//! not modelled — the reference emulator leaves it unimplemented too, and it
-//! would need the VDP1 frame buffer threaded into the per-layer window test.
+//! The **sprite window** (WCTL SWE/SWA, C5) is modelled: when SPCTL.SPWINEN is
+//! set, bit 15 of the VDP1 framebuffer pixel is the sprite-window flag, folded
+//! into a layer's W0/W1 window logic. Deferred to later increments: dual-
+//! parameter window selection, the coefficient mode-3 (Xp) override and
+//! CRAM-resident coefficient tables, and the screen-over pattern (mode 1) —
+//! each has semantics that need a game exercising them to validate.
 //!
 //! `render_frame` is pure (no allocation); the sprite source is the VDP1
 //! frame buffer, supplied by the [`crate::system::Saturn`] aggregate.
@@ -128,19 +129,19 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
             let mut shadow = false;
 
             // The sprite layer may produce a colour dot or an MSB shadow.
-            if window_allows(vdp2, vdp2.regs.sprite_window_control(), sx, sy) {
+            if window_allows(vdp2, sprite_fb, vdp2.regs.sprite_window_control(), sx, sy) {
                 match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
                     Some(SpriteDot::Colour(d)) => insert_dot(&mut top, &mut second, Some(d)),
                     Some(SpriteDot::Shadow) => shadow = true,
                     None => {}
                 }
             }
-            insert_dot(&mut top, &mut second, rbg_layer(vdp2, 0, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 0, sx, sy));
-            insert_dot(&mut top, &mut second, rbg_layer(vdp2, 1, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 1, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 2, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, 3, sx, sy));
+            insert_dot(&mut top, &mut second, rbg_layer(vdp2, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, rbg_layer(vdp2, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 2, sx, sy));
+            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 3, sx, sy));
 
             let mut rgb = match top {
                 Some(t) => match t.cc {
@@ -294,18 +295,42 @@ fn blend(t: (u8, u8, u8), b: (u8, u8, u8), ratio: u8, add: bool) -> (u8, u8, u8)
 }
 
 /// Whether `ctl` (a per-layer WCTL byte) permits drawing at `(x, y)`. Combines
-/// W0 and W1 per the layer's logic bit; the sprite window is a later
-/// refinement (its enable bit, if set, is treated as "always pass").
-fn window_allows(vdp2: &Vdp2, ctl: u8, x: u32, y: u32) -> bool {
-    let (w0e, w0a) = (ctl & 0x02 != 0, ctl & 0x01 != 0);
-    let (w1e, w1a) = (ctl & 0x08 != 0, ctl & 0x04 != 0);
-    if !w0e && !w1e {
+/// the three windows that the byte enables — W0 (bits 0/1), W1 (bits 2/3), and
+/// the **sprite window** (bits 4/5: SWA/SWE) — by the LOG bit (0x80: set = OR,
+/// clear = AND). Disabled windows are neutral; if none are enabled, the dot
+/// passes. The sprite window reads its inside/outside flag from the VDP1
+/// framebuffer (`sprite_fb`).
+fn window_allows(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, ctl: u8, x: u32, y: u32) -> bool {
+    let (w0e, w1e, swe) = (ctl & 0x02 != 0, ctl & 0x08 != 0, ctl & 0x20 != 0);
+    if !w0e && !w1e && !swe {
         return true;
     }
-    let w0 = win_pixel(vdp2, 0, x, y, w0e, w0a);
-    let w1 = win_pixel(vdp2, 1, x, y, w1e, w1a);
-    // LOG bit (0x80): set = OR the two windows, clear = AND them.
-    if ctl & 0x80 != 0 { w0 || w1 } else { w0 && w1 }
+    let or_logic = ctl & 0x80 != 0;
+    // AND starts true, OR starts false; each enabled window folds in.
+    let mut pass = !or_logic;
+    let fold = |acc: bool, p: bool| if or_logic { acc || p } else { acc && p };
+    if w0e {
+        pass = fold(pass, win_pixel(vdp2, 0, x, y, true, ctl & 0x01 != 0));
+    }
+    if w1e {
+        pass = fold(pass, win_pixel(vdp2, 1, x, y, true, ctl & 0x04 != 0));
+    }
+    if swe {
+        pass = fold(pass, sprite_window_pixel(vdp2, sprite_fb, x, y, ctl & 0x10 != 0));
+    }
+    pass
+}
+
+/// The sprite window's pass/fail at `(x, y)`: when SPCTL.SPWINEN is set, bit 15
+/// of the VDP1 framebuffer pixel is the in-window flag (`area` set → pass inside
+/// it, clear → pass outside). With SPWINEN clear there is no sprite-window data,
+/// so the window passes. (Mednafen `sd = (src >> 15) & 1`.)
+fn sprite_window_pixel(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, x: u32, y: u32, area: bool) -> bool {
+    if !vdp2.regs.sprite_window_enabled() {
+        return true;
+    }
+    let inside = sprite_fb.is_some_and(|fb| fb.pixel(x as i32, y as i32) & 0x8000 != 0);
+    if area { inside } else { !inside }
 }
 
 /// One window's pass/fail at `(x, y)`: disabled → always pass; `area` set →
@@ -330,12 +355,12 @@ fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) ->
 }
 
 /// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`.
-fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Dot> {
+fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.nbg_enabled(n) {
         return None;
     }
     let pri = vdp2.regs.nbg_priority(n);
-    if pri == 0 || !window_allows(vdp2, vdp2.regs.nbg_window_control(n), x, y) {
+    if pri == 0 || !window_allows(vdp2, sprite_fb, vdp2.regs.nbg_window_control(n), x, y) {
         return None;
     }
     // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
@@ -350,14 +375,14 @@ fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Dot> {
 }
 
 /// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`.
-fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Dot> {
+fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.rbg_enabled(which) {
         return None;
     }
     let pri = vdp2.regs.rbg_priority(which);
     // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
     // ungated for now.
-    let gated = which != 0 || window_allows(vdp2, vdp2.regs.rbg0_window_control(), x, y);
+    let gated = which != 0 || window_allows(vdp2, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
     if pri == 0 || !gated {
         return None;
     }
@@ -1697,6 +1722,29 @@ mod tests {
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0x7F, 0x7F, 0x7F, 0xFF], "shadowed");
         assert_eq!(pixel(&buf, 0, 1), [0xFF, 0xFF, 0xFF, 0xFF], "unshadowed");
+    }
+
+    /// The sprite window (WCTL SWE/SWA) gates a layer by bit 15 of the VDP1
+    /// framebuffer pixel when SPCTL.SPWINEN is set (C5).
+    #[test]
+    fn sprite_window_clips_nbg_to_the_vdp1_window_bit() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 8bpp bitmap
+        v.regs.write16(0x0E0, 0x0010); // SPCTL.SPWINEN — bit 15 = sprite-window flag
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
+        v.cram.write16(2, 0x001F); // index 1 red
+        v.vram.write8(0, 1); // NBG0 dot at (0,0)
+        v.vram.write8(1, 1); // NBG0 dot at (1,0)
+        // NBG0 WCTL: sprite-window enable (0x20) + area = inside (0x10).
+        v.regs.write16(0x0D0, 0x0030);
+        // VDP1 frame buffer: sprite-window bit set at (0,0), clear at (1,0).
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(0, 0, 0x8000);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "inside sprite window → NBG0");
+        assert_eq!(pixel(&buf, 1, 0), [0, 0xFF, 0, 0xFF], "outside → backdrop");
     }
 
     #[test]
