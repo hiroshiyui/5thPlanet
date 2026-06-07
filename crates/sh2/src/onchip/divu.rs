@@ -20,10 +20,20 @@
 //! [`Source::DivuOvf`](super::intc::Source::DivuOvf) at the IPRA-programmed
 //! level with the VCRDIV vector (M13 D1).
 //!
-//! Real hardware spends 39 cycles on a divide; this completes it synchronously.
-//! A future timing pass can defer the result by N cycles via the pipeline
-//! scoreboard if a game is observed to poll DVCR.OVF before reading the
-//! quotient.
+//! Real hardware spends ~39 cycles on a 32/32 divide (≈6 on overflow); the
+//! division itself is computed eagerly here, but the **timing** is modelled
+//! faithfully (M13 D1): a triggering write records the latency in
+//! [`Divu::pending_latency`], the interpreter schedules
+//! [`Pipeline::schedule_divide`](crate::pipeline::Pipeline::schedule_divide),
+//! and a read of any DIVU register before the divider retires stalls the CPU
+//! (Mednafen `divide_finish_timestamp`; `sh7095.inc` `DIVU_S32_S32`).
+
+/// Latency of a successful divide (cycles), from the trigger write to a
+/// readable result — the canonical SH7604 figure (Mednafen `+1+39`).
+const DIVIDE_LATENCY: u32 = 39;
+/// Latency to the result/flag when the divide overflows (divide-by-zero or a
+/// quotient that doesn't fit) — Mednafen settles these in ~6 cycles.
+const OVERFLOW_LATENCY: u32 = 6;
 
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -33,6 +43,10 @@ pub struct Divu {
     pub dvdntl: u32,
     pub dvcr: u32,
     pub vcrdiv: u32,
+    /// Set by a triggering write to the latency (in CPU cycles) the divider
+    /// will take; the interpreter consumes it via [`Divu::take_pending_latency`]
+    /// right after the on-chip write to arm the pipeline divide-ready stall.
+    pub pending_latency: Option<u32>,
 }
 
 impl Divu {
@@ -70,6 +84,14 @@ impl Divu {
         }
     }
 
+    /// Take (and clear) the latency a just-triggered divide will run for, so
+    /// the interpreter can arm the pipeline divide-ready stall. `None` when no
+    /// divide was triggered by the preceding write.
+    #[inline]
+    pub fn take_pending_latency(&mut self) -> Option<u32> {
+        self.pending_latency.take()
+    }
+
     /// 32-bit signed dividend (DVDNT) ÷ 32-bit signed divisor (DVSR).
     fn divide_32(&mut self) {
         let dividend = self.dvdntl as i32;
@@ -77,6 +99,7 @@ impl Divu {
 
         if divisor == 0 || (dividend == i32::MIN && divisor == -1) {
             self.dvcr |= 1; // OVF
+            self.pending_latency = Some(OVERFLOW_LATENCY);
             return;
         }
 
@@ -84,6 +107,7 @@ impl Divu {
         let r = dividend.wrapping_rem(divisor);
         self.dvdntl = q as u32;
         self.dvdnth = r as u32;
+        self.pending_latency = Some(DIVIDE_LATENCY);
     }
 
     /// 64-bit signed dividend (DVDNTH:DVDNTL) ÷ 32-bit signed divisor.
@@ -93,17 +117,20 @@ impl Divu {
 
         if divisor == 0 {
             self.dvcr |= 1;
+            self.pending_latency = Some(OVERFLOW_LATENCY);
             return;
         }
         // Quotient must fit in 32 bits signed; otherwise OVF.
         let q = dividend.wrapping_div(divisor);
         if q > i32::MAX as i64 || q < i32::MIN as i64 {
             self.dvcr |= 1;
+            self.pending_latency = Some(OVERFLOW_LATENCY);
             return;
         }
         let r = dividend.wrapping_rem(divisor);
         self.dvdntl = q as i32 as u32;
         self.dvdnth = r as i32 as u32;
+        self.pending_latency = Some(DIVIDE_LATENCY);
     }
 }
 
@@ -164,5 +191,21 @@ mod tests {
         d.write32(0x10, 1);
         d.write32(0x14, 0); // 1:0 / 1 = 2^32 → overflow
         assert_eq!(d.dvcr & 1, 1);
+    }
+
+    #[test]
+    fn triggering_a_divide_arms_the_latency_a_plain_write_does_not() {
+        let mut d = Divu::new();
+        // Writing DVSR alone is just a register store — no divide, no latency.
+        d.write32(0x00, 7);
+        assert_eq!(d.take_pending_latency(), None);
+        // Writing DVDNT triggers a 32/32 divide → the full latency.
+        d.write32(0x04, 50);
+        assert_eq!(d.take_pending_latency(), Some(DIVIDE_LATENCY));
+        assert_eq!(d.take_pending_latency(), None, "consumed exactly once");
+        // A divide-by-zero overflow settles faster.
+        d.write32(0x00, 0);
+        d.write32(0x04, 50);
+        assert_eq!(d.take_pending_latency(), Some(OVERFLOW_LATENCY));
     }
 }

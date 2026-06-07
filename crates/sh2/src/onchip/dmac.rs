@@ -17,10 +17,11 @@
 //!   DMAOR   (FFFFFFB0)        DMA operation register (DME enable, NMIF, AE)
 //! ```
 //!
-//! M1 stores the registers and exposes [`Dmac::run_channel`] for an
-//! immediate-mode synchronous transfer; autonomous cycle-stealing /
-//! burst-mode triggering by external sources arrives in M2 alongside the
-//! Saturn bus arbitration.
+//! This module stores the registers and decodes the control bits; the actual
+//! transfer engine lives in [`crate::interpreter::Cpu`] (`run_dma`), which has
+//! the bus handle and runs any enabled channel to completion after each
+//! instruction step (M13 D1 — modelled on Mednafen `DMA_DoTransfer`).
+//! Cycle-stealing / burst bus arbitration is a later timing refinement.
 
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

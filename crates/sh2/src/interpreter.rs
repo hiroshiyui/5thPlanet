@@ -40,6 +40,14 @@ const fn is_assoc_purge(addr: u32) -> bool {
     matches!(addr >> 29, 2 | 5)
 }
 
+/// True for any address in the on-chip DIVU register block (`FFFFFF00..1F`).
+/// A read of any of these stalls the CPU until the hardware divider retires
+/// (M13 D1; Mednafen `divide_finish_timestamp`).
+#[inline]
+const fn is_divu_reg(addr: u32) -> bool {
+    matches!(addr & 0x1FF, 0x100..=0x11F)
+}
+
 /// SH7604 Cache Control Register. 8-bit, byte-accessed. It lives in the
 /// on-chip address window but controls [`Cache`], not [`OnChip`], so the
 /// memory path routes it here explicitly rather than letting the generic
@@ -1171,7 +1179,8 @@ impl Cpu {
             return (self.cache.ccr(), 0);
         }
         if OnChip::owns(addr) {
-            return (self.onchip.read8(addr), 0);
+            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            return (self.onchip.read8(addr), stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1195,7 +1204,8 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> (u16, u32) {
         if OnChip::owns(addr) {
-            return (self.onchip.read16(addr), 0);
+            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            return (self.onchip.read16(addr), stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1219,7 +1229,8 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> (u32, u32) {
         if OnChip::owns(addr) {
-            return (self.onchip.read32(addr), 0);
+            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            return (self.onchip.read32(addr), stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1249,6 +1260,9 @@ impl Cpu {
         }
         if OnChip::owns(addr) {
             self.onchip.write8(addr, val);
+            if let Some(lat) = self.onchip.divu.take_pending_latency() {
+                self.pipeline.schedule_divide(lat);
+            }
             return 0;
         }
         if is_assoc_purge(addr) {
@@ -1274,6 +1288,9 @@ impl Cpu {
     ) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write16(addr, val);
+            if let Some(lat) = self.onchip.divu.take_pending_latency() {
+                self.pipeline.schedule_divide(lat);
+            }
             return 0;
         }
         if is_assoc_purge(addr) {
@@ -1297,6 +1314,9 @@ impl Cpu {
     ) -> u32 {
         if OnChip::owns(addr) {
             self.onchip.write32(addr, val);
+            if let Some(lat) = self.onchip.divu.take_pending_latency() {
+                self.pipeline.schedule_divide(lat);
+            }
             return 0;
         }
         if is_assoc_purge(addr) {
@@ -1340,102 +1360,121 @@ impl Cpu {
     }
 
     /// Run any enabled on-chip DMAC channel to completion. Mirrors the SH7604
-    /// DMAC: a channel runs when the master enable (DMAOR.DME) and the
-    /// channel's CHCR.DE are set with CHCR.TE clear; it copies TCR units of
-    /// the CHCR.TS size from SAR to DAR honouring the SM/DM address modes
-    /// (fixed / increment / decrement), then writes back the final SAR/DAR,
-    /// zeroes TCR, and latches TE (which raises the channel interrupt when
+    /// DMAC `DMA_DoTransfer` (Mednafen `sh7095.inc`): a channel runs when the
+    /// master enable is on with no fault (DMAOR `DME & !NMIF & !AE`, i.e.
+    /// `DMAOR & 0x07 == 0x01`) and the channel's CHCR.DE is set with CHCR.TE
+    /// clear. It copies TCR units of the CHCR.TS size from SAR to DAR honouring
+    /// the SM/DM address modes, writes back the final SAR/DAR + residual TCR,
+    /// and latches TE on completion (which raises the channel interrupt when
     /// CHCR.IE is set — surfaced by [`OnChip::refresh_interrupts`]).
     ///
-    /// Auto-request, synchronous block transfer. Cycle-stealing/burst bus
-    /// timing and module (DREQ / peripheral) request sources are a later
-    /// refinement — matching the SCU DMA's current synchronous model.
+    /// **Request mode (CHCR.AR) is intentionally not gated** — Mednafen's
+    /// `DMA_RunCond` runs any enabled channel, modelling auto-request only (the
+    /// Saturn wires no DREQ source to the SH-2 DMAC). Synchronous block
+    /// transfer; cycle-stealing/burst bus timing is a later refinement, as for
+    /// the SCU DMA.
     fn run_dma(&mut self, bus: &mut impl Bus) {
-        if self.onchip.dmac.dmaor & 1 == 0 {
-            return; // DMAOR.DME master-disable
-        }
         for ch in 0..2 {
+            // Re-checked per channel: a fault (AE) raised by channel 0 clears the
+            // master run condition, so channel 1 does not start (DMAOR: DME set
+            // AND NMIF/AE fault bits clear — Mednafen DMA_RecalcRunning).
+            if !self.onchip.dmac.enabled() {
+                return;
+            }
             self.run_dma_channel(ch, bus);
         }
     }
 
     fn run_dma_channel(&mut self, ch: usize, bus: &mut impl Bus) {
         let chcr = self.onchip.dmac.channels[ch].chcr;
-        // Need DE (bit 0) set and TE (bit 1) clear.
+        // Run condition (Mednafen DMA_RunCond): DE (bit 0) set, TE (bit 1) clear.
         if chcr & 0b11 != 0b01 {
             return;
         }
-        let dst_mode = (chcr >> 14) & 3;
-        let src_mode = (chcr >> 12) & 3;
-        let size = (chcr >> 10) & 3;
-        if src_mode == 3 || dst_mode == 3 {
-            return; // illegal address-mode setting; the channel doesn't start
-        }
-        let unit: u32 = match size {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            _ => 16,
-        };
+        let ts = (chcr >> 10) & 3; // transfer size: 0 byte / 1 word / 2 long / 3 block
+        let sm = (chcr >> 12) & 3; // source address mode
+        let dm = (chcr >> 14) & 3; // destination address mode
 
         const AM: u32 = 0x07FF_FFFF; // 27-bit external address mask
-        let align = match size {
+        // Per-mode address delta (Mednafen `ainc` table): 0 fixed, 1 +unit,
+        // 2/3 −unit (mode 3 is "setting prohibited" but the hardware, like
+        // mode 2, decrements). The unit follows the access size.
+        let unit: u32 = match ts {
+            0 => 1,
+            1 => 2,
+            _ => 4, // long *and* the per-longword stride of block mode
+        };
+        let ainc = |mode: u32| -> u32 {
+            match mode {
+                1 => unit,
+                2 | 3 => unit.wrapping_neg(),
+                _ => 0,
+            }
+        };
+        let align = match ts {
             0 => 0,
             1 => 1,
             _ => 3,
         };
-        let mut src = self.onchip.dmac.channels[ch].sar & AM & !align;
-        let mut dst = self.onchip.dmac.channels[ch].dar & AM & !align;
-        let mut count = self.onchip.dmac.channels[ch].tcr & 0x00FF_FFFF;
-        if count == 0 {
-            count = 0x0100_0000; // a TCR of 0 means the maximum count
-        }
-        if size == 3 {
-            count &= !3;
-            if count == 0 {
-                count = 4;
-            }
-        }
 
-        let advance = |mode: u32, u: u32, addr: u32| match mode {
-            1 => addr.wrapping_add(u) & AM,
-            2 => addr.wrapping_sub(u) & AM,
-            _ => addr,
-        };
+        // SAR/DAR accumulate at full 32-bit width (masked to 27 bits only at the
+        // access), matching Mednafen — they are written back unmasked.
+        let mut sar = self.onchip.dmac.channels[ch].sar;
+        let mut dar = self.onchip.dmac.channels[ch].dar;
+        let mut tcr = self.onchip.dmac.channels[ch].tcr & 0x00FF_FFFF;
+        if tcr == 0 {
+            tcr = 0x0100_0000; // a TCR of 0 means the maximum count (16M)
+        }
+        let mut fault = false; // a misaligned access sets AE and aborts the channel
 
-        while count > 0 {
-            if size == 3 {
-                // 16-byte block: four longwords. The source always advances by
-                // 16; the destination follows DM (fixed / +16 / −16), writing
-                // at the pre-decremented base in decrement mode.
-                let base = if dst_mode == 2 {
-                    dst.wrapping_sub(16) & AM
-                } else {
-                    dst
-                };
-                for k in 0..4 {
-                    let v = self.dma_read(src.wrapping_add(k * 4) & AM, 2, bus);
-                    self.dma_write(base.wrapping_add(k * 4) & AM, v, 2, bus);
+        loop {
+            if ts == 3 {
+                // 16-byte block: four longwords. A misaligned base sets AE but
+                // the current block still completes (Mednafen). The source reads
+                // sar, sar+4, sar+8, sar+12 then advances by 16 (SM ignored); the
+                // destination is written per-longword, advancing by DM each time.
+                if (sar | dar) & 3 != 0 {
+                    self.onchip.dmac.dmaor |= 4; // AE
+                    fault = true;
                 }
-                src = src.wrapping_add(16) & AM;
-                dst = advance(dst_mode, 16, dst);
-                count -= 4;
+                let mut buf = [0u32; 4];
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = self.dma_read(sar.wrapping_add((i as u32) << 2) & AM & !3, 2, bus);
+                }
+                sar = sar.wrapping_add(0x10);
+                for v in buf {
+                    self.dma_write(dar & AM & !3, v, 2, bus);
+                    dar = dar.wrapping_add(ainc(dm));
+                    tcr = tcr.wrapping_sub(1) & 0x00FF_FFFF;
+                    if tcr == 0 {
+                        break;
+                    }
+                }
             } else {
-                let v = self.dma_read(src, size, bus);
-                self.dma_write(dst, v, size, bus);
-                src = advance(src_mode, unit, src);
-                dst = advance(dst_mode, unit, dst);
-                count -= 1;
+                if (sar | dar) & align != 0 {
+                    self.onchip.dmac.dmaor |= 4; // AE: misaligned word/long address
+                    fault = true;
+                }
+                let v = self.dma_read(sar & AM & !align, ts, bus);
+                self.dma_write(dar & AM & !align, v, ts, bus);
+                sar = sar.wrapping_add(ainc(sm));
+                dar = dar.wrapping_add(ainc(dm));
+                tcr = tcr.wrapping_sub(1) & 0x00FF_FFFF;
+            }
+            if tcr == 0 || fault {
+                break;
             }
         }
 
-        // Completion: SAR/DAR point past the transferred region, TCR = 0,
-        // and TE latches.
+        // Completion: TE latches only when the count reaches zero (a fault aborts
+        // with TCR still non-zero, leaving TE clear). SAR/DAR/TCR write back.
+        if tcr == 0 {
+            self.onchip.dmac.channels[ch].chcr |= 0b10; // TE
+        }
         let c = &mut self.onchip.dmac.channels[ch];
-        c.sar = src;
-        c.dar = dst;
-        c.tcr = 0;
-        c.chcr |= 0b10; // TE
+        c.sar = sar;
+        c.dar = dar;
+        c.tcr = tcr;
     }
 
     /// Cache miss-fill. Returns `Some((line, stall))` if the cache is
