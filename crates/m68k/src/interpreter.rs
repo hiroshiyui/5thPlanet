@@ -13,11 +13,16 @@
 //! NEG/NEGX/NOT/CLR/TST/TAS; the bit ops (BTST/BCHG/BCLR/BSET, static and
 //! dynamic); EXT/SWAP/EXG; shifts/rotates; MOVEM and LINK/UNLK; the branch
 //! group (BRA/BSR/Bcc/DBcc/Scc), RTS, JMP/JSR; and MOVE to/from CCR/SR.
-//! The **exception model** is in too: TRAP/TRAPV/CHK, zero-divide,
-//! illegal + line-A/F, privilege violation, STOP/RESET/RTE/RTR, and
-//! external-interrupt dispatch (autovector, `SR.imask`-gated, level-7 NMI).
-//! Still to come: address-error/bus-error stack frames (the 68000's longer
-//! group-0 frame), and the exact MUL/DIV cycle-by-cycle timing tables.
+//! The **exception model** is complete: TRAP/TRAPV/CHK, zero-divide,
+//! illegal + line-A/F, privilege violation, STOP/RESET/RTE/RTR, external-
+//! interrupt dispatch (autovector, `SR.imask`-gated, level-7 NMI), the
+//! **address error** (vector 3, on a word/long access to an odd address) and
+//! **bus error** (vector 2) with the 68000's longer **group-0 stack frame**,
+//! and the **trace** exception (vector 9, after an instruction executed with
+//! `SR.T` set). The address-error fault is recorded by the faulting access and
+//! taken at the instruction boundary (M13 D4). Bus error is modelled (frame +
+//! vector) but has no trigger on the Saturn sound bus, which mirrors with no
+//! unmapped region.
 //!
 //! **Cycle model:** each memory word access costs the 68000's 4-clock bus
 //! cycle (8 for a long = two words), accumulated in [`Cpu::cycles`] along with
@@ -27,11 +32,13 @@
 //! through), `RTS`/`ANDI-CCR`-style trailing prefetch, `ADDA`/`ADD.L`-to-Dn
 //! operand penalties, the `-(An)` predecrement and `(d8,An/PC,Xn)` index +2,
 //! register shift/rotate `2 + 2n`, `JMP`/`JSR` target-mode +2/+4, and the
-//! `MOVEM`-to-regs trailing word read. Validated by a cycle-exact 68k
-//! instruction-lockstep against Mednafen on the SCSP sound driver (the SCSP
-//! timer phase the driver polls is a function of this count). Still to come:
-//! MUL/DIV exact cycle-by-cycle tables (currently a fixed estimate) and the
-//! 68000's longer group-0 (address/bus-error) stack frame.
+//! `MOVEM`-to-regs trailing word read, **and the exact MUL/DIV data-dependent
+//! cycle tables** (M13 D4: MULU 34 + 2·popcount, MULS 34 + 2·transitions, and
+//! the bit-serial DIVU/DIVS restoring-division algorithm with its taken-path /
+//! overflow / sign-fixup penalties, ported verbatim from Mednafen `m68k.cpp`).
+//! Validated by a cycle-exact 68k instruction-lockstep against Mednafen on the
+//! SCSP sound driver (the SCSP timer phase the driver polls is a function of
+//! this count).
 
 use crate::bus::{AccessKind, Bus};
 use crate::isa::{Cond, Size};
@@ -60,15 +67,27 @@ pub struct Cpu {
     /// (the SCSP, later) raises it; the CPU takes it at an instruction
     /// boundary when the level beats `SR.imask` (level 7 is non-maskable).
     pub pending_irq: u8,
+    /// A group-0 fault (address error / bus error) raised mid-instruction by a
+    /// memory access. It can't unwind the in-flight instruction directly, so
+    /// the access records the vector here and `step` takes the exception at the
+    /// instruction boundary. Always cleared by the end of a `step`.
+    pub fault: Option<u32>,
+    /// True only while inside [`Cpu::take_exception`] — suppresses the
+    /// odd-address check on the frame-stacking writes (a misaligned stack
+    /// during exception processing is a hardware double-fault we don't model).
+    pub in_exception: bool,
 }
 
 /// Fixed 68000 exception vector numbers (vector address = number × 4).
 mod vector {
+    pub const BUS_ERROR: u32 = 2;
+    pub const ADDRESS_ERROR: u32 = 3;
     pub const ILLEGAL: u32 = 4;
     pub const ZERO_DIVIDE: u32 = 5;
     pub const CHK: u32 = 6;
     pub const TRAPV: u32 = 7;
     pub const PRIVILEGE: u32 = 8;
+    pub const TRACE: u32 = 9;
     pub const LINE_A: u32 = 10;
     pub const LINE_F: u32 = 11;
     pub const AUTOVECTOR_BASE: u32 = 24; // + level → 25..31
@@ -93,6 +112,8 @@ impl Cpu {
         self.regs.pc = pc;
         self.stopped = false;
         self.pending_irq = 0;
+        self.fault = None;
+        self.in_exception = false;
     }
 
     /// Raise an external interrupt at `level` (1..7); the CPU takes it at the
@@ -111,9 +132,23 @@ impl Cpu {
         let saved_sr = self.regs.sr.to_u16();
         self.regs.set_supervisor(true);
         self.regs.sr.trace = false;
+        self.in_exception = true;
         self.push32(self.regs.pc, bus);
         self.push16(saved_sr, bus);
+        // Group 0 (bus error / address error) stacks an extended frame: the
+        // 68000 appends the access address, the instruction register, and a
+        // special-status word with the R/W, I/N, and function-code fields.
+        // Mednafen leaves these three as zeros (`m68k.cpp` `Exception`), and so
+        // do we — the values are only meaningful to a recovery handler. (68000
+        // manual §6.3; the long group-0 frame.)
+        if vector == vector::BUS_ERROR || vector == vector::ADDRESS_ERROR {
+            self.push16(0, bus); // instruction register
+            self.push32(0, bus); // access address
+            self.push16(0, bus); // R/W, I/N, function code
+            self.cycles += 2;
+        }
         self.regs.pc = self.read_mem(vector * 4, Size::Long, bus);
+        self.in_exception = false;
         self.stopped = false;
     }
 
@@ -155,7 +190,25 @@ impl Cpu {
 
     // ---- memory access (with the 4-clock bus-cycle model) -------------
 
+    /// True (and arms a pending address-error fault) iff a word/long access at
+    /// `addr` is misaligned. The 68000 takes an address error (vector 3) on any
+    /// word- or long-sized access to an odd address; the fault is recorded and
+    /// taken at the instruction boundary by [`Cpu::step`]. Suppressed during
+    /// exception frame-stacking (`in_exception`).
+    #[inline]
+    fn address_error(&mut self, addr: u32, size: Size) -> bool {
+        if size != Size::Byte && addr & 1 != 0 && !self.in_exception && self.fault.is_none() {
+            self.fault = Some(vector::ADDRESS_ERROR);
+            true
+        } else {
+            false
+        }
+    }
+
     fn read_mem(&mut self, addr: u32, size: Size, bus: &mut impl Bus) -> u32 {
+        if self.address_error(addr, size) {
+            return 0;
+        }
         match size {
             Size::Byte => {
                 let (v, s) = bus.read8(addr, AccessKind::Data);
@@ -176,6 +229,9 @@ impl Cpu {
     }
 
     fn write_mem(&mut self, addr: u32, size: Size, val: u32, bus: &mut impl Bus) {
+        if self.address_error(addr, size) {
+            return;
+        }
         match size {
             Size::Byte => self.cycles += 4 + bus.write8(addr, val as u8, AccessKind::Data) as u64,
             Size::Word => self.cycles += 4 + bus.write16(addr, val as u16, AccessKind::Data) as u64,
@@ -523,6 +579,9 @@ impl Cpu {
         }
 
         let instr_pc = self.regs.pc;
+        // Trace mode is sampled at the start of the instruction: a `T` set here
+        // arms a trace exception (vector 9) once the instruction retires.
+        let trace = self.regs.sr.trace;
         let op = self.fetch16(bus);
         match op >> 12 {
             0x0 => self.op_immediate(op, bus),
@@ -541,6 +600,17 @@ impl Cpu {
             // instruction's address and vector through 10 / 11.
             0xA => self.fault(vector::LINE_A, instr_pc, bus),
             _ => self.fault(vector::LINE_F, instr_pc, bus),
+        }
+        // A group-0 fault (address/bus error) raised by a memory access during
+        // the instruction is taken at the boundary, with the stacked PC pointing
+        // at the faulting instruction (it takes priority over a pending trace).
+        if let Some(vec) = self.fault.take() {
+            self.regs.pc = instr_pc;
+            self.take_exception(vec, bus);
+        } else if trace && self.regs.sr.trace {
+            // Trace fires after an instruction that completed without trapping
+            // (a trap clears T), with the stacked PC at the *next* instruction.
+            self.take_exception(vector::TRACE, bus);
         }
         (self.cycles - start) as u32
     }
@@ -1392,6 +1462,11 @@ impl Cpu {
     }
 
     /// MULU.W / MULS.W: `Dn.W × <ea>.W → Dn.L`. N from bit 31, Z, V=C=0.
+    ///
+    /// **Cycle timing** is the exact 68000 data-dependent table (Mednafen
+    /// `m68k.cpp` MULU/MULS): a 34-cycle base plus 2 per "work" step — for MULU
+    /// one per set bit of the source, for MULS one per 0↔1 transition in the
+    /// source word (with a 0 appended at the LSB).
     fn op_mul(&mut self, op: u16, signed: bool, bus: &mut impl Bus) {
         let reg = ((op >> 9) & 7) as usize;
         let ea = self.resolve_ea((op >> 3) & 7, op & 7, Size::Word, bus);
@@ -1402,6 +1477,25 @@ impl Cpu {
         } else {
             src * dn
         };
+
+        let mut extra = 0u64;
+        if signed {
+            // +2 per bit-pair transition in (src << 1), scanned 16 times.
+            let mut t = src << 1;
+            for _ in 0..16 {
+                extra += ((t ^ (t << 1)) & 2) as u64;
+                t >>= 1;
+            }
+        } else {
+            // +2 per set bit of the source.
+            let mut t = src;
+            while t != 0 {
+                extra += 2;
+                t &= t - 1;
+            }
+        }
+        self.cycles += 34 + extra;
+
         self.regs.d[reg] = result;
         self.regs.sr.n = result & 0x8000_0000 != 0;
         self.regs.sr.z = result == 0;
@@ -1410,41 +1504,112 @@ impl Cpu {
     }
 
     /// DIVU.W / DIVS.W: `Dn.L / <ea>.W` → quotient in the low word, remainder
-    /// in the high word. Overflow sets V and leaves Dn; divide-by-zero is a
-    /// no-op here (the zero-divide trap arrives with the exception model).
+    /// in the high word. Divide-by-zero takes the zero-divide trap (vector 5);
+    /// a quotient that doesn't fit 16 bits sets V/N, clears Z, and leaves Dn.
     fn op_div(&mut self, op: u16, signed: bool, bus: &mut impl Bus) {
         let reg = ((op >> 9) & 7) as usize;
         let ea = self.resolve_ea((op >> 3) & 7, op & 7, Size::Word, bus);
-        let divisor = self.read_ea(ea, Size::Word, bus) & 0xFFFF;
-        if divisor == 0 {
+        let divisor = (self.read_ea(ea, Size::Word, bus) & 0xFFFF) as u16;
+        self.divide(divisor, reg, signed, bus);
+    }
+
+    /// The 68000 divide step, ported from Mednafen `m68k.cpp` `Divide<sdiv>`:
+    /// the bit-serial restoring-division algorithm with its exact
+    /// data-dependent cycle accumulation (taken-path / overflow / sign-fixup
+    /// penalties) and flag semantics. Result and flags match a native divide
+    /// for in-range quotients; the value of porting the algorithm verbatim is
+    /// the cycle count (which the sound driver's timing depends on).
+    fn divide(&mut self, divisor_in: u16, dr: usize, signed: bool, bus: &mut impl Bus) {
+        if divisor_in == 0 {
             self.take_exception(vector::ZERO_DIVIDE, bus);
             return;
         }
-        let dividend = self.regs.d[reg];
-        self.regs.sr.c = false;
+        let mut dividend = self.regs.d[dr];
+        let mut divisor = divisor_in as u32;
+        let mut neg_quotient = false;
+        let mut neg_remainder = false;
+        let mut oflow = false;
+
+        self.cycles += 4;
+
         if signed {
-            let dvs = divisor as u16 as i16 as i32;
-            let q = (dividend as i32) / dvs;
-            let r = (dividend as i32) % dvs;
-            if !(-32768..=32767).contains(&q) {
-                self.regs.sr.v = true;
-                return;
+            neg_quotient = (((dividend >> 31) ^ (divisor >> 15)) & 1) != 0;
+            if dividend & 0x8000_0000 != 0 {
+                dividend = dividend.wrapping_neg();
+                neg_remainder = true;
+                self.cycles += 2;
             }
-            self.regs.d[reg] = ((r as u32) << 16) | (q as u16 as u32);
-            self.regs.sr.n = (q as i16) < 0;
-            self.regs.sr.z = q == 0;
-        } else {
-            let q = dividend / divisor;
-            let r = dividend % divisor;
-            if q > 0xFFFF {
-                self.regs.sr.v = true;
-                return;
+            if divisor & 0x8000 != 0 {
+                divisor = (divisor_in.wrapping_neg()) as u32;
             }
-            self.regs.d[reg] = (r << 16) | (q & 0xFFFF);
-            self.regs.sr.n = q & 0x8000 != 0;
-            self.regs.sr.z = q == 0;
         }
-        self.regs.sr.v = false;
+
+        let divisor_sl16 = divisor << 16;
+        let mut tmp = dividend;
+
+        if dividend >= divisor_sl16 {
+            self.cycles += 2;
+            oflow = true;
+            if signed {
+                self.cycles += 6;
+            }
+        } else {
+            if signed {
+                self.cycles += 14;
+                if neg_remainder || neg_quotient {
+                    self.cycles += 2;
+                }
+                if neg_remainder && neg_quotient {
+                    self.cycles += 2;
+                }
+            }
+            let mut carry = false;
+            for _ in 0..16 {
+                self.cycles += 4;
+                if !carry {
+                    self.cycles += 2;
+                    carry |= tmp >= divisor_sl16;
+                }
+                if carry {
+                    tmp = tmp.wrapping_sub(divisor_sl16);
+                } else {
+                    self.cycles += 2;
+                }
+                let lb = carry;
+                carry = (tmp >> 31) & 1 != 0;
+                tmp = (tmp << 1) | (lb as u32);
+            }
+            carry |= tmp >= divisor_sl16;
+            if carry {
+                tmp = tmp.wrapping_sub(divisor_sl16);
+            }
+            tmp = (((tmp << 1) & 0xFFFF) | (carry as u32)) | (tmp & 0xFFFF_0000);
+
+            if signed {
+                if (tmp & 0xFFFF) > (0x7FFF + neg_quotient as u32) {
+                    oflow = true;
+                } else {
+                    if neg_quotient {
+                        tmp = (tmp.wrapping_neg() & 0xFFFF) | (tmp & 0xFFFF_0000);
+                    }
+                    if neg_remainder {
+                        tmp = (((tmp >> 16).wrapping_neg() << 16) & 0xFFFF_0000) | (tmp & 0xFFFF);
+                    }
+                }
+            }
+        }
+
+        self.regs.sr.c = false;
+        if oflow {
+            self.regs.sr.z = false;
+            self.regs.sr.n = true;
+            self.regs.sr.v = true;
+        } else {
+            self.regs.sr.z = (tmp & 0xFFFF) == 0;
+            self.regs.sr.n = (tmp & 0x8000) != 0;
+            self.regs.sr.v = false;
+            self.regs.d[dr] = tmp;
+        }
     }
 
     /// ABCD / SBCD: packed-BCD add/subtract with extend, on a Dn pair or a

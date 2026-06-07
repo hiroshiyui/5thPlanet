@@ -1748,9 +1748,12 @@ fn eori_to_ccr_toggles_condition_bits() {
 }
 
 #[test]
-fn andi_to_sr_masks_system_byte() {
+fn andi_to_sr_masks_system_byte_then_traces() {
     // ANDI #0xD0FF,SR → 0x027C + word imm: keep T (bit 15) and CCR, clear the
-    // supervisor bit (bit 13 absent from the mask). Privileged.
+    // supervisor bit (bit 13) and the interrupt mask (bits 10..8 absent from the
+    // mask). Privileged. Because T was set at the start of the instruction, a
+    // trace exception (vector 9) fires the moment it retires — so the masking is
+    // verified through the SR that the trace exception stacks.
     let (mut cpu, mut bus) = boot(&[0x027C, 0xD0FF], |c| {
         c.regs.sr.supervisor = true;
         c.regs.sr.trace = true;
@@ -1758,9 +1761,19 @@ fn andi_to_sr_masks_system_byte() {
         c.regs.ssp = 0x2000;
         c.regs.usp = 0x4000;
     });
+    bus.write_word(0x0024, 0x0000); // trace vector (9 << 2 = 0x24)
+    bus.write_word(0x0026, 0x3000);
     cpu.step(&mut bus);
-    // 0xF0FF keeps T (0x8000) and S (0x2000) is cleared (bit 13 not in mask).
-    assert!(cpu.regs.sr.trace, "T kept (bit 15 in mask)");
-    assert!(!cpu.regs.sr.supervisor, "S cleared (bit 13 not in mask)");
-    assert_eq!(cpu.regs.a[7], 0x4000, "A7 banked to USP on S clear");
+
+    // The trace exception re-entered supervisor mode (banking A7 back to SSP),
+    // cleared T, and vectored through the trace handler.
+    assert!(cpu.regs.sr.supervisor, "trace exception entered supervisor");
+    assert!(!cpu.regs.sr.trace, "T cleared on trace-exception entry");
+    assert_eq!(cpu.regs.pc, 0x3000, "vectored through the trace handler");
+    // The stacked SR (at A7) is the post-ANDI value: T kept (0x8000), S and the
+    // interrupt mask cleared.
+    let stacked_sr = Bus::read16(&mut bus, cpu.regs.a[7], AccessKind::Data).0;
+    assert_eq!(stacked_sr & 0x8000, 0x8000, "ANDI kept T (bit 15 in mask)");
+    assert_eq!(stacked_sr & 0x2000, 0, "ANDI cleared S (bit 13 not in mask)");
+    assert_eq!(stacked_sr & 0x0700, 0, "ANDI cleared the interrupt mask");
 }
