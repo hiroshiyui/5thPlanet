@@ -107,6 +107,23 @@ impl Cram {
             _ => self.color_rgb888_mode0(index),
         }
     }
+
+    /// The colour-calc-enable MSB of a CRAM entry, used by VDP2 special
+    /// colour-calculation mode 3 (SFCCMD=3): bit 15 of an RGB555 entry
+    /// (modes 0/1) or bit 31 of an RGB888 entry (modes 2/3). (Mednafen
+    /// `(int32)rgb24 >> 31` after `rgb15_to_rgb24` lifts bit 15 to bit 31.)
+    pub fn color_cc_msb(&self, index: usize, cram_mode: u8) -> bool {
+        match cram_mode {
+            2 | 3 => {
+                let off = ((index * 4) % self.bytes.len()) as u32;
+                self.read32(off) & 0x8000_0000 != 0
+            }
+            _ => {
+                let off = (index * 2) % self.bytes.len();
+                u16::from_be_bytes([self.bytes[off], self.bytes[off + 1]]) & 0x8000 != 0
+            }
+        }
+    }
 }
 
 /// Expand a 15-bit RGB555 value (the low 15 bits of an entry / a direct

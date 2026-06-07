@@ -218,11 +218,97 @@ struct Dot {
     layer: Layer,
 }
 
+/// A sampled background dot before priority / colour-calc resolution: its
+/// colour plus the per-dot attributes the special-function (SFPRMD/SFCCMD)
+/// reads. For the common case (special modes off) only `rgb` matters.
+#[derive(Clone, Copy)]
+struct Sample {
+    rgb: (u8, u8, u8),
+    /// Palette code (paletted dots) — indexes the SFCODE LUT via `(code>>1)&7`.
+    code: u8,
+    /// Special-priority bit (pattern supplement / bitmap BMSPR).
+    spr: bool,
+    /// Special-colour-calc bit (pattern supplement / bitmap BMSCC).
+    scc: bool,
+    /// True for RGB direct-colour dots (changes special-function behaviour).
+    is_rgb: bool,
+    /// CRAM-entry colour-calc MSB (SFCCMD mode 3, paletted dots).
+    msb: bool,
+}
+
+/// Resolve an NBG/RBG layer's per-dot priority and colour-calc descriptor from
+/// its registers and the sampled dot's special-function attributes — a faithful
+/// port of Mednafen's `MakeSFCodeLUT` + `MakeNBGRBGPix` (`vdp2_render.cpp`).
+///
+/// `prio_reg` is the 3-bit priority register; `cc_base` is `Some((ratio, add))`
+/// when the layer's colour calc is enabled (CCCTL bit) else `None`; `priomode`
+/// / `ccmode` are SFPRMD/SFCCMD (0..3); `sfcode` is the selected 8-bit code.
+/// Priority modes: 0 = register, 1 = LSB from the per-character `spr` bit, 2 =
+/// `spr` then masked by the SFCODE palette-code test, 3 = LSB forced 0. Colour-
+/// calc modes: 0 = whole layer, 1 = per-dot `scc`, 2 = `scc` then SFCODE-masked,
+/// 3 = CRAM-MSB (paletted) / always (RGB).
+fn resolve_special(
+    prio_reg: u8,
+    cc_base: Option<(u8, bool)>,
+    priomode: u8,
+    ccmode: u8,
+    sfcode: u8,
+    s: &Sample,
+) -> (u8, Option<(u8, bool)>) {
+    let cc_on = cc_base.is_some();
+    // SFCCMD is inert unless the layer's colour calc is enabled (Mednafen forces
+    // ccmode = 0 when CCCTL's layer bit is clear).
+    let ccmode = if cc_on { ccmode } else { 0 };
+    let ta_prio = priomode % 3; // mode 3 templates as 0 (LSB stays the forced 0)
+
+    // Priority: modes >= 1 clear the register LSB; the per-character bit then
+    // sets it (mode 1, or mode 2 on paletted dots).
+    let mut prio = if priomode >= 1 { prio_reg & !1 } else { prio_reg };
+    if ta_prio == 1 || (ta_prio == 2 && !s.is_rgb) {
+        prio |= s.spr as u8;
+    }
+
+    // Colour-calc enable: whole-layer (mode 0), per-dot scc (modes 1/2), or the
+    // CRAM MSB / always-on for RGB (mode 3).
+    let mut cce = ccmode == 0 && cc_on;
+    if ccmode == 1 || (ccmode == 2 && !s.is_rgb) {
+        cce |= s.scc;
+    }
+    if ccmode == 3 {
+        cce |= if s.is_rgb { true } else { s.msb };
+    }
+
+    // SFCODE palette-code LUT (paletted dots only): when the code's selected
+    // bit is clear, mode 2 clears the priority LSB and/or the colour-calc enable.
+    if !s.is_rgb && (ta_prio == 2 || ccmode == 2) && (sfcode >> ((s.code >> 1) & 7)) & 1 == 0 {
+        if ta_prio & 2 != 0 {
+            prio &= !1;
+        }
+        if ccmode == 2 {
+            cce = false;
+        }
+    }
+
+    let cc = cce.then(|| cc_base.unwrap_or((0, false)));
+    (prio, cc)
+}
+
 /// Look up CRAM palette `index` honouring the live CRAM mode (RGB555 for
 /// modes 0/1, RGB888 for modes 2/3).
 #[inline]
 fn cram(vdp2: &Vdp2, index: usize) -> (u8, u8, u8) {
     vdp2.cram.color_rgb888(index, vdp2.regs.cram_mode())
+}
+
+/// CRAM lookup returning the colour and its colour-calc MSB together, for the
+/// per-dot samplers that feed [`resolve_special`].
+#[inline]
+fn cram_cc(vdp2: &Vdp2, index: usize) -> ((u8, u8, u8), bool) {
+    let mode = vdp2.regs.cram_mode();
+    (
+        vdp2.cram.color_rgb888(index, mode),
+        vdp2.cram.color_cc_msb(index, mode),
+    )
 }
 
 /// The back-screen (backdrop) colour for scanline `y`: RGB555 read from VRAM at
@@ -376,36 +462,60 @@ fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) ->
     if area { inside } else { !inside }
 }
 
-/// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`.
+/// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`. Resolves the
+/// per-dot special priority / colour-calc function (SFPRMD/SFCCMD) from the
+/// sampled dot's attributes.
 fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.nbg_enabled(n) {
         return None;
     }
-    let pri = vdp2.regs.nbg_priority(n);
-    if pri == 0 || !window_allows(vdp2, sprite_fb, vdp2.regs.nbg_window_control(n), x, y) {
+    if !window_allows(vdp2, sprite_fb, vdp2.regs.nbg_window_control(n), x, y) {
+        return None;
+    }
+    let priomode = vdp2.regs.special_priority_mode(n);
+    let prio_reg = vdp2.regs.nbg_priority(n);
+    // Priority 0 hides the layer — but only when the special-priority function
+    // can't raise the LSB per-dot (mode 0); otherwise resolve and let the
+    // compositor drop a resolved priority of 0.
+    if priomode == 0 && prio_reg == 0 {
         return None;
     }
     // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
     let (mx, my) = vdp2.regs.mosaic_coord(1 << n, x, y);
-    let rgb = sample_nbg(vdp2, n, mx, my)?;
+    let s = sample_nbg(vdp2, n, mx, my)?;
+    let (pri, cc) = resolve_special(
+        prio_reg,
+        vdp2.regs.nbg_color_calc(n),
+        priomode,
+        vdp2.regs.special_color_calc_mode(n),
+        vdp2.regs.special_function_code(n),
+        &s,
+    );
     Some(Dot {
         pri,
-        rgb,
-        cc: vdp2.regs.nbg_color_calc(n),
+        rgb: s.rgb,
+        cc,
         layer: Layer::Nbg(n as u8),
     })
 }
 
-/// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`.
+/// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`. RBG0 uses
+/// special-function layer index 4 (SFPRMD/SFCCMD bits 8..9); RBG1 shares NBG0's
+/// slot (index 0).
 fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.rbg_enabled(which) {
         return None;
     }
-    let pri = vdp2.regs.rbg_priority(which);
     // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
     // ungated for now.
     let gated = which != 0 || window_allows(vdp2, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
-    if pri == 0 || !gated {
+    if !gated {
+        return None;
+    }
+    let sf_layer = if which == 0 { 4 } else { 0 };
+    let priomode = vdp2.regs.special_priority_mode(sf_layer);
+    let prio_reg = vdp2.regs.rbg_priority(which);
+    if priomode == 0 && prio_reg == 0 {
         return None;
     }
     // Mosaic (MZCTL bit 4) applies to RBG0 only.
@@ -414,11 +524,19 @@ fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32,
     } else {
         (x, y)
     };
-    let rgb = sample_rbg(vdp2, which, mx, my)?;
+    let s = sample_rbg(vdp2, which, mx, my)?;
+    let (pri, cc) = resolve_special(
+        prio_reg,
+        vdp2.regs.rbg_color_calc(which),
+        priomode,
+        vdp2.regs.special_color_calc_mode(sf_layer),
+        vdp2.regs.special_function_code(sf_layer),
+        &s,
+    );
     Some(Dot {
         pri,
-        rgb,
-        cc: vdp2.regs.rbg_color_calc(which),
+        rgb: s.rgb,
+        cc,
         layer: Layer::Rbg(which as u8),
     })
 }
@@ -498,7 +616,7 @@ fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
 }
 
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
-fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
+fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Sample> {
     // Source position as 16.16 fixed point: whole-layer scroll (integer plus,
     // for NBG0/1, an 8-bit fraction) walked by a per-dot coordinate increment
     // that carries reduction/zoom. NBG2/3 are integer scroll — no fraction, no
@@ -559,35 +677,54 @@ fn bitmap_dims(size: u8) -> (u32, u32) {
     }
 }
 
-fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8, u8, u8)> {
+fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
     let base = vdp2.regs.nbg_bitmap_base(n);
     let (w, h) = bitmap_dims(vdp2.regs.nbg_bitmap_size(n));
     let (px, py) = (sx % w, sy % h);
     let coff = vdp2.regs.nbg_color_ram_offset(n);
     let tpon = vdp2.regs.nbg_transparent_pen_solid(n);
+    // Bitmap special-function bits are whole-layer constants (BMSPR/BMSCC).
+    let (spr, scc) = (
+        vdp2.regs.nbg_bitmap_special_priority(n),
+        vdp2.regs.nbg_bitmap_special_calc(n),
+    );
     match depth {
         // 16bpp RGB555 direct colour.
         3 => {
             let off = base + (py * w + px) * 2;
             let entry = vdp2.vram.read16(off);
-            (entry & 0x7FFF != 0).then(|| cram::rgb555_to_888(entry))
+            (entry & 0x7FFF != 0).then(|| Sample {
+                rgb: cram::rgb555_to_888(entry),
+                code: 0,
+                spr,
+                scc,
+                is_rgb: true,
+                msb: entry & 0x8000 != 0,
+            })
         }
         // 8bpp paletted (256 colour).
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0 || tpon).then(|| cram(vdp2, coff | idx))
+            (idx != 0 || tpon).then(|| {
+                let (rgb, msb) = cram_cc(vdp2, coff | idx);
+                Sample { rgb, code: idx as u8, spr, scc, is_rgb: false, msb }
+            })
         }
         // 4bpp paletted (16 colour). The BMPNA palette bank is a later
         // refinement; the nibble indexes the low palette directly.
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0 || tpon).then(|| cram(vdp2, coff | nibble))
+            (nibble != 0 || tpon).then(|| {
+                let (rgb, msb) = cram_cc(vdp2, coff | nibble);
+                Sample { rgb, code: nibble as u8, spr, scc, is_rgb: false, msb }
+            })
         }
     }
 }
 
-/// Decoded pattern-name entry: which 8×8 cell, palette base, and flip.
+/// Decoded pattern-name entry: which 8×8 cell, palette base, flip, and the
+/// per-character special-priority / special-colour-calc bits.
 struct Pattern {
     /// 8×8 cell number of the character's top-left cell.
     cell: u32,
@@ -595,6 +732,10 @@ struct Pattern {
     palette: u32,
     hflip: bool,
     vflip: bool,
+    /// Special-priority bit (2-word PN bit 13, or the 1-word supplement bit).
+    spr: bool,
+    /// Special-colour-calc bit (2-word PN bit 12, or the 1-word supplement bit).
+    scc: bool,
 }
 
 /// Pattern-name format bits (PNCN for NBG, PNCR for rotation) — they share the
@@ -605,6 +746,10 @@ struct PnFormat {
     cnsm: bool,
     spcn: u32,
     splt: u32,
+    /// 1-word-mode supplement special-priority / special-colour-calc bits
+    /// (PNCN/PNCR bits 9/8); ignored in 2-word mode (the bits come from the PN).
+    sup_spr: bool,
+    sup_scc: bool,
 }
 
 /// Decode the pattern-name entry at `pn_addr` per `fmt`, the character size,
@@ -640,6 +785,9 @@ fn decode_pattern(vdp2: &Vdp2, pn_addr: u32, fmt: PnFormat, two_cells: bool, dep
             palette,
             hflip,
             vflip,
+            // 1-word mode: the special bits come from the PNCN/PNCR supplement.
+            spr: fmt.sup_spr,
+            scc: fmt.sup_scc,
         }
     } else {
         let data = vdp2.vram.read32(pn_addr);
@@ -648,6 +796,9 @@ fn decode_pattern(vdp2: &Vdp2, pn_addr: u32, fmt: PnFormat, two_cells: bool, dep
             palette: (data >> 16) & 0x7F,
             hflip: data & 0x4000_0000 != 0,
             vflip: data & 0x8000_0000 != 0,
+            // 2-word mode: special-priority = first-word bit 13, special-cc bit 12.
+            spr: data & 0x2000_0000 != 0,
+            scc: data & 0x1000_0000 != 0,
         }
     }
 }
@@ -665,7 +816,7 @@ fn sample_pattern_cell(
     mut in_y: u32,
     coff: usize,
     tpon: bool,
-) -> Option<(u8, u8, u8)> {
+) -> Option<Sample> {
     let cell_px = if two_cells { 16 } else { 8 };
     if pat.hflip {
         in_x = (cell_px - 1) - in_x;
@@ -680,21 +831,32 @@ fn sample_pattern_cell(
     // base is therefore always `char × 0x20`.
     let subcell = (in_y / 8) * 2 + (in_x / 8);
     let (px, py) = (in_x % 8, in_y % 8);
-    if depth == 1 {
+    let (code, idx) = if depth == 1 {
         // 8bpp cell: 0x40 bytes, one byte/pixel; palette is the colour bank.
         let cell = pat.cell + subcell * 2;
         let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
-        (byte != 0 || tpon).then(|| cram(vdp2, coff | (pat.palette as usize) << 8 | byte))
+        (byte, coff | (pat.palette as usize) << 8 | byte)
     } else {
         // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
         let cell = pat.cell + subcell;
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
         let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
-        (nibble != 0 || tpon).then(|| cram(vdp2, coff | (pat.palette as usize) << 4 | nibble))
-    }
+        (nibble, coff | (pat.palette as usize) << 4 | nibble)
+    };
+    (code != 0 || tpon).then(|| {
+        let (rgb, msb) = cram_cc(vdp2, idx);
+        Sample {
+            rgb,
+            code: code as u8,
+            spr: pat.spr,
+            scc: pat.scc,
+            is_rgb: false,
+            msb,
+        }
+    })
 }
 
-fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8, u8, u8)> {
+fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
     let r = &vdp2.regs;
     let two_cells = r.nbg_char_size_2x2(n); // 16×16 vs 8×8 character
     let one_word = r.nbg_pn_one_word(n);
@@ -747,6 +909,8 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<(u8
         cnsm: r.nbg_pn_cnsm(n),
         spcn: r.nbg_pn_spcn(n),
         splt: r.nbg_pn_splt(n),
+        sup_spr: r.nbg_pn_special_priority(n),
+        sup_scc: r.nbg_pn_special_calc(n),
     };
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
     let coff = r.nbg_color_ram_offset(n);
@@ -848,7 +1012,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
 
 /// Sample rotation background `which` at screen `(x, y)`: transform through
 /// its parameter table, then read the rotation plane (bitmap or tile).
-fn sample_rbg(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
+fn sample_rbg(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Sample> {
     let mut rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), which);
     // Per-line coefficient table: overrides kx/ky (giving perspective) or makes
     // the whole line transparent.
@@ -922,7 +1086,7 @@ fn sample_rot_bitmap(
     depth: u8,
     plane_x: i32,
     plane_y: i32,
-) -> Option<(u8, u8, u8)> {
+) -> Option<Sample> {
     let base = vdp2.regs.rbg_bitmap_base(which);
     let w: i32 = 512;
     let h: i32 = if vdp2.regs.rbg_bitmap_size() == 0 {
@@ -944,19 +1108,36 @@ fn sample_rot_bitmap(
     let w = w as u32;
     let coff = vdp2.regs.rbg_color_ram_offset(which);
     let tpon = vdp2.regs.rbg_transparent_pen_solid(which);
+    let (spr, scc) = (
+        vdp2.regs.rbg_bitmap_special_priority(),
+        vdp2.regs.rbg_bitmap_special_calc(),
+    );
     match depth {
         3 => {
             let entry = vdp2.vram.read16(base + (py * w + px) * 2);
-            (entry & 0x7FFF != 0).then(|| cram::rgb555_to_888(entry))
+            (entry & 0x7FFF != 0).then(|| Sample {
+                rgb: cram::rgb555_to_888(entry),
+                code: 0,
+                spr,
+                scc,
+                is_rgb: true,
+                msb: entry & 0x8000 != 0,
+            })
         }
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
-            (idx != 0 || tpon).then(|| cram(vdp2, coff | idx))
+            (idx != 0 || tpon).then(|| {
+                let (rgb, msb) = cram_cc(vdp2, coff | idx);
+                Sample { rgb, code: idx as u8, spr, scc, is_rgb: false, msb }
+            })
         }
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
-            (nibble != 0 || tpon).then(|| cram(vdp2, coff | nibble))
+            (nibble != 0 || tpon).then(|| {
+                let (rgb, msb) = cram_cc(vdp2, coff | nibble);
+                Sample { rgb, code: nibble as u8, spr, scc, is_rgb: false, msb }
+            })
         }
     }
 }
@@ -973,7 +1154,7 @@ fn sample_rot_tile(
     depth: u8,
     plane_x: i32,
     plane_y: i32,
-) -> Option<(u8, u8, u8)> {
+) -> Option<Sample> {
     let r = &vdp2.regs;
     let two_cells = r.rbg_char_size_2x2();
     let one_word = r.rbg_pn_one_word();
@@ -1032,6 +1213,8 @@ fn sample_rot_tile(
         cnsm: r.rbg_pn_cnsm(),
         spcn: r.rbg_pn_spcn(),
         splt: r.rbg_pn_splt(),
+        sup_spr: r.rbg_pn_special_priority(),
+        sup_scc: r.rbg_pn_special_calc(),
     };
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
     let coff = r.rbg_color_ram_offset(which);

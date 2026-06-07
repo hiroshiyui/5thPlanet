@@ -380,6 +380,40 @@ impl Vdp2Regs {
         (self.read16(0x026) >> (sel * 8)) as u8
     }
 
+    /// NBG`n` per-dot special-priority / special-colour-calc supplement bits in
+    /// **1-word** pattern-name mode (PNCN bits 9/8 — Mednafen `Supp & 0x200 /
+    /// 0x100`). These feed SFPRMD/SFCCMD modes 1/2 when the character itself
+    /// carries the bit (vs the SFCODE palette-code path).
+    pub fn nbg_pn_special_priority(&self, n: usize) -> bool {
+        self.nbg_pncn(n) & 0x200 != 0
+    }
+    pub fn nbg_pn_special_calc(&self, n: usize) -> bool {
+        self.nbg_pncn(n) & 0x100 != 0
+    }
+    /// NBG`n` **bitmap** special-priority / special-colour-calc bits (BMPNA
+    /// 0x02C: NBG0 bits 5/4, NBG1 bits 13/12 — Mednafen `BMSPR`/`BMSCC`).
+    pub fn nbg_bitmap_special_priority(&self, n: usize) -> bool {
+        (self.read16(0x02C) >> (5 + n * 8)) & 1 != 0
+    }
+    pub fn nbg_bitmap_special_calc(&self, n: usize) -> bool {
+        (self.read16(0x02C) >> (4 + n * 8)) & 1 != 0
+    }
+    /// RBG 1-word pattern-name supplement spr/scc (PNCR 0x038 bits 9/8).
+    pub fn rbg_pn_special_priority(&self) -> bool {
+        self.rbg_pncr() & 0x200 != 0
+    }
+    pub fn rbg_pn_special_calc(&self) -> bool {
+        self.rbg_pncr() & 0x100 != 0
+    }
+    /// RBG bitmap spr/scc (BMPNB 0x02E bits 5/4 — Mednafen `(BMPNB>>5)&1` /
+    /// `(BMPNB>>4)&1`).
+    pub fn rbg_bitmap_special_priority(&self) -> bool {
+        self.read16(0x02E) & 0x20 != 0
+    }
+    pub fn rbg_bitmap_special_calc(&self) -> bool {
+        self.read16(0x02E) & 0x10 != 0
+    }
+
     /// Cell size for NBG`n`: 0 = 1×1 cell (8×8 px), 1 = 2×2 cells (16×16 px).
     pub fn nbg_char_size_2x2(&self, n: usize) -> bool {
         let bit = match n {
