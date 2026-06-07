@@ -83,3 +83,48 @@ impl AluOp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_bits_decodes_every_defined_code() {
+        assert_eq!(AluOp::from_bits(0x0), AluOp::Nop);
+        assert_eq!(AluOp::from_bits(0x1), AluOp::And);
+        assert_eq!(AluOp::from_bits(0x2), AluOp::Or);
+        assert_eq!(AluOp::from_bits(0x3), AluOp::Xor);
+        assert_eq!(AluOp::from_bits(0x4), AluOp::Add);
+        assert_eq!(AluOp::from_bits(0x5), AluOp::Sub);
+        assert_eq!(AluOp::from_bits(0x6), AluOp::Ad2);
+        assert_eq!(AluOp::from_bits(0x8), AluOp::Sr);
+        assert_eq!(AluOp::from_bits(0x9), AluOp::Rr);
+        assert_eq!(AluOp::from_bits(0xA), AluOp::Sl);
+        assert_eq!(AluOp::from_bits(0xB), AluOp::Rl);
+        assert_eq!(AluOp::from_bits(0xF), AluOp::Rl8);
+    }
+
+    #[test]
+    fn from_bits_maps_undefined_codes_to_unknown() {
+        // 0x7 and 0xC..0xE have no defined ALU op.
+        for code in [0x7u32, 0xC, 0xD, 0xE] {
+            assert_eq!(AluOp::from_bits(code), AluOp::Unknown);
+        }
+    }
+
+    #[test]
+    fn from_bits_masks_to_low_nibble() {
+        // Only the low 4 bits select the op; higher bits are ignored.
+        assert_eq!(AluOp::from_bits(0xFFFF_FFF4), AluOp::Add);
+        assert_eq!(AluOp::from_bits(0x1234_5670 | 0x1), AluOp::And);
+    }
+
+    #[test]
+    fn op_variants_carry_their_raw_word() {
+        // The structured variants are thin wrappers around the raw 32-bit word.
+        assert_eq!(Op::Operation(0xDEAD_BEEF), Op::Operation(0xDEAD_BEEF));
+        assert_ne!(Op::Mvi(1), Op::Dma(1));
+        assert_ne!(Op::Jmp(1), Op::Loop(1));
+        assert_ne!(Op::End(1), Op::Illegal(1));
+    }
+}

@@ -125,3 +125,97 @@ impl Default for Registers {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_zeroes_every_field() {
+        let r = Registers::new();
+        assert_eq!(r.pc, 0);
+        assert_eq!(r.top, 0);
+        assert_eq!(r.lop, 0);
+        assert_eq!(r.rx, 0);
+        assert_eq!(r.ry, 0);
+        assert_eq!(r.mul, 0);
+        assert_eq!(r.pl, 0);
+        assert_eq!(r.ph, 0);
+        assert_eq!(r.alu, 0);
+        assert_eq!(r.acl, 0);
+        assert_eq!(r.ach, 0);
+        assert_eq!(r.ct, [0; DATA_RAM_BANKS]);
+        assert_eq!(r.ra0, 0);
+        assert_eq!(r.wa0, 0);
+        assert_eq!(r.ra, 0);
+        assert_eq!(r.flags, Flags::default());
+    }
+
+    #[test]
+    fn default_matches_new() {
+        // `Registers` has no `PartialEq`, so compare a load-bearing field set.
+        let d = Registers::default();
+        let n = Registers::new();
+        assert_eq!(d.pc, n.pc);
+        assert_eq!(d.ct, n.ct);
+        assert_eq!(d.flags, n.flags);
+    }
+
+    #[test]
+    fn flags_default_all_clear() {
+        let f = Flags::default();
+        assert!(!f.z && !f.s && !f.c && !f.v && !f.t0 && !f.end && !f.exec);
+    }
+
+    #[test]
+    fn sign_extend48_positive_below_msb_is_unchanged() {
+        // Largest 48-bit value with bit 47 clear stays non-negative.
+        assert_eq!(sign_extend48(0x7FFF_FFFF_FFFF), 0x7FFF_FFFF_FFFF);
+        assert_eq!(sign_extend48(0), 0);
+        assert_eq!(sign_extend48(1), 1);
+    }
+
+    #[test]
+    fn sign_extend48_negative_sets_high_bits() {
+        // Bit 47 set → the i64 is negative with the top 16 bits filled in.
+        assert_eq!(sign_extend48(0x8000_0000_0000), -0x8000_0000_0000_i64);
+        assert_eq!(sign_extend48(0xFFFF_FFFF_FFFF), -1);
+    }
+
+    #[test]
+    fn sign_extend48_ignores_bits_above_48() {
+        // Only the low 48 bits are considered; garbage above is masked off.
+        assert_eq!(sign_extend48(0xFFFF_0000_0000_0001), 1);
+    }
+
+    #[test]
+    fn ac48_combines_ach_acl_with_sign_extension() {
+        let mut r = Registers::new();
+        // Positive: ACH bit 15 clear.
+        r.ach = 0x1234;
+        r.acl = 0x5678_9ABC;
+        assert_eq!(r.ac48(), 0x1234_5678_9ABC);
+
+        // Negative: ACH bit 15 set → sign-extended below zero.
+        r.ach = 0xFFFF;
+        r.acl = 0xFFFF_FFFF;
+        assert_eq!(r.ac48(), -1);
+
+        // ACH bits above 16 are masked off (only the low 16 are the accumulator).
+        r.ach = 0xFFF0_0000;
+        r.acl = 0;
+        assert_eq!(r.ac48(), 0);
+    }
+
+    #[test]
+    fn p48_combines_ph_pl_with_sign_extension() {
+        let mut r = Registers::new();
+        r.ph = 0x0001;
+        r.pl = 0x0000_0002;
+        assert_eq!(r.p48(), 0x0001_0000_0002);
+
+        r.ph = 0xFFFF;
+        r.pl = 0xFFFF_FFFE;
+        assert_eq!(r.p48(), -2);
+    }
+}

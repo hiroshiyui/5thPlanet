@@ -822,3 +822,945 @@ fn memory_ror_rotates_a_word_in_place() {
     );
     assert!(cpu.regs.sr.c, "rotated-out bit in carry");
 }
+
+// ---- increment 5: effective-address modes (coverage of resolve_ea) ----
+
+#[test]
+fn ea_predecrement_decrements_then_addresses() {
+    // MOVE.L D0, -(A0) → 0010 000 100 000 000 = 0x2100.
+    let (mut cpu, mut bus) = boot(&[0x2100], |c| {
+        c.regs.d[0] = 0xCAFE_F00D;
+        c.regs.a[0] = 0x3004;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x3000, "long predecrement by 4");
+    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0xCAFE_F00D);
+}
+
+#[test]
+fn ea_displacement_an_addresses_base_plus_disp() {
+    // MOVE.W (4,A0), D0 → 0011 000 000 101 000 = 0x3028 ; disp = 4.
+    let (mut cpu, mut bus) = boot(&[0x3028, 0x0004], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3004, 0x1357);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0x1357);
+}
+
+#[test]
+fn ea_brief_index_word_sign_extends_index() {
+    // MOVE.W (2,A0,D1.W), D0 → 0011 000 000 110 000 = 0x3030.
+    // Brief ext: index D1 (word, no scale), disp8 = 2 → 0x1002.
+    let (mut cpu, mut bus) = boot(&[0x3030, 0x1002], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.d[1] = 0x0000_FFFE; // word index -2
+    });
+    // effective address = 0x3000 + 2 + (-2) = 0x3000.
+    bus.write_word(0x3000, 0xBEEF);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0xBEEF);
+}
+
+#[test]
+fn ea_brief_index_long_uses_full_index() {
+    // MOVE.W (0,A0,A1.L), D0 → 0x3030 ; ext: A-reg index 1, long (bit11), disp 0.
+    // ext = 1000 1 000 0 0000000 = 0x9800.
+    let (mut cpu, mut bus) = boot(&[0x3030, 0x9800], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.a[1] = 0x0000_0010;
+    });
+    bus.write_word(0x3010, 0x4242);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0x4242);
+}
+
+#[test]
+fn ea_absolute_word_sign_extends() {
+    // MOVE.W (xxx).W, D0 → 0011 000 000 111 000 = 0x3038 ; abs.W = 0x0040.
+    let (mut cpu, mut bus) = boot(&[0x3038, 0x0040], |_| {});
+    bus.write_word(0x0040, 0x9876);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0x9876);
+}
+
+#[test]
+fn ea_pc_displacement_addresses_relative_to_ext_word() {
+    // MOVE.W (d16,PC), D0 → 0011 000 000 111 010 = 0x303A ; disp = 0x10.
+    let (mut cpu, mut bus) = boot(&[0x303A, 0x0010], |_| {});
+    // ext word at 0x1002; target = 0x1002 + 0x10.
+    bus.write_word(0x1012, 0x0F0F);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0x0F0F);
+}
+
+#[test]
+fn ea_pc_brief_index_addresses_relative() {
+    // MOVE.W (d8,PC,D1.W), D0 → 0x303B ; ext: D1 word, disp8 = 0x10.
+    let (mut cpu, mut bus) = boot(&[0x303B, 0x1010], |c| c.regs.d[1] = 4);
+    // base = 0x1002, target = 0x1002 + 0x10 + 4 = 0x1016.
+    bus.write_word(0x1016, 0xABCD);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 0xABCD);
+}
+
+#[test]
+fn ea_immediate_byte_takes_low_byte() {
+    // ADD.B #imm,D0 via ADDI is elsewhere; use OR.B #imm,D0 source = immediate.
+    // OR.B (xxx imm), D0 → 1000 000 000 111 100 = 0x803C ; imm word 0x00F0.
+    let (mut cpu, mut bus) = boot(&[0x803C, 0x00F0], |c| c.regs.d[0] = 0x0000_000F);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0xFF, "byte immediate OR");
+}
+
+// ---- increment 6: ALU direction / ADDA-SUBA distinction (regression) ----
+
+#[test]
+fn add_b_to_memory_direction() {
+    // ADD.B D0, (A0) → 1101 000 100 010 000 = 0xD110 (to-ea direction).
+    let (mut cpu, mut bus) = boot(&[0xD110], |c| {
+        c.regs.d[0] = 0x05;
+        c.regs.a[0] = 0x3000;
+    });
+    bus.write8(0x3000, 0x10, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x15);
+}
+
+#[test]
+fn sub_l_to_memory_direction_sets_borrow() {
+    // SUB.L D0, (A0) → 1001 000 110 010 000 = 0x9190.
+    let (mut cpu, mut bus) = boot(&[0x9190], |c| {
+        c.regs.d[0] = 0x0000_0002;
+        c.regs.a[0] = 0x3000;
+    });
+    bus.write_long(0x3000, 0x0000_0001);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0xFFFF_FFFF);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "borrow sets C and X");
+}
+
+#[test]
+fn adda_l_dn_to_an_does_not_decode_as_addx() {
+    // Regression for the ADDA.L Dn,An vs ADDX bug: ADDA.L D0,A1 → 0xD3C0.
+    // opmode 111 (long), addressing field 000 (Dn) — must accumulate the address.
+    let (mut cpu, mut bus) = boot(&[0xD3C0], |c| {
+        c.regs.d[0] = 0x0000_0100;
+        c.regs.a[1] = 0x0000_2000;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[1], 0x0000_2100, "ADDA.L Dn,An accumulates");
+}
+
+#[test]
+fn suba_l_dn_to_an_does_not_decode_as_subx() {
+    // SUBA.L D0,A1 → 0x93C0. Same shared-pattern guard as ADDA.
+    let (mut cpu, mut bus) = boot(&[0x93C0], |c| {
+        c.regs.d[0] = 0x0000_0100;
+        c.regs.a[1] = 0x0000_2000;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[1], 0x0000_1F00, "SUBA.L Dn,An subtracts");
+}
+
+#[test]
+fn suba_w_sign_extends_source() {
+    // SUBA.W D0,A1 → 0x92C0. Word source -1 sign-extends to a full long subtract.
+    let (mut cpu, mut bus) = boot(&[0x92C0], |c| {
+        c.regs.d[0] = 0x0000_FFFF; // -1 word
+        c.regs.a[1] = 0x0000_1000;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[1], 0x0000_1001, "A1 -= (-1)");
+}
+
+#[test]
+fn adda_l_memory_source_accumulates() {
+    // ADDA.L (A0),A1 → opmode 111, mode 010 → 0xD3D0.
+    let (mut cpu, mut bus) = boot(&[0xD3D0], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.a[1] = 0x0000_1000;
+    });
+    bus.write_long(0x3000, 0x0000_0234);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[1], 0x0000_1234);
+}
+
+#[test]
+fn addx_memory_predecrement_form() {
+    // ADDX.L -(A1),-(A0) → 1101 000 1 10 00 1 001 = 0xD189.
+    let (mut cpu, mut bus) = boot(&[0xD189], |c| {
+        c.regs.a[0] = 0x3008; // dest -(A0) → 0x3004
+        c.regs.a[1] = 0x3004; // src  -(A1) → 0x3000
+        c.regs.sr.x = true;
+    });
+    bus.write_long(0x3000, 0x0000_0010); // source
+    bus.write_long(0x3004, 0x0000_0020); // dest
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x3004);
+    assert_eq!(cpu.regs.a[1], 0x3000);
+    assert_eq!(
+        bus.read32(0x3004, AccessKind::Data).0,
+        0x31,
+        "0x20 + 0x10 + X"
+    );
+}
+
+#[test]
+fn subx_memory_predecrement_keeps_sticky_zero() {
+    // SUBX.B -(A1),-(A0) → 1001 000 1 00 00 1 001 = 0x9109.
+    let (mut cpu, mut bus) = boot(&[0x9109], |c| {
+        c.regs.a[0] = 0x3001;
+        c.regs.a[1] = 0x3001;
+        c.regs.sr.x = false;
+        c.regs.sr.z = true; // sticky-Z: equal bytes leave Z set
+    });
+    bus.write8(0x3000, 0x05, AccessKind::Data); // both read 0x05
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x00, "5 - 5 - 0 = 0");
+    assert!(cpu.regs.sr.z, "sticky Z preserved on zero result");
+}
+
+// ---- increment 7: immediate group to memory + to SR ----
+
+#[test]
+fn ori_b_to_memory() {
+    // ORI.B #0xF0, (A0) → 0x0010 + word imm 0x00F0.
+    let (mut cpu, mut bus) = boot(&[0x0010, 0x00F0], |c| c.regs.a[0] = 0x3000);
+    bus.write8(0x3000, 0x0F, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0xFF);
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn andi_w_to_memory() {
+    // ANDI.W #0x0FF0, (A0) → 0x0250 + word imm.
+    let (mut cpu, mut bus) = boot(&[0x0250, 0x0FF0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0xFFFF);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0FF0);
+}
+
+#[test]
+fn subi_l_to_memory_sets_flags() {
+    // SUBI.L #1, (A0) → 0x0490 + long imm.
+    let (mut cpu, mut bus) = boot(&[0x0490, 0x0000, 0x0001], |c| c.regs.a[0] = 0x3000);
+    bus.write_long(0x3000, 0x0000_0000);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0xFFFF_FFFF);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.n);
+}
+
+#[test]
+fn addi_b_to_memory() {
+    // ADDI.B #0x10, (A0) → 0x0610 + word imm.
+    let (mut cpu, mut bus) = boot(&[0x0610, 0x0010], |c| c.regs.a[0] = 0x3000);
+    bus.write8(0x3000, 0x20, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x30);
+}
+
+#[test]
+fn eori_w_to_memory() {
+    // EORI.W #0xFFFF, (A0) → 0x0A50 + word imm.
+    let (mut cpu, mut bus) = boot(&[0x0A50, 0xFFFF], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x0F0F);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0xF0F0);
+}
+
+#[test]
+fn cmpi_l_to_memory_does_not_modify() {
+    // CMPI.L #0x5, (A0) → 0x0C90 + long imm.
+    let (mut cpu, mut bus) = boot(&[0x0C90, 0x0000, 0x0005], |c| c.regs.a[0] = 0x3000);
+    bus.write_long(0x3000, 0x0000_0005);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0x0000_0005, "no write");
+    assert!(cpu.regs.sr.z, "equal → Z");
+}
+
+#[test]
+fn ori_to_sr_is_privileged_and_sets_system_byte() {
+    // ORI #0x0700, SR → 0x007C + word imm (raise interrupt mask to 7).
+    let (mut cpu, mut bus) = boot(&[0x007C, 0x0700], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.imask = 0;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.sr.imask, 7, "OR into the SR system byte");
+}
+
+#[test]
+fn eori_to_sr_toggles_bits() {
+    // EORI #0x2000, SR → 0x0A7C + word imm: toggles the supervisor bit.
+    let (mut cpu, mut bus) = boot(&[0x0A7C, 0x2000], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.ssp = 0x2000;
+        c.regs.usp = 0x4000;
+    });
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.supervisor, "S bit toggled off");
+    assert_eq!(cpu.regs.a[7], 0x4000, "A7 banked to USP");
+}
+
+// ---- increment 8: 0x4 group remainder (RTR / RESET / TRAPV / CHK / etc) ----
+
+#[test]
+fn rtr_restores_ccr_and_pc_keeping_system_byte() {
+    // RTR → 0x4E77. Frame: CCR word at SSP, PC at SSP+2.
+    let (mut cpu, mut bus) = boot(&[0x4E77], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.imask = 5;
+        c.regs.a[7] = 0x1F00;
+    });
+    bus.write_word(0x1F00, 0x001F); // all CCR bits set
+    bus.write_long(0x1F02, 0x0000_5000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x5000);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.v && cpu.regs.sr.z && cpu.regs.sr.n && cpu.regs.sr.x);
+    assert_eq!(cpu.regs.sr.imask, 5, "system byte untouched by RTR");
+}
+
+#[test]
+fn reset_instruction_is_a_nop_for_the_core() {
+    // RESET → 0x4E70 (privileged).
+    let (mut cpu, mut bus) = boot(&[0x4E70], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.d[0] = 0x99;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x1002, "RESET advances past the opcode");
+    assert_eq!(cpu.regs.d[0], 0x99, "core state untouched");
+}
+
+#[test]
+fn trapv_traps_only_when_overflow_set() {
+    // TRAPV → 0x4E76, vector 7 at 0x1C.
+    let (mut cpu, mut bus) = boot(&[0x4E76], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.v = true;
+    });
+    bus.write_long(7 * 4, 0x0000_3000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x3000, "V set → TRAPV taken");
+
+    // V clear → falls through.
+    let (mut cpu, mut bus) = boot(&[0x4E76], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.v = false;
+    });
+    bus.write_long(7 * 4, 0x0000_3000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x1002, "V clear → no trap");
+}
+
+#[test]
+fn chk_traps_when_value_exceeds_bound() {
+    // CHK D0,D1 → 0100 001 110 000 000 = 0x4380 (Dn = D1, ea = D0 bound).
+    let (mut cpu, mut bus) = boot(&[0x4380], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.d[0] = 0x0000_0005; // bound
+        c.regs.d[1] = 0x0000_0009; // value > bound
+    });
+    bus.write_long(6 * 4, 0x0000_2000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x2000, "value > bound → CHK trap");
+    assert!(!cpu.regs.sr.n, "N clear when value > bound");
+}
+
+#[test]
+fn chk_traps_on_negative_value() {
+    let (mut cpu, mut bus) = boot(&[0x4380], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.d[0] = 0x0000_0010; // bound
+        c.regs.d[1] = 0x0000_FFFF; // -1 word → negative
+    });
+    bus.write_long(6 * 4, 0x0000_2000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x2000, "negative value → CHK trap");
+    assert!(cpu.regs.sr.n, "N set when value < 0");
+}
+
+#[test]
+fn chk_in_bounds_falls_through() {
+    let (mut cpu, mut bus) = boot(&[0x4380], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.d[0] = 0x0000_0010;
+        c.regs.d[1] = 0x0000_0008;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x1002, "0 <= value <= bound → no trap");
+}
+
+#[test]
+fn ext_l_sign_extends_word_to_long() {
+    // EXT.L D0 → 0x48C0.
+    let (mut cpu, mut bus) = boot(&[0x48C0], |c| c.regs.d[0] = 0x0000_8000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xFFFF_8000, "word 0x8000 → long 0xFFFF8000");
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn nbcd_negates_packed_bcd() {
+    // NBCD D0 → 0x4800. 0 - 0x12 - 0 = 0x88 (BCD ten's complement) + borrow.
+    let (mut cpu, mut bus) = boot(&[0x4800], |c| {
+        c.regs.d[0] = 0x12;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x88, "NBCD of 0x12");
+    assert!(cpu.regs.sr.c, "borrow out");
+}
+
+#[test]
+fn move_from_sr_stores_status_word() {
+    // MOVE SR,D0 → 0x40C0.
+    let (mut cpu, mut bus) = boot(&[0x40C0], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.imask = 3;
+        c.regs.sr.z = true;
+    });
+    cpu.step(&mut bus);
+    let expected = cpu.regs.sr.to_u16() as u32;
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, expected & 0xFFFF);
+}
+
+#[test]
+fn move_to_ccr_sets_condition_codes() {
+    // MOVE #imm,CCR → 0x44FC + word imm (immediate source).
+    let (mut cpu, mut bus) = boot(&[0x44FC, 0x001F], |c| {
+        c.regs.sr.imask = 4;
+        c.regs.sr.supervisor = true;
+    });
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.v && cpu.regs.sr.z && cpu.regs.sr.n && cpu.regs.sr.x);
+    assert_eq!(cpu.regs.sr.imask, 4, "system byte untouched by MOVE to CCR");
+}
+
+#[test]
+fn move_to_sr_is_privileged() {
+    // MOVE #0x2700,SR → 0x46FC + word imm. In user mode → privilege trap.
+    let (mut cpu, mut bus) = boot(&[0x46FC, 0x2700], |c| {
+        c.regs.sr.supervisor = false;
+        c.regs.ssp = 0x2000;
+    });
+    bus.write_long(8 * 4, 0x0000_7000);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x7000, "MOVE to SR in user mode traps");
+
+    // In supervisor mode it loads the SR.
+    let (mut cpu, mut bus) = boot(&[0x46FC, 0x2300], |c| c.regs.sr.supervisor = true);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.sr.imask, 3, "SR system byte loaded");
+}
+
+// ---- increment 9: NEG/NOT memory, EXG variants, CMPA/CMPM ----
+
+#[test]
+fn not_w_to_memory_complements_in_place() {
+    // NOT.W (A0) → 0x4650.
+    let (mut cpu, mut bus) = boot(&[0x4650], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x0F0F);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0xF0F0);
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn neg_b_to_memory() {
+    // NEG.B (A0) → 0x4410.
+    let (mut cpu, mut bus) = boot(&[0x4410], |c| c.regs.a[0] = 0x3000);
+    bus.write8(0x3000, 0x01, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0xFF, "0 - 1 = -1");
+    assert!(cpu.regs.sr.c);
+}
+
+#[test]
+fn negx_b_to_memory_with_extend() {
+    // NEGX.B (A0) → 0x4010, X set → 0 - 0 - 1 = -1.
+    let (mut cpu, mut bus) = boot(&[0x4010], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.sr.x = true;
+    });
+    bus.write8(0x3000, 0x00, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0xFF);
+}
+
+#[test]
+fn exg_address_registers() {
+    // EXG A0,A1 → 0xC149.
+    let (mut cpu, mut bus) = boot(&[0xC149], |c| {
+        c.regs.a[0] = 0x1111_1111;
+        c.regs.a[1] = 0x2222_2222;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x2222_2222);
+    assert_eq!(cpu.regs.a[1], 0x1111_1111);
+}
+
+#[test]
+fn exg_data_and_address_register() {
+    // EXG D0,A1 → 0xC189.
+    let (mut cpu, mut bus) = boot(&[0xC189], |c| {
+        c.regs.d[0] = 0xAAAA_AAAA;
+        c.regs.a[1] = 0xBBBB_BBBB;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xBBBB_BBBB);
+    assert_eq!(cpu.regs.a[1], 0xAAAA_AAAA);
+}
+
+#[test]
+fn cmpa_w_sign_extends_and_compares_full_long() {
+    // CMPA.W D0,A1 → 1011 001 011 000 000 = 0xB2C0.
+    let (mut cpu, mut bus) = boot(&[0xB2C0], |c| {
+        c.regs.d[0] = 0x0000_FFFF; // -1 word → sign-extended
+        c.regs.a[1] = 0xFFFF_FFFF; // -1 long
+    });
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.z, "-1 == -1 → Z");
+}
+
+#[test]
+fn cmpa_l_compares_full_long() {
+    // CMPA.L D0,A1 → opmode 111 → 0xB3C0.
+    let (mut cpu, mut bus) = boot(&[0xB3C0], |c| {
+        c.regs.d[0] = 0x0000_0010;
+        c.regs.a[1] = 0x0000_0008;
+    });
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.n, "8 - 16 < 0 → N");
+    assert!(cpu.regs.sr.c, "borrow");
+}
+
+#[test]
+fn cmpm_compares_and_post_increments_both() {
+    // CMPM.W (A1)+,(A0)+ → 1011 000 101 001 001 = 0xB149.
+    let (mut cpu, mut bus) = boot(&[0xB149], |c| {
+        c.regs.a[0] = 0x3000; // Ax dest
+        c.regs.a[1] = 0x3010; // Ay src
+    });
+    bus.write_word(0x3010, 0x1234); // source
+    bus.write_word(0x3000, 0x1234); // dest
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.z, "equal operands");
+    assert_eq!(cpu.regs.a[0], 0x3002, "Ax post-incremented");
+    assert_eq!(cpu.regs.a[1], 0x3012, "Ay post-incremented");
+}
+
+#[test]
+fn divs_overflow_sets_v_and_leaves_dn() {
+    // DIVS.W with quotient out of i16 range → V, Dn unchanged.
+    // 0x4000_0000 / 1 = 0x4000_0000 >> exceeds i16.
+    let (mut cpu, mut bus) = boot(&[0x81C1], |c| {
+        c.regs.d[0] = 0x4000_0000;
+        c.regs.d[1] = 0x0000_0001;
+    });
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.v, "signed quotient overflow → V");
+    assert_eq!(cpu.regs.d[0], 0x4000_0000, "Dn left unmodified on overflow");
+}
+
+// ---- increment 10: shift/rotate register forms (ROXL/ROXR/ROL/ROR, count) ----
+
+#[test]
+fn roxl_l_rotates_through_extend() {
+    // ROXL.L #1,D0 → 1110 001 1 10 1 10 000 = 0xE390.
+    let (mut cpu, mut bus) = boot(&[0xE390], |c| {
+        c.regs.d[0] = 0x8000_0000;
+        c.regs.sr.x = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0001, "MSB out, X rotated into bit 0");
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "old MSB → C and X");
+}
+
+#[test]
+fn roxr_l_rotates_through_extend() {
+    // ROXR.L #1,D0 → 1110 001 0 10 1 10 000 = 0xE290.
+    let (mut cpu, mut bus) = boot(&[0xE290], |c| {
+        c.regs.d[0] = 0x0000_0001;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0000, "LSB out, X(0) into MSB");
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "old LSB → C and X");
+}
+
+#[test]
+fn rol_l_register_count() {
+    // ROL.L D1,D0 → register count form, count = bits 11..9 reg, bit 5 set.
+    // 1110 001 1 10 1 01 000 ... actually ROL kind=3 left: 0xE3B8.
+    let (mut cpu, mut bus) = boot(&[0xE3B8], |c| {
+        c.regs.d[0] = 0x8000_0001;
+        c.regs.d[1] = 1; // rotate by 1
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0003, "MSB wraps to LSB");
+    assert!(cpu.regs.sr.c, "rotated-out bit in carry");
+}
+
+#[test]
+fn ror_l_register_count() {
+    // ROR.L D1,D0 → kind 3 right, register count: 0xE2B8.
+    let (mut cpu, mut bus) = boot(&[0xE2B8], |c| {
+        c.regs.d[0] = 0x0000_0001;
+        c.regs.d[1] = 1;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x8000_0000, "LSB wraps to MSB");
+    assert!(cpu.regs.sr.c);
+}
+
+#[test]
+fn lsr_l_immediate_clears_msb() {
+    // LSR.L #1,D0 → 1110 001 0 10 0 01 000 = 0xE288 (count bits 11..9 = 001).
+    let (mut cpu, mut bus) = boot(&[0xE288], |c| c.regs.d[0] = 0x0000_0003);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_0001);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "bit 0 shifted out");
+}
+
+#[test]
+fn asl_l_register_count_detects_overflow() {
+    // ASL.L D1,D0 → 1110 001 1 10 1 00 000 = 0xE3A0, count via D1.
+    let (mut cpu, mut bus) = boot(&[0xE3A0], |c| {
+        c.regs.d[0] = 0x4000_0000;
+        c.regs.d[1] = 1;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x8000_0000);
+    assert!(cpu.regs.sr.v, "sign bit changed → V");
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn shift_by_zero_count_clears_carry() {
+    // LSR.L D1,D0 with D1=0 → no shift, C cleared, X untouched.
+    // 1110 001 0 10 1 01 000 = 0xE2A8 (count register = D1).
+    let (mut cpu, mut bus) = boot(&[0xE2A8], |c| {
+        c.regs.d[0] = 0x0000_00FF;
+        c.regs.d[1] = 0; // count 0
+        c.regs.sr.c = true;
+        c.regs.sr.x = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0x0000_00FF, "zero-count shift is a no-op");
+    assert!(!cpu.regs.sr.c, "zero count clears C");
+    assert!(cpu.regs.sr.x, "zero count leaves X untouched");
+}
+
+// ---- increment 11: memory shift kinds (LSR/ROXL/ROXR/ASR in memory) ----
+
+#[test]
+fn memory_lsr_shifts_word_right() {
+    // LSR (A0) → kind 1 (LS) right → 0xE2D0.
+    let (mut cpu, mut bus) = boot(&[0xE2D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x0003);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0001);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x);
+}
+
+#[test]
+fn memory_asr_preserves_sign() {
+    // ASR (A0) → kind 0 right → 0xE0D0.
+    let (mut cpu, mut bus) = boot(&[0xE0D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x8000);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0xC000, "sign preserved");
+    assert!(cpu.regs.sr.n);
+}
+
+#[test]
+fn memory_lsl_shifts_word_left() {
+    // LSL (A0) → kind 1 left → 0xE3D0.
+    let (mut cpu, mut bus) = boot(&[0xE3D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x8001);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0002);
+    assert!(cpu.regs.sr.c && cpu.regs.sr.x, "MSB out → C and X");
+}
+
+#[test]
+fn memory_roxl_rotates_word_through_extend() {
+    // ROXL (A0) → kind 2 left → 0xE5D0.
+    let (mut cpu, mut bus) = boot(&[0xE5D0], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.sr.x = true;
+    });
+    bus.write_word(0x3000, 0x0000);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0001, "X into bit 0");
+    assert!(!cpu.regs.sr.c, "old MSB was 0");
+}
+
+#[test]
+fn memory_roxr_rotates_word_through_extend() {
+    // ROXR (A0) → kind 2 right → 0xE4D0.
+    let (mut cpu, mut bus) = boot(&[0xE4D0], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.sr.x = true;
+    });
+    bus.write_word(0x3000, 0x0000);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x8000, "X into bit 15");
+    assert!(!cpu.regs.sr.c, "old LSB was 0");
+}
+
+#[test]
+fn memory_rol_rotates_word_left() {
+    // ROL (A0) → kind 3 left → 0xE7D0.
+    let (mut cpu, mut bus) = boot(&[0xE7D0], |c| c.regs.a[0] = 0x3000);
+    bus.write_word(0x3000, 0x8000);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0001, "MSB wraps");
+    assert!(cpu.regs.sr.c);
+}
+
+// ---- increment 12: MOVEM control modes + word load sign-extend ----
+
+#[test]
+fn movem_store_to_control_mode_walks_ascending() {
+    // MOVEM.L D0/A0, (A1) → 0x48D1 mask: D0 bit0, A0 bit8 → 0x0101.
+    let (mut cpu, mut bus) = boot(&[0x48D1, 0x0101], |c| {
+        c.regs.d[0] = 0x1111_1111;
+        c.regs.a[0] = 0x2222_2222;
+        c.regs.a[1] = 0x3000;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0x1111_1111, "D0 first");
+    assert_eq!(bus.read32(0x3004, AccessKind::Data).0, 0x2222_2222, "A0 next");
+}
+
+#[test]
+fn movem_load_word_sign_extends_into_registers() {
+    // MOVEM.W (A1), D0/D1 → 0x4C91 mask 0x0003.
+    let (mut cpu, mut bus) = boot(&[0x4C91, 0x0003], |c| c.regs.a[1] = 0x3000);
+    bus.write_word(0x3000, 0x8000); // D0 ← sign-extended
+    bus.write_word(0x3002, 0x0001); // D1
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xFFFF_8000, "word load sign-extends");
+    assert_eq!(cpu.regs.d[1], 0x0000_0001);
+}
+
+#[test]
+fn movem_load_postincrement_advances_pointer() {
+    // MOVEM.L (A0)+, D0/D1 → 0x4CD8 mask 0x0003.
+    let (mut cpu, mut bus) = boot(&[0x4CD8, 0x0003], |c| c.regs.a[0] = 0x3000);
+    bus.write_long(0x3000, 0xAAAA_AAAA);
+    bus.write_long(0x3004, 0xBBBB_BBBB);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0], 0xAAAA_AAAA);
+    assert_eq!(cpu.regs.d[1], 0xBBBB_BBBB);
+    assert_eq!(cpu.regs.a[0], 0x3008, "A0 advanced past both longs");
+}
+
+// ---- increment 13: BTST on memory (no write-back) + MOVEA.L ----
+
+#[test]
+fn bchg_on_memory_toggles_byte_bit() {
+    // BCHG #0, (A0) → 0x0850 + word imm 0.
+    let (mut cpu, mut bus) = boot(&[0x0850, 0x0000], |c| c.regs.a[0] = 0x3000);
+    bus.write8(0x3000, 0x00, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x01, "bit toggled set");
+    assert!(cpu.regs.sr.z, "old bit was 0");
+}
+
+#[test]
+fn btst_on_memory_dynamic_does_not_write() {
+    // BTST D1, (A0) → 0x0310 (dynamic, kind 0 = test only).
+    let (mut cpu, mut bus) = boot(&[0x0310], |c| {
+        c.regs.a[0] = 0x3000;
+        c.regs.d[1] = 0; // bit 0
+    });
+    bus.write8(0x3000, 0x01, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.z, "bit 0 set");
+    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x01, "BTST never writes");
+}
+
+#[test]
+fn movea_l_loads_full_long_without_flags() {
+    // MOVEA.L #imm,A0 → 0x207C + long imm.
+    let (mut cpu, mut bus) = boot(&[0x207C, 0x1234, 0x5678], |c| c.regs.sr.z = true);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x1234_5678, "full long, no sign-extend");
+    assert!(cpu.regs.sr.z, "MOVEA leaves CCR untouched");
+}
+
+// ---- increment 14: line-A / line-F emulator traps ----
+
+#[test]
+fn line_a_opcode_traps_through_vector_10() {
+    // 0xA000 is a line-A opcode → vector 10 (byte 0x28).
+    let (mut cpu, mut bus) = boot(&[0xA000], |c| c.regs.sr.supervisor = true);
+    bus.write_long(10 * 4, 0x0000_AAAA);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x0000_AAAA);
+    // Frame: SR (word) at SSP, then the PC (long) — which must point at the
+    // faulting instruction, not the one after it.
+    assert_eq!(bus.read32(cpu.regs.a[7] + 2, AccessKind::Data).0, 0x1000);
+}
+
+#[test]
+fn line_f_opcode_traps_through_vector_11() {
+    // 0xF000 is a line-F opcode → vector 11 (byte 0x2C).
+    let (mut cpu, mut bus) = boot(&[0xF000], |c| c.regs.sr.supervisor = true);
+    bus.write_long(11 * 4, 0x0000_FFFF);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.pc, 0x0000_FFFF);
+}
+
+// ---- increment 15: BCD edge / DBcc condition-true / Scc false / addr ADDQ-sub ----
+
+#[test]
+fn abcd_with_carry_propagates_to_high_digit() {
+    // ABCD with X set and a low-digit carry: 0x09 + 0x08 + 1 = 0x18.
+    let (mut cpu, mut bus) = boot(&[0xC101], |c| {
+        c.regs.d[0] = 0x09;
+        c.regs.d[1] = 0x08;
+        c.regs.sr.x = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x18, "9 + 8 + 1 = 18 BCD");
+    assert!(!cpu.regs.sr.c, "no high-digit carry out");
+}
+
+#[test]
+fn sbcd_with_borrow_from_low_digit() {
+    // SBCD: 0x10 - 0x01 - 0 = 0x09 (borrow into the low digit).
+    let (mut cpu, mut bus) = boot(&[0x8101], |c| {
+        c.regs.d[0] = 0x10;
+        c.regs.d[1] = 0x01;
+        c.regs.sr.x = false;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x09, "10 - 1 = 9 BCD");
+    assert!(!cpu.regs.sr.c);
+}
+
+#[test]
+fn dbcc_condition_true_terminates_without_decrement() {
+    // DBEQ D0,disp → 0101 0111 11001 000 = 0x57C8. Z set → loop terminates.
+    let (mut cpu, mut bus) = boot(&[0x57C8, 0xFFFE], |c| {
+        c.regs.sr.z = true;
+        c.regs.d[0] = 5;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFFFF, 5, "condition true → counter untouched");
+    assert_eq!(cpu.regs.pc, 0x1004, "fell through past the displacement");
+}
+
+#[test]
+fn scc_false_clears_byte() {
+    // SNE D0 → 0x56C0. Z set → Ne false → 0x00.
+    let (mut cpu, mut bus) = boot(&[0x56C0], |c| {
+        c.regs.sr.z = true;
+        c.regs.d[0] = 0x0000_00FF;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[0] & 0xFF, 0x00, "Scc false → 0x00");
+}
+
+#[test]
+fn subq_l_from_address_register_is_full_width() {
+    // SUBQ.L #1,A0 → 0x5388.
+    let (mut cpu, mut bus) = boot(&[0x5388], |c| {
+        c.regs.a[0] = 0x0000_1000;
+        c.regs.sr.c = true;
+    });
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x0000_0FFF);
+    assert!(cpu.regs.sr.c, "address SUBQ sets no flags");
+}
+
+#[test]
+fn movep_l_loads_from_alternating_bytes() {
+    // MOVEP.L (0,A1),D3 — opmode 101 → 0x0749, disp 0.
+    let (mut cpu, mut bus) = boot(&[0x0749, 0x0000], |c| c.regs.a[1] = 0x3000);
+    bus.write8(0x3000, 0xDE, AccessKind::Data);
+    bus.write8(0x3002, 0xAD, AccessKind::Data);
+    bus.write8(0x3004, 0xBE, AccessKind::Data);
+    bus.write8(0x3006, 0xEF, AccessKind::Data);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.d[3], 0xDEAD_BEEF, "long from even bytes only");
+}
+
+// ---- increment 16: BCD memory form, ANDI/ORI/EORI to CCR/SR variants ----
+
+#[test]
+fn abcd_memory_predecrement_form() {
+    // ABCD -(A1),-(A0) → 1100 000 100 00 1 001 = 0xC109. The two predecremented
+    // pointers must land on distinct bytes.
+    let (mut cpu, mut bus) = boot(&[0xC109], |c| {
+        c.regs.a[0] = 0x3004; // dest -(A0) → 0x3003
+        c.regs.a[1] = 0x3001; // src  -(A1) → 0x3000
+        c.regs.sr.x = false;
+    });
+    bus.write8(0x3000, 0x18, AccessKind::Data); // src
+    bus.write8(0x3003, 0x25, AccessKind::Data); // dest
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.a[0], 0x3003);
+    assert_eq!(cpu.regs.a[1], 0x3000);
+    assert_eq!(
+        bus.read8(0x3003, AccessKind::Data).0,
+        0x43,
+        "25 + 18 = 43 BCD"
+    );
+}
+
+#[test]
+fn sbcd_memory_predecrement_form() {
+    // SBCD -(A1),-(A0) → 1000 000 100 00 1 001 = 0x8109.
+    let (mut cpu, mut bus) = boot(&[0x8109], |c| {
+        c.regs.a[0] = 0x3004; // dest → 0x3003
+        c.regs.a[1] = 0x3001; // src  → 0x3000
+        c.regs.sr.x = false;
+    });
+    bus.write8(0x3000, 0x18, AccessKind::Data); // src
+    bus.write8(0x3003, 0x42, AccessKind::Data); // dest
+    cpu.step(&mut bus);
+    assert_eq!(
+        bus.read8(0x3003, AccessKind::Data).0,
+        0x24,
+        "42 - 18 = 24 BCD"
+    );
+}
+
+#[test]
+fn ori_to_ccr_sets_condition_bits() {
+    // ORI #0x01,CCR → 0x003C + word imm (set the C bit).
+    let (mut cpu, mut bus) = boot(&[0x003C, 0x0001], |c| c.regs.sr.c = false);
+    cpu.step(&mut bus);
+    assert!(cpu.regs.sr.c, "C set by ORI to CCR");
+}
+
+#[test]
+fn eori_to_ccr_toggles_condition_bits() {
+    // EORI #0x04,CCR → 0x0A3C + word imm (toggle the Z bit).
+    let (mut cpu, mut bus) = boot(&[0x0A3C, 0x0004], |c| c.regs.sr.z = true);
+    cpu.step(&mut bus);
+    assert!(!cpu.regs.sr.z, "Z toggled off by EORI to CCR");
+}
+
+#[test]
+fn andi_to_sr_masks_system_byte() {
+    // ANDI #0xD0FF,SR → 0x027C + word imm: keep T (bit 15) and CCR, clear the
+    // supervisor bit (bit 13 absent from the mask). Privileged.
+    let (mut cpu, mut bus) = boot(&[0x027C, 0xD0FF], |c| {
+        c.regs.sr.supervisor = true;
+        c.regs.sr.trace = true;
+        c.regs.sr.imask = 7;
+        c.regs.ssp = 0x2000;
+        c.regs.usp = 0x4000;
+    });
+    cpu.step(&mut bus);
+    // 0xF0FF keeps T (0x8000) and S (0x2000) is cleared (bit 13 not in mask).
+    assert!(cpu.regs.sr.trace, "T kept (bit 15 in mask)");
+    assert!(!cpu.regs.sr.supervisor, "S cleared (bit 13 not in mask)");
+    assert_eq!(cpu.regs.a[7], 0x4000, "A7 banked to USP on S clear");
+}
