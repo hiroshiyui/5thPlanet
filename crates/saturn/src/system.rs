@@ -261,7 +261,15 @@ pub struct Saturn {
     /// master-side analog of the 68k `pcstream`). `#[serde(skip)]`.
     #[serde(skip)]
     master_pcstream: Option<Vec<(u32, u64)>>,
+    /// Debug-only (M11 Doukyuusei menu): when the master's low-24 PC equals
+    /// `target`, append `(R[reg], cycle)` — a cycle-stamped dispatch-index
+    /// sequence for time-aligned diffing vs Mednafen's `SS_LOGSEQ`. `#[serde(skip)]`.
+    #[serde(skip)]
+    seqlog: Option<SeqLog>,
 }
+
+/// `(target_low24_pc, reg_index, records[(reg_value, cycle)])` — see [`Saturn::enable_seqlog`].
+type SeqLog = (u32, usize, Vec<(u32, u64)>);
 
 impl Saturn {
     /// Construct with a real BIOS image. Both CPUs start with default
@@ -283,6 +291,7 @@ impl Saturn {
             slave_id,
             cd_id,
             master_pcstream: None,
+            seqlog: None,
         }
     }
 
@@ -425,6 +434,21 @@ impl Saturn {
     /// Debug-only: drain the master PC+cycle stream `(pc, accumulated_cycle)`.
     pub fn take_master_pcstream(&mut self) -> Vec<(u32, u64)> {
         self.master_pcstream.take().unwrap_or_default()
+    }
+
+    /// Debug-only (M11 Doukyuusei menu): record `(R[reg], cycle)` every time the
+    /// master's low-24 PC equals `target_low24`. Used to capture the menu
+    /// controller's dispatch-index sequence, cycle-stamped for time-alignment vs
+    /// Mednafen's `SS_LOGSEQ`. Drain with [`Self::take_seqlog`].
+    pub fn enable_seqlog(&mut self, target_low24: u32, reg: usize) {
+        self.seqlog = Some((target_low24 & 0x00FF_FFFF, reg, Vec::new()));
+    }
+    /// Drain the accumulated dispatch-index records, leaving the logger armed.
+    pub fn take_seqlog(&mut self) -> Vec<(u32, u64)> {
+        match self.seqlog.as_mut() {
+            Some((_, _, v)) => core::mem::take(v),
+            None => Vec::new(),
+        }
     }
 
     /// Debug-only: start / drain a full-speed *slave*-PC trace (M12 slave
@@ -849,6 +873,7 @@ impl Saturn {
             slave_id,
             cd_id,
             master_pcstream,
+            seqlog,
             ..
         } = self;
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
@@ -923,6 +948,14 @@ impl Saturn {
                 let e = scheduler.entity(*master_id).sh2();
                 if !e.cpu.next_is_delay_slot() {
                     ps.push((e.cpu.regs.pc, e.cpu.pipeline.cycles));
+                }
+            }
+            // Dispatch-index seqlog: record R[reg] when the master is about to
+            // execute the controller's dispatch PC (cycle-stamped for alignment).
+            if let Some((tgt, reg, log)) = seqlog.as_mut() {
+                let e = scheduler.entity(*master_id).sh2();
+                if (e.cpu.regs.pc & 0x00FF_FFFF) == *tgt && !e.cpu.next_is_delay_slot() {
+                    log.push((e.cpu.regs.r[*reg], e.cpu.pipeline.cycles));
                 }
             }
             scheduler.entity_mut(*master_id).step(bus);

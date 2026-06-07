@@ -3009,3 +3009,120 @@ fn emulator_plays_cdda_track() {
         "the running emulator output real CD-DA audio (peak {peak}), not silence"
     );
 }
+
+/// M11 Doukyuusei menu: capture the menu controller's dispatch-index sequence
+/// (R8 at the dispatcher PC), FRAME-STAMPED so it can be time-aligned to menu
+/// entry — the alignment problem that blocked the previous diff. Boots the game,
+/// injects START once at `PAD_FROM`, logs R8 at `SEQ_PC` (default 0x01BD64), and
+/// prints one line per frame that dispatched, with the R8 values.
+///
+/// `BIOS=… CUE="Doukyuusei - if (Japan) (1M, 2M).cue" PAD_FROM=2450 FRAMES=2700 \
+///   SEQ_PC=01BD64 SEQ_REG=8 cargo test -p saturn --test trace_boot \
+///   menu_dispatch_seqlog -- --ignored --nocapture`
+#[test]
+#[ignore = "manual: Doukyuusei menu dispatch-index sequence, frame-stamped"]
+fn menu_dispatch_seqlog() {
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+        println!("inserted disc roms/{cue_name}");
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+
+    let seq_pc = std::env::var("SEQ_PC")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x01_BD64);
+    let seq_reg: usize = std::env::var("SEQ_REG").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let pad_from: u32 = std::env::var("PAD_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(2450);
+    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2700);
+    sat.enable_seqlog(seq_pc, seq_reg);
+    println!("logging R{seq_reg} at low24-PC 0x{seq_pc:06X}; START one-shot at frame {pad_from}");
+
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for f in 0..frames {
+        // One-shot START: hold for 6 frames starting at pad_from.
+        let held = if f >= pad_from && f < pad_from + 6 { 0x0800u16 } else { 0 };
+        sat.set_pad1(held);
+        sat.run_frame(&mut fb);
+        let recs = sat.take_seqlog();
+        if !recs.is_empty() {
+            let vals: Vec<String> = recs.iter().map(|(v, _)| format!("{v}")).collect();
+            // Only print frames near/after START to keep output readable, unless DUMP_ALL.
+            if std::env::var("DUMP_ALL").is_ok() || f + 60 >= pad_from {
+                println!("f{f}: [{}]", vals.join(" "));
+            }
+        }
+    }
+    // DISASM=addr,len[,addr,len,...] (hex): disassemble menu code now in WRAM.
+    if let Ok(spec) = std::env::var("DISASM") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        for pair in nums.chunks(2) {
+            if let [addr, len] = pair {
+                disasm_range(&mut sat, "menu", *addr, *len, 0);
+            }
+        }
+    }
+    // SEARCH=word[,lo,hi] (hex): scan a HWRAM range for a 32-bit value (the
+    // literal a dispatcher loads), print matching addresses.
+    if let Ok(spec) = std::env::var("SEARCH") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let needle = nums[0];
+        let lo = nums.get(1).copied().unwrap_or(0x0600_0000);
+        let hi = nums.get(2).copied().unwrap_or(0x0608_0000);
+        let mut hits = 0;
+        let mut a = lo;
+        while a < hi && hits < 64 {
+            let (v, _) = sat.bus.read32(a, sh2::bus::AccessKind::Data);
+            if v == needle {
+                println!("  SEARCH hit: 0x{a:08X} = 0x{needle:08X}");
+                hits += 1;
+            }
+            a += 2;
+        }
+        println!("  SEARCH done: {hits} hits for 0x{needle:08X} in [{lo:08X},{hi:08X})");
+    }
+    // READMEM=addr,len (hex): dump raw bus bytes (cache-through) as u32 words.
+    if let Ok(spec) = std::env::var("READMEM") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if let [base, len] = nums[..] {
+            for off in (0..len).step_by(16) {
+                let mut row = format!("  0x{:08X}:", base + off);
+                for w in 0..4 {
+                    let (v, _) = sat.bus.read32(base + off + w * 4, sh2::bus::AccessKind::Data);
+                    row.push_str(&format!(" {v:08X}"));
+                }
+                println!("{row}");
+            }
+        }
+    }
+}
