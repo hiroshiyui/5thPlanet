@@ -382,8 +382,10 @@ fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
     let mut zoom_x: u32 = 1 << 16;
     if n < 2 {
         let (dx, dy, zoom) = line_scroll(vdp2, n, y);
-        scroll_x += dx;
-        scroll_y += dy;
+        // The scroll deltas are sign-extended (a negative offset is a large
+        // `u32`), so accumulate them modulo 2^32 like the vcell/zoom adds below.
+        scroll_x = scroll_x.wrapping_add(dx);
+        scroll_y = scroll_y.wrapping_add(dy);
         zoom_x = zoom;
         if vdp2.regs.nbg_vcell_scroll(n) {
             scroll_y = scroll_y.wrapping_add(vcell_scroll(vdp2, n, x) as u32);
@@ -392,7 +394,10 @@ fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<(u8, u8, u8)> {
     let depth = vdp2.regs.nbg_color_mode(n);
     // Horizontal line zoom scales the per-dot source step (1.0 = no zoom).
     let sx = scroll_x.wrapping_add(((x as u64 * zoom_x as u64) >> 16) as u32);
-    let sy = y + scroll_y;
+    // `scroll_y` may be a sign-extended negative (line/vcell scroll up), so wrap
+    // rather than panic on overflow in debug builds; the source coord is masked
+    // to the plane size downstream.
+    let sy = y.wrapping_add(scroll_y);
     if vdp2.regs.nbg_bitmap_enabled(n) {
         sample_bitmap(vdp2, n, depth, sx, sy)
     } else {
@@ -1816,6 +1821,36 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 +7 (odd longword)");
+    }
+
+    /// Regression: a NEGATIVE vertical cell-scroll offset (scroll up) is
+    /// sign-extended to a near-`u32::MAX` value, so `sy = y + scroll_y` must
+    /// wrap rather than panic on overflow in a debug build. Before the fix,
+    /// rendering any line `y >= |offset|` overflowed and panicked here; now the
+    /// source row is `y - offset` modulo the plane size.
+    #[test]
+    fn negative_vcell_scroll_wraps_instead_of_overflowing() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0001); // NBG0 on
+        v.regs.write16(0x028, 0x0012); // NBG0 8bpp bitmap
+        v.regs.write16(0x0F8, 0x0005); // NBG0 priority 5
+        v.regs.write16(0x09A, 0x0001); // SCRCTL: N0VCSC (vertical cell scroll)
+        v.regs.write16(0x09E, 0x0200); // VCSTAL → table byte 0x400
+        // Column 0 scroll = -5 (11-bit 0x7FB, sign-extended → 0xFFFF_FFFB). The
+        // value lives in the high half-word of the longword.
+        v.vram.write32(0x400, 0x07FB << 16);
+        v.cram.write16(2, 0x001F); // index 1 = red
+        // A dot at source row 5; with scroll -5 it lands on screen row 10.
+        v.vram.write8(5 * 512, 1);
+        let mut buf = fresh_buf();
+        // Without the wrapping fix this panics at y>=6 (u32 add overflow).
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 10),
+            [0xFF, 0, 0, 0xFF],
+            "screen (0,10) samples source row 10 + (-5) = 5 → red"
+        );
     }
 
     /// Sprite colour calculation: SPCCEN + the SPCCCS/SPCCN priority condition
