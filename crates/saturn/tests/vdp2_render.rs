@@ -58,7 +58,89 @@ fn bitmap_nbg0_through_run_frame_picks_up_synthetic_scene() {
 
     let px = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(&out[px..px + 4], &[0xFF, 0, 0, 0xFF], "red at (50,60)");
-    // Pixel right next door is the backdrop (CRAM[0] = black).
+    // Pixel right next door is the backdrop — the back screen at BKTA=0 reads
+    // VRAM word 0, which is 0 (black) here.
     let px_next = (60 * FRAME_WIDTH + 51) * 4;
     assert_eq!(&out[px_next..px_next + 4], &[0, 0, 0, 0xFF]);
+}
+
+#[test]
+fn back_screen_single_colour_fills_the_backdrop_from_vram() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    // DISP on, no backgrounds enabled → the whole frame is the back screen.
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0000, AccessKind::Data);
+    // Back-screen table at VRAM word 0x100 (byte 0x200), single RGB555 green.
+    sat.bus.vdp2.vram.write16(0x200, 0x03E0); // g = 0x1F
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU: hi=0, BKCLMD=0
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL: word addr 0x100
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    // Every sampled pixel is the single back-screen colour (green).
+    for &(x, y) in &[(0usize, 0usize), (160, 100), (319, 223)] {
+        let px = (y * FRAME_WIDTH + x) * 4;
+        assert_eq!(&out[px..px + 4], &[0, 0xFF, 0, 0xFF], "green backdrop at ({x},{y})");
+    }
+}
+
+#[test]
+fn back_screen_per_line_colour_advances_one_word_per_scanline() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0000, AccessKind::Data);
+    // Per-line table at word 0x100: line 0 = red, line 1 = blue, line 2 = white.
+    sat.bus.vdp2.vram.write16(0x200, 0x001F); // r
+    sat.bus.vdp2.vram.write16(0x202, 0x7C00); // b
+    sat.bus.vdp2.vram.write16(0x204, 0x7FFF); // white
+    sat.bus.write16(0x05F8_00AC, 0x8000, AccessKind::Data); // BKTAU: BKCLMD = per-line
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data);
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let row = |y: usize| -> [u8; 4] {
+        let px = (y * FRAME_WIDTH + 10) * 4;
+        out[px..px + 4].try_into().unwrap()
+    };
+    assert_eq!(row(0), [0xFF, 0, 0, 0xFF], "line 0 red");
+    assert_eq!(row(1), [0, 0, 0xFF, 0xFF], "line 1 blue");
+    assert_eq!(row(2), [0xFF, 0xFF, 0xFF, 0xFF], "line 2 white");
+}
+
+#[test]
+fn line_colour_screen_is_the_colour_calc_partner_of_an_enabled_layer() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    // NBG0 bitmap, 8bpp, priority 1, with colour calc enabled at ratio 31
+    // (front weight 0 → the result is purely the colour-calc partner colour).
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data);
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // N0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA.N0PRIN = 1
+    sat.bus.write16(0x05F8_00EC, 0x0001, AccessKind::Data); // CCCTL: N0 colour-calc on, ratio mode
+    sat.bus.write16(0x05F8_0108, 0x001F, AccessKind::Data); // CCRNA: N0 ratio = 31
+    // Line-colour screen on for NBG0, table word 0x100 → CRAM index 9 = green.
+    sat.bus.write16(0x05F8_00E8, 0x0001, AccessKind::Data); // LNCLEN: NBG0
+    sat.bus.write16(0x05F8_00A8, 0x0000, AccessKind::Data); // LCTAU
+    sat.bus.write16(0x05F8_00AA, 0x0100, AccessKind::Data); // LCTAL: word 0x100
+    sat.bus.vdp2.vram.write16(0x200, 9); // line-colour palette index
+    sat.bus.vdp2.cram.write16(9 * 2, 0x03E0); // CRAM[9] = green
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red (the NBG0 dot)
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 7); // NBG0 bitmap dot = index 7
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    // At ratio 31 the NBG0 red dot is fully replaced by its colour-calc partner,
+    // which the line-colour screen supplies → green.
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 0xFF, 0, 0xFF],
+        "line colour is the colour-calc partner of the NBG0 dot"
+    );
 }

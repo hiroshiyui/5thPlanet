@@ -17,8 +17,10 @@
 //!   (RGB) is transparent. 8bpp tiles select a CRAM colour bank from the
 //!   pattern-name palette field. Palette lookups honour the live CRAM mode —
 //!   RGB555 (modes 0/1) or true RGB888 (modes 2/3).
-//! - **Backdrop** = CRAM index 0 (the real BKTAU/BKTAL backdrop register is
-//!   a later refinement; palette entry 0 is what splash software programs).
+//! - **Backdrop** = the VDP2 **back screen** — RGB555 read from VRAM at the
+//!   BKTA table (BKTAU/BKTAL), per scanline, with the BKCLMD per-line-colour
+//!   mode for gradients. The **line-colour screen** (LCTA/LNCLEN) inserts a
+//!   per-line CRAM colour as the colour-calc partner of selected layers.
 //! - **Scrolling**: integer whole-layer NBG scroll, plus per-line scroll,
 //!   per-line horizontal zoom, and per-column vertical cell scroll for
 //!   NBG0/NBG1 (SCRCTL/LSTAn/VCSTA); fractional whole-layer scroll is ignored.
@@ -49,7 +51,9 @@
 //! scanline from a VRAM table while WPSY/WPEY bound it vertically.
 //!
 //! **Sprite shadow**: an MSB-only sprite word (bit 15 set, no colour) on a
-//! shadow-capable sprite type halves the colour of the layer beneath.
+//! shadow-capable sprite type halves the colour of the screen beneath — but
+//! only screens whose SDCTL shadow-receive bit is set (NBG0–3, RBG0, or the
+//! back screen; C2).
 //!
 //! The rotation **line-coefficient table** (KTCTL) is applied per scanline:
 //! it overrides kx/ky (perspective) in modes 0/1/2, or flags a line
@@ -86,8 +90,6 @@ pub const MAX_FRAME_WIDTH: usize = 704;
 pub const MAX_FRAME_HEIGHT: usize = 512;
 pub const FRAMEBUFFER_BYTES: usize = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
 
-const BACKDROP_PALETTE_INDEX: usize = 0;
-
 /// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
 /// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
 /// frame buffer to read). Panics if `out`'s length isn't [`FRAMEBUFFER_BYTES`].
@@ -110,9 +112,11 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
         return (w, h);
     }
 
-    let backdrop = cram(vdp2, BACKDROP_PALETTE_INDEX);
-
     for y in 0..h {
+        // The backdrop is the VDP2 back screen — RGB555 read from VRAM at the
+        // BKTA table, per scanline (the real Saturn backdrop, not CRAM[0]). In
+        // per-line-colour mode the table advances one word per line (gradients).
+        let backdrop = back_color(vdp2, y);
         for x in 0..w {
             let (sx, sy) = (x as u32, y as u32);
             // Evaluate layers in VDP2's default front-to-back order, keeping
@@ -141,21 +145,60 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
             let mut rgb = match top {
                 Some(t) => match t.cc {
                     Some((ratio, add)) => {
-                        let below = second.map(|s| s.rgb).unwrap_or(backdrop);
+                        // Line-colour screen: when LNCLEN selects the top layer,
+                        // the line colour is the colour-calc partner (it sits at
+                        // the bottom of the colour-calc stack); otherwise the
+                        // layer below / back screen is.
+                        let lce =
+                            vdp2.regs.line_colour_enable() & (1 << t.layer.screen_bit()) != 0;
+                        let below = lce
+                            .then(|| line_color(vdp2, y))
+                            .flatten()
+                            .or_else(|| second.map(|s| s.rgb))
+                            .unwrap_or(backdrop);
                         blend(t.rgb, below, ratio, add)
                     }
                     None => t.rgb,
                 },
                 None => backdrop,
             };
-            // MSB-shadow sprites darken whatever shows beneath them by half.
+            // An MSB-shadow sprite darkens the screen beneath it by half — but
+            // only screens whose SDCTL shadow-receive bit is set (NBG/RBG via
+            // Layer::screen_bit, the back screen via bit 5). C2: previously every
+            // screen was darkened unconditionally.
             if shadow {
-                rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+                let receiver = top.map_or(5, |t| t.layer.screen_bit());
+                if vdp2.regs.shadow_enabled(receiver) {
+                    rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+                }
             }
             put_pixel(out, x, y, w, rgb.0, rgb.1, rgb.2);
         }
     }
     (w, h)
+}
+
+/// Which screen produced a dot — used by the per-layer enables (line-colour
+/// insertion, special priority, shadow) to look up the right control bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Sprite,
+    Nbg(u8),
+    Rbg(u8),
+}
+
+impl Layer {
+    /// Bit position in the per-layer enable registers that share the VDP2
+    /// "screen" ordering (LNCLEN line-colour, etc.): NBG0/RBG1 = 0, NBG1 = 1,
+    /// NBG2 = 2, NBG3 = 3, RBG0 = 4, sprite = 5.
+    fn screen_bit(self) -> u8 {
+        match self {
+            Layer::Sprite => 5,
+            Layer::Rbg(0) => 4,
+            Layer::Nbg(n) => n,
+            Layer::Rbg(_) => 0, // RBG1 shares NBG0's slot
+        }
+    }
 }
 
 /// One layer's contribution at a pixel: priority, colour, and the colour-calc
@@ -166,6 +209,7 @@ struct Dot {
     pri: u8,
     rgb: (u8, u8, u8),
     cc: Option<(u8, bool)>,
+    layer: Layer,
 }
 
 /// Look up CRAM palette `index` honouring the live CRAM mode (RGB555 for
@@ -173,6 +217,36 @@ struct Dot {
 #[inline]
 fn cram(vdp2: &Vdp2, index: usize) -> (u8, u8, u8) {
     vdp2.cram.color_rgb888(index, vdp2.regs.cram_mode())
+}
+
+/// The back-screen (backdrop) colour for scanline `y`: RGB555 read from VRAM at
+/// the BKTA table. In per-line-colour mode the table advances one word per
+/// scanline; otherwise every line reads the same word. (VDP2 manual §back
+/// screen; Mednafen `vdp2_render.cpp` `CurBackColor = VRAM[CurBackTabAddr] &
+/// 0x7FFF`.)
+fn back_color(vdp2: &Vdp2, y: usize) -> (u8, u8, u8) {
+    let (base, per_line) = vdp2.regs.back_screen();
+    let word_addr = if per_line { base + y as u32 } else { base };
+    let entry = vdp2.vram.read16((word_addr & 0x3FFFF) * 2);
+    cram::rgb555_to_888(entry & 0x7FFF)
+}
+
+/// The line-colour-screen colour for scanline `y`, or `None` when no layer
+/// enables it (LNCLEN = 0). The per-line CRAM index is read from VRAM at the
+/// LCTA table (advancing one word per line in per-line mode) and looked up in
+/// CRAM. (VDP2 manual §line colour screen; Mednafen `CurLCColor`.)
+///
+/// **Simplified model:** the line colour is used as the below-reference of an
+/// LNCLEN-enabled top layer's colour calculation, rather than Mednafen's full
+/// per-pixel multi-screen insertion pipeline. Dormant unless LNCLEN is set.
+fn line_color(vdp2: &Vdp2, y: usize) -> Option<(u8, u8, u8)> {
+    if vdp2.regs.line_colour_enable() == 0 {
+        return None;
+    }
+    let (base, per_line) = vdp2.regs.line_colour_screen();
+    let word_addr = if per_line { base + y as u32 } else { base };
+    let index = (vdp2.vram.read16((word_addr & 0x3FFFF) * 2) & 0x07FF) as usize;
+    Some(cram(vdp2, index))
 }
 
 /// The sprite layer's contribution: a normal colour dot, or an MSB shadow that
@@ -271,6 +345,7 @@ fn nbg_layer(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Dot> {
         pri,
         rgb,
         cc: vdp2.regs.nbg_color_calc(n),
+        layer: Layer::Nbg(n as u8),
     })
 }
 
@@ -297,6 +372,7 @@ fn rbg_layer(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Dot> {
         pri,
         rgb,
         cc: vdp2.regs.rbg_color_calc(which),
+        layer: Layer::Rbg(which as u8),
     })
 }
 
@@ -677,6 +753,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
                 pri,
                 rgb: cram::rgb555_to_888(pix),
                 cc: sprite_cc(vdp2, pri, 0),
+                layer: Layer::Sprite,
             })
         });
     }
@@ -697,6 +774,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
         pri,
         rgb: cram(vdp2, code),
         cc: sprite_cc(vdp2, pri, ccidx),
+        layer: Layer::Sprite,
     }))
 }
 
@@ -913,6 +991,16 @@ mod tests {
         v.regs.write16(0x0F8, 0x0001); // PRINA.N0PRIN = 1
     }
 
+    /// Program the back screen (the real backdrop) to an RGB555 colour at a high
+    /// VRAM word, clear of the low-address tile/bitmap data the tests reuse. The
+    /// default BKTA = 0 reads VRAM word 0, so backdrop tests set an explicit
+    /// table address rather than relying on CRAM[0] (the former simplification).
+    fn set_backdrop(v: &mut Vdp2, rgb555: u16) {
+        v.regs.write16(0x0AC, 0x0003); // BKTAU: word-address high bits → 0x3_xxxx
+        v.regs.write16(0x0AE, 0xF000); // BKTAL → word 0x3_F000 (byte 0x7_E000)
+        v.vram.write16(0x3F000 * 2, rgb555);
+    }
+
     #[test]
     fn display_disabled_emits_opaque_black() {
         let v = Vdp2::new();
@@ -927,7 +1015,7 @@ mod tests {
     fn display_enabled_no_layer_fills_with_backdrop() {
         let mut v = Vdp2::new();
         v.regs.write16(0x000, 0x8000); // DISP
-        v.cram.write16(0, 0x001F); // backdrop = red
+        set_backdrop(&mut v, 0x001F); // back screen = red
         let mut buf = fresh_buf();
         let (w, h) = render_frame(&v, None, &mut buf);
         for chunk in buf[..w * h * 4].chunks_exact(4) {
@@ -942,7 +1030,7 @@ mod tests {
         v.regs.write16(0x020, 0x0001); // NBG0 on
         v.regs.write16(0x028, 0x0002); // bitmap
         v.regs.write16(0x0F8, 0x0000); // PRINA.N0PRIN = 0 → hidden
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.cram.write16(2, 0x001F); // index 1 red
         v.vram.write8(0, 1);
         let mut buf = fresh_buf();
@@ -1169,7 +1257,7 @@ mod tests {
         let mut v = Vdp2::new();
         v.regs.write16(0x000, 0x8000); // DISP
         v.regs.write16(0x020, 0x0000); // NBG0 off
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.vram.write8(0, 1);
         v.cram.write16(2, 0x7C00);
         let mut buf = fresh_buf();
@@ -1255,7 +1343,7 @@ mod tests {
     fn priority_zero_sprite_is_not_shown() {
         let mut v = Vdp2::new();
         v.regs.write16(0x000, 0x8000);
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.cram.write16(0x12 * 2, 0x001F);
         // S0PRIN defaults to 0 → sprite hidden.
         let fb = sprite_fb_with(5, 5, 0x0012);
@@ -1489,6 +1577,7 @@ mod tests {
         v.regs.write16(0x0FC, 0x0001); // priority 1
         v.regs.write16(0x03E, 0x0001); // bitmap base 0x20000
         setup_rot_identity(&mut v, 0);
+        set_backdrop(&mut v, 0x0000); // back screen black (BKTA=0 would read VRAM word 0, used below)
         v.vram.write32(0, 0x0200_0000); // Xst = 512 → screen (0,0) → plane (512,0)
         v.cram.write16(2, 0x001F); // red
         v.vram.write8(0x20000, 1); // bitmap dot at (0,0)
@@ -1570,7 +1659,7 @@ mod tests {
         let mut v = Vdp2::new();
         enable_nbg0(&mut v);
         v.regs.write16(0x028, 0x0012); // bitmap, 8bpp
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.cram.write16(2, 0x001F); // index 1 red
         v.vram.write8(0, 1); // (0,0)
         v.vram.write8(2 * 512 + 3, 1); // (3,2)
@@ -1599,6 +1688,7 @@ mod tests {
         enable_nbg0(&mut v);
         v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
         v.regs.write16(0x0E0, 0x0002); // SPCTL.SPTYPE = 2 (shadow-capable)
+        v.regs.write16(0x0E2, 0x0001); // SDCTL: NBG0 receives shadow (C2 gating)
         v.cram.write16(2, 0x7FFF); // index 1 = white (0xFF,0xFF,0xFF)
         v.vram.write8(0, 1); // NBG0 white at (0,0)
         v.vram.write8(512, 1); // NBG0 white at (0,1)
@@ -1688,7 +1778,7 @@ mod tests {
         let mut v = Vdp2::new();
         enable_nbg0(&mut v);
         v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.cram.write16(2, 0x001F); // index 1 red
         v.vram.write8(2 * 512 + 2, 1); // NBG0 dot at (2,2)
         v.vram.write8(2, 1); // NBG0 dot at (2,0)
@@ -1760,7 +1850,7 @@ mod tests {
         let mut v = Vdp2::new();
         enable_nbg0(&mut v);
         v.regs.write16(0x028, 0x0012); // bitmap, 8bpp
-        v.cram.write16(0, 0x1F << 5); // backdrop green
+        set_backdrop(&mut v, 0x1F << 5); // back screen green
         v.cram.write16(2, 0x001F); // index 1 red
         for y in 0..4u32 {
             for x in 0..8u32 {
@@ -2087,6 +2177,7 @@ mod tests {
         v.regs.write16(0x050, 0x0000); // MPABRA plane A map 0
         v.regs.write16(0x0BE, 0x4000); // RPTAL → param table at 0x8000 (off PN)
         setup_rot_param_at(&mut v, 0x8000);
+        set_backdrop(&mut v, 0x0000); // back screen black (BKTA=0 would read VRAM word 0, used below)
         // Plane A PN[0] → char 1; char 1 pixel (0,0) nibble 5 → red.
         v.vram.write16(0, 0x0001);
         v.vram.write8(32, 0x50); // char 1 byte base = 1·0x20

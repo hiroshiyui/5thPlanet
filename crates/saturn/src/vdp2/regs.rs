@@ -277,6 +277,79 @@ impl Vdp2Regs {
         self.bgon() & (1 << bit) != 0
     }
 
+    /// Back-screen table: `(VRAM word address, per-line-colour mode)`. The
+    /// backdrop colour is read as RGB555 from VRAM at this word address — the
+    /// real Saturn backdrop, not CRAM[0]. BKTAU (0x0AC) bits 2..0 are the high
+    /// word-address bits and bit 15 (BKCLMD) selects per-line colour (the table
+    /// advances one word per scanline → gradients); BKTAL (0x0AE) is the low 16
+    /// bits. (VDP2 manual §back screen; Mednafen `vdp2_render.cpp` `BKTA`.)
+    pub fn back_screen(&self) -> (u32, bool) {
+        let upper = self.read16(0x0AC);
+        let lower = self.read16(0x0AE);
+        let addr = (((upper as u32 & 0x0007) << 16) | lower as u32) & 0x7FFFF;
+        (addr, upper & 0x8000 != 0)
+    }
+
+    /// Line-colour-screen table: `(VRAM word address, per-line mode)`. LCTAU
+    /// (0x0A8) bits 2..0 + bit 15 (per-line), LCTAL (0x0AA) low 16. The colour is
+    /// RGB555 masked to the low 11 bits on hardware (`& 0x07FF`); inserted into
+    /// the colour calculation of layers selected by [`Self::line_colour_enable`].
+    pub fn line_colour_screen(&self) -> (u32, bool) {
+        let upper = self.read16(0x0A8);
+        let lower = self.read16(0x0AA);
+        let addr = (((upper as u32 & 0x0007) << 16) | lower as u32) & 0x7FFFF;
+        (addr, upper & 0x8000 != 0)
+    }
+
+    /// Per-layer line-colour-screen insertion enable (LNCLEN, 0x0E8): bit 0
+    /// NBG0/RBG1, 1 NBG1, 2 NBG2, 3 NBG3, 4 RBG0, 5 sprite (Mednafen
+    /// `LineColorEn = V & 0x3F`).
+    pub fn line_colour_enable(&self) -> u8 {
+        (self.read16(0x0E8) & 0x3F) as u8
+    }
+
+    /// Shadow-receive enable for a screen (SDCTL 0x0E2, bits 0..5): NBG0..3 =
+    /// 0..3, RBG0 = 4, back screen = 5 (RBG1 shares NBG0's bit 0). A sprite
+    /// (MSB) shadow only darkens screens with their bit set — Mednafen
+    /// `(SDCTL >> n) & 1` → `PIX_SHADEN`. (VDP2 manual §shadow, SDCTL.)
+    pub fn shadow_enabled(&self, screen_bit: u8) -> bool {
+        self.read16(0x0E2) & (1 << screen_bit) != 0
+    }
+
+    // ---- Special function: priority / colour-calc (C4 — registers modelled) ----
+    //
+    // The special-function machinery lets a layer raise/lower a *per-dot* effect
+    // keyed on the dot's palette code: a colour code whose bit in the selected
+    // SFCODE matches gets a priority-LSB or colour-calc adjustment (Mednafen
+    // `MakeSFCodeLUT`). The registers below are decoded; **the per-dot
+    // application is not yet wired** — it needs the sampler to carry each dot's
+    // palette code out to the compositor, a sizeable change to a dormant feature
+    // (SFPRMD/SFCCMD default 0). Deferred to avoid mis-rendering on an
+    // unvalidatable per-dot path. (VDP2 manual §special priority / colour calc.)
+
+    /// Special-function priority mode for `layer` (SFPRMD 0x0EA, 2 bits each):
+    /// NBG0 0..1, NBG1 2..3, NBG2 4..5, NBG3 6..7, RBG0 8..9. 0 = off (priority
+    /// is the register value), 1 = per-character special bit, 2/3 = per-dot
+    /// SFCODE match.
+    pub fn special_priority_mode(&self, layer: usize) -> u8 {
+        ((self.read16(0x0EA) >> (layer * 2)) & 0x3) as u8
+    }
+
+    /// Special-function colour-calculation mode for `layer` (SFCCMD 0x0EE, 2
+    /// bits each, same layout as SFPRMD).
+    pub fn special_color_calc_mode(&self, layer: usize) -> u8 {
+        ((self.read16(0x0EE) >> (layer * 2)) & 0x3) as u8
+    }
+
+    /// The 8-bit special-function code selected for `layer`: SFSEL (0x024, one
+    /// bit per layer) picks SFCODE-A (low byte) or SFCODE-B (high byte) of
+    /// SFCODE (0x026). A dot triggers the special function when bit
+    /// `(palette_code >> 1) & 7` of this code is set (Mednafen `MakeSFCodeLUT`).
+    pub fn special_function_code(&self, layer: usize) -> u8 {
+        let sel = (self.read16(0x024) >> layer) & 1;
+        (self.read16(0x026) >> (sel * 8)) as u8
+    }
+
     /// Cell size for NBG`n`: 0 = 1×1 cell (8×8 px), 1 = 2×2 cells (16×16 px).
     pub fn nbg_char_size_2x2(&self, n: usize) -> bool {
         let bit = match n {
@@ -1091,5 +1164,50 @@ mod tests {
         // Only the low 11 bits are the integer part.
         r.write16(0x070, 0xF801);
         assert_eq!(r.nbg0_scroll_x(), 1);
+    }
+
+    #[test]
+    fn back_and_line_colour_screen_addresses_decode() {
+        let mut r = Vdp2Regs::new();
+        // BKTAU bits 2..0 are the high word-address bits; bit 15 is per-line.
+        r.write16(0x0AC, 0x8003); // BKCLMD + high bits 3
+        r.write16(0x0AE, 0x1234); // low 16
+        assert_eq!(r.back_screen(), (0x3_1234, true));
+        r.write16(0x0AC, 0x0000);
+        assert_eq!(r.back_screen(), (0x1234, false));
+        // Line-colour table + enable register.
+        r.write16(0x0A8, 0x0001);
+        r.write16(0x0AA, 0x5678);
+        assert_eq!(r.line_colour_screen(), (0x1_5678, false));
+        r.write16(0x0E8, 0x00FF); // LNCLEN masked to 6 bits
+        assert_eq!(r.line_colour_enable(), 0x3F);
+    }
+
+    #[test]
+    fn shadow_enable_bits_decode_per_screen() {
+        let mut r = Vdp2Regs::new();
+        r.write16(0x0E2, 0b11_0001); // NBG0 (0), RBG0 (4), back (5)
+        assert!(r.shadow_enabled(0));
+        assert!(!r.shadow_enabled(1));
+        assert!(r.shadow_enabled(4));
+        assert!(r.shadow_enabled(5));
+    }
+
+    #[test]
+    fn special_function_registers_decode() {
+        let mut r = Vdp2Regs::new();
+        // SFPRMD: NBG0 = mode 2, NBG3 = mode 1, RBG0 = mode 3.
+        r.write16(0x0EA, 2 | (1 << 6) | (3 << 8));
+        assert_eq!(r.special_priority_mode(0), 2);
+        assert_eq!(r.special_priority_mode(3), 1);
+        assert_eq!(r.special_priority_mode(4), 3); // RBG0 in bits 8..9
+        // SFCCMD: NBG1 = mode 2.
+        r.write16(0x0EE, 2 << 2);
+        assert_eq!(r.special_color_calc_mode(1), 2);
+        // SFSEL picks code A/B; SFCODE-A = 0x12, SFCODE-B = 0x34.
+        r.write16(0x026, 0x3412);
+        r.write16(0x024, 0b0010); // layer 1 → code B
+        assert_eq!(r.special_function_code(0), 0x12);
+        assert_eq!(r.special_function_code(1), 0x34);
     }
 }
