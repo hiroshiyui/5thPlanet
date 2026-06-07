@@ -118,6 +118,12 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 fn drain_dma(bus: &mut SaturnBus) -> u64 {
     let mut cost = 0u64;
     while let Some(req) = bus.scu.take_pending_dma() {
+        if std::env::var("DMALOG").is_ok() {
+            eprintln!(
+                "DMA ch{} src={:08X} dst={:08X} bytes={:X} indirect={}",
+                req.channel, req.src, req.dst, req.bytes, req.indirect
+            );
+        }
         let bios_src = |a: u32| a & 0x07F0_0000 == 0;
         let (final_src, final_dst) = if req.indirect {
             // Indirect: `dst` points at {size, dst, src} longword triplets; the
