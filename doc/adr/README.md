@@ -51,6 +51,7 @@ We use Michael Nygard's lightweight format — see
 | [0010](0010-hle-direct-boot.md) | Optional HLE direct boot (load the 1st-read program, bypass the BIOS CD loader) | Superseded |
 | [0011](0011-hle-bios-syscalls.md) | HLE the BIOS system-call library for cold direct boot | Superseded |
 | [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Rejected |
+| [0013](0013-render-pipeline-worker-thread.md) | Render-pipeline worker thread (offload only the read-only render edge) | Accepted |
 
 ### Decisions worth recording (backlog)
 
