@@ -1454,6 +1454,16 @@ impl Saturn {
     /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
     /// pixels are packed tightly with row stride = `width`, so the caller uploads
     /// `width × height` with a `width × 4` pitch.
+    /// Advance one NTSC frame of emulation **without rendering** — the compute
+    /// half of [`Self::run_frame`]. The frontend's render-pipeline worker
+    /// composites the frame on another core from a cloned VDP snapshot, so the
+    /// main thread only needs to advance the machine here. Identical emulation
+    /// to `run_frame` (rendering is observe-only); the displayed pixels are
+    /// produced by `render_frame` elsewhere, bit-for-bit.
+    pub fn advance_frame(&mut self) {
+        self.run_for(CYCLES_PER_FRAME);
+    }
+
     pub fn run_frame(&mut self, out: &mut [u8]) -> (usize, usize) {
         // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
         // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short

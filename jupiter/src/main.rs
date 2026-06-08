@@ -24,6 +24,8 @@ use saturn::cartridge::Cartridge;
 // in a headless non-test build where nothing uses it.
 #[cfg(any(feature = "sdl2-frontend", test))]
 mod osd;
+#[cfg(any(feature = "sdl2-frontend", test))]
+mod render_pipe;
 
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
 /// somehow before the epoch). Used to seed the Saturn RTC.
@@ -310,6 +312,13 @@ fn run(
     // last frame (we redraw the menu over the same frame while it's open).
     let mut compose = vec![0u8; FRAMEBUFFER_BYTES];
     let mut osd = Osd::new();
+    // Render-pipeline worker: composites each frame on a second core from a
+    // cloned VDP snapshot, overlapped with the next frame's emulation, so the
+    // displayed rate rises from the compute+render rate toward compute-only.
+    // The displayed frame trails the emulated frame by one (standard pipeline
+    // latency); `framebuffer` is the main thread's display buffer, the pipe
+    // holds the spare, and they swap each frame.
+    let mut pipe = render_pipe::RenderPipe::new(FRAMEBUFFER_BYTES);
     // Current texture (and frozen-frame) resolution; updated when a game
     // switches video mode so the texture/pitch track the active display size.
     let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
@@ -477,7 +486,22 @@ fn run(
             // texture on change.
             let mut burst = 0;
             while audio_queue.size() < audio_target_bytes && burst < max_frames_per_burst {
-                let dims = saturn.run_frame(&mut framebuffer);
+                // Compute only — the worker composited the *previous* frame
+                // during (and overlapping) this loop; intermediate burst frames
+                // are never displayed, so they're never rendered at all.
+                saturn.advance_frame();
+                audio_queue.queue_audio(&saturn.take_audio()).ok();
+                burst += 1;
+            }
+
+            // Collect the frame the worker rendered while we computed, swap it
+            // in as the display buffer, and hand the old one back as the spare.
+            // (On the very first frame nothing is in flight → keep the black
+            // buffer.) The active resolution comes from the rendered frame, so
+            // the texture is re-created a frame after a game switches modes.
+            if let Some((rendered, dims)) = pipe.wait() {
+                let old = std::mem::replace(&mut framebuffer, rendered);
+                pipe.recycle(old);
                 if dims != cur_dims {
                     texture = creator
                         .create_texture_streaming(
@@ -488,9 +512,10 @@ fn run(
                         .expect("recreate streaming texture");
                     cur_dims = dims;
                 }
-                audio_queue.queue_audio(&saturn.take_audio()).ok();
-                burst += 1;
             }
+            // Dispatch this frame's render on the worker; it overlaps the next
+            // iteration's compute. (No-op if a buffer isn't free yet.)
+            pipe.submit(&saturn);
 
             // Present the latest frame (re-presents the last one if the queue was
             // already full and no frame ran). A lingering toast (e.g. "Quicksave")
