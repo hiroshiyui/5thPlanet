@@ -3126,3 +3126,110 @@ fn menu_dispatch_seqlog() {
         }
     }
 }
+
+/// Fast Doukyuusei menu-render probe via a **save-state snapshot**, to avoid the
+/// ~8-min boot-to-menu on every iteration. The first run (or `FORCE_SNAP=1`)
+/// boots `SNAP_AT` frames (default 2440 — just before START) and writes a
+/// snapshot to `SNAP_FILE`; later runs `load_state` it in milliseconds, inject
+/// START, run `PROBE_FRAMES`, and report. The probe counts executions at
+/// `SEQ_PC` (default 0x011798 — the menu bg-builder pinned via the Mednafen
+/// `SS_WWATCH` diff) over the window; Mednafen runs `0x06011798` 66× and
+/// `0x0601172C` 41× building the brick. If ours' count is 0, the menu skips the
+/// builder (a control-flow gate). `READMEM=addr,len` dumps the bg-buffer body.
+///
+///   BIOS=… cargo test -p saturn --test trace_boot menu_savestate_probe \
+///     -- --ignored --nocapture                 # first run builds the snapshot
+///   SEQ_PC=011798 cargo … menu_savestate_probe -- --ignored --nocapture   # fast
+///   SEQ_PC=01172C READMEM=060F3000,0x40 cargo … menu_savestate_probe -- --ignored --nocapture
+#[test]
+#[ignore = "manual: fast Doukyuusei menu probe via save-state snapshot"]
+fn menu_savestate_probe() {
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    // The disc must be inserted before load_state (it is re-grafted by fingerprint).
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+
+    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2440);
+    let snap_file =
+        std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+
+    if std::env::var("FORCE_SNAP").is_err() && std::path::Path::new(&snap_file).exists() {
+        let bytes = std::fs::read(&snap_file).expect("read snapshot");
+        sat.load_state(&bytes).expect("load_state (BIOS/disc must match the snapshot)");
+        println!("loaded snapshot {snap_file} (≈f{snap_at})");
+    } else {
+        println!("booting to f{snap_at} to build snapshot (one-time)…");
+        for _ in 0..snap_at {
+            sat.run_frame(&mut fb);
+        }
+        let bytes = sat.save_state();
+        std::fs::write(&snap_file, &bytes).expect("write snapshot");
+        println!("wrote snapshot {snap_file} ({} bytes) at f{snap_at}", bytes.len());
+    }
+
+    // Probe from the snapshot: press START shortly after the load, run PROBE_FRAMES.
+    let seq_pc = std::env::var("SEQ_PC")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x01_1798);
+    let seq_reg: usize = std::env::var("SEQ_REG").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let start_at: u32 = std::env::var("START_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let probe_frames: u32 =
+        std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(340);
+    sat.enable_seqlog(seq_pc, seq_reg);
+    let mut hits = 0usize;
+    let mut first_frame: Option<u32> = None;
+    for f in 0..probe_frames {
+        let held = if f >= start_at && f < start_at + 6 { 0x0800u16 } else { 0 };
+        sat.set_pad1(held);
+        sat.run_frame(&mut fb);
+        let n = sat.take_seqlog().len();
+        if n > 0 && first_frame.is_none() {
+            first_frame = Some(f);
+        }
+        hits += n;
+    }
+    println!(
+        "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
+    );
+
+    if let Ok(spec) = std::env::var("READMEM") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if let [base, len] = nums[..] {
+            for off in (0..len).step_by(16) {
+                let mut row = format!("  0x{:08X}:", base + off);
+                for w in 0..4 {
+                    let (v, _) = sat.bus.read32(base + off + w * 4, sh2::bus::AccessKind::Data);
+                    row.push_str(&format!(" {v:08X}"));
+                }
+                println!("{row}");
+            }
+        }
+    }
+}
