@@ -27,7 +27,7 @@ Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
 | SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard → digital pad, F5/F9 save-state hotkeys |
 | Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
 | Backup RAM (battery) | ✅ | Internal 32 KiB backup RAM with hardware odd-byte packing + "BackUpRam Format" default; persisted to a host `.bup` file by the frontend. M8 |
-| On-screen menu (OSD) | 🟡 | Hand-rolled, software-composited in-window menu (ADR-0008): Esc opens it; save/load slots, reset, eject/insert disc, quit. M9 Phase 1 done; graphics / controller / region-BIOS / cartridge submenus pending |
+| On-screen menu (OSD) | 🟡 | Hand-rolled, software-composited in-window menu (ADR-0008): Esc opens it; save/load slots, reset, eject/insert disc, quit, **Settings → Graphics (window scale 1×–4× + fullscreen) / Region (Japan/NA/EU/Asia) / Cartridge (None/Ext-RAM/Backup)**. Controller-rebind submenu + persisted config + BIOS-image swap pending |
 
 **Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ✅ — SEGA splash renders
 · M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
@@ -42,10 +42,11 @@ sector ops.) · **M8 (save states + battery-backed backup RAM) ✅** — full
 deterministic snapshot/restore (`save_state`/`load_state`, bincode + versioned
 header, media referenced not embedded) and a hardware-faithful, host-persisted
 internal backup RAM. See the Milestone 8 section. · **M9 (frontend OSD) 🚧
-active** — Phase 1 done: a hand-rolled, software-composited in-window menu
-(ADR-0008) with save/load slots, reset, eject/insert disc, and quit; Esc opens
-it. Graphics / controller / region-BIOS / cartridge submenus are the remaining
-phases. · **M10 (live physical disc + CDDA→SCSP) ✅** — the `SectorSource`
+active** — Phase 1 done (save/load slots, reset, eject/insert disc, quit; Esc
+opens it) plus the **Settings submenus**: Graphics (window scale 1×–4× +
+fullscreen) and Region / Cartridge (both reset + re-apply). Remaining: a
+controller-rebind submenu (deferred with the input-devices work), a persisted
+config file, and BIOS-image swapping. · **M10 (live physical disc + CDDA→SCSP) ✅** — the `SectorSource`
 trait, CD-audio BGM mixed into the SCSP, and live optical-drive reads via the
 feature-gated `physdisc`/libcdio crate (ADR-0009; verified on a real drive with
 Virtua Fighter 2). See the Milestone 10 section.
@@ -546,9 +547,9 @@ A hand-rolled, ZSNES/fwNES-style on-screen menu in the SDL2 frontend
 | # | Phase | Notes |
 |---|-------|-------|
 | 1 | **OSD framework + core actions** ✅ done | `jupiter/src/osd/` — `font.rs` (embedded CC0 8×8 font + RGBA `fill_rect`/`draw_text`/`dim` primitives) and `mod.rs` (menu state machine). Software-composited into the 320×224 framebuffer; **Esc** opens it; arrows/Enter navigate. Actions: save/load state to 10 slots (`<bios>.<n>.state`), Reset, Eject/Insert disc, Quit; transient toasts. The module is `sdl2`-free + core-free (`&mut [u8]` buffer + a `Nav` enum), so it's unit-tested without a window. Core add: `Saturn::eject_disc`. **Tests:** 12 OSD (font draw + nav state machine, run even with `--no-default-features`) + 1 cd-block (insert→eject NODISC round-trip). |
-| 2 | **Graphics settings** ⬜ | Window scale 1×/2×/3×, fullscreen, integer/aspect scaling. Introduces a serde-backed config file persisted next to the BIOS. |
-| 3 | **Controller settings** ⬜ | Keyboard rebind (config-driven map + press-to-bind UI) + SDL2 GameController (gamepad) support. Persisted. |
-| 4 | **Region/BIOS + cartridge management** ⬜ | Scan `bios/` and power-cycle into a chosen BIOS + matching `set_region`; cartridge submenu over the `Cartridge` variants via `insert_cartridge`. Persisted. |
+| 2 | **Graphics settings** 🟡 scale + fullscreen done (2026-06-08) | A **Settings → Graphics** submenu: **window scale 1×–4×** (cycles; `canvas.window_mut().set_size`, base 320×224 × N) and **fullscreen toggle** (`FullscreenType::Desktop`). Driven by new core-free `OsdAction::SetScale`/`ToggleFullscreen` + `OsdCtx.scale`/`fullscreen`. Integer/aspect-ratio scaling and a persisted serde config file remain deferred. |
+| 3 | **Controller settings** ⬜ deferred | Keyboard rebind (config-driven map + press-to-bind UI) + SDL2 GameController support. **Deferred:** needs an input-remap config layer that overlaps the M-later *input devices* work (analog/3D pad, multitap, mouse) — best done together, not as a one-off OSD screen. |
+| 4 | **Region + cartridge management** 🟡 done (2026-06-08); BIOS-scan deferred | **Settings → Region** (Japan / North America / Europe-PAL / Asia-NTSC — `set_region` + reset, re-applying the cart; the active region is marked) and **Settings → Cartridge** (None / Ext RAM 1M / Ext RAM 4M / Backup RAM — `insert_cartridge` + reset; active marked). New core-free `OsdAction::SetRegion(OsdRegion)`/`SetCartridge(OsdCart)` + the `OsdCtx.region`/`cart` marks; frontend maps the OSD enums to `smpc::region` codes / `Cartridge`. **Deferred:** scanning `bios/` to power-cycle into a *different* BIOS image, and persisting choices to a config file. |
 
 **Related fix landed alongside Phase 1:** with no disc the CD-block now reports
 status `NODISC` (`0x07`) instead of `PAUSE`, matching MAME's no-image reset.
