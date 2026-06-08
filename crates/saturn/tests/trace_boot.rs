@@ -3320,3 +3320,138 @@ fn bench_fps() {
     let render_share = 1.0 - compute.as_secs_f64() / rendered.as_secs_f64();
     println!("render is {:.0}% of the compute+render frame time", render_share * 100.0);
 }
+
+/// Per-stage fps curve across the opening: boots continuously (compute-only,
+/// draining audio each frame like the frontend) and reports the sustained
+/// compute fps over each WINDOW-frame window — so the Inter-Channel / fade /
+/// title-paint / "Press Start" stages show up as distinct fps bands, locating
+/// any dip. Compute-only is the render-pipeline's displayed ceiling, so this is
+/// what the user actually experiences. Run with --release.
+///
+///   STAGE_FRAMES=3000 WINDOW=120 cargo test --release -p saturn --test \
+///     trace_boot bench_stages -- --ignored --nocapture
+#[test]
+#[ignore = "manual: per-stage opening fps curve (run with --release)"]
+fn bench_stages() {
+    use std::time::Instant;
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+    const CYC: u64 = 479_151;
+    let frames: u32 = std::env::var("STAGE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let window: u32 = std::env::var("WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    // Optional START injection (to profile past the title into the menu).
+    let pad_from: u32 = std::env::var("PAD_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+
+    println!("stage fps (compute-only = pipeline ceiling), window={window} frames; ~60 = real-time");
+    let mut t = Instant::now();
+    for f in 0..frames {
+        let held = if f >= pad_from && f < pad_from + 6 { 0x0800u16 } else { 0 };
+        sat.set_pad1(held);
+        sat.run_for(CYC);
+        let _ = sat.take_audio(); // drain so the SCSP mixer doesn't freeze (cap)
+        if (f + 1) % window == 0 {
+            let dt = t.elapsed().as_secs_f64();
+            let fps = window as f64 / dt;
+            let bar = "#".repeat((fps / 2.0).min(40.0) as usize);
+            println!("f{:>5}-{:<5} {:5.1} fps  {bar}", f + 1 - window, f, fps);
+            t = Instant::now();
+        }
+    }
+}
+
+/// Guest-PC histogram at a given opening stage: boots to PROFILE_AT frames, then
+/// histograms the master SH-2 PC over HIST_FRAMES frames (via the full
+/// run_for_traced path) to find which game code dominates — e.g. the heavy
+/// per-frame loop the "Press Start" state runs. The top PCs are the addresses
+/// to disassemble / trace-diff against Mednafen. Run with --release.
+///
+///   PROFILE_AT=2400 HIST_FRAMES=12 cargo test --release -p saturn --test \
+///     trace_boot presstart_pchist -- --ignored --nocapture
+#[test]
+#[ignore = "manual: master-PC histogram at an opening stage (run with --release)"]
+fn presstart_pchist() {
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+    const CYC: u64 = 479_151;
+    let at: u32 = std::env::var("PROFILE_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2400);
+    let nframes: u32 = std::env::var("HIST_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    for _ in 0..at {
+        sat.run_for(CYC);
+        let _ = sat.take_audio();
+    }
+    let mut h: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut pcs = Vec::new();
+    let mut total = 0u64;
+    for _ in 0..nframes {
+        pcs.clear();
+        sat.run_for_traced(CYC, &mut pcs);
+        for &pc in &pcs {
+            *h.entry(pc).or_default() += 1;
+        }
+        total += pcs.len() as u64;
+        let _ = sat.take_audio();
+    }
+    let mut v: Vec<(u32, u64)> = h.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("master-PC histogram at ~f{at} ({total} insns / {nframes} frames), top 30:");
+    for (pc, n) in v.iter().take(30) {
+        println!("  {pc:08X}  {:5.2}%  ({n})", *n as f64 / total as f64 * 100.0);
+    }
+    // Also bucket by 64 KiB region to show where the work concentrates.
+    let mut region: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for (pc, n) in &v {
+        *region.entry(pc & 0xFFFF_0000).or_default() += n;
+    }
+    let mut rv: Vec<(u32, u64)> = region.into_iter().collect();
+    rv.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("by 64KiB region:");
+    for (base, n) in rv.iter().take(8) {
+        println!("  {base:08X}  {:5.1}%", *n as f64 / total as f64 * 100.0);
+    }
+}
