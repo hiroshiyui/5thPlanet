@@ -322,11 +322,25 @@ fn run(
     // Current texture (and frozen-frame) resolution; updated when a game
     // switches video mode so the texture/pitch track the active display size.
     let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
-    // Audio-paced emulation: keep ~this many bytes of SCSP output buffered in the
-    // SDL queue. `44_100 * 2 * 2` is one second (44.1 kHz × 2 channels × 2 bytes),
-    // so `/ 12` ≈ 83 ms (~5 frames) — comfortably above SDL's ~23 ms period. The
-    // audio draining in real time, not the display vsync, sets the emulator speed.
-    let audio_target_bytes = 44_100 * 2 * 2 / 12;
+    // Audio-paced emulation: keep ~`SAT_AUDIO_MS` of SCSP output buffered in the
+    // SDL queue (44.1 kHz × 2 channels × 2 bytes = 176_400 bytes/s). The audio
+    // draining in real time — not the display vsync — sets the emulator speed,
+    // and this buffer is the reserve that rides out compute dips below real-time.
+    //
+    // The default 120 ms is low-latency. A *larger* buffer (e.g. `SAT_AUDIO_MS=
+    // 1000`) is pre-filled during the surplus stages and then drains across a
+    // heavy stage, so it covers a normal pass through a sub-real-time screen
+    // (e.g. a software-rendered title's "Press Start") without the audio queue
+    // under-running into the "buzz" — at the cost of that much audio latency.
+    // Ideal for latency-tolerant games (visual novels); keep it small for
+    // twitch/action games. It only delays, not cures, an *indefinitely* lingered
+    // sustained deficit (the reserve drains at the deficit rate); the real cure
+    // for that is faster compute. Audio samples are unchanged — accuracy-neutral.
+    let audio_ms: u64 = std::env::var("SAT_AUDIO_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
     // Cap emulated frames run per *displayed* frame. This is the smoothness
     // knob: the burst below advances the machine until audio is buffered, but
     // only the LAST frame of the burst is ever presented — so a large cap turns
