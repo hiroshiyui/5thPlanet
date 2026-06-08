@@ -34,6 +34,26 @@ pub enum Nav {
     Back,
 }
 
+/// SMPC region, named in the OSD's own terms so the module stays core-free; the
+/// frontend maps these to `saturn::smpc::region` codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsdRegion {
+    Japan,
+    NorthAmerica,
+    EuropePal,
+    AsiaNtsc,
+}
+
+/// Rear-slot cartridge kind, in the OSD's own terms (frontend maps to
+/// `saturn::cartridge::Cartridge`). Backup-RAM size is the frontend's default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsdCart {
+    None,
+    ExtRam1M,
+    ExtRam4M,
+    BackupRam,
+}
+
 /// An effect the frontend must carry out. The OSD itself never touches the
 /// emulator; it just says what the user chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +65,14 @@ pub enum OsdAction {
     EjectDisc,
     ReinsertDisc,
     Quit,
+    /// Set the window scale (1..=4× the base 320×224); frontend window op.
+    SetScale(u8),
+    /// Toggle borderless-desktop fullscreen; frontend window op.
+    ToggleFullscreen,
+    /// Switch SMPC region (frontend applies it and resets the machine).
+    SetRegion(OsdRegion),
+    /// Swap the rear-slot cartridge (frontend applies it and resets).
+    SetCartridge(OsdCart),
 }
 
 /// Dynamic context the frontend supplies each draw so labels reflect live
@@ -54,6 +82,14 @@ pub struct OsdCtx {
     pub disc_present: bool,
     /// Whether each save slot already has a file on disk.
     pub slot_used: [bool; SLOTS],
+    /// Current window scale (1..=4×) — shown on the Graphics screen.
+    pub scale: u8,
+    /// Whether the window is currently fullscreen.
+    pub fullscreen: bool,
+    /// Current SMPC region — the Region screen marks it.
+    pub region: OsdRegion,
+    /// Current rear-slot cartridge — the Cartridge screen marks it.
+    pub cart: OsdCart,
 }
 
 /// Which screen is on top of the stack.
@@ -64,6 +100,11 @@ enum Screen {
     Slots {
         saving: bool,
     },
+    /// Settings hub → Graphics / Region / Cartridge.
+    Settings,
+    Graphics,
+    Region,
+    Cartridge,
 }
 
 /// One menu item: its label is computed from [`OsdCtx`] at draw time.
@@ -168,6 +209,7 @@ impl Osd {
                 } else {
                     mk("Insert Disc", Select::Emit(OsdAction::ReinsertDisc))
                 },
+                mk("Settings", Select::Push(Screen::Settings)),
                 mk("Quit", Select::Emit(OsdAction::Quit)),
             ],
             Screen::Slots { saving } => {
@@ -186,6 +228,54 @@ impl Osd {
                 v.push(mk("Back", Select::Close)); // Close here means "pop one"
                 v
             }
+            Screen::Settings => vec![
+                mk("Graphics", Select::Push(Screen::Graphics)),
+                mk("Region", Select::Push(Screen::Region)),
+                mk("Cartridge", Select::Push(Screen::Cartridge)),
+                mk("Back", Select::Close),
+            ],
+            Screen::Graphics => {
+                // Scale cycles 1→2→3→4→1 on each activation.
+                let next = ctx.scale % 4 + 1;
+                vec![
+                    mk(
+                        &format!("Scale: {}x", ctx.scale),
+                        Select::Emit(OsdAction::SetScale(next)),
+                    ),
+                    mk(
+                        &format!("Fullscreen: {}", if ctx.fullscreen { "On" } else { "Off" }),
+                        Select::Emit(OsdAction::ToggleFullscreen),
+                    ),
+                    mk("Back", Select::Close),
+                ]
+            }
+            Screen::Region => {
+                // The active region is marked with a leading '*'.
+                let row = |name: &str, r: OsdRegion| {
+                    let mark = if ctx.region == r { "* " } else { "  " };
+                    mk(&format!("{mark}{name}"), Select::Emit(OsdAction::SetRegion(r)))
+                };
+                vec![
+                    row("Japan", OsdRegion::Japan),
+                    row("North America", OsdRegion::NorthAmerica),
+                    row("Europe (PAL)", OsdRegion::EuropePal),
+                    row("Asia (NTSC)", OsdRegion::AsiaNtsc),
+                    mk("Back", Select::Close),
+                ]
+            }
+            Screen::Cartridge => {
+                let row = |name: &str, k: OsdCart| {
+                    let mark = if ctx.cart == k { "* " } else { "  " };
+                    mk(&format!("{mark}{name}"), Select::Emit(OsdAction::SetCartridge(k)))
+                };
+                vec![
+                    row("None", OsdCart::None),
+                    row("Ext RAM 1M", OsdCart::ExtRam1M),
+                    row("Ext RAM 4M", OsdCart::ExtRam4M),
+                    row("Backup RAM", OsdCart::BackupRam),
+                    mk("Back", Select::Close),
+                ]
+            }
         }
     }
 
@@ -194,6 +284,10 @@ impl Osd {
             Screen::Main => "5thPlanet",
             Screen::Slots { saving: true } => "Save State",
             Screen::Slots { saving: false } => "Load State",
+            Screen::Settings => "Settings",
+            Screen::Graphics => "Graphics",
+            Screen::Region => "Region",
+            Screen::Cartridge => "Cartridge",
         }
     }
 
@@ -324,7 +418,23 @@ mod tests {
         OsdCtx {
             disc_present: disc,
             slot_used: [false; SLOTS],
+            scale: 2,
+            fullscreen: false,
+            region: OsdRegion::Japan,
+            cart: OsdCart::None,
         }
+    }
+
+    /// Navigate from the main screen to a named item by repeated Down, then
+    /// Select. Returns the action (if any) the Select produced.
+    fn select_main(osd: &mut Osd, c: &OsdCtx, label: &str) -> Option<OsdAction> {
+        // Find the index of `label` on the current screen.
+        let items = osd.items(osd.screen(), c);
+        let idx = items.iter().position(|it| it.label == label).expect("item exists");
+        for _ in 0..idx {
+            osd.handle(Nav::Down, c);
+        }
+        osd.handle(Nav::Select, c)
     }
 
     #[test]
@@ -425,5 +535,83 @@ mod tests {
         assert!(osd.toast.is_some());
         osd.tick_toast();
         assert!(osd.toast.is_none());
+    }
+
+    #[test]
+    fn settings_graphics_cycles_scale_and_toggles_fullscreen() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // scale = 2, fullscreen = false
+        assert_eq!(select_main(&mut osd, &c, "Settings"), None); // push Settings
+        assert_eq!(select_main(&mut osd, &c, "Graphics"), None); // push Graphics
+        // Scale 2 → next is 3.
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::SetScale(3)));
+        // Fullscreen item toggles.
+        osd.handle(Nav::Down, &c);
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ToggleFullscreen));
+    }
+
+    #[test]
+    fn graphics_scale_wraps_4_to_1() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.scale = 4;
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Graphics");
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::SetScale(1)));
+    }
+
+    #[test]
+    fn region_screen_emits_selected_region() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // region = Japan (marked)
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Region");
+        // Region order: Japan, North America, Europe, Asia, Back.
+        assert_eq!(
+            select_main(&mut osd, &c, "  Europe (PAL)"),
+            Some(OsdAction::SetRegion(OsdRegion::EuropePal))
+        );
+    }
+
+    #[test]
+    fn region_marks_the_active_region() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.region = OsdRegion::NorthAmerica;
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Region");
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label == "* North America"));
+        assert!(items.iter().any(|it| it.label == "  Japan"));
+    }
+
+    #[test]
+    fn cartridge_screen_emits_selected_cart() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // cart = None
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Cartridge");
+        assert_eq!(
+            select_main(&mut osd, &c, "  Ext RAM 4M"),
+            Some(OsdAction::SetCartridge(OsdCart::ExtRam4M))
+        );
+    }
+
+    #[test]
+    fn settings_back_returns_to_main_then_resume() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        select_main(&mut osd, &c, "Settings");
+        // Back from Settings pops to Main (still open).
+        assert_eq!(osd.handle(Nav::Back, &c), None);
+        assert!(osd.is_open());
+        // Back from Main closes/resumes.
+        assert_eq!(osd.handle(Nav::Back, &c), Some(OsdAction::Resume));
     }
 }

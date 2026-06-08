@@ -234,6 +234,14 @@ fn run(
         return ExitCode::from(1);
     }
     let launched_spec = disc_spec;
+    // Remember the launched config so the OSD Settings screens can mark the
+    // active region / cartridge and re-apply it across a runtime change.
+    let mut ui = UiState {
+        scale: 2,
+        fullscreen: false,
+        region: region_code_to_osd(region),
+        cart: cartridge_to_osd(&cart),
+    };
     saturn.insert_cartridge(cart);
 
     // Save-state quickslot and the persisted battery (internal backup RAM),
@@ -342,6 +350,10 @@ fn run(
         let ctx = OsdCtx {
             disc_present: saturn.has_disc(),
             slot_used: std::array::from_fn(|n| slot_path(n as u8).exists()),
+            scale: ui.scale,
+            fullscreen: ui.fullscreen,
+            region: ui.region,
+            cart: ui.cart,
         };
 
         for ev in events.poll_iter() {
@@ -360,7 +372,15 @@ fn run(
                         _ => None,
                     };
                     if let Some(action) = action
-                        && dispatch_osd(action, &mut osd, &mut saturn, &save_base, &launched_spec)
+                        && dispatch_osd(
+                            action,
+                            &mut osd,
+                            &mut saturn,
+                            &save_base,
+                            &launched_spec,
+                            &mut ui,
+                            &mut canvas,
+                        )
                     {
                         break 'main; // Quit
                     }
@@ -499,6 +519,62 @@ fn run(
     ExitCode::SUCCESS
 }
 
+/// Mutable frontend display/config state the Settings screens read (for their
+/// active-item marks) and write (when the user changes a setting).
+#[cfg(feature = "sdl2-frontend")]
+struct UiState {
+    scale: u8,
+    fullscreen: bool,
+    region: osd::OsdRegion,
+    cart: osd::OsdCart,
+}
+
+#[cfg(feature = "sdl2-frontend")]
+fn region_code_to_osd(code: u8) -> osd::OsdRegion {
+    use saturn::smpc::region;
+    match code {
+        c if c == region::NORTH_AMERICA => osd::OsdRegion::NorthAmerica,
+        c if c == region::EUROPE_PAL => osd::OsdRegion::EuropePal,
+        c if c == region::ASIA_NTSC => osd::OsdRegion::AsiaNtsc,
+        _ => osd::OsdRegion::Japan,
+    }
+}
+
+#[cfg(feature = "sdl2-frontend")]
+fn osd_region_to_code(r: osd::OsdRegion) -> u8 {
+    use saturn::smpc::region;
+    match r {
+        osd::OsdRegion::Japan => region::JAPAN,
+        osd::OsdRegion::NorthAmerica => region::NORTH_AMERICA,
+        osd::OsdRegion::EuropePal => region::EUROPE_PAL,
+        osd::OsdRegion::AsiaNtsc => region::ASIA_NTSC,
+    }
+}
+
+/// Best-effort identification of an inserted cartridge for the Settings mark.
+/// A ROM cart has no Settings equivalent (you can't re-create it from the menu),
+/// so it reads as `None` — selecting a menu cart would replace it.
+#[cfg(feature = "sdl2-frontend")]
+fn cartridge_to_osd(c: &Cartridge) -> osd::OsdCart {
+    match c {
+        Cartridge::Dram { id, .. } if *id == 0x5C => osd::OsdCart::ExtRam4M,
+        Cartridge::Dram { .. } => osd::OsdCart::ExtRam1M,
+        Cartridge::Bram { .. } => osd::OsdCart::BackupRam,
+        Cartridge::None | Cartridge::Rom { .. } => osd::OsdCart::None,
+    }
+}
+
+#[cfg(feature = "sdl2-frontend")]
+fn osd_cart_to_cartridge(c: osd::OsdCart) -> Cartridge {
+    match c {
+        osd::OsdCart::None => Cartridge::None,
+        osd::OsdCart::ExtRam1M => Cartridge::ext_ram_1mb(),
+        osd::OsdCart::ExtRam4M => Cartridge::ext_ram_4mb(),
+        // The 32 Mbit default, matching `--cart=bram`.
+        osd::OsdCart::BackupRam => Cartridge::backup_ram(0x0040_0000),
+    }
+}
+
 /// Carry out a menu action against the running machine. Returns `true` if the
 /// emulator should quit. Save-state slots live at `<bios>.<n>.state`.
 #[cfg(feature = "sdl2-frontend")]
@@ -508,8 +584,12 @@ fn dispatch_osd(
     saturn: &mut saturn::Saturn,
     save_base: &std::path::Path,
     launched_spec: &Option<String>,
+    ui: &mut UiState,
+    canvas: &mut sdl2::render::WindowCanvas,
 ) -> bool {
     use osd::OsdAction;
+    use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH};
+    use sdl2::video::FullscreenType;
     let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
     match action {
         OsdAction::Resume => osd.close(),
@@ -544,6 +624,59 @@ fn dispatch_osd(
             },
             None => osd.set_toast("No disc to insert", 120),
         },
+        OsdAction::SetScale(s) => {
+            ui.scale = s;
+            // Window pixels = base 320×224 × scale; the canvas stretches the
+            // texture to fill, so no texture re-create is needed.
+            let _ = canvas
+                .window_mut()
+                .set_size(FRAME_WIDTH as u32 * s as u32, FRAME_HEIGHT as u32 * s as u32);
+            osd.set_toast(format!("Scale {s}x"), 90);
+        }
+        OsdAction::ToggleFullscreen => {
+            ui.fullscreen = !ui.fullscreen;
+            let mode = if ui.fullscreen {
+                FullscreenType::Desktop
+            } else {
+                FullscreenType::Off
+            };
+            let _ = canvas.window_mut().set_fullscreen(mode);
+            osd.set_toast(
+                if ui.fullscreen { "Fullscreen on" } else { "Fullscreen off" },
+                90,
+            );
+        }
+        OsdAction::SetRegion(r) => {
+            // A region change is a hardware-level change: reset and re-apply the
+            // boot config (region + current cart). The disc stays inserted, so
+            // the machine re-boots from it under the new region.
+            ui.region = r;
+            saturn.reset();
+            saturn.set_region(osd_region_to_code(r));
+            saturn.insert_cartridge(osd_cart_to_cartridge(ui.cart));
+            let name = match r {
+                osd::OsdRegion::Japan => "Japan",
+                osd::OsdRegion::NorthAmerica => "North America",
+                osd::OsdRegion::EuropePal => "Europe (PAL)",
+                osd::OsdRegion::AsiaNtsc => "Asia (NTSC)",
+            };
+            osd.set_toast(format!("Region: {name} (reset)"), 150);
+            osd.close();
+        }
+        OsdAction::SetCartridge(k) => {
+            ui.cart = k;
+            saturn.reset();
+            saturn.set_region(osd_region_to_code(ui.region));
+            saturn.insert_cartridge(osd_cart_to_cartridge(k));
+            let name = match k {
+                osd::OsdCart::None => "None",
+                osd::OsdCart::ExtRam1M => "Ext RAM 1M",
+                osd::OsdCart::ExtRam4M => "Ext RAM 4M",
+                osd::OsdCart::BackupRam => "Backup RAM",
+            };
+            osd.set_toast(format!("Cartridge: {name} (reset)"), 150);
+            osd.close();
+        }
     }
     false
 }
