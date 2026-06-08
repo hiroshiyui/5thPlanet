@@ -338,3 +338,44 @@ fn special_priority_mode2_raises_lsb_by_sfcode() {
     let b = (60 * FRAME_WIDTH + 52) * 4;
     assert_eq!(&out[b..b + 4], &[0, 255, 0, 0xFF], "code 2: NBG0 prio→2, NBG1 shows (green)");
 }
+
+#[test]
+fn rpmd_selects_rotation_parameter_set_for_rbg0() {
+    // RBG0 drives its geometry from rotation parameter set A or B per RPMD.
+    // Both sets use an identity transform but address different bitmap bases
+    // (MPOFR), so RPMD=0 shows parameter A's bitmap and RPMD=1 parameter B's.
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0 only
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // CHCTLB: R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR (RBG0 priority) = 1
+    sat.bus.write16(0x05F8_003E, 0x0010, AccessKind::Data); // MPOFR: param B base offset 1
+    // Rotation parameter table at VRAM byte 0x40000 (RPTA word addr 0x20000).
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
+    // Identity transform for parameter set A (0x40000) and B (0x40080).
+    for base in [0x40000u32, 0x40080] {
+        for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+            sat.bus.vdp2.vram.write32(base + k * 4, val);
+        }
+    }
+    // CRAM: code 1 = red (param A bitmap), code 2 = green (param B bitmap).
+    sat.bus.vdp2.cram.write16(2, 0x001F);
+    sat.bus.vdp2.cram.write16(4, 0x03E0);
+    // Bitmap dot at plane (10,10): param A base 0 → red, param B base 0x20000 → green.
+    sat.bus.vdp2.vram.write8(10 * 512 + 10, 1);
+    sat.bus.vdp2.vram.write8(0x20000 + 10 * 512 + 10, 2);
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    let px = (10 * FRAME_WIDTH + 10) * 4;
+
+    sat.bus.write16(0x05F8_00B0, 0x0000, AccessKind::Data); // RPMD = 0 → param A
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[0xFF, 0, 0, 0xFF], "RPMD=0 → param A bitmap (red)");
+
+    sat.bus.write16(0x05F8_00B0, 0x0001, AccessKind::Data); // RPMD = 1 → param B
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[0, 0xFF, 0, 0xFF], "RPMD=1 → param B bitmap (green)");
+}

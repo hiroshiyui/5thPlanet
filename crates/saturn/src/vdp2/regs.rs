@@ -810,6 +810,14 @@ impl Vdp2Regs {
     pub fn rotation_table_addr(&self) -> u32 {
         (((self.read16(0x0BC) & 0x7) as u32) << 16 | self.read16(0x0BE) as u32) << 1
     }
+    /// Rotation-parameter mode (RPMD, 0x0B0 bits 1..0) — how RBG0 selects between
+    /// rotation parameter set A and B: 0 = A, 1 = B, 2 = per-dot (coefficient
+    /// MSB), 3 = rotation-parameter window. Mednafen forces it to 0 when RBG1 is
+    /// active (`EffRPMD = (BGON & 0x20) ? 0 : RPMD`). Modes 2/3 need per-dot
+    /// coefficient sampling / a rotation window and are not yet wired.
+    pub fn rotation_param_mode(&self) -> u8 {
+        (self.read16(0x0B0) & 0x3) as u8
+    }
     /// Rotation plane-A map number (low 6 bits): RA from MPABRA (0x050), RB
     /// from MPABRB (0x060).
     pub fn rbg_plane_a_map(&self, which: usize) -> u16 {

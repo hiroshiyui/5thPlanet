@@ -524,7 +524,20 @@ fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32,
     } else {
         (x, y)
     };
-    let s = sample_rbg(vdp2, which, mx, my)?;
+    // Rotation parameter set (geometry/coefficient/plane): RBG0 picks per RPMD —
+    // A (0) or B (1) whole-layer — while RBG1 is fixed to param B. RPMD is forced
+    // to A when RBG1 is active (dual-rotation mode). Modes 2/3 (per-dot coeff /
+    // rotation window) fall back to A pending the per-dot coefficient rework.
+    let param = if which == 0 {
+        if vdp2.regs.rbg_enabled(1) {
+            0
+        } else {
+            (vdp2.regs.rotation_param_mode() == 1) as usize
+        }
+    } else {
+        1
+    };
+    let s = sample_rbg(vdp2, param, which, mx, my)?;
     let (pri, cc) = resolve_special(
         prio_reg,
         vdp2.regs.rbg_color_calc(which),
@@ -1010,13 +1023,16 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
     }))
 }
 
-/// Sample rotation background `which` at screen `(x, y)`: transform through
-/// its parameter table, then read the rotation plane (bitmap or tile).
-fn sample_rbg(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Sample> {
-    let mut rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), which);
+/// Sample a rotation background at screen `(x, y)`, using rotation parameter set
+/// `param` (0 = A, 1 = B) for the geometry/coefficient/plane and `layer` (the
+/// RBG layer, 0/1) for the per-layer colour attributes (CRAM offset, transparent
+/// pen). RBG0 may drive itself from either parameter set via RPMD; RBG1 is fixed
+/// to set B — hence the two indices are kept distinct.
+fn sample_rbg(vdp2: &Vdp2, param: usize, layer: usize, x: u32, y: u32) -> Option<Sample> {
+    let mut rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), param);
     // Per-line coefficient table: overrides kx/ky (giving perspective) or makes
     // the whole line transparent.
-    match rot_line_coeff(vdp2, which, &rp, y) {
+    match rot_line_coeff(vdp2, param, &rp, y) {
         Coeff::Off => {}
         Coeff::Transparent => return None,
         Coeff::Set(kx, ky) => {
@@ -1027,9 +1043,9 @@ fn sample_rbg(vdp2: &Vdp2, which: usize, x: u32, y: u32) -> Option<Sample> {
     let (plane_x, plane_y) = rp.transform(x as i32, y as i32);
     let depth = vdp2.regs.rbg_color_mode();
     if vdp2.regs.rbg_bitmap_enabled() {
-        sample_rot_bitmap(vdp2, which, depth, plane_x, plane_y)
+        sample_rot_bitmap(vdp2, param, layer, depth, plane_x, plane_y)
     } else {
-        sample_rot_tile(vdp2, which, depth, plane_x, plane_y)
+        sample_rot_tile(vdp2, param, layer, depth, plane_x, plane_y)
     }
 }
 
@@ -1082,12 +1098,13 @@ fn rot_line_coeff(vdp2: &Vdp2, which: usize, rp: &RotationParams, y: u32) -> Coe
 
 fn sample_rot_bitmap(
     vdp2: &Vdp2,
-    which: usize,
+    param: usize,
+    layer: usize,
     depth: u8,
     plane_x: i32,
     plane_y: i32,
 ) -> Option<Sample> {
-    let base = vdp2.regs.rbg_bitmap_base(which);
+    let base = vdp2.regs.rbg_bitmap_base(param);
     let w: i32 = 512;
     let h: i32 = if vdp2.regs.rbg_bitmap_size() == 0 {
         256
@@ -1096,7 +1113,7 @@ fn sample_rot_bitmap(
     };
     // Screen-over modes 2/3 leave the area outside the bitmap transparent;
     // mode 0/1 repeat it.
-    let over = vdp2.regs.rbg_screen_over(which);
+    let over = vdp2.regs.rbg_screen_over(param);
     let (px, py) = if over == 2 || over == 3 {
         if plane_x < 0 || plane_y < 0 || plane_x >= w || plane_y >= h {
             return None;
@@ -1106,8 +1123,8 @@ fn sample_rot_bitmap(
         (plane_x.rem_euclid(w) as u32, plane_y.rem_euclid(h) as u32)
     };
     let w = w as u32;
-    let coff = vdp2.regs.rbg_color_ram_offset(which);
-    let tpon = vdp2.regs.rbg_transparent_pen_solid(which);
+    let coff = vdp2.regs.rbg_color_ram_offset(layer);
+    let tpon = vdp2.regs.rbg_transparent_pen_solid(layer);
     let (spr, scc) = (
         vdp2.regs.rbg_bitmap_special_priority(),
         vdp2.regs.rbg_bitmap_special_calc(),
@@ -1150,7 +1167,8 @@ fn sample_rot_bitmap(
 /// (shared with the NBG tile path).
 fn sample_rot_tile(
     vdp2: &Vdp2,
-    which: usize,
+    param: usize,
+    layer: usize,
     depth: u8,
     plane_x: i32,
     plane_y: i32,
@@ -1158,7 +1176,7 @@ fn sample_rot_tile(
     let r = &vdp2.regs;
     let two_cells = r.rbg_char_size_2x2();
     let one_word = r.rbg_pn_one_word();
-    let plane_size = (r.rbg_plane_size(which) & 3) as u32;
+    let plane_size = (r.rbg_plane_size(param) & 3) as u32;
     let cell_px = if two_cells { 16 } else { 8 };
     let pg_tiles = if two_cells { 32 } else { 64 };
     let entry_bytes = if one_word { 2 } else { 4 };
@@ -1171,7 +1189,7 @@ fn sample_rot_tile(
     let page_px = pg_tiles * cell_px;
     let plane_w = pages_x * page_px;
     let plane_h = pages_y * page_px;
-    let over = vdp2.regs.rbg_screen_over(which);
+    let over = vdp2.regs.rbg_screen_over(param);
     let (field_w, field_h) = if over == 3 {
         (page_px, page_px) // transparent outside a single 512×512 area
     } else {
@@ -1200,7 +1218,7 @@ fn sample_rot_tile(
     let (xoff, yoff) = (tx % pg_tiles, ty % pg_tiles);
 
     // Plane base: align the plane number to the plane size, then scale.
-    let plane_num = r.rbg_plane_number(which, plane_idx);
+    let plane_num = r.rbg_plane_number(param, plane_idx);
     let shift = [0u32, 1, 2, 2][plane_size as usize];
     let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
     let upper_mask = 0x1FF >> upper_shift;
@@ -1217,8 +1235,8 @@ fn sample_rot_tile(
         sup_scc: r.rbg_pn_special_calc(),
     };
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
-    let coff = r.rbg_color_ram_offset(which);
-    let tpon = r.rbg_transparent_pen_solid(which);
+    let coff = r.rbg_color_ram_offset(layer);
+    let tpon = r.rbg_transparent_pen_solid(layer);
     sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon)
 }
 
