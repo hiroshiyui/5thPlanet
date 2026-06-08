@@ -3236,3 +3236,87 @@ fn menu_savestate_probe() {
         }
     }
 }
+
+/// Measure ours' sustained emulation frame rate vs the real-machine target
+/// (~60 fps NTSC). Loads the cached menu snapshot (a 640 hi-res Doukyuusei
+/// scene — the heavy case) and times BENCH_FRAMES (default 600) two ways:
+/// `run_for` (compute only) and `run_frame` (compute + the 640×224 composite),
+/// so the render fraction is visible. RUN IN RELEASE for a meaningful number:
+///
+///   cargo test --release -p saturn --test trace_boot bench_fps \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "manual: sustained-fps benchmark (run with --release)"]
+fn bench_fps() {
+    use std::time::Instant;
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let snap_file =
+        std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
+    const CYC: u64 = 479_151;
+    let snap = if std::path::Path::new(&snap_file).exists() {
+        std::fs::read(&snap_file).expect("read snapshot")
+    } else {
+        println!("building snapshot to f{snap_at} (one-time, no-render)…");
+        for _ in 0..snap_at {
+            sat.run_for(CYC);
+        }
+        let b = sat.save_state();
+        std::fs::write(&snap_file, &b).expect("write snapshot");
+        b
+    };
+    sat.load_state(&snap).expect("load_state (BIOS/disc must match)");
+
+    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+
+    // Compute only (run_for): the CPU/bus/SCSP cost without rendering.
+    let t0 = Instant::now();
+    for _ in 0..n {
+        sat.run_for(CYC);
+    }
+    let compute = t0.elapsed();
+
+    // Compute + render (run_frame): the full per-frame cost the frontend pays,
+    // over the SAME emulated range (reload the snapshot first).
+    sat.load_state(&snap).expect("reload");
+    let t1 = Instant::now();
+    let mut dims = (0usize, 0usize);
+    for _ in 0..n {
+        dims = sat.run_frame(&mut fb);
+    }
+    let rendered = t1.elapsed();
+
+    let cfps = n as f64 / compute.as_secs_f64();
+    let rfps = n as f64 / rendered.as_secs_f64();
+    println!("--- ours sustained fps (snapshot ≈f{snap_at}, {}×{}) ---", dims.0, dims.1);
+    println!("compute-only : {n} frames in {compute:?} = {cfps:.1} fps");
+    println!("compute+render: {n} frames in {rendered:?} = {rfps:.1} fps");
+    println!("real-time target ≈ 60 fps NTSC → headroom: {:.0}% (render path)", rfps / 60.0 * 100.0);
+    let render_share = 1.0 - compute.as_secs_f64() / rendered.as_secs_f64();
+    println!("render is {:.0}% of the compute+render frame time", render_share * 100.0);
+}
