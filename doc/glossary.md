@@ -133,6 +133,13 @@ only handles chunky.
 [SCU]. Bits 0–2 select start factor; bit 8 (DGO) is the manual-fire
 trigger.
 
+**Colour offset (CLOFEN / CLOFSL / COxx)** — VDP2 per-screen signed RGB
+offset added *after* colour calculation. CLOFEN (`0x05F8_0110`, bits 0..6,
+one per [NBG] / [RBG] / sprite layer) enables it; CLOFSL (`0x0112`) picks
+offset set A (COAR/COAG/COAB, `0x0114`/`0x0116`/`0x0118`) or B (COBR/COBG/COBB,
+`0x011A`/`0x011C`/`0x011E`), each a signed per-channel delta clamped to
+0..=255. M13 Tier C (C7); see `vdp2/regs.rs` `color_offset` + the renderer.
+
 **Coscheduling** — Running the master and slave [SH-2]s in lock-step
 with each other and the rest of the chip set. Implemented via the
 [Scheduler]'s "smallest deadline wins" rule.
@@ -154,9 +161,11 @@ so ignoring this draws the wrong (dark) bank — see the renderer's
 `nbg_color_ram_offset` / `rbg_color_ram_offset`.
 
 **Cycle-stealing** — DMA mode where the controller takes single bus
-cycles between SH-2 accesses rather than holding the bus for the
-entire transfer. M3 models DMA as synchronous block-transfer only;
-cycle-stealing accuracy is a later refinement.
+cycles between SH-2 accesses rather than holding the bus for the entire
+transfer. [SCU] DMA now charges the per-access bus wait-states a transfer
+incurs and stalls the requesting CPU for that cost (M13 Tier A, A3 —
+`Saturn::scu_transfer`); a fuller per-access CPU↔CPU bus-contention model
+is still open (deferred to the per-access SH-2 cycle model).
 
 ---
 
@@ -215,6 +224,12 @@ on-chip peripherals.
 ---
 
 ## E
+
+**EXCC** — Extended Colour Calculation. VDP2 colour-calc control register
+CCCTL bit 10 (EXCEN): a **three-layer** blend (top + 2nd + 3rd colour)
+instead of the normal two-layer ratio mix, for translucency/gradients over
+multiple [NBG]/[RBG] backgrounds. M13 Tier C (C9); `vdp2/regs.rs`
+`extended_color_calc`.
 
 **EXTEN** — VDP2 EXTernal ENable register. Out-of-scope minutia for M3.
 
@@ -467,6 +482,14 @@ issues RESDISA early in boot.
 **ROM** — Read-Only Memory. The Saturn BIOS, cartridge contents, and
 CD-block firmware are all ROMs in our model.
 
+**RPMD** — Rotation Parameter Mode (VDP2 `0x05F8_00B0`, bits 1..0): how
+[RBG0] selects between rotation parameter sets A and B — 0 = A, 1 = B,
+2 = per-dot via the coefficient table, 3 = per-dot via a window. When RBG0
+is the rotation background, modes 0/1 are honoured (`EffRPMD` forces A in
+dual-rotation, i.e. when RBG1 is active); modes 2/3 are only partly modelled
+(they need per-dot coefficient/window selection). M13 Tier C (C5);
+`vdp2/regs.rs`.
+
 **RTE** — Return from Exception. SH-2 instruction that pops PC then
 SR from the stack (via R15) and jumps to the popped PC. Has a delay
 slot. Used by the BIOS to return from `TRAPA` / interrupts.
@@ -536,6 +559,13 @@ Accepted as a no-op that drops SF; full clock-state support is M5+.
 **SF** — SMPC Status Flag at `0x0010_0063`. Goes to 1 when COMREG is
 written and queues a command; drops to 0 once the command is
 processed. Polling SF is how software waits for SMPC to finish.
+
+**SFPRMD / SFCCMD** — VDP2 Special-Function Priority / Colour-Calculation
+Mode registers (`0x05F8_00EA` / `0x00EE`, 2 bits per layer). Let a layer
+raise or lower a **per-dot** priority or colour-calc effect, gated by the
+8-bit special-function code (SFSEL `0x024` / SFCODE `0x026`) or the dot's
+own palette bits. M13 Tier C (C4); see `vdp2/regs.rs` special-function
+helpers + the renderer's per-dot path.
 
 **SH-1** — Hitachi SH-1. The CPU in the Saturn's CD-block. Different
 ISA from SH-2 (no MAC.L, no division unit, simpler pipeline). M5.

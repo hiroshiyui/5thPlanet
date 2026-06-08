@@ -26,8 +26,9 @@ foundation stays solid.
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 | M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 Doukyuusei ~if~ boots to its title screen (640×224 hi-res); the disc-present boot animation now plays (CD recognition spin-up); VF2 on a CD-state wall |
 | M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
+| M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (pending) |
 
-Current test count: **961 workspace-wide, 0 failures**, at **~85% line
+Current test count: **1011 workspace-wide, 0 failures**, at **~85% line
 coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
 FFI `physdisc` crate). Task-by-task status lives in
 [`doc/roadmap.md`](doc/roadmap.md).
