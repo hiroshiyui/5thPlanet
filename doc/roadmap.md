@@ -865,16 +865,34 @@ performance track for once the core is feature-complete — never replacing the
 cycle-faithful default, never a JIT/dynarec. They're cataloged from how the
 reference oracle **Mednafen achieves full speed while remaining LLE** (it runs
 real BIOS + game code; it is *not* a HLE/approximation — it's just engineered
-for speed and makes a few principled omissions). Today we run ~64% real-time at
-peak gameplay; this is the menu of levers to close that gap without abandoning
-fidelity.
+for speed and makes a few principled omissions); this is the menu of levers to
+close the speed gap without abandoning fidelity.
+
+**Landed so far — the accuracy-neutral levers (P2 + P4), all bit-identical (the
+`bios_boot` golden is unchanged):** a profiling pass (P4) measured Doukyuusei at
+640×224 hi-res — its heaviest "Press Start" stage — at ~55% of real-time
+(~33 fps), then closed most of the gap. **(1)** INTC O(1) highest-pending cache
+(`addfe06`), **(2)** per-instruction interrupt re-arm early-out when source regs
+are unchanged (`69b6fdf`, the biggest single win), **(3)** a pre-decoded
+instruction LUT (`bc7c3c1`), **(4)** eliminating the per-hit cache line copy in
+`mem_read*` — the `bench_cache` probe showed a 99.9 % hit rate, so `cache_fill`'s
+cost was the hit-path whole-line copy, not the rare miss-fill; `Cache::probe`
+returns the line *location* and the caller extracts in place (`6b0f907`). Plus a
+frontend lever outside the table: a **render-pipeline worker thread**
+(`757f164`) overlaps the VDP2 composite onto a 2nd core (the multi-core answer to
+"1 core at 100%"; `render_frame` is a pure read, so the displayed frame just
+trails by 1, pixels identical). Net: compute-only 640-hi-res went ~33 → ~67 fps
+(now above real-time at that stage). Profilers added: `bench_fps`,
+`bench_stages`, `bench_cache`, `presstart_pchist` (in `trace_boot.rs`,
+`#[ignore]`d). The remaining interpreter cost is `step` dispatch + the rare
+cache-miss fill (only 0.1 % of accesses — the probe proved it's not worth it).
 
 | # | Lever | What Mednafen does | What ours does today | Risk / caveat |
 |---|-------|--------------------|----------------------|---------------|
 | P1 | **Coarser cross-chip sync** | Runs each CPU in batches against a shared `SH7095_mem_timestamp` + an **event scheduler**; only re-syncs the siblings at the next scheduled *event* edge. | **Per-instruction** master-leads-slave interleave + per-instruction SCU sampling — re-syncs every instruction. | The single biggest cost. A "fast mode" could widen the sync quantum; must keep the per-instruction path for the accuracy default + trace-diff. |
-| P2 | **Optimized interpreter dispatch** | Template-specialized SH-2 core, tight computed dispatch, **fastmap** page table for memory access. | Younger, straightforwardly-written Rust interpreter (clear over micro-optimized). | Pure constant-factor win, accuracy-neutral. Profile first; a fastmap-style page table for the bus `match` is the obvious start. |
+| P2 | **Optimized interpreter dispatch** | Template-specialized SH-2 core, tight computed dispatch, **fastmap** page table for memory access. | 🟢 *partly landed* — pre-decoded instruction LUT, INTC O(1) pending cache, interrupt-re-arm early-out, and the cache hit-path copy elimination (all bit-identical; see "Landed so far" above). Still a clear-over-micro-optimized core otherwise. | Pure constant-factor win, accuracy-neutral. Remaining: `step` dispatch + a fastmap-style page table for the bus `match` (the bus dispatch reorder was tried and gave zero gain — the SH-2 cache absorbs nearly all HWRAM accesses). |
 | P3 | **Skip invisible models in fast mode** | Default **"CPU Cache Emulation Mode: Data only"** (skips full I-cache emulation); **no VDP2 VRAM-contention** model at all. | Models the I-cache + per-region wait-states + (M13) VDP-VRAM base access waits faithfully. | Accuracy-affecting → fast-mode only. NB: Mednafen's *lack* of VRAM contention is why we must **not** add it on the accuracy path (it would diverge the trace — see M13 notes). |
-| P4 | **Build & profile** | Native, mature, `-O2`, no test harness. | `--release` is optimized but unprofiled; most measurement happens via debug/test builds. | Free wins: PGO/LTO, a release-mode frontend default, and a perf-counter pass to find the real hot spots before hand-optimizing. |
+| P4 | **Build & profile** | Native, mature, `-O2`, no test harness. | 🟢 *profiled* — a `perf` + save-state-snapshot pass located the real hot spots (INTC scan, interrupt re-arm, decode, cache hit-path), all since optimized; `bench_*` profilers live in `trace_boot.rs`. Still unprofiled for PGO/LTO. | Free wins remaining: PGO/LTO and a release-mode frontend default. |
 
 Sequencing note: **P2 + P4 are accuracy-neutral and can land anytime**; **P1 + P3
 change observable timing and must be gated behind an explicit opt-in** so the
