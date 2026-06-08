@@ -16,22 +16,22 @@ of meaning.
 **A-Bus** — One of the Saturn's three external buses (A, B, C). A-Bus
 carries cartridge / CD-block traffic. Saturn-side address range
 `0x0500_0000..0x05FF_FFFF` is shared with the B-bus; [VDP1], [VDP2],
-the [CD-block], and the [SCU] now carve out their own sub-windows from
-it (dispatched ahead of the remaining `StubRegisterBank` catch-all),
-with [SCSP] still to come. The SH-2 BSC's [ASR0]/[ASR1] registers
-configure A-bus wait states.
+the [CD-block], and the [SCU] carve out their own sub-windows from
+it (dispatched ahead of the remaining `StubRegisterBank` catch-all), as
+does the [SCSP]. The SH-2 BSC's [ASR0]/[ASR1] registers configure A-bus
+wait states.
 
 **ASR0 / ASR1** — A-bus Set registers in the [SCU]. Configure wait
 states and bus width for the A-bus chip-select windows. Stored
-verbatim in M3; SH-2 BSC integration is queued for later.
+verbatim; SH-2 BSC wait-state integration is still deferred.
 
 ---
 
 ## B
 
 **B-Bus** — The other external bus alongside [A-Bus]. Carries
-[VDP1] / [VDP2] / [SCSP] traffic in addresses `0x0500_0000+`. Same
-M3 stub as A-bus.
+[VDP1] / [VDP2] / [SCSP] traffic in addresses `0x0500_0000+`. Those
+chips now own real sub-windows, dispatched ahead of the stub catch-all.
 
 **Backup RAM** — 32 KiB battery-backed save memory at
 `0x0018_0000..0x001F_FFFF` (the console's built-in "memory card").
@@ -60,9 +60,9 @@ game. Modelled by `Bsc::is_slave` (set via `Cpu::set_bsc_slave`); the rest of
 
 **BSC** — Bus State Controller. SH7604 on-chip peripheral at
 `0xFFFFFF40+` (and [BCR1] at `0xFFFFFFE0`) that configures wait states for
-each external chip select. Mostly register-storage in M3 plus the [BCR1]
-master/slave bit (`sh2::onchip::bsc::Bsc`); real wait-state math deferred
-until a target game shows it matters.
+each external chip select. Mostly register-storage plus the [BCR1]
+master/slave bit (`sh2::onchip::bsc::Bsc`); real wait-state math is still
+deferred until a target game shows it matters.
 
 ---
 
@@ -126,8 +126,8 @@ worked.
 
 **Chunky** vs. **planar** — Pixel-storage modes. VDP1 / VDP2 use
 chunky (one pixel = N consecutive bits in memory); some legacy modes
-use planar (each bit-plane stored separately). M3's VDP2 renderer
-only handles chunky.
+use planar (each bit-plane stored separately). The Saturn's VDP1/VDP2
+use chunky, which the renderer handles.
 
 **CHCR** — Channel Control Register. Per-DMA-channel register in the
 [SCU]. Bits 0–2 select start factor; bit 8 (DGO) is the manual-fire
@@ -207,11 +207,13 @@ unblocked the M11 game boot (matches Mednafen `cdb.cpp`).
 **DMA** — Direct Memory Access. Saturn has DMA in the [SH-2] on-chip
 DMAC (2 channels) and in the [SCU] (3 channels). The SCU's three
 channels are the heavy-lift transfers; on-chip DMAC is for SH-2-
-internal motion. SCU DMA is the M3 task #2 deliverable.
+internal motion. Both the [SCU] DMA (3 channels) and the on-chip [DMAC]
+are implemented and transfer through the bus.
 
 **DMAC** — Direct Memory Access Controller. SH7604 on-chip at
-`0xFFFFFFA0+`. Two channels. Distinct from the [SCU] DMAC. Register
-storage only in M3; full implementation deferred.
+`0xFFFFFFA0+`. Two channels. Distinct from the [SCU] DMAC. Functionally implemented —
+its transfer engine moves bytes / words / longwords / 16-byte blocks
+through the bus, hardened to Mednafen's `DMA_DoTransfer` (M13 Tier D, D2).
 
 **Dual SH-2** — The Saturn has two SH-2 SH7604s on one shared bus.
 The master runs from power-on; the slave is held in reset until the
@@ -231,7 +233,8 @@ instead of the normal two-layer ratio mix, for translucency/gradients over
 multiple [NBG]/[RBG] backgrounds. M13 Tier C (C9); `vdp2/regs.rs`
 `extended_color_calc`.
 
-**EXTEN** — VDP2 EXTernal ENable register. Out-of-scope minutia for M3.
+**EXTEN** — VDP2 EXTernal ENable register (external sync / latch).
+Out-of-scope minutia; register-storage only.
 
 ---
 
@@ -339,12 +342,14 @@ primary volume descriptor (FAD 166) and directory records to serve the file
 commands (Change Dir / Get File Info / Read File).
 
 **INTBACK** — SMPC command **0x10**. Returns SMPC status + peripheral
-data (region/area code, RTC, controllers) in [OREG]. M4 returns a
-"no controller connected, North-America region" status response. The
+data (region/area code, RTC, controllers) in [OREG]: a status-only
+INTBACK returns the SMPC status + the live RTC date/time + region. The
 command is **not instantaneous**: the SMPC holds [SF] busy for its
-execution time (~250 µs ≈ 7150 SH-2 cycles) before filling OREG and
+execution time (a status-only request ≈ 261 µs ≈ 7475 SH-2 cycles,
+reconciled to Mednafen's 4 MHz SMPC clock) before filling OREG and
 clearing SF — the BIOS polls SF in a wait loop, and clearing it too
-early derails the boot. Keyboard/full peripheral protocol is M5+.
+early derails the boot. The full multi-port peripheral nibble-stream
+protocol is still simplified (one digital pad on port 1).
 
 **INTC** — Interrupt Controller. Two layers: one on-chip per SH-2
 (`crates/sh2/src/onchip/intc.rs`) handles internal sources (DIVU
@@ -403,7 +408,9 @@ trips up implementers — see the doc comment in
 
 **NBG0..NBG3** — Normal Background layers in VDP2. Four flat
 backgrounds composited with the [RBG] layers and the [VDP1]
-framebuffer. M3's renderer handles only NBG0.
+framebuffer. All four are rendered by the full VDP2 compositor (M5+):
+tile/bitmap, 4/8bpp + RGB, priority, colour calculation, windows,
+per-line scroll/zoom.
 
 **NMI** — Non-Maskable Interrupt. SH-2 vector 11. Bypasses SR.imask
 (modeled as level 16 in `sh2::onchip::intc`).
@@ -529,18 +536,23 @@ contract: ties resolve to insertion order.
 **SCI** — Serial Communication Interface. SH7604 on-chip. Saturn
 uses it minimally. Stub-only in `crates/sh2/src/onchip/sci.rs`.
 
-**SCSP** — Saturn Custom Sound Processor. Audio chip with built-in
-MC68EC000 plus a vector DSP. Out of scope until M4.
+**SCSP** — Saturn Custom Sound Processor. The 32-slot FM/PCM audio
+engine plus a vector DSP (the SCSP-DSP) and a hosted MC68EC000 in sound
+RAM at `0x05A0_0000` (released by SMPC `SNDON`). Fully implemented (M6):
+slot synthesis, the SCSP-DSP, timers/interrupts, master volume, LFO, and
+slot-to-slot FM. `Saturn::take_audio` drains the mixed 44.1 kHz stereo
+each frame. See `crates/saturn/src/scsp/`.
 
 **SCU** — System Control Unit. Saturn's bus bridge between the SH-2s
 and everything not on the SH-2 bus. Holds 3 DMA channels, an
-interrupt aggregator, timers, and the [SCU-DSP]. M3 task #2 lands the
-DMA half; tasks #3 + #4 land the rest.
+interrupt aggregator, timers, and the [SCU-DSP] — all implemented
+(`crates/saturn/src/scu.rs`): 3 DMA channels, a per-instruction-sampled
+interrupt level model, and Timer0/Timer1.
 
 **SCU-DSP** — 32-bit DSP embedded in the SCU. Own ISA, own microcode
 RAM (256 × 32-bit), four banks of 64 × 32-bit data RAM. Used for
-matrix math in 3D games and some BIOS init paths. M3 task #4
-delivers a standalone `scu_dsp` crate parallel to `sh2`.
+matrix math in 3D games and some BIOS init paths. Implemented as the
+standalone `scu_dsp` crate (parallel to `sh2`).
 
 **SETSL / SSHON** — SMPC command 0x02. Releases the [slave] SH-2
 from its power-on halt. Tracked by `Sh2Entity::halted` in the
@@ -551,10 +563,12 @@ slave then runs from wherever the BIOS left its PC/vectors.
 
 **SETSM / SSHOFF** — SMPC command 0x03. Halts the slave.
 
-**SETTIME** — SMPC command **0x16**. Initialises the SMPC's clock state.
-Accepted as a no-op that drops SF; full clock-state support is M5+.
+**SETTIME** — SMPC command **0x16**. Sets the SMPC's RTC from IREG0–6
+(`set_rtc_bcd`, synced to the current cycle); the live clock then advances
+and is reported as BCD date/time in [INTBACK]'s OREG1–7.
 
-**SETSMEM** — SMPC command 0x17. Stores backup-memory bytes. No-op.
+**SETSMEM** — SMPC command 0x17. Stores the four SMEM bytes from
+IREG0–3; they are echoed back in [INTBACK]'s OREG12–15.
 
 **SF** — SMPC Status Flag at `0x0010_0063`. Goes to 1 when COMREG is
 written and queues a command; drops to 0 once the command is
@@ -567,8 +581,10 @@ raise or lower a **per-dot** priority or colour-calc effect, gated by the
 own palette bits. M13 Tier C (C4); see `vdp2/regs.rs` special-function
 helpers + the renderer's per-dot path.
 
-**SH-1** — Hitachi SH-1. The CPU in the Saturn's CD-block. Different
-ISA from SH-2 (no MAC.L, no division unit, simpler pipeline). M5.
+**SH-1** — Hitachi SH-1. The CPU in the Saturn's CD-block, running
+undumped on-die firmware. **Not emulated**: because that firmware can't be
+dumped, the [CD-block] is high-level-emulated instead, so there is no SH-1
+core in this project.
 
 **SH-2** — Hitachi SH-2 SH7604. The Saturn's main CPUs (×2). 32-bit
 RISC at 28.6 MHz. Full ISA in `crates/sh2/src/isa.rs`.
@@ -590,7 +606,7 @@ on write by `Sr::WRITE_MASK`.
 **Stall** — Cycle(s) the CPU loses waiting for something. Three flavors
 in M2+: bus stalls (from `Bus::read*/write*` returning a non-zero
 count), interlock stalls (load-use + MAC-read), and DMA cycle-stealing
-(not modeled in M3).
+(the requesting CPU now stalls for the [SCU] transfer cost — M13 Tier A).
 
 ---
 
