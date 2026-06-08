@@ -3438,7 +3438,7 @@ fn presstart_pchist() {
         let _ = sat.take_audio();
     }
     let mut v: Vec<(u32, u64)> = h.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|&(_, n)| core::cmp::Reverse(n));
     println!("master-PC histogram at ~f{at} ({total} insns / {nframes} frames), top 30:");
     for (pc, n) in v.iter().take(30) {
         println!("  {pc:08X}  {:5.2}%  ({n})", *n as f64 / total as f64 * 100.0);
@@ -3449,7 +3449,7 @@ fn presstart_pchist() {
         *region.entry(pc & 0xFFFF_0000).or_default() += n;
     }
     let mut rv: Vec<(u32, u64)> = region.into_iter().collect();
-    rv.sort_by(|a, b| b.1.cmp(&a.1));
+    rv.sort_by_key(|&(_, n)| core::cmp::Reverse(n));
     println!("by 64KiB region:");
     for (base, n) in rv.iter().take(8) {
         println!("  {base:08X}  {:5.1}%", *n as f64 / total as f64 * 100.0);
