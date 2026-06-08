@@ -58,6 +58,12 @@ Saturn (`mednaref/src/ss/`)
 > The general fidelity observations below (SCU/timing model, etc.) still stand
 > as accuracy notes, but were not the boot decider.
 
+> **See also:** [`mame-divergence-review.md`](mame-divergence-review.md) — the
+> MAME counterpart to this review. MAME is the low-level / early-boot reference
+> (and its CD-block is HLE like ours), so that review reads differently: most
+> MAME divergences are *deliberate* Mednafen/hardware alignments or places ours
+> is more faithful, not bugs.
+
 ## Why
 
 5thPlanet's Saturn layer was built up one chip at a time, walking several
