@@ -9,7 +9,6 @@
 
 use crate::bus::{AccessKind, Bus};
 use crate::cache::{self, Cache};
-use crate::decoder::decode;
 use crate::isa::Op;
 use crate::onchip::OnChip;
 use crate::pipeline::Pipeline;
@@ -110,6 +109,22 @@ pub struct Cpu {
     /// cache treatment — see [`ReadWatch`]. Set via [`Cpu::enable_read_watch`].
     #[cfg_attr(feature = "serde", serde(skip))]
     pub read_watch: Option<ReadWatch>,
+    /// Pre-decoded instruction table: `decode(w)` for every 16-bit word `w`.
+    /// Turns the per-instruction decode (a match + operand-field extraction +
+    /// `Op` construction, ~7% of run time) into one indexed load. Pure function
+    /// of the word, so it's identical for every CPU and bit-identical to calling
+    /// `decode` — derived state, rebuilt on construction/load, never serialized.
+    /// ~0.5 MiB; built once in [`Self::new`].
+    #[cfg_attr(feature = "serde", serde(skip, default = "build_decode_lut"))]
+    decode_lut: alloc::boxed::Box<[Op]>,
+}
+
+/// Build the 65536-entry pre-decode table (see [`Cpu::decode_lut`]).
+fn build_decode_lut() -> alloc::boxed::Box<[Op]> {
+    (0..=u16::MAX)
+        .map(crate::decoder::decode)
+        .collect::<alloc::vec::Vec<Op>>()
+        .into_boxed_slice()
 }
 
 impl Default for Cpu {
@@ -131,6 +146,7 @@ impl Cpu {
             last_fault: None,
             last_illegal_word: None,
             read_watch: None,
+            decode_lut: build_decode_lut(),
         }
     }
 
@@ -231,7 +247,9 @@ impl Cpu {
         let instr_pc = self.regs.pc;
         let (word, fetch_stall) = self.mem_read16(instr_pc, AccessKind::Fetch, bus);
         self.regs.pc = instr_pc.wrapping_add(2);
-        let op = decode(word);
+        // Pre-decoded table lookup (bit-identical to `decode(word)`; see
+        // `decode_lut`) — `word` indexes the full u16 space, always in bounds.
+        let op = self.decode_lut[word as usize];
 
         // ---- Pre-dispatch interlocks ----
         let mut interlock_stall = 0u32;
