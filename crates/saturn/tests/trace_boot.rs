@@ -3174,16 +3174,19 @@ fn menu_savestate_probe() {
     let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2440);
     let snap_file =
         std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
-    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    // One emulated frame's worth of cycles (system.rs CYCLES_PER_FRAME). Advancing
+    // via run_for instead of run_frame skips the 640×224 composite — rendering is
+    // observe-only, so the emulation is identical but the boot is faster.
+    const CYC_PER_FRAME: u64 = 479_151;
 
     if std::env::var("FORCE_SNAP").is_err() && std::path::Path::new(&snap_file).exists() {
         let bytes = std::fs::read(&snap_file).expect("read snapshot");
         sat.load_state(&bytes).expect("load_state (BIOS/disc must match the snapshot)");
         println!("loaded snapshot {snap_file} (≈f{snap_at})");
     } else {
-        println!("booting to f{snap_at} to build snapshot (one-time)…");
+        println!("booting to f{snap_at} to build snapshot (one-time, no-render)…");
         for _ in 0..snap_at {
-            sat.run_frame(&mut fb);
+            sat.run_for(CYC_PER_FRAME);
         }
         let bytes = sat.save_state();
         std::fs::write(&snap_file, &bytes).expect("write snapshot");
@@ -3205,7 +3208,7 @@ fn menu_savestate_probe() {
     for f in 0..probe_frames {
         let held = if f >= start_at && f < start_at + 6 { 0x0800u16 } else { 0 };
         sat.set_pad1(held);
-        sat.run_frame(&mut fb);
+        sat.run_for(CYC_PER_FRAME);
         let n = sat.take_seqlog().len();
         if n > 0 && first_frame.is_none() {
             first_frame = Some(f);
