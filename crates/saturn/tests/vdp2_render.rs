@@ -495,3 +495,42 @@ fn rbg0_special_color_calc_mode2_gates_blending_by_sfcode() {
     let b = (60 * FRAME_WIDTH + 52) * 4;
     assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "code 2: SFCODE bit clear → opaque");
 }
+
+#[test]
+fn extended_color_calc_blends_front_over_second_third_average() {
+    // Extended colour calc (CCCTL EXCEN, bit 10): the front layer's colour-calc
+    // partner becomes the average of the 2nd and 3rd layers instead of just the
+    // 2nd. NBG0 (front, red) over NBG1 (green) + the back screen (blue, the 3rd
+    // "layer"): with EXCEN the partner is avg(green, blue) = (0,127,127); without
+    // it, just green.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data); // low-res (HRESO 0) → EXCC eligible
+    sat.bus.write16(REG_BGON, 0x0003, AccessKind::Data); // NBG0 + NBG1
+    sat.bus.write16(REG_CHCTLA, 0x1212, AccessKind::Data); // both bitmap, 8bpp
+    sat.bus.write16(0x05F8_003C, 0x0010, AccessKind::Data); // MPOFN: NBG1 base offset 1
+    sat.bus.write16(0x05F8_00F8, 0x0203, AccessKind::Data); // PRINA: N0=3 (front), N1=2
+    // Back screen = blue.
+    sat.bus.vdp2.vram.write16(0x200, 0x7C00);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red   (NBG0)
+    sat.bus.vdp2.cram.write16(6 * 2, 0x03E0); // CRAM[6] = green (NBG1)
+    // NBG0 cc enable + ratio 16; NBG1 cc bit set (the EXCC 2nd-layer condition).
+    sat.bus.write16(0x05F8_0108, 0x0010, AccessKind::Data); // CCRNA N0 ratio = 16
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 7); // NBG0 red
+    sat.bus.vdp2.vram.write8(0x20000 + 60 * 512 + 50, 6); // NBG1 green
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+
+    // EXCEN off: front blends only with the 2nd layer (green) at alpha 123.
+    sat.bus.write16(0x05F8_00EC, 0x0003, AccessKind::Data); // CCCTL: N0 + N1 cc, EXCEN off
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[123, 132, 0, 0xFF], "EXCEN off → red over green");
+
+    // EXCEN on: front blends with avg(green, blue) = (0,127,127).
+    sat.bus.write16(0x05F8_00EC, 0x0403, AccessKind::Data); // CCCTL: + EXCEN (bit 10)
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[123, 65, 65, 0xFF], "EXCEN on → red over avg(green, blue)");
+}

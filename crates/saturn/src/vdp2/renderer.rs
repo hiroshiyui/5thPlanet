@@ -126,22 +126,25 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
             // sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
             let mut top: Option<Dot> = None;
             let mut second: Option<Dot> = None;
+            let mut third: Option<Dot> = None;
             let mut shadow = false;
 
             // The sprite layer may produce a colour dot or an MSB shadow.
             if window_allows(vdp2, sprite_fb, vdp2.regs.sprite_window_control(), sx, sy) {
                 match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
-                    Some(SpriteDot::Colour(d)) => insert_dot(&mut top, &mut second, Some(d)),
+                    Some(SpriteDot::Colour(d)) => {
+                        insert_dot(&mut top, &mut second, &mut third, Some(d))
+                    }
                     Some(SpriteDot::Shadow) => shadow = true,
                     None => {}
                 }
             }
-            insert_dot(&mut top, &mut second, rbg_layer(vdp2, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, rbg_layer(vdp2, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 2, sx, sy));
-            insert_dot(&mut top, &mut second, nbg_layer(vdp2, sprite_fb, 3, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 2, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 3, sx, sy));
 
             let mut rgb = match top {
                 Some(t) => match t.cc {
@@ -149,14 +152,19 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
                         // Line-colour screen: when LNCLEN selects the top layer,
                         // the line colour is the colour-calc partner (it sits at
                         // the bottom of the colour-calc stack); otherwise the
-                        // layer below / back screen is.
+                        // colour-calc partner is the layer below — or, under
+                        // extended colour calc, the 2nd/3rd-layer average.
                         let lce =
                             vdp2.regs.line_colour_enable() & (1 << t.layer.screen_bit()) != 0;
-                        let below = lce
-                            .then(|| line_color(vdp2, y))
-                            .flatten()
-                            .or_else(|| second.map(|s| s.rgb))
-                            .unwrap_or(backdrop);
+                        let below = if lce {
+                            line_color(vdp2, y)
+                                .or_else(|| second.map(|s| s.rgb))
+                                .unwrap_or(backdrop)
+                        } else if let Some(s) = second {
+                            excc_partner(vdp2, s, third, backdrop)
+                        } else {
+                            backdrop
+                        };
                         blend(t.rgb, below, ratio, add)
                     }
                     None => t.rgb,
@@ -205,6 +213,18 @@ impl Layer {
             Layer::Rbg(_) => 0, // RBG1 shares NBG0's slot
         }
     }
+    /// Bit position in CCCTL of this layer's colour-calc-enable bit: NBG0–3 =
+    /// 0..3, RBG0 = 4, RBG1 = 0 (NBG0's), sprite = 6 (SPCCEN). Differs from
+    /// [`Self::screen_bit`] only for the sprite layer (CCCTL puts SPCCEN at bit 6,
+    /// not 5). Used by extended colour calc to test the 2nd layer's CC bit.
+    fn cc_ctl_bit(self) -> u8 {
+        match self {
+            Layer::Sprite => 6,
+            Layer::Rbg(0) => 4,
+            Layer::Nbg(n) => n,
+            Layer::Rbg(_) => 0,
+        }
+    }
 }
 
 /// One layer's contribution at a pixel: priority, colour, and the colour-calc
@@ -216,6 +236,9 @@ struct Dot {
     rgb: (u8, u8, u8),
     cc: Option<(u8, bool)>,
     layer: Layer,
+    /// RGB direct-colour dot (vs paletted). Extended colour calc's RGB888 mode
+    /// averages the 3rd layer only when it is RGB direct colour.
+    is_rgb: bool,
 }
 
 /// A sampled background dot before priority / colour-calc resolution: its
@@ -348,23 +371,38 @@ enum SpriteDot {
     Shadow,
 }
 
-/// Slot `cand` into the running top-two by priority. Front-order callers win
-/// ties (strict `>` keeps the earlier dot), and a displaced top becomes second.
-fn insert_dot(top: &mut Option<Dot>, second: &mut Option<Dot>, cand: Option<Dot>) {
+/// Slot `cand` into the running top-three by priority. Front-order callers win
+/// ties (strict `>` keeps the earlier dot); a displaced dot cascades down one
+/// rank. The third rank is only consulted by extended colour calculation; the
+/// ordinary top-two compositing reads `top`/`second` exactly as before.
+fn insert_dot(
+    top: &mut Option<Dot>,
+    second: &mut Option<Dot>,
+    third: &mut Option<Dot>,
+    cand: Option<Dot>,
+) {
     let Some(d) = cand else { return };
     if d.pri == 0 {
         return;
     }
     match *top {
         Some(t) if d.pri > t.pri => {
+            *third = *second;
             *second = *top;
             *top = Some(d);
         }
-        Some(_) => {
-            if second.is_none_or(|s| d.pri > s.pri) {
+        Some(_) => match *second {
+            Some(s) if d.pri > s.pri => {
+                *third = *second;
                 *second = Some(d);
             }
-        }
+            Some(_) => {
+                if third.is_none_or(|th| d.pri > th.pri) {
+                    *third = Some(d);
+                }
+            }
+            None => *second = Some(d),
+        },
         None => *top = Some(d),
     }
 }
@@ -384,6 +422,42 @@ fn apply_color_offset(vdp2: &Vdp2, top: Option<Dot>, rgb: (u8, u8, u8)) -> (u8, 
     let (or, og, ob) = vdp2.regs.color_offset(sel);
     let clamp = |c: u8, o: i32| (c as i32 + o).clamp(0, 255) as u8;
     (clamp(rgb.0, or), clamp(rgb.1, og), clamp(rgb.2, ob))
+}
+
+/// The colour-calc partner ("below" colour) for a front layer that is *not*
+/// using the line-colour screen. Ordinarily the 2nd layer's colour; under
+/// **extended colour calculation** (CCCTL EXCEN, low-res) the front instead
+/// blends over the rounding-down average of the 2nd and 3rd layers — a 3-layer
+/// blend — when the 2nd layer's own CCCTL colour-calc-enable bit is set. In
+/// RGB888 CRAM mode the average is taken only when the 3rd layer is RGB direct
+/// colour (the back screen counts as RGB). Mirrors Mednafen's non-line
+/// `MIXIT_SPECIAL_EXCC_CRAM0`/`CRAM12` branch (`vdp2_render.cpp:2537-2550`); the
+/// line-colour and gradient EXCC variants are deferred.
+fn excc_partner(vdp2: &Vdp2, second: Dot, third: Option<Dot>, backdrop: (u8, u8, u8)) -> (u8, u8, u8) {
+    if !vdp2.regs.extended_color_calc_active()
+        || vdp2.regs.ccctl() & (1 << second.layer.cc_ctl_bit()) == 0
+    {
+        return second.rgb;
+    }
+    // 3rd layer, or the back screen (which is RGB direct colour) below it.
+    let (third_rgb, third_is_rgb) = match third {
+        Some(t) => (t.rgb, t.is_rgb),
+        None => (backdrop, true),
+    };
+    // RGB888 CRAM mode (EXCC_CRAM12) averages only an RGB 3rd layer.
+    if vdp2.regs.cram_mode() >= 2 && !third_is_rgb {
+        return second.rgb;
+    }
+    avg_rgb(second.rgb, third_rgb)
+}
+
+/// Per-channel rounding-down average of two RGB colours, matching Mednafen's
+/// packed `(a + b - ((a ^ b) & 0x010101)) >> 1` (the carry-safe byte-wise mean).
+fn avg_rgb(a: (u8, u8, u8), b: (u8, u8, u8)) -> (u8, u8, u8) {
+    let pack = |c: (u8, u8, u8)| c.0 as u32 | (c.1 as u32) << 8 | (c.2 as u32) << 16;
+    let (pa, pb) = (pack(a), pack(b));
+    let m = (pa + pb - ((pa ^ pb) & 0x0001_0101)) >> 1;
+    (m as u8, (m >> 8) as u8, (m >> 16) as u8)
 }
 
 /// Blend front colour `t` over `b`. Ratio mode (CCMD=0) weights the front by
@@ -496,6 +570,7 @@ fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: 
         rgb: s.rgb,
         cc,
         layer: Layer::Nbg(n as u8),
+        is_rgb: s.is_rgb,
     })
 }
 
@@ -551,6 +626,7 @@ fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32,
         rgb: s.rgb,
         cc,
         layer: Layer::Rbg(which as u8),
+        is_rgb: s.is_rgb,
     })
 }
 
@@ -999,6 +1075,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
                 rgb: cram::rgb555_to_888(pix),
                 cc: sprite_cc(vdp2, pri, 0),
                 layer: Layer::Sprite,
+                is_rgb: true,
             })
         });
     }
@@ -1020,6 +1097,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
         rgb: cram(vdp2, code),
         cc: sprite_cc(vdp2, pri, ccidx),
         layer: Layer::Sprite,
+        is_rgb: false,
     }))
 }
 

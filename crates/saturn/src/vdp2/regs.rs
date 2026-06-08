@@ -683,6 +683,22 @@ impl Vdp2Regs {
     pub fn sprite_color_calc_enabled(&self) -> bool {
         self.ccctl() & 0x40 != 0
     }
+    /// Whether **extended colour calculation** (CCCTL EXCEN, bit 10) is active:
+    /// a 3-layer blend where the colour-calc partner becomes the average of the
+    /// 2nd and 3rd layers (Mednafen `MIXIT_SPECIAL_EXCC_CRAM0/12`, `:3136`). Only
+    /// in low-res (HRESO bit 1/2 clear — the hi-res path uses a different special
+    /// mode, deferred) and not when the gradient mode (CCCTL bit 15 + CRAM mode 0)
+    /// takes precedence. The CRAM-mode-dependent restriction (RGB888 averages only
+    /// an RGB 3rd layer) is applied by the caller. Line-colour and gradient EXCC
+    /// variants are deferred.
+    pub fn extended_color_calc_active(&self) -> bool {
+        if self.h_resolution() & 0x6 != 0 {
+            return false;
+        }
+        let ccctl = self.ccctl();
+        let gradient = ccctl & 0x8000 != 0 && self.cram_mode() == 0;
+        !gradient && ccctl & 0x0400 != 0
+    }
     /// Colour-calc ratio (0..31) for NBG`n`: CCRNA (0x108) holds N0/N1,
     /// CCRNB (0x10A) holds N2/N3, low/high 5-bit fields.
     pub fn nbg_color_calc_ratio(&self, n: usize) -> u8 {
@@ -1190,6 +1206,28 @@ mod tests {
         r.write16(0x0EC, 0x0010 | 0x0100);
         r.write16(0x10C, 0x0007);
         assert_eq!(r.rbg_color_calc(0), Some((7, true)));
+    }
+
+    #[test]
+    fn extended_color_calc_active_gates_on_excen_lowres_and_gradient() {
+        let mut r = Vdp2Regs::new();
+        r.write16(0x000, 0x0000); // TVMD HRESO = 0 (320, low-res)
+        r.write16(0x0EC, 0x0400); // CCCTL EXCEN (bit 10)
+        assert!(r.extended_color_calc_active(), "EXCEN + low-res → active");
+        r.write16(0x0EC, 0x0000);
+        assert!(!r.extended_color_calc_active(), "EXCEN clear → inactive");
+        // Hi-res (HRESO bit 1 set → 640) takes the deferred hi-res special path.
+        r.write16(0x000, 0x0002);
+        r.write16(0x0EC, 0x0400);
+        assert!(!r.extended_color_calc_active(), "hi-res → inactive");
+        // Gradient mode (CCCTL bit 15 + CRAM mode 0) wins over EXCC.
+        r.write16(0x000, 0x0000);
+        r.write16(0x00E, 0x0000); // RAMCTL CRMD = 0
+        r.write16(0x0EC, 0x0400 | 0x8000);
+        assert!(!r.extended_color_calc_active(), "gradient precedence → inactive");
+        // …but in RGB888 CRAM mode the gradient bit doesn't apply, so EXCC holds.
+        r.write16(0x00E, 0x2000); // CRMD = 2
+        assert!(r.extended_color_calc_active(), "RGB888 + EXCEN (gradient n/a) → active");
     }
 
     #[test]
