@@ -100,7 +100,7 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
 | 2 | **NBG0/1 reduction + fractional scroll** (ZMXN/ZMYN, XScrollF) | fixed-point `CurXCoordInc`/`CurXScrollIF` per dot (`:110`, `:114`, `:1590-1592`) | ✅ **implemented 2026-06-08** | **High** | Med |
 | 3 | **Special priority / special colour-calc per-dot** (SFPRMD/SFCCMD/SFCODE/SFSEL) | templated `priomode`/`ccmode` `:3065`; SFCODE LUT | ✅ **implemented 2026-06-08** | Med | Med |
 | 4 | **Extended colour calc — 3/4-layer blending** | `MIXIT_SPECIAL_EXCC_*` `:2491-2549` | top-two only | Med | Med-High |
-| 5 | **Dual rotation parameter selection** (RPMD 2/3: per-pixel coeff-MSB + rotation-param window) | `EffRPMD` `:1862`, `rotabsel[x]` `:1977-2004`, `GetWinRotAB` | fixed RBG0=A / RBG1=B; RPMD ignored; coeff mode 3 (Xp) deferred | Med (rotation games) | Med-High |
+| 5 | **Dual rotation parameter selection** (RPMD 0/1 whole-layer; 2/3 per-pixel) | `EffRPMD` `:1862`, `rotabsel[x]` `:1977-2004`, `GetWinRotAB` | 🟡 **RPMD 0/1 done 2026-06-08**; modes 2/3 (per-dot coeff / window) deferred | Med (rotation games) | Med-High |
 | 6 | **VRAM access cycle patterns** (CYCA0-CYCB1 / VCP) — bandwidth gating of fetches + reduction limits | full `VCPRegs` model `:71`, `:1399-1454` | not modelled | Low visual / High edge-case | **High** |
 
 ### 2.7 What is NOT a gap (corrections to first-pass analysis)
@@ -178,7 +178,15 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
    four SFPRMD priority modes and four SFCCMD colour-calc modes for NBG0–3 +
    RBG0/1. Golden-safe (collapses to prior behaviour when special modes are 0).
    Validated by unit tests vs the oracle algorithm — no game exercises it yet.
-   Then **dual rotation params (#5)** — medium impact.
+4. 🟡 **Dual rotation params (#5)** — RPMD **0/1 done 2026-06-08**: RBG0 selects
+   rotation parameter set A or B whole-layer (`rotation_param_mode`; forced to A
+   when RBG1 is active). `sample_rbg` now takes the parameter set and the layer
+   separately (geometry/coefficient/plane from the set; CRAM offset / transparent
+   pen from the layer). Modes **2/3** (per-dot coefficient-MSB / rotation-param
+   window) are **deferred** — they need per-dot-x coefficient sampling, which our
+   per-line coefficient model doesn't do (same root as the C5-deferred per-dot
+   coefficient modes); fall back to set A for now. Test:
+   `rpmd_selects_rotation_parameter_set_for_rbg0`.
 4. **Extended colour calc (#4)** — medium impact, more involved.
 5. **VCP cycle patterns (#6)** — last; complex, mostly edge-case correctness.
 
