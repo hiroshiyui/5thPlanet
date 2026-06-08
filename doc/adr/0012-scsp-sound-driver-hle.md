@@ -36,8 +36,9 @@ causal link to the actual silence (0 BGM voices keyed) still unconfirmed. The
 cheap, high-confidence axes (cycle timing) are exhausted.
 
 The project is **accuracy-first** (ADR-0002). The user has chosen to consider
-deviating for this *optional* audio goal (`doc/bios-bgm-diagnosis.md` "Project
-note"), via this design study.
+deviating for this *optional* audio goal (the boot-BGM investigation, now
+resolved — see [`../bootstrapping.md` §B.7](../bootstrapping.md#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06)),
+via this design study.
 
 **Directly relevant precedent — HLE was tried here and removed.** ADR-0010
 (HLE direct boot) and ADR-0011 (HLE BIOS SYS-call library) were **superseded

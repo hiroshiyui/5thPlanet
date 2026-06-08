@@ -193,8 +193,9 @@ earlier "just report BUSY" attempt failed because the BIOS's own `Init` reset th
 drive back to `PAUSE` before the window was ever observed (the symptom the user
 spotted: ours jumped to the logo "as if the CD door were open"). Verified against
 MAME with an audio CD inserted — ours now plays the animation, and Doukyuusei
-~if~ still boots to its title. The boot *sound* over the animation is still
-missing (a separate SCSP voice-keying issue; see `doc/bios-bgm-diagnosis.md`).
+~if~ still boots to its title. The boot *sound* over the animation was a separate
+SCSP voice-keying issue, since **resolved** — see
+[§B.7](#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06).
 
 ### B.4 Authentication & region
 
@@ -229,6 +230,47 @@ On success the loader reads **IP.BIN** (FAD 150, 16 sectors; carries the
 `+0xE8/+0xEC`), then reads the 1st-read program file (`AAAVF2.BIN` for VF2) into
 work RAM at its load address and jumps to it — that PC leaving BIOS/loader space
 for the game's own code is "booted".
+
+### B.7 The boot / CD-player-panel BGM (resolved 2026-06-06)
+
+With a disc inserted the BIOS plays its disc-present **boot animation**
+([§B.3](#b3-the-recognition-command-sequence)); with no disc the multimedia
+**CD-player panel** animates and plays BGM. Both exercise the same SCSP sound
+driver (an MC68EC000 program the BIOS uploads to sound RAM), and for a long time
+both were **silent** — the animation drew correctly but no BGM voice keyed.
+
+**Root: an `m68k` decode bug, not a timing divergence.** `ADDA.L`/`SUBA.L Dn,An`
+(opmode `0b111`) was mis-decoded as `ADDX`/`SUBX` — the ADDX dispatch guard in
+`op_addsub` (`crates/m68k/src/interpreter.rs`) did not exclude opmode `0b11`. So
+the sound driver's note-ring enqueue `adda.l d7,a2` never accumulated its offset,
+collapsing a 9-entry command ring to 2; note-on records overwrote each other
+before the player drain (`0x2162`) consumed them, so the BGM voices never keyed.
+**Fix `32662f7`** (add `&& op & 0x00C0 != 0x00C0` to the dispatch); regression
+`crates/m68k/tests/ring_offset_repro.rs`. Result: the audio-CD panel keys **12
+voices (was 1)**, avg |amplitude| 0→111 — user-confirmed full melody. (This is
+the same `ADDA`/`ADDX` decode hazard called out in the `m68k` crate notes — it
+was also the SCSP-BGM-silence root.)
+
+**Found by a cross-emulator note-ring slot diff.** Using an **audio CD** (which
+the LLE oracle Mednafen *can* boot, unlike no-disc) and a mednaref `SS_SEQFIRE`
+hook, Mednafen wrote 9 distinct ring slots (`0x7A00,04,08,…,20`) where ours wrote
+only 2 (`0x7A00,04`) on byte-identical driver code and index — which pinned the
+bad `adda.l` to an `m68k` unit test. The decisive instrument was the
+config-driven cross-emulator **signal "oscilloscope"** (`Scsp::enable_scope` /
+`take_scope` + `tools/scope_diff.py`, a 68k-trigger-PC timebase sampling
+sound-RAM channels on both emulators and reporting the first divergent row) — the
+generalization of the one-off `ENQLOG`/itrace/write-watch probes that preceded
+it. See [the debugging-tooling note in `CLAUDE.md`](../CLAUDE.md) and [ADR-0012,
+SCSP sound-driver HLE](adr/0012-scsp-sound-driver-hle.md).
+
+The long hunt that preceded this fix — seq-tick-phase, WRAM-bus-timing, and a
+68k-control-flow-fork hypothesis — were all downstream **symptoms** of the
+collapsed ring. One real finding it surfaced is genuine but **decoupled from the
+BGM**: ours under-charges the master SH-2's external-bus accesses relative to
+Mednafen's shared `SH7095_mem_timestamp` model, so the master's BGM-trigger
+timeline runs a phase early. That **per-access SH-2 cycle model** is its own
+cycle-accuracy task (roadmap M13; large and `bios_boot`-golden-churning), not a
+prerequisite for sound.
 
 ---
 
@@ -339,5 +381,5 @@ trace-by-trace history.
 its disc-present **boot animation** — the recognition spin-up (the `Startup`
 drive phase, [§B.3](#b3-the-recognition-command-sequence)) holds `STATUS_BUSY`
 for ~1 s so the BIOS animates instead of jumping straight to the static logo.
-The animation is still **silent** — a separate SCSP voice-keying issue, tracked
-in [`bios-bgm-diagnosis.md`](bios-bgm-diagnosis.md).
+The animation's **silence is resolved** (an `m68k` `ADDA`/`ADDX` decode bug, fix
+`32662f7`) — see [§B.7](#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06).
