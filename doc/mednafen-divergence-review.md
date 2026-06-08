@@ -1,6 +1,47 @@
 # Mednafen cross-reference divergence review
 
-**Date:** 2026-05-30 · **Reference:** Mednafen / Beetle Saturn (`mednaref/src/ss/`)
+**Date:** 2026-05-30 · **Revised:** 2026-06-08 · **Reference:** Mednafen / Beetle
+Saturn (`mednaref/src/ss/`)
+
+> **Update (2026-06-08) — this consolidation pass is essentially complete; the
+> findings below are now a resolution record.** Almost every boot-critical and
+> medium item in this review has since landed (Mednafen-alignment Phases 1–2,
+> M11 game-boot, M13 Tier A/C/D). The per-subsystem sections below have been
+> annotated in place with their current status — **✅ resolved**, **◑ partial /
+> by-design**, **○ open** — and a `file:line` or commit pointer. The short
+> version:
+>
+> - **CD-block** — the actual M11 boot root (the `DCHG`-at-`Init` latch, see the
+>   2026-06-01 note) is fixed, plus `DrivePhase::Startup` recognition spin-up and
+>   the CD→SCU external interrupt (vector `0x50`, level 7). All ✅.
+> - **SCU** — the interrupt model was reworked exactly as #5 proposed: a level
+>   sampled per master instruction (`fresh_assertions` vs `ist`), internal/external
+>   vector split, IMASK reset `0xBFFF` + bit-15 sign-extend, AIACK/`cd_prohibit`.
+>   All ✅ except Timer0 (line-compare only) and a couple of L items.
+> - **System** — slave full-reset + BCR1 master/slave bit on `SSHON`; the coarse
+>   256-cycle batch replaced by an **event-clamped, master-leads-slave**
+>   interleave with per-instruction SCU sampling; `run_frame` is a single
+>   `run_for`. ✅ The full per-access SH-2 bus-timing model (#5/system-#3 residue)
+>   is the one large item still open (M13).
+> - **SMPC** — `CKCHG` now NMIs the master; INTBACK SF held via
+>   `intback_complete_at`; status-SR corrected. ✅
+> - **VDP2** — TVSTAT display-off, HBlank-IN, Timer1, CRAOFB + colour-offset,
+>   RBG1/RPMD, special priority/CC, hi-res, NBG reduction+fractional scroll all
+>   ✅. The VBlank-OUT 1-line phase (H2) and progressive-ODD (M5) remain ○ minor.
+> - **VDP1** — the full command-list plotter shipped (RGB transparency,
+>   end-codes, SPD, gouraud, half-transparency, MSBON, scaled sprites, draw-end).
+>   Erase-on-displayed-buffer is the notable ○.
+> - **SCSP** — the BIOS-BGM saga is fully resolved (the `m68k` `ADDA`/`ADDX`
+>   decode bug `32662f7`, slot-monitor `0x408`, access wait-states; see
+>   [`bootstrapping.md` §B.7](bootstrapping.md#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06)).
+>   SNDON-full-reset and the per-sample `0x400` interrupt are the open ◑/○ items.
+>
+> **Boot status:** VF2 (JP) and Doukyuusei ~if~ both boot **into their own game
+> code** on the LLE path — the "VF2 LLE boot fails after IP.BIN" headline below is
+> resolved. Doukyuusei reaches its title screen; VF2 stalls later, in its intro
+> demo-script loop on a *polled CD-state* divergence (a different, post-boot
+> issue). See [`bootstrapping.md`](bootstrapping.md) §B and the
+> `m11-game-boot-progress` memory.
 
 > **Update (2026-06-01) — VF2 now boots; the root was in the CD-block after
 > all.** This review's headline ("eliminated the CD-block as the cause… the
@@ -32,7 +73,12 @@ Method: one reviewer per subsystem compared our module to its Mednafen
 counterpart (read-only), reporting semantic divergences with severity and
 boot/game impact. The CD-block section is from this session's direct work.
 
-## Headline conclusion
+## Headline conclusion (2026-05-30, superseded)
+
+> *Superseded — kept as the record of what this review originally concluded. The
+> actual boot root was the CD-block `DCHG`-at-`Init` latch (2026-06-01 note); the
+> interrupt/raster consolidation it called for landed anyway and was the right
+> hygiene. VF2 now boots into game code (2026-06-08).*
 
 The VF2 LLE boot fails *after* the BIOS reads a valid IP.BIN: the boot loader
 rejects the disc and re-recognizes instead of loading the 1st-read. This
@@ -52,218 +98,266 @@ interrupt-driven and timing-sensitive. The likely culprits cluster in:
 - **SMPC** — `CKCHG` is a no-op (misses the master NMI the BIOS waits on),
   INTBACK status-phase SR value wrong.
 
-## Boot-critical fix queue (prioritized)
+## Boot-critical fix queue (all landed)
 
-| # | Fix | Subsystem | Risk | Confidence |
-|---|-----|-----------|------|-----------|
-| 1 | TVSTAT.VBLANK reflects display-off (=1 when display off / power-on) | VDP2 | low | high |
-| 2 | IMASK reset = `0xBFFF`; IMS writes masked to `0xBFFF` | SCU | low | high |
-| 3 | VBlank-OUT/VBLANK-clear edge at last line (262), not line 0 | VDP2 | low | med |
-| 4 | Raise HBlank-IN per line; implement SCU Timer0/Timer1 | VDP2/SCU | med | med |
-| 5 | IST = live *pending* set (separate asserted vs pending; level re-assert; clear only on W1C / vector-fetch) | SCU | **high** (golden) | high |
-| 6 | Slave SH-2 full-reset on `SSHON`/`SSHOFF` (LLE), VBR=0, reset vector | system | med | high |
-| 7 | `CKCHG` performs subsystem reset + master NMI | SMPC | med | med |
-| 8 | INTBACK status SR = `(SR&~0x80)|0x0F`; OREG0/10/11 from live state | SMPC | med | med |
+Every row below has since been implemented; the queue is kept to show the path
+taken. Status as of 2026-06-08:
 
-Each fix re-verifies the `bios_boot` splash golden and re-checks the VF2 LLE
-boot trace before moving on. #5 (the SCU interrupt rework) is the deepest and
-riskiest; do it on its own with the golden as guard.
+| # | Fix | Subsystem | Status |
+|---|-----|-----------|--------|
+| 1 | TVSTAT.VBLANK reflects display-off (=1 when display off / power-on) | VDP2 | ✅ `3e43928` (`vdp2/mod.rs`) |
+| 2 | IMASK reset = `0xBFFF`; IMS writes masked to `0xBFFF` | SCU | ✅ `5ce37d4` (`scu.rs:279,319`) |
+| 3 | VBlank-OUT/VBLANK-clear edge at last line (262), not line 0 | VDP2 | ○ deferred (1-line phase, marginal; `system.rs:718`) |
+| 4 | Raise HBlank-IN per line; implement SCU Timer0/Timer1 | VDP2/SCU | ✅ HBlank-IN + Timer1; Timer0 line-compare (`scu.rs:627`) |
+| 5 | IST = live *pending* set (asserted vs pending; level re-assert; clear only on W1C / vector-fetch) | SCU | ✅ `fresh_assertions` vs `ist`, per-instruction level (`scu.rs:706`) |
+| 6 | Slave SH-2 full-reset on `SSHON`/`SSHOFF` (LLE), VBR=0, reset vector | system | ✅ `879bba7` + BCR1 bit (`system.rs:366`) |
+| 7 | `CKCHG` performs subsystem reset + master NMI | SMPC | ✅ halt-slave + master NMI (`system.rs:1145`) |
+| 8 | INTBACK status SR = `(SR&~0x80)|0x0F`; OREG0/10/11 from live state | SMPC | ✅-SR `534a7ba` (`(SR&~0xA0)|0x0F|npe`, `system.rs:1115`); OREG live-state ◑ |
 
-**Status (2026-05-30):** four boot-critical consolidation fixes landed — #1
-`3e43928`, #2 `5ce37d4`, #6 `879bba7` (slave power-on-reset on SSHON), #8-SR
-`534a7ba` (INTBACK status SR = `(SR&~0x80&~NPE)|0x0F`). All correct, golden-safe
-(splash hash unchanged), full suite + clippy green. **VF2 still gives up** —
-expected: the post-IP.BIN rejection is a *convergence* and none of these is the
-single unblock.
+#5 (the SCU interrupt rework) was the deepest and riskiest; it was done on its
+own with the `bios_boot` golden as guard and is now the per-instruction
+level-sampled model described in [`../CLAUDE.md`](../CLAUDE.md) and `scu.rs`.
 
-**Reassessment of the remaining queue:**
-- **#5 (SCU IST live-pending / level re-assert)** — on closer scoping this is
-  *unlikely* the VF2 unblock: the boot loader barely touches the SCU IST (~3
-  register writes the whole run; it reads the CD HIRQ instead), and the
-  boot-path interrupt sources (VBlank-IN/OUT, HBlank) are edges, not held
-  levels, so the level-re-assertion substance is moot for boot. It's a real
-  Mednafen-consolidation fix but high-risk (golden) + low boot payoff. Deferred.
-- **#3 (VBlank-OUT edge)** — a 1-line phase shift; marginal, golden risk. Deferred.
-- **#7 (CKCHG subsystem-reset + master NMI)** — involved and *not* low-risk
-  (injecting a master NMI mid-boot is a large behavior change), and it isn't
-  blocking us (we proceed past display init). Warrants its own focused pass.
-- **#8-OREG / #4 timers** — minor / BIOS-ignored fidelity.
+**Historical status (2026-05-30):** four boot-critical consolidation fixes
+landed first — #1 `3e43928`, #2 `5ce37d4`, #6 `879bba7` (slave power-on-reset on
+SSHON), #8-SR `534a7ba`. All golden-safe, suite + clippy green. **VF2 still gave
+up** at that point — expected: the post-IP.BIN rejection was a *convergence* and
+none of these was the single unblock. The actual unblock came later: the
+CD-block `DCHG`-at-`Init` latch (2026-06-01 note).
 
-**The actual VF2 unblock is still the unpinned, overlay-obscured value the
-loader reads when it rejects the disc post-IP.BIN** — that needs a focused deep
-trace (master read-watch / step-trace through the loader's validation), not more
-interrupt-model edits. The consolidation pass above has materially de-tangled
-the boot-path interrupt/timing model against Mednafen, which was the goal.
+**Reassessment of the queue at the time (now historical):**
+- **#5 (SCU IST live-pending / level re-assert)** — judged *unlikely* the VF2
+  unblock (correct — it wasn't), but a real Mednafen-consolidation fix. Landed
+  anyway; the per-instruction level model is now load-bearing for the M11 CD
+  external interrupt (vector `0x50`).
+- **#3 (VBlank-OUT edge)** — a 1-line phase shift; deferred then, still ○ open
+  (marginal, golden risk).
+- **#7 (CKCHG subsystem-reset + master NMI)** — landed: it halts the slave and
+  NMIs the master, which the BIOS `ChangeSystemClock` SYS call waits on.
+- **#8-OREG / #4 timers** — minor / BIOS-ignored fidelity; Timer1 since
+  implemented, OREG live-state still partial.
 
 ---
 
 ## Findings by subsystem
 
+Each finding is tagged with its 2026-06-08 status: **✅ resolved**, **◑ partial /
+by-design**, **○ open**.
+
 ### SCU (`scu.rs`, `crates/scu_dsp/`) vs `scu.inc`, `scu_dsp_*.cpp`
 
-- **H1 — IST exposes ack-cleared state, not pending.** `take_pending_interrupt`
-  clears `ist` on the vector-take (`scu.rs:~576`); a handler reading IST (0xA4)
-  sees the bit already gone. Mednafen separates `IPending` (set on assert,
-  cleared only by W1C or vector-fetch) from `IAsserted` (live line, drives
-  re-pend). Ours conflates them and clears too aggressively. *Prime boot suspect.*
-- **H2 — vector/priority hand-coded.** We use `0x40+index` for all 14 sources;
-  Mednafen splits internal (`0x40+bit`, `internal_tab`) vs external/A-bus
-  (`0x50+bit`, `external_tab`), selected by tzcount. Priority levels for common
-  sources *do* match `internal_tab`.
-- **H3 — no level re-assertion; one source per drain.** `raise()` sets an edge
-  bit consumed once; a held level never re-pends. `system.rs` only ever
-  `raise()`s VBlankIn/Out (rising edge), never deasserts; Mednafen drives them
-  as levels (`SetInt(..., active)`) each line.
-- **H4 — IMASK reset/auto-mask wrong.** Reset leaves `ims=0` (all unmasked);
-  Mednafen resets to `0xBFFF`, re-sets `IMask=0xBFFF` on every vector-fetch, and
-  masks IMS writes to `0xBFFF`.
-- **M5 — IST W1C polarity.** We clear bits set in `val` (`ist &= !val`);
-  Mednafen keeps bits where the data bit is 1 within the lane (`IPending &= DB |
-  ~mask`). Verify vs the SCU manual.
-- **M6 — manual DMA with count 0 skipped.** Mednafen promotes 0 → max length.
-- **M7 — indirect-mode write-back address.** Mednafen writes back the *table*
-  pointer for indirect; we don't distinguish indirect vs direct.
-- **M8 — Timer0/Timer1 unimplemented** (registers store, never count/fire).
-- **M9 — DSP-end IRQ not deasserted on PPAF read.**
-- **L10–L12** — DMA stride reset defaults, AIACK/ABusIProhibit, register field masks.
+- **H1 — IST exposes ack-cleared state, not pending.** *(orig: `take_pending_interrupt`
+  cleared `ist` on vector-take; a handler reading IST saw the bit gone.)*
+  **✅ resolved** — reworked to Mednafen's split: `fresh_assertions` (edge, drives
+  re-pend) vs `ist` (software-visible status), and the SCU IRL is now a **level
+  sampled per master instruction** (`scu.rs:706-727`; system.rs `step_cpus`).
+- **H2 — vector/priority hand-coded.** **✅ resolved** — `Source::vector()` gives
+  internal `0x40+index`; the external CD source (`Source::Cd = 16`) lands at
+  `0x50`, matching Mednafen's internal/external split (`scu.rs:84-96`).
+- **H3 — no level re-assertion; one source per drain.** **✅ resolved for the
+  level case** — the CD external interrupt is driven as a live level
+  (`set_cd_int`, `(HIRQ & HIRQ_Mask) != 0`); VBlank-IN/OUT remain raised as edges
+  on the raster transition (functionally correct, since they're momentary
+  sources) (`system.rs:703-725`).
+- **H4 — IMASK reset/auto-mask wrong.** **✅ resolved** — reset = `0xBFFF`, IMS
+  writes masked to `0xBFFF`, and external interrupts masked by IMS **bit 15** via
+  16-bit sign-extension (`~(int16)IMask`), matching Mednafen (`scu.rs:279,319,712`).
+- **M5 — IST W1C polarity.** **✅ resolved** — `ist &= !val` (W1C), with a
+  regression `ist_writes_are_write_one_to_clear` (`scu.rs:322`).
+- **M6 — manual DMA with count 0 skipped.** **✅ resolved** — `dma_count` promotes
+  0 → channel max (1 MiB ch0 / 4 KiB ch1-2) (`system.rs:209-217`).
+- **M7 — indirect-mode write-back address.** ○ open — not revisited in this pass.
+- **M8 — Timer0/Timer1 unimplemented.** **◑ partial** — Timer1 is a full per-line
+  down-counter (reload at HBLANK, fires on underflow, TENB-gated); Timer0 is a
+  raster line-compare (no free-running counter) (`scu.rs:627-672`,
+  `system.rs:734-738`).
+- **M9 — DSP-end IRQ not deasserted on PPAF read.** **✅ resolved** — the EF flag
+  is cleared on the PPAF read (`scu.rs:437-441`).
+- **L10–L12** — DMA stride reset defaults, AIACK/ABusIProhibit, register field
+  masks. **✅ AIACK/`cd_prohibit`** present (set on CD fire, cleared by AIACK bit 0,
+  `scu.rs:227,329`); the rest unverified/minor.
 - *Consistent:* register offset map, internal vector base, priority levels,
   channel widths, byte/halfword-don't-trigger-DMA, indirect end-flag, DSP ports.
 
 ### SMPC (`smpc.rs`) vs `smpc.cpp`
 
-- **1 (H) — INTBACK status SR wrong.** We set `sr = 0x40 | (stage<<5)`;
-  Mednafen does `SR = (SR&~0x80)|0x0F` (+`SR_NPE` if peripheral requested).
-- **2 (H) — OREG0 RESD/STE static.** Hardcoded `0x80`; should be
-  `(RTC.Valid<<7)|(!ResetNMIEnable<<6)`. We don't model `ResetNMIEnable`.
-- **3 (H) — INTBACK peripheral OREG layout** doesn't match the real nibble-stream
-  protocol (static bytes vs the JR engine / per-port loop).
-- **4 (H) — CKCHG is a no-op.** Should reset SOUND/VDP1/VDP2/SCU, switch clock,
-  wait vblanks, then **NMI the master** — which the BIOS waits on.
-- **5 (H) — SF busy/ready phasing.** We clear SF between INTBACK phases; Mednafen
-  holds SF set across the whole multi-phase fetch (BIOS polls SF tightly).
-- **6–10 (M)** — INTBACK runs even when no status requested; SNDON/SNDOFF 68k
-  reset path; SYSRES no-op; RESENAB/RESDISA unmodeled; region default `0x04`
-  (NA) mismatches a JP/EU BIOS unless overridden (wrong region = hard halt).
-- **11–13 (L)** — OREG10/11 static; OREG16+ blanket `0xFF`; power-on master NMI.
+- **1 (H) — INTBACK status SR wrong.** **✅ resolved** — `SR = (SR&~0xA0)|0x0F|npe`
+  (masks bits 7/5, sets the low nibble, ORs `SR_NPE=0x20` when a peripheral phase
+  follows), the staged-protocol form (`system.rs:1115`).
+- **2 (H) — OREG0 RESD/STE static.** ○ open — `ResetNMIEnable` still unmodeled.
+- **3 (H) — INTBACK peripheral OREG layout.** ◑ partial — the multi-phase SF/timing
+  is modeled; the full nibble-stream peripheral payload is still simplified.
+- **4 (H) — CKCHG is a no-op.** **✅ resolved** — `CkChg320/352` halts the slave and
+  raises the master **NMI**, which the BIOS `ChangeSystemClock` waits on
+  (`system.rs:1145-1151`).
+- **5 (H) — SF busy/ready phasing.** **✅ resolved** — SF is held busy across the
+  multi-phase fetch via `intback_complete_at` (set per phase, cleared by
+  `settle_intback` when the cycle is reached), reconciled to Mednafen's 4 MHz
+  SMPC clock (`smpc.rs:128`, `system.rs:1116-1174`).
+- **6–10 (M)** — INTBACK-when-no-status, SNDON/SNDOFF 68k reset, SYSRES,
+  RESENAB/RESDISA, region default. **◑ partial** — region default `0x04` (NA),
+  overridable; SNDON releases the sound 68k but via a full reset (see SCSP below);
+  the rest largely unmodeled (BIOS-tolerated).
+- **11–13 (L)** — OREG10/11 static; OREG16+ blanket `0xFF`; power-on master NMI. ○.
 - *Consistent:* all command codes, odd-byte register addressing, RTC/SETTIME,
   SSHON/SSHOFF→slave, SETSMEM echo.
 
 ### System glue (`bus.rs`, `scheduler.rs`, `system.rs`, `memory.rs`, `cartridge.rs`) vs `ss.cpp`, `cart.cpp`
 
-- **1 (H) — slave not reset on SSHON.** `release_slave` only resyncs cycle +
-  un-halts; Mednafen `SetActive(true)` calls a full power-on `Reset` (VBR=0,
-  imask=0xF, re-fetch PC/SP from `0x00000000`). On LLE the slave must come up at
-  the BIOS reset vector, not resume stale state.
-- **2 (H) — SSHOFF should also reset.** We only set `halted`; Mednafen resets,
-  so an off/on cycle re-vectors the slave.
-- **3 (H) — coarse 256-cycle batch scheduling** vs Mednafen's event-exact
-  interleave (`SH7095_mem_timestamp`, per-chip event handlers). Peripheral side
-  effects (DMA done, SCU assert, sound IRQ) observed up to ~256 cycles late;
-  mis-orders interrupts vs CPU poll loops. Dominant architectural divergence;
-  not a quick fix.
-- **4 (H) — SCU DMA synchronous/instant**, no start-factor/cycle-steal interleave.
-- **5 (M) — per-region wait states differ** (BIOS 10 vs +8, low RAM 3 vs +7,
-  STUB 0 under-counts). Re-derive from `BusRW_DB_CS0`.
-- **6 (M) — low work RAM window** maps 1 MiB (`0x00200000..0x002FFFFF`); Mednafen
-  decodes 2 MiB with the upper 1 MiB returning `0xFFFF` (revision-dependent).
-- **7 (M) — FRT input-capture** applied as a deferred batch pulse, 16-bit only;
-  Mednafen fires immediately on any non-byte write (16 *or* 32-bit). The pulse
-  is ~256 cycles late (master→slave wake path).
-- **8 (M) — backup-RAM high byte reads `0x00`** here vs `0xFF` on hardware
-  (`DB | 0xFF00`). SMPC reads similarly OR `0xFF00` — check `smpc.rs` too.
-- **9 (M) — cart backup-RAM packing** uses a 4-byte stride; Mednafen (and our
-  *internal* backup) use 1 byte per 16-bit word at odd addresses. Inconsistent.
-- **10 (M-L) — cart ID** only at exact `0x04FFFFFF`; Mednafen decodes a window
-  and the even-1 address.
-- **11–13 (L)** — SCSP RAM mirrors 512 KiB across 1 MiB (upper half should be
-  unmapped); CS1/CS2 flat stub vs SCU/A-bus routing; RTC frame-rate constant.
+- **1 (H) — slave not reset on SSHON.** **✅ resolved** — `release_slave` now calls
+  the slave's full power-on `reset` (re-fetch PC/SP from `0x00000000`, VBR=0) and
+  resyncs its cycle, and the slave's **BCR1 master/slave bit** is set so the BIOS
+  cold-start takes the slave path instead of re-initialising WRAM
+  (`system.rs:366-382,327-336`).
+- **2 (H) — SSHOFF should also reset.** **◑ by-design** — `halt_slave` sets only
+  `halted`; the full re-vector happens on the next `SSHON`/`release_slave`, so an
+  off/on cycle still re-vectors the slave.
+- **3 (H) — coarse 256-cycle batch scheduling.** **✅ resolved** — replaced by an
+  **event-clamped** interleave: each batch is clamped to the next peripheral-event
+  edge (`cycles_to_next_event`: VBlank-IN/OUT, INTBACK-completion, VDP1 draw-end,
+  Timer0 line-compare), capped by `SMPC_POLL_QUANTUM = 256`. The SH-2 pair steps
+  **master-leads-slave** (`step_cpus`) with SCU interrupts sampled per master
+  instruction (`system.rs:801-865,935`).
+- **4 (H) — SCU DMA synchronous/instant.** **◑ by-design** — still synchronous, but
+  now charges per-access wait-state cost and stalls the requesting CPU
+  (cycle-steal approximation) (`system.rs:118-176,974-1000`).
+- **5 (M) — per-region wait states differ.** **○ open (the big one)** — current
+  flat defaults (BIOS 10, backup 6, low WRAM 3, high WRAM 1 r/w, VDP1 14/11, VDP2
+  20/5, CD-block A-bus CS2 8). The full **per-access SH-2 cycle model** (shared
+  `SH7095_mem_timestamp`, region-weighted waits + CPU↔CPU contention, SDRAM page
+  timing) is the one large, golden-churning item still deferred to **M13**
+  (`bus.rs:73-314`).
+- **6 (M) — low work RAM window.** **○ open (minor)** — maps 1 MiB; Mednafen
+  decodes 2 MiB with the upper 1 MiB returning `0xFFFF` (revision-dependent)
+  (`bus.rs:48-49`).
+- **7 (M) — FRT input-capture.** **✅ resolved** — applied per instruction (not a
+  deferred batch) via `apply_fti!` after each CPU step; 16-bit writes pulse it
+  (32-bit composes from two 16-bit) (`system.rs:885-910`).
+- **8 (M) — backup-RAM high byte.** **◑ by-design** — even byte lanes read `0x00`
+  (the MAME `backupram_r` odd-byte packing now used consistently); the `DB|0xFF00`
+  open-bus nuance is unmodeled (`memory.rs:197-202`).
+- **9 (M) — cart backup-RAM packing.** **✅ resolved** — now 1 byte per 16-bit word
+  at odd addresses, consistent with the internal backup RAM (`cartridge.rs:185-202`).
+- **10 (M-L) — cart ID.** **○ open (minor)** — only at the exact `0x04FF_FFFF`
+  (`cartridge.rs:46,162`).
+- **11–13 (L)** — SCSP RAM mirror span, CS1/CS2 routing, RTC frame-rate. ○ minor.
+- **`run_frame`** — **✅** runs the whole frame in a **single** `run_for(CYCLES_PER_FRAME)`
+  (the active+VBLANK split that diverged the master was removed; this was a VF2
+  stall fix) (`system.rs:1457-1481`).
 - *Consistent (lower 1 MiB common cases):* region dispatch shape, the FTI region
   selectors, internal backup packing, cart enum.
 
 ### VDP2 (`vdp2/*.rs`, `system.rs::update_video_timing`) vs `vdp2.cpp`, `vdp2_render.cpp`
 
-- **H1 — TVSTAT.VBLANK ignores display-off.** We derive VBLANK purely from
-  raster position; Mednafen forces `InternalVB = !DisplayOn` (and reset
-  `InternalVB=true`). With display off (incl. power-on), hardware reads
-  VBLANK=1 continuously; we only pulse it. **The BIOS waits for VBLANK before
-  enabling display** — strong boot suspect.
-- **H2 — VBlank-OUT/VBLANK-clear a line late.** We wrap at line 0; Mednafen
-  clears at the last line (262 NTSC). ~1 scanline phase error every frame.
-- **H3 — HBlank-IN never raised** (source defined, never fired); drives SCU
-  Timer0 + line interrupts.
-- **H4 — SCU Timer0/Timer1 storage-only** (mirror of SCU M8).
-- **M1 — sprite CRAM offset (CRAOFB) ignored** → wrong sprite palette bank.
-- **M2 — RBG1 added as extra layer** instead of replacing NBG0 in dual-rotation.
-- **M3 — color-calc ratio blend off-by-one** (`/0x1F` vs `>>5`, fore=`ratio^0x1F`).
-- **M4 — sprite shadow / type 8–F handling simplified** (no `src&0xFF` mask).
-- **M5 — ODD bit toggles in progressive mode** (should be constant 1).
-- **L1–L3** — PAL/EXLATCH bits, HBLANK width approximation, VCNT latch-on-read.
+- **H1 — TVSTAT.VBLANK ignores display-off.** **✅ resolved** — VBLANK reads 1 when
+  display is off (incl. power-on), OR'd with the raster-derived bit
+  (`vdp2/mod.rs:71-82`).
+- **H2 — VBlank-OUT/VBLANK-clear a line late.** **○ open** — still wraps at the
+  frame boundary (~1-line phase error); marginal, golden risk (`system.rs:718`).
+- **H3 — HBlank-IN never raised.** **✅ resolved** — raised on the HBLANK rising
+  edge per scanline, TENB-gated (`scu.rs:627-670`).
+- **H4 — SCU Timer0/Timer1 storage-only.** **✅/◑** — Timer1 fully counts/fires;
+  Timer0 is line-compare (see SCU M8).
+- **M1 — sprite CRAM offset (CRAOFB) ignored.** **✅ resolved** — CRAOFB applied as
+  the RBG CRAM offset; the broader **colour-offset** feature (C7) also landed
+  (`vdp2/regs.rs:255-263`).
+- **M2 — RBG1 added as extra layer.** **✅ resolved** — RBG0 selects its rotation
+  parameter set via **RPMD 0/1**; RBG1 shares NBG0's slot in dual-rotation
+  (`vdp2/renderer.rs:602-610`).
+- **M3 — color-calc ratio blend off-by-one.** **◑ partial** — the **special
+  priority / special colour-calc** modes (C4) are implemented per-dot; the exact
+  ratio rounding (`/0x1F` vs `>>5`) is not separately re-verified
+  (`vdp2/renderer.rs`).
+- **M4 — sprite shadow / type 8–F handling simplified.** **○ open** — deferred
+  until a game exercises it.
+- **M5 — ODD bit toggles in progressive mode.** **○ open** — still toggles per
+  frame; should be constant 1 when LSMD ≠ 3 (`system.rs:691-692`).
+- **L1–L3** — PAL/EXLATCH bits, HBLANK width, VCNT latch-on-read. ○ minor.
+- **Hi-res output (640/704) + NBG0/1 reduction + fractional scroll** — **✅** added
+  in the M11/M13 Tier C push (`vdp2/regs.rs:130-148`, `vdp2/renderer.rs`).
 - *Consistent:* layer set, char/bitmap addressing basics, CRAM banking for NBG.
 
 ### VDP1 (`vdp1/*.rs`) vs `vdp1.cpp`, `vdp1_*.cpp`
 
-(Not on the critical boot path — a game must launch first — but these make a
-launched game render wrong; medium priority once booting.)
+**✅ mostly resolved** — the full command-list plotter shipped (M5): command
+walker (END/NEXT/JUMP/CALL/RETURN), normal/scaled/distorted sprites + polygons +
+lines, all six CMDPMOD colour modes, **SPD-governed transparency**, per-mode
+**end-codes**, **gouraud** shading, the **half-transparency / shadow / half-luminance**
+colour-calc modes, **MSBON** (set MSB without overwriting colour), scaled-sprite
+zoom-point decode, and a cycle-exact **draw-end** (`vdp1/plotter.rs`).
 
-- **Med:** RGB-mode (mode 5) transparency uses raw==0 not bit-15 (`<0x4000`);
-  RGB end-code is the `0xC000==0x4000` pattern + 2-consecutive `ec_count`, not
-  equality with `0x7FFF`; polygon/line transparency governed by SPD not color
-  value (color-0 polys vanish); polygons skip gouraud + half-transparency; MSBON
-  should read-back FB and set only MSB, not overwrite color; scaled-sprite
-  zoom-point two-axis decode; erase targets the *displayed* (non-draw) buffer at
-  swap, not the draw buffer pre-plot; draw-end interrupt on a synthetic timer not
-  at list completion; jump field is bits 13:12 only (no skip-draw bit), type 0xB
-  is a 2nd user-clip (we end the list).
-- **Low:** half-transparent blend formula, coordinate 13/11/13-bit masking,
-  user-clip masking, gouraud DDA vs bilinear, EDSR BEF/COPR→LOPR at swap.
+Still simplified / **○ open:** erase targets the draw buffer rather than the
+*displayed* (non-draw) buffer at swap; and some 2nd-user-clip (type 0xB) edge
+cases. The original "Med/Low" item list below is retained as the spec of what was
+implemented:
+
+- *(implemented)* RGB-mode transparency via raw==0; RGB end-code pattern; SPD
+  governs polygon/line transparency; gouraud + half-transparency on polygons;
+  MSBON read-modify; scaled-sprite two-axis zoom; draw-end at list completion.
+- *(open/minor)* erase-on-displayed-buffer at swap; half-transparent blend
+  rounding; coordinate masking widths; EDSR BEF/COPR→LOPR at swap.
 
 ### SCSP / MC68EC000 (`scsp/*.rs`, `crates/m68k/`) vs `scsp.inc`, `sound.cpp`
 
-- **Med/High — SNDON does a full 68k reset** every time instead of un-halt;
-  Mednafen resets once at power-on and only halts/unhalts (`SetExtHalted`). A
-  SNDON-after-running re-resets the sound driver (can stall a game's
-  sound-handshake init).
-- **Med — per-sample interrupt (SCIPD/MCIPD bit 10, `0x400`) never generated**;
-  Mednafen sets it every sample. Sound drivers clocked off it get no tick; main
-  CPU `SoundRequest` only ever sourced from Timer A here.
-- **Med — sound IRQ level encoding** picks one source by priority vs Mednafen's
-  bitwise-OR of all enabled SCILV levels.
-- **Low/Med (audio fidelity):** EG model (ms-table vs counter RE), no LFO, FM
-  phase / `0x400^FreqNum` vs `+0x400`, loop-mode semantics, DSP MIXS scaling,
-  DSP not run per-sample, CDDA routed to output not EXTS, master volume absent,
-  timer reload semantics.
-- *Consistent:* 68k interrupt delivery (autovector, IPL, NMI), memory map (512
-  KiB case), main-interrupt level-latch.
+- **SNDON does a full 68k reset every time.** **○ open** — `SndOn` still calls
+  `cpu.reset` (full reset) rather than an un-halt; no `SetExtHalted`-style gate
+  (`scsp/mod.rs:1519-1526`). A SNDON-after-running re-resets the driver.
+- **per-sample interrupt (SCIPD/MCIPD bit 10, `0x400`) never generated.** **○ open**
+  — sound drivers clocked off the per-sample tick get none; `SoundRequest` is only
+  sourced from the timers.
+- **sound IRQ level encoding.** **◑ partial** — picks one source by priority
+  (`decode_sci`) rather than bitwise-OR of all enabled SCILV levels
+  (`scsp/mod.rs:579-598`).
+- **slot CA monitor (`0x408`).** **✅ resolved** — `slot_monitor()` computes the
+  MSLC slot's CA/EG-phase/level live, instead of returning a static backing byte;
+  this was the boot-jingle BGM-loop root (`scsp/mod.rs:416-454`).
+- **the BIOS-BGM silence** *(the whole "voices never key" saga that motivated much
+  of this and the SCSP fidelity items)* — **✅ resolved**: the root was the `m68k`
+  `ADDA.L`/`SUBA.L` → `ADDX`/`SUBX` decode bug (`32662f7`, guard
+  `op & 0x00C0 != 0x00C0`, `m68k/interpreter.rs:1049`), plus the SCSP sound-RAM
+  access wait-state and interleave-budget carry. See
+  [`bootstrapping.md` §B.7](bootstrapping.md#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06).
+- **Low/Med (audio fidelity):** EG model, LFO, FM phase, loop-mode, DSP MIXS
+  scaling, master volume, timer reload. **◑** — several addressed during the BGM
+  work (DSP effect-send scaling, MIXS-wrap, master volume reg); LFO and the
+  ms-table-vs-counter EG remain approximations.
+- *Consistent:* 68k interrupt delivery (autovector, IPL, NMI), memory map,
+  main-interrupt level-latch.
 
-### CD-block (`cd_block.rs`) vs `cdb.cpp` — this session
+### CD-block (`cd_block.rs`) vs `cdb.cpp`
 
-- **FIXED (`9e0ea9f`):** status report used the stale `self.fad` instead of the
-  live `cd_curfad` — reported the head parked at the IP.BIN start after a read.
-- **HIRQ register model:** reading HIRQ cleared `DCHG|BFUL|CSCT` *before
-  returning* — non-faithful (HIRQ is W1C/sticky on hardware; Mednafen keeps the
-  bits). Parallels SCU IST H1/M5. (Tested CSCT-sticky; correct but not the boot
-  fix on its own.)
-- **Ruled out as the boot cause this session:** IP.BIN content (full 32 KB
-  verified valid), the FAD report, Play status (PLAY vs BUSY), and HIRQ bits
-  (MPED/CSCT) — none change the loader's reject decision. The recognition →
-  auth → region → IP.BIN-read sequence matches Mednafen command-for-command; the
-  divergence is the post-IP.BIN decision, which is **not** a CD-block output.
+- **✅ status report uses live `cd_curfad`** (was the stale `self.fad`,
+  `9e0ea9f`; current at `cd_block.rs:946-950`).
+- **✅ HIRQ register model is W1C/sticky** — reading HIRQ no longer clears
+  `DCHG|BFUL|CSCT`; and the host's `DCHG` write-1-to-clear **also clears the
+  internal `disk_changed` latch**, which was the actual M11 boot root (it stopped
+  `Init` re-raising `DCHG` and looping recognition) (`cd_block.rs:765-850`).
+- **✅ `DrivePhase::Startup`** — a disc present at power-on/insert reports
+  `STATUS_BUSY` for ~1 s of recognition spin-up before settling to PAUSE, so the
+  BIOS plays its disc-present boot animation (`cd_block.rs:255-266,1454-1462`).
+- **✅ CD→SCU external interrupt** — the CD-block drives `Source::Cd` (IST bit 16,
+  vector `0x50`, level 7) as a level (`irq_active()`), masked by IMS bit 15,
+  re-armed by AIACK (M11).
+- **✅ `NODISC` (0x07), not `PAUSE`, when empty** (`cd_block.rs:556-565`).
 - *Consistent:* command set, buffer/filter/partition engine, read pump, data
-  transfer, ISO9660 FS, auth/region — all match Mednafen through the IP.BIN read.
+  transfer, ISO9660 FS, auth/region — match Mednafen through the IP.BIN read and
+  on into the 1st-read load.
 
 ---
 
-## Fix plan & risks
+## Fix plan & risks (retrospective)
 
-1. Work the **boot-critical queue** above in order, each as its own commit, each
-   re-verifying the `bios_boot` golden and re-running the VF2 LLE boot trace.
-2. The **SCU interrupt rework (#5)** is the deepest change and the highest-risk
-   for the golden — isolate it; expect to regenerate the splash golden only if a
-   visual check confirms the new frame is still correct.
-3. After the boot path, address VDP1/VDP2 rendering and SCSP fidelity (post-boot
-   quality) and the M/L system-bus items as a coherence pass.
-4. The **256-cycle batch scheduler (system #3)** is the dominant architectural
-   divergence but a large rework; defer unless the targeted interrupt-model
-   fixes don't unblock the boot.
-</content>
-</invoke>
+The plan below was followed; its outcome is folded into the status tags above.
+
+1. The **boot-critical queue** was worked in order, each as its own commit with
+   the `bios_boot` golden re-verified — all eight items landed.
+2. The **SCU interrupt rework (#5)** was isolated as planned; it is now the
+   per-instruction level-sampled model and underpins the M11 CD external
+   interrupt.
+3. **VDP1/VDP2 rendering and SCSP fidelity** were addressed post-boot (M11 / M13
+   Tier C and the BGM work) — most items resolved, the rest deferred until a game
+   exercises them.
+4. The **256-cycle batch scheduler (system #3)** was the dominant architectural
+   divergence and *was* reworked (event-clamped, master-leads-slave). The one
+   remaining large item is the **per-access SH-2 bus-timing model** (system #5),
+   deferred to M13 because it is golden-churning and system-wide.
