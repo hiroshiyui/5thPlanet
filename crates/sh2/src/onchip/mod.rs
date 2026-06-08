@@ -52,6 +52,12 @@ pub struct OnChip {
     pub ubc: Ubc,
     pub dmac: Dmac,
     pub bsc: Bsc,
+    /// Signature of the inputs [`Self::refresh_interrupts`] reads, so it can
+    /// skip the per-instruction re-arm when no interrupt-source register
+    /// changed (the common case). Derived state — not serialized; `None` after
+    /// load forces one refresh, which self-corrects.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    intc_sig: Option<(u8, u8, bool, u32, u32, u32, u32)>,
 }
 
 impl OnChip {
@@ -166,6 +172,24 @@ impl OnChip {
     /// flags at the next instruction boundary. A flag cleared by software
     /// (FTCSR W1C, CHCR W0C of TE) drops the pending bit on the next refresh.
     pub fn refresh_interrupts(&mut self) {
+        // Skip the re-arm when none of the interrupt-source registers this
+        // reads has changed since the last call (the overwhelmingly common
+        // per-instruction case). The signature captures every input below; a
+        // change in any forces the full refresh, so the result is identical to
+        // re-arming unconditionally.
+        let sig = (
+            self.frt.tier,
+            self.frt.ftcsr,
+            self.wdt.interrupt_active(),
+            self.divu.dvcr,
+            self.divu.vcrdiv,
+            self.dmac.channels[0].chcr,
+            self.dmac.channels[1].chcr,
+        );
+        if self.intc_sig == Some(sig) {
+            return;
+        }
+        self.intc_sig = Some(sig);
         let (tier, ftcsr) = (self.frt.tier, self.frt.ftcsr);
         self.intc
             .set_pending(Source::FrtIci, tier & 0x80 != 0 && ftcsr & 0x80 != 0);
