@@ -101,7 +101,7 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
 | 3 | **Special priority / special colour-calc per-dot** (SFPRMD/SFCCMD/SFCODE/SFSEL) | templated `priomode`/`ccmode` `:3065`; SFCODE LUT | ✅ **implemented 2026-06-08** | Med | Med |
 | 4 | **Extended colour calc — 3/4-layer blending** | `MIXIT_SPECIAL_EXCC_*` `:2491-2549` | 🟡 **non-line EXCC (CRAM0/CRAM12) done 2026-06-08** — front blends over avg(2nd, 3rd); line-colour + gradient EXCC variants deferred | Med | Med-High |
 | 5 | **Dual rotation parameter selection** (RPMD 0/1 whole-layer; 2/3 per-pixel) | `EffRPMD` `:1862`, `rotabsel[x]` `:1977-2004`, `GetWinRotAB` | 🟡 **RPMD 0/1 done 2026-06-08**; modes 2/3 (per-dot coeff / window) deferred | Med (rotation games) | Med-High |
-| 6 | **VRAM access cycle patterns** (CYCA0-CYCB1 / VCP) — bandwidth gating of fetches + reduction limits | full `VCPRegs` model `:71`, `:1399-1454` | not modelled | Low visual / High edge-case | **High** |
+| 6 | **VRAM access cycle patterns** (CYCA0-CYCB1 / VCP) — bandwidth gating of fetches + reduction limits | full `VCPRegs` model `:71`, `:1399-1454` | 🟡 **fetch-gating done 2026-06-08** (NBG name-table/character `nt_ok`/`cg_ok` → dummy tile); reduction-limit half **excluded** (Mednafen per-game whitelist `:1714-1726` = oracle hack) | Low visual / High edge-case | **High** |
 
 ### 2.7 What is NOT a gap (corrections to first-pass analysis)
 
@@ -156,8 +156,20 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
 6. **VRAM access cycle patterns.** Mednafen models the CYCA0-CYCB1 access-pattern
    table (4 banks × 8 cycles) that gates which layer may fetch pattern-name /
    character / vertical-cell-scroll data each cycle and constrains reduction.
-   We don't model it. Highest effort, lowest *visual* payoff (it mostly matters
-   for bandwidth-overcommit glitches) → lowest priority.
+   **Done 2026-06-08 (fetch-gating half):** `Vdp2Regs::nbg_vcp_fetch_masks`
+   decodes the VCP table + VRAM partition (`vram_partition_mode`/`vcp_esb`) +
+   RDBS into per-bank name-table / character permission masks (Mednafen's
+   `nt_ok`/`cg_ok`, `vdp2_render.cpp:270-311`); `sample_tile` dummies a fetch
+   from a non-granted bank → transparent (the hardware bandwidth gate). Validated
+   by the `bios_boot` golden, which is unchanged because the BIOS splash programs
+   a VCP table (VRAM_Mode 3, dumped from a boot) that grants its NBG2/NBG3 fetches
+   the banks their data lives in — i.e. honouring the table reproduces the splash
+   exactly. **The reduction-limit half is deliberately excluded:** Mednafen could
+   not generalize it and carries a *hardcoded per-game VCP whitelist*
+   (`vdp2_render.cpp:1714-1726`: Akumajou Dracula X, Alien Trilogy, Daytona,
+   Fighters Megamix…) — porting that is importing per-game oracle hacks, against
+   this project's accuracy-first / no-special-casing stance. Bitmap CG gating and
+   the rotation (RDBS) fetch path also remain deferred.
 
 ---
 
@@ -199,7 +211,13 @@ Mednafen reference: `mednaref/src/ss/vdp2_render.cpp` + `vdp2.cpp`.
    when CCCTL EXCEN is set (low-res, 2nd-layer CC bit set; RGB888 averages only
    an RGB 3rd layer). Line-colour + gradient EXCC variants deferred. Test:
    `extended_color_calc_blends_front_over_second_third_average`.
-5. **VCP cycle patterns (#6)** — last; complex, mostly edge-case correctness.
+5. 🟡 **VCP cycle patterns (#6)** — **fetch-gating done 2026-06-08**: NBG
+   name-table/character fetches are gated per VRAM bank by the CYCA0–CYCB1 table
+   (`nbg_vcp_fetch_masks` → dummy tile when not granted), validated by the
+   splash golden. The **reduction-limit half is excluded** (Mednafen per-game
+   whitelist = oracle hack); bitmap CG + rotation RDBS gating deferred. Tests:
+   `vram_cycle_pattern_gates_a_tile_layers_character_fetch`,
+   `nbg_vcp_fetch_masks_decode_the_bios_splash_cycle_pattern`.
 
 Per the M13 Tier C principle ("don't ship an active rendering feature whose
 behaviour *direction* you can't validate"), #1 and #2 are the safest first steps;
