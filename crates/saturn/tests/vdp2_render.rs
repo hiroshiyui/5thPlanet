@@ -379,3 +379,119 @@ fn rpmd_selects_rotation_parameter_set_for_rbg0() {
     sat.run_frame(&mut out);
     assert_eq!(&out[px..px + 4], &[0, 0xFF, 0, 0xFF], "RPMD=1 → param B bitmap (green)");
 }
+
+#[test]
+fn special_color_calc_mode3_uses_cram_msb_in_rgb888_mode() {
+    // SFCCMD mode 3 on a paletted dot keys colour calc on the CRAM entry's
+    // colour-calc MSB. In RGB888 CRAM mode (RAMCTL.CRMD=2) that MSB is bit 31 of
+    // the 32-bit entry. Two red dots whose entries differ only in that bit: the
+    // MSB-set one blends with the backdrop, the MSB-clear one stays opaque.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(0x05F8_000E, 0x2000, AccessKind::Data); // RAMCTL CRMD = 2 (RGB888)
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0012, AccessKind::Data); // NBG0 bitmap, 8bpp
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA N0PRIN = 1
+    // Backdrop = blue (read as RGB555 from VRAM regardless of CRAM mode).
+    sat.bus.vdp2.vram.write16(0x200, 0x7C00);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    // RGB888 entries (0x00BBGGRR): both red; only bit 31 (the cc MSB) differs.
+    sat.bus.vdp2.cram.write32(5 * 4, 0x8000_00FF); // CRAM[5] = red, cc-MSB set
+    sat.bus.vdp2.cram.write32(6 * 4, 0x0000_00FF); // CRAM[6] = red, cc-MSB clear
+    // Colour calc for NBG0: enable (CCCTL bit 0), ratio 16, SFCCMD mode 3.
+    sat.bus.write16(0x05F8_00EC, 0x0001, AccessKind::Data); // CCCTL N0 cc enable
+    sat.bus.write16(0x05F8_0108, 0x0010, AccessKind::Data); // CCRNA N0 ratio = 16
+    sat.bus.write16(0x05F8_00EE, 0x0003, AccessKind::Data); // SFCCMD NBG0 = 3
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 5); // dot A: CRAM[5] (MSB set)
+    sat.bus.vdp2.vram.write8(60 * 512 + 52, 6); // dot B: CRAM[6] (MSB clear)
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
+    let a = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(&out[a..a + 4], &[123, 0, 132, 0xFF], "CRAM MSB set → blended");
+    // Dot B: MSB clear → cc gated off → opaque red.
+    let b = (60 * FRAME_WIDTH + 52) * 4;
+    assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "CRAM MSB clear → opaque");
+}
+
+#[test]
+fn special_color_calc_mode3_always_blends_rgb_direct_dots() {
+    // SFCCMD mode 3 on an RGB direct-colour (16bpp) dot enables colour calc
+    // unconditionally (no palette/MSB to consult — Mednafen `TA_isrgb` forces
+    // the CCE bit). So a 16bpp NBG0 dot blends with the backdrop.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0032, AccessKind::Data); // NBG0 bitmap, RGB555 (CHCN=3)
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA N0PRIN = 1
+    // Backdrop = blue.
+    sat.bus.vdp2.vram.write16(0x200, 0x7C00);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    // Colour calc: enable (CCCTL bit 0), ratio 16, SFCCMD mode 3.
+    sat.bus.write16(0x05F8_00EC, 0x0001, AccessKind::Data); // CCCTL N0 cc enable
+    sat.bus.write16(0x05F8_0108, 0x0010, AccessKind::Data); // CCRNA N0 ratio = 16
+    sat.bus.write16(0x05F8_00EE, 0x0003, AccessKind::Data); // SFCCMD NBG0 = 3
+    // 16bpp RGB555 red dot (bit 15 clear — proves cc is on regardless of the MSB).
+    sat.bus.vdp2.vram.write16((60 * 512 + 50) * 2, 0x001F);
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    // Red over blue at alpha = (31-16)*255/31 = 123 → [123, 0, 132].
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(&out[px..px + 4], &[123, 0, 132, 0xFF], "RGB direct dot blends under SFCCMD 3");
+}
+
+#[test]
+fn rbg0_special_color_calc_mode2_gates_blending_by_sfcode() {
+    // Exercises the RBG0 special-function path: SFPRMD/SFCCMD layer index 4. As
+    // for NBG, SFCCMD mode 2 = the bitmap special-cc bit (BMSCC, BMPNB) masked
+    // off when the dot's palette code fails the SFCODE test. Identity rotation,
+    // so screen (x,y) samples plane (x,y).
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0 only
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // CHCTLB: R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR (RBG0 priority) = 1
+    // Rotation parameter table at VRAM byte 0x40000; identity transform.
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
+    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
+    }
+    // Backdrop = blue.
+    sat.bus.vdp2.vram.write16(0x200, 0x7C00);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    // CRAM[2] = CRAM[4] = red (both dots red; only their cc differs).
+    sat.bus.vdp2.cram.write16(2 * 2, 0x001F);
+    sat.bus.vdp2.cram.write16(4 * 2, 0x001F);
+    // Colour calc for RBG0: enable (CCCTL bit 4), ratio 16 (CCRR).
+    sat.bus.write16(0x05F8_00EC, 0x0010, AccessKind::Data); // CCCTL R0 cc enable
+    sat.bus.write16(0x05F8_010C, 0x0010, AccessKind::Data); // CCRR ratio = 16
+    // Special cc: BMSCC (BMPNB bit 4), SFCCMD RBG0 (bits 8..9) = mode 2.
+    sat.bus.write16(0x05F8_002E, 0x0010, AccessKind::Data); // BMPNB: R0 BMSCC
+    sat.bus.write16(0x05F8_00EE, 0x0200, AccessKind::Data); // SFCCMD RBG0 = 2
+    sat.bus.write16(0x05F8_0024, 0x0000, AccessKind::Data); // SFSEL → SFCODE-A
+    sat.bus.write16(0x05F8_0026, 0x0004, AccessKind::Data); // SFCODE-A = 0x04 (bit 2)
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 4); // dot A: code 4 → (4>>1)&7=2 → bit set
+    sat.bus.vdp2.vram.write8(60 * 512 + 52, 2); // dot B: code 2 → (2>>1)&7=1 → bit clear
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
+    let a = (60 * FRAME_WIDTH + 50) * 4;
+    assert_eq!(&out[a..a + 4], &[123, 0, 132, 0xFF], "code 4: SFCODE bit set → blended");
+    // Dot B: cc gated off → opaque red.
+    let b = (60 * FRAME_WIDTH + 52) * 4;
+    assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "code 2: SFCODE bit clear → opaque");
+}
