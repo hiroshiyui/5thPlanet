@@ -534,3 +534,40 @@ fn extended_color_calc_blends_front_over_second_third_average() {
     sat.run_frame(&mut out);
     assert_eq!(&out[px..px + 4], &[123, 65, 65, 0xFF], "EXCEN on → red over avg(green, blue)");
 }
+
+#[test]
+fn vram_cycle_pattern_gates_a_tile_layers_character_fetch() {
+    // VRAM cycle-pattern (VCP) gating: a tile-NBG character fetch from a VRAM
+    // bank the CYCx table doesn't grant reads as a transparent dummy → the layer
+    // blanks to the backdrop. A minimal 8bpp tile NBG0 (NT + char both in bank0)
+    // renders when bank0 is granted NBG0's CG slot, and vanishes when it isn't.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(0x05F8_000E, 0x0300, AccessKind::Data); // RAMCTL: VRAM_Mode 3 → esb = bank
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0010, AccessKind::Data); // NBG0 tile, 8bpp, 8×8 char
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA N0PRIN = 1
+    // Backdrop = blue (so a blanked layer shows blue, not black).
+    sat.bus.vdp2.vram.write16(0x200, 0x7C00);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red
+    // 2-word pattern-name entry (0,0): char number 2 (8bpp → byte base 2×0x20 = 64).
+    sat.bus.vdp2.vram.write32(0, 2);
+    sat.bus.vdp2.vram.write8(64, 7); // char pixel (0,0) = palette index 7 (red)
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    let px = 0; // screen (0,0)
+
+    // Grant: bank0 gets NBG0 name-table (code 0) + character (code 4) slots.
+    sat.bus.write16(0x05F8_0010, 0x0400, AccessKind::Data); // CYCA0 bank0 slots: N0NT,N0CG,…
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[255, 0, 0, 0xFF], "bank0 grants NBG0 CG → tile renders (red)");
+
+    // Deny: remove the NBG0 character slot (no bank holds code 4) → char fetch
+    // dummied → transparent → backdrop blue shows.
+    sat.bus.write16(0x05F8_0010, 0x0000, AccessKind::Data); // all slots N0NT, none = N0CG
+    sat.run_frame(&mut out);
+    assert_eq!(&out[px..px + 4], &[0, 0, 255, 0xFF], "no CG grant → NBG0 char blanks → backdrop");
+}

@@ -905,6 +905,7 @@ fn sample_pattern_cell(
     mut in_y: u32,
     coff: usize,
     tpon: bool,
+    cg_gate: Option<u8>,
 ) -> Option<Sample> {
     let cell_px = if two_cells { 16 } else { 8 };
     if pat.hflip {
@@ -920,14 +921,18 @@ fn sample_pattern_cell(
     // base is therefore always `char × 0x20`.
     let subcell = (in_y / 8) * 2 + (in_x / 8);
     let (px, py) = (in_x % 8, in_y % 8);
-    let (code, idx) = if depth == 1 {
+    let cell = if depth == 1 { pat.cell + subcell * 2 } else { pat.cell + subcell };
+    // VRAM cycle-pattern gating: a character fetch landing in a bank the VCP
+    // table doesn't grant this NBG reads as a transparent dummy tile (code 0).
+    let cg_blocked = cg_gate.is_some_and(|mask| mask & (1 << (((cell * 32) >> 17) & 3)) == 0);
+    let (code, idx) = if cg_blocked {
+        (0, coff)
+    } else if depth == 1 {
         // 8bpp cell: 0x40 bytes, one byte/pixel; palette is the colour bank.
-        let cell = pat.cell + subcell * 2;
         let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
         (byte, coff | (pat.palette as usize) << 8 | byte)
     } else {
         // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
-        let cell = pat.cell + subcell;
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
         let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
         (nibble, coff | (pat.palette as usize) << 4 | nibble)
@@ -1001,10 +1006,19 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sam
         sup_spr: r.nbg_pn_special_priority(n),
         sup_scc: r.nbg_pn_special_calc(n),
     };
-    let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
+    // VRAM cycle-pattern gating (CYCA0..CYCB1): a name-table fetch from a bank
+    // the VCP table doesn't grant this NBG reads as a transparent dummy tile —
+    // and the character fetch is gated likewise inside sample_pattern_cell.
+    let (nt_mask, cg_mask) = r.nbg_vcp_fetch_masks(n);
+    let nt_bank = ((pn_addr >> 17) & 3) as u8;
+    let pat = if nt_mask & (1 << nt_bank) != 0 {
+        decode_pattern(vdp2, pn_addr, fmt, two_cells, depth)
+    } else {
+        Pattern { cell: 0, palette: 0, hflip: false, vflip: false, spr: false, scc: false }
+    };
     let coff = r.nbg_color_ram_offset(n);
     let tpon = r.nbg_transparent_pen_solid(n);
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon)
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon, Some(cg_mask))
 }
 
 // Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
@@ -1315,7 +1329,8 @@ fn sample_rot_tile(
     let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
     let coff = r.rbg_color_ram_offset(layer);
     let tpon = r.rbg_transparent_pen_solid(layer);
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon)
+    // No VCP gating on the rotation path yet (RDBS bank selection unmodelled).
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon, None)
 }
 
 #[cfg(test)]
@@ -1336,6 +1351,13 @@ mod tests {
         v.regs.write16(0x000, 0x8000); // TVMD.DISP
         v.regs.write16(0x020, 0x0001); // BGON.NBG0
         v.regs.write16(0x0F8, 0x0001); // PRINA.N0PRIN = 1
+        // VRAM cycle-pattern: grant NBG0 name-table (code 0) + character (code 4)
+        // access in every bank, so a tile layer can fetch (real software always
+        // programs this; without it the VCP gating dummies the char fetch). With
+        // VRAM_Mode 0 (default) esb is 0 for banks A0/A1 and 2 for B0/B1, so the
+        // two CYCA0/CYCB0 registers cover all four banks.
+        v.regs.write16(0x010, 0x0040); // CYCA0: slot0 = N0NT, slot2 = N0CG
+        v.regs.write16(0x018, 0x0040); // CYCB0: same
     }
 
     /// Program the back screen (the real backdrop) to an RGB555 colour at a high

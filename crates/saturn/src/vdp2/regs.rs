@@ -154,6 +154,61 @@ impl Vdp2Regs {
     pub fn cram_mode(&self) -> u8 {
         ((self.ramctl() >> 12) & 0b11) as u8
     }
+    /// VRAM partition mode (RAMCTL bits 9:8 = VRAMD/VRBMD): bit 0 splits VRAM
+    /// bank A into sub-banks A0/A1, bit 1 splits bank B into B0/B1. Selects the
+    /// effective VCP sub-bank via [`Self::vcp_esb`].
+    pub fn vram_partition_mode(&self) -> u8 {
+        ((self.ramctl() >> 8) & 0x3) as u8
+    }
+    /// Effective VCP sub-bank for VRAM `bank` (0..3): an unsplit bank's two
+    /// halves share the upper half's cycle-pattern register (Mednafen `esb =
+    /// bank & (2 | ((VRAM_Mode >> (bank>>1)) & 1))`).
+    fn vcp_esb(&self, bank: usize) -> usize {
+        bank & (2 | ((self.vram_partition_mode() as usize >> (bank >> 1)) & 1))
+    }
+    /// VRAM cycle-pattern access code (0..0xF) for sub-bank `esb` (0..3), cycle
+    /// `slot` (0..7): the 4-bit field of the CYCA0/A1/B0/B1 registers (0x010..
+    /// 0x01E, high nibble = slot 0). `0..3` = NBG0–3 name-table, `4..7` = NBG0–3
+    /// character, `0xC/0xD` = NBG0/1 vertical-cell-scroll, `0xE` = CPU, `0xF` =
+    /// no access. Mednafen `VCPRegs[bank][slot]` (`vdp2.cpp:590`).
+    fn vcp_access(&self, esb: usize, slot: usize) -> u8 {
+        let off = 0x10 + (esb as u32) * 4 + (slot as u32 / 4) * 2;
+        ((self.read16(off) >> (12 - (slot % 4) * 4)) & 0xF) as u8
+    }
+    /// Per-bank VRAM-fetch permission for NBG`n`'s name-table and character
+    /// data, derived from the VRAM **cycle-pattern** table (CYCA0..CYCB1) +
+    /// VRAM partition + RDBS — a port of Mednafen's `nt_ok`/`cg_ok` build
+    /// (`vdp2_render.cpp:270-311`, non-rotation path). Returns `(nt_mask,
+    /// cg_mask)`: bit `b` set ⇒ NBG`n` may fetch name-table / character data
+    /// from VRAM bank `b`. A fetch landing in a bank whose bit is clear reads as
+    /// a transparent dummy tile — the hardware's VRAM-bandwidth gating. The
+    /// rotation RDBS-claimed-bank path (`BGON & 0x10`) is honoured as a *deny*
+    /// here but the rotation layer's own VCP fetch is not yet modelled.
+    pub fn nbg_vcp_fetch_masks(&self, n: usize) -> (u8, u8) {
+        let bgon = self.bgon();
+        let rdbs_mode = self.ramctl() & 0xFF;
+        let slots = if self.h_resolution() & 0x6 != 0 { 4 } else { 8 };
+        let (mut nt, mut cg) = (0u8, 0u8);
+        for bank in 0..4usize {
+            if bgon & 0x20 != 0 && bank & 2 != 0 {
+                continue; // RBG1 active reserves banks B0/B1
+            }
+            let esb = self.vcp_esb(bank);
+            let rdbs = (rdbs_mode >> (esb * 2)) & 0x3;
+            if bgon & 0x10 != 0 && rdbs != 0 {
+                continue; // RBG0 rotation claims this bank for name/char/coeff
+            }
+            for slot in 0..slots {
+                let a = self.vcp_access(esb, slot);
+                if a == 0x4 + n as u8 {
+                    cg |= 1 << bank;
+                } else if a == n as u8 {
+                    nt |= 1 << bank;
+                }
+            }
+        }
+        (nt, cg)
+    }
     pub fn bgon(&self) -> u16 {
         self.read16(0x020)
     }
@@ -1206,6 +1261,45 @@ mod tests {
         r.write16(0x0EC, 0x0010 | 0x0100);
         r.write16(0x10C, 0x0007);
         assert_eq!(r.rbg_color_calc(0), Some((7, true)));
+    }
+
+    #[test]
+    fn nbg_vcp_fetch_masks_decode_the_bios_splash_cycle_pattern() {
+        // The exact VCP table the real BIOS programs for its SEGA-logo splash
+        // (captured from a boot): VRAM_Mode 3 (both banks split → esb = bank),
+        // NBG2/NBG3 active. Honouring it keeps the bios_boot golden, so this is
+        // the decode validated against hardware-programmed data.
+        let mut r = Vdp2Regs::new();
+        r.write16(0x00E, 0x0300); // RAMCTL: VRAM_Mode = 3, RDBS = 0
+        r.write16(0x020, 0x080C); // BGON: NBG2 + NBG3 (+ N3TPON)
+        // CYCA0/A1/B0/B1 (high nibble = slot 0):
+        r.write16(0x010, 0x7744); // bank0 slots0-3: N3CG,N3CG,N0CG,N0CG
+        r.write16(0x012, 0xFFFF); // bank0 slots4-7: NOP
+        r.write16(0x014, 0xFF30); // bank1 slots0-3: NOP,NOP,N3NT,N0NT
+        r.write16(0x016, 0xFFFF);
+        r.write16(0x018, 0x6655); // bank2 slots0-3: N2CG,N2CG,N1CG,N1CG
+        r.write16(0x01A, 0xFFFF);
+        r.write16(0x01C, 0x21FF); // bank3 slots0-3: N2NT,N1NT,NOP,NOP
+        r.write16(0x01E, 0xFFFF);
+        // bit b set ⇒ NBG`n` may fetch NT / CG from VRAM bank b.
+        assert_eq!(r.nbg_vcp_fetch_masks(0), (0b0010, 0b0001), "NBG0: NT bank1, CG bank0");
+        assert_eq!(r.nbg_vcp_fetch_masks(1), (0b1000, 0b0100), "NBG1: NT bank3, CG bank2");
+        assert_eq!(r.nbg_vcp_fetch_masks(2), (0b1000, 0b0100), "NBG2: NT bank3, CG bank2");
+        assert_eq!(r.nbg_vcp_fetch_masks(3), (0b0010, 0b0001), "NBG3: NT bank1, CG bank0");
+    }
+
+    #[test]
+    fn nbg_vcp_unsplit_bank_shares_the_upper_subbank_pattern() {
+        // VRAM_Mode 0: neither bank split → banks 0/1 share VCPRegs[0], 2/3 share
+        // VCPRegs[2] (esb = bank & 2). A slot in bank0's register grants *both*
+        // halves of bank A.
+        let mut r = Vdp2Regs::new();
+        r.write16(0x00E, 0x0000); // VRAM_Mode = 0 (unsplit)
+        r.write16(0x010, 0x0004); // bank0 slot0 = N0NT, slot1 = N0CG (0x0004 → 0,0,0,4)
+        // esb(0)=0, esb(1)=0 → both banks 0 and 1 see VCPRegs[0].
+        let (nt, cg) = r.nbg_vcp_fetch_masks(0);
+        assert_eq!(nt & 0b0011, 0b0011, "NT granted in both halves of unsplit bank A");
+        assert_eq!(cg & 0b0011, 0b0011, "CG granted in both halves of unsplit bank A");
     }
 
     #[test]
