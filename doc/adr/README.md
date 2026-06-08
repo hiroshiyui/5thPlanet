@@ -52,6 +52,7 @@ We use Michael Nygard's lightweight format — see
 | [0011](0011-hle-bios-syscalls.md) | HLE the BIOS system-call library for cold direct boot | Superseded |
 | [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Rejected |
 | [0013](0013-render-pipeline-worker-thread.md) | Render-pipeline worker thread (offload only the read-only render edge) | Accepted |
+| [0014](0014-audio-paced-emulation-loop.md) | Audio-paced emulation loop: real-time clock, reserve buffer, prebuffer | Accepted |
 
 ### Decisions worth recording (backlog)
 
