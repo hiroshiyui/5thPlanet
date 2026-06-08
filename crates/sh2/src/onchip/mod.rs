@@ -251,6 +251,10 @@ fn intc_write8(i: &mut Intc, off: u32, val: u8, ipra_block: bool) {
             _ => {}
         }
     }
+    // An IPRA/IPRB write changes source priorities, so the cached highest-
+    // priority pending source must be re-derived (no-op for VCR*/ICR writes,
+    // but cheap and rare).
+    i.refresh_priorities();
 }
 
 // ---- DMAC register helpers ----

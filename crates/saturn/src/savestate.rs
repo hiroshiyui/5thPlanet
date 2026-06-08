@@ -30,8 +30,9 @@ use crate::system::Saturn;
 const MAGIC: [u8; 4] = *b"5PSS";
 /// Snapshot format version. Bump on any change to a serialized struct's shape;
 /// rejects mismatches rather than attempting migration. v2 added the CD-block
-/// drive-phase machine fields (`cdb.cpp`-faithful `Drive_Run` port).
-const VERSION: u32 = 2;
+/// drive-phase machine fields (`cdb.cpp`-faithful `Drive_Run` port). v3 added
+/// the SH-2 INTC cached highest-priority-pending source (`Intc::best`).
+const VERSION: u32 = 3;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.

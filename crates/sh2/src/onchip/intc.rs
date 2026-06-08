@@ -20,6 +20,7 @@
 /// On-chip interrupt sources the SH-2 core needs to know about.
 /// External (Saturn-side, NMI, IRL) sources arrive via [`Intc::raise`] too.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Source {
     Nmi,
     UserBreak,
@@ -68,6 +69,14 @@ pub struct Intc {
     /// during the interrupt-acknowledge cycle) it is whatever the asserting
     /// device supplied via [`Intc::raise_external`].
     ext_vector: u8,
+    /// Cached highest-priority pending source (NMI folded as level 16),
+    /// **ignoring** SR.imask — recomputed only when the pending set, external
+    /// level, or a priority register changes (all rare), so the per-instruction
+    /// [`Intc::next_pending`] is O(1) instead of scanning every source. Kept in
+    /// lockstep by [`Intc::recompute_best`] at every mutation point; serialized
+    /// with the rest so it stays consistent across save/load. (Was a 17%-of-
+    /// runtime hotspot when recomputed per instruction.)
+    best: Option<(Source, u8)>,
 }
 
 impl Intc {
@@ -84,42 +93,21 @@ impl Intc {
             self.ext_vector = 64 + level.min(15);
         }
         self.pending |= 1 << src.ord();
+        self.recompute_best();
     }
 
-    /// Assert an external (IRL) interrupt at `level`, latching an explicit
-    /// `vector` rather than the auto-vector `64 + level`. This models the
-    /// SH7604's external-vector-fetch mode: the asserting device (on the
-    /// Saturn, the SCU) presents the vector number during the
-    /// interrupt-acknowledge cycle. The Saturn SCU's vectors are fixed at
-    /// 0x40 + source index, independent of priority level.
-    pub fn raise_external(&mut self, level: u8, vector: u8) {
-        self.ext_level = level.min(15);
-        self.ext_vector = vector;
-        self.pending |= 1 << Source::External(0).ord();
-    }
-
-    pub fn acknowledge(&mut self, src: Source) {
-        self.pending &= !(1 << src.ord());
-    }
-
-    /// Drive a level-triggered on-chip source's pending bit directly from the
-    /// device's current flag state. Unlike [`Intc::raise`] (edge-style, set
-    /// once), this is called every step so the pending bit tracks the flag —
-    /// e.g. an FRT compare-match interrupt asserts while OCFA is set and the
-    /// match-enable is on, and clears the instant software W1C-clears OCFA.
-    pub fn set_pending(&mut self, src: Source, active: bool) {
-        if active {
-            self.pending |= 1 << src.ord();
-        } else {
-            self.pending &= !(1 << src.ord());
-        }
-    }
-
-    /// Return the highest-priority pending source whose level is > `mask`.
-    /// `None` means no interrupt should be taken this cycle.
-    pub fn next_pending(&self, sr_imask: u8) -> Option<(Source, u8)> {
+    /// Recompute the cached highest-priority pending source (ignoring SR.imask;
+    /// NMI folded as level 16). Must be called after **every** change to the
+    /// pending set, `ext_level`, or a priority register (IPRA/IPRB) — it is the
+    /// sole keeper of the [`Intc::best`] cache. Equivalent to the old inline
+    /// per-instruction scan: since priority *is* the level, the global-highest
+    /// source (then mask-filtered by `next_pending`) is the same source the old
+    /// "highest among those above the mask" loop selected.
+    fn recompute_best(&mut self) {
+        // NMI is non-maskable (fixed level 16) and outranks everything.
         if self.pending & (1 << Source::Nmi.ord()) != 0 {
-            return Some((Source::Nmi, 16));
+            self.best = Some((Source::Nmi, 16));
+            return;
         }
         let mut best: Option<(Source, u8)> = None;
         for src in ALL_SOURCES {
@@ -132,11 +120,68 @@ impl Intc {
                 continue;
             }
             let lvl = self.priority_of(src);
-            if lvl > sr_imask && best.map(|(_, l)| lvl > l).unwrap_or(true) {
+            if best.is_none_or(|(_, l)| lvl > l) {
                 best = Some((src, lvl));
             }
         }
-        best
+        self.best = best;
+    }
+
+    /// Recompute the pending cache after a priority-register (IPRA/IPRB) write,
+    /// which changes [`Self::priority_of`] for the affected sources. Called by
+    /// the on-chip register write path.
+    pub fn refresh_priorities(&mut self) {
+        self.recompute_best();
+    }
+
+    /// Assert an external (IRL) interrupt at `level`, latching an explicit
+    /// `vector` rather than the auto-vector `64 + level`. This models the
+    /// SH7604's external-vector-fetch mode: the asserting device (on the
+    /// Saturn, the SCU) presents the vector number during the
+    /// interrupt-acknowledge cycle. The Saturn SCU's vectors are fixed at
+    /// 0x40 + source index, independent of priority level.
+    pub fn raise_external(&mut self, level: u8, vector: u8) {
+        self.ext_level = level.min(15);
+        self.ext_vector = vector;
+        self.pending |= 1 << Source::External(0).ord();
+        self.recompute_best();
+    }
+
+    pub fn acknowledge(&mut self, src: Source) {
+        self.pending &= !(1 << src.ord());
+        self.recompute_best();
+    }
+
+    /// Drive a level-triggered on-chip source's pending bit directly from the
+    /// device's current flag state. Unlike [`Intc::raise`] (edge-style, set
+    /// once), this is called every step so the pending bit tracks the flag —
+    /// e.g. an FRT compare-match interrupt asserts while OCFA is set and the
+    /// match-enable is on, and clears the instant software W1C-clears OCFA.
+    pub fn set_pending(&mut self, src: Source, active: bool) {
+        // This is called every step for level-triggered sources, so skip the
+        // cache recompute when the bit is already in the requested state (the
+        // overwhelmingly common case — the flag rarely flips).
+        let bit = 1 << src.ord();
+        if (self.pending & bit != 0) == active {
+            return;
+        }
+        if active {
+            self.pending |= bit;
+        } else {
+            self.pending &= !bit;
+        }
+        self.recompute_best();
+    }
+
+    /// Return the highest-priority pending source whose level is > `mask`.
+    /// `None` means no interrupt should be taken this cycle.
+    pub fn next_pending(&self, sr_imask: u8) -> Option<(Source, u8)> {
+        // O(1): the highest-priority pending source is cached (see `best` /
+        // `recompute_best`); only the per-call SR.imask test remains. Because
+        // priority == level, mask-filtering the global highest yields the same
+        // source as the old "highest among those above the mask" scan: if the
+        // highest is ≤ mask then every source is, so both return None.
+        self.best.filter(|&(_, lvl)| lvl > sr_imask)
     }
 
     /// Priority level (0..=15) configured for `src` via IPRA/IPRB. Sources
