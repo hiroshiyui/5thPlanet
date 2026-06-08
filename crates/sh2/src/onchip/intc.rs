@@ -323,6 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn reprioritising_an_already_pending_source_updates_next_pending() {
+        // Guards the `best`/`recompute_best` cache invariant: a priority-register
+        // write *after* a source is already pending must update next_pending.
+        // (The other tests set IPRA before raise(), so they'd still pass even if
+        // refresh_priorities — the hook the IPRA/IPRB write path calls — were
+        // dropped; this one would not.)
+        let mut i = Intc::new();
+        i.ipra = 0x0500; // DMAC priority 5
+        i.raise(Source::DmacCh0);
+        assert!(i.next_pending(7).is_none(), "5 ≤ mask 7 → suppressed");
+
+        // Raise DMAC's priority to 0xA *after* it's pending, the way an IPRA
+        // write does, and re-arm the cache via the same hook intc_write8 calls.
+        i.ipra = 0x0A00;
+        i.refresh_priorities();
+        let (src, lvl) = i.next_pending(7).expect("now 0xA > mask 7");
+        assert_eq!((src, lvl), (Source::DmacCh0, 0xA));
+
+        // Lowering it back below the mask must drop it again.
+        i.ipra = 0x0300;
+        i.refresh_priorities();
+        assert!(i.next_pending(7).is_none(), "3 ≤ mask 7 → suppressed again");
+    }
+
+    #[test]
     fn external_irl_level_is_priority() {
         let mut i = Intc::new();
         i.raise(Source::External(9));
