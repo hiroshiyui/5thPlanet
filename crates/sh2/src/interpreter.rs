@@ -1205,10 +1205,20 @@ impl Cpu {
             return (!0, 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
-            return (cache::extract_u8(&line, phys), stall);
-        }
-        if !cacheable {
+        if cacheable {
+            match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
+                cache::Probe::Hit(set, way) => {
+                    self.note_watched_read(phys, kind, 1);
+                    return (cache::extract_u8(self.cache.line_at(set, way), phys), 0);
+                }
+                cache::Probe::Miss => {
+                    self.note_watched_read(phys, kind, 2);
+                    let (line, stall) = self.fill_line(phys, kind, bus);
+                    return (cache::extract_u8(&line, phys), stall);
+                }
+                cache::Probe::Bypass => self.note_watched_read(phys, kind, 3),
+            }
+        } else {
             self.note_watched_read(phys, kind, 0);
         }
         bus.read8(phys, kind)
@@ -1230,10 +1240,20 @@ impl Cpu {
             return (!0, 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
-            return (cache::extract_u16(&line, phys), stall);
-        }
-        if !cacheable {
+        if cacheable {
+            match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
+                cache::Probe::Hit(set, way) => {
+                    self.note_watched_read(phys, kind, 1);
+                    return (cache::extract_u16(self.cache.line_at(set, way), phys), 0);
+                }
+                cache::Probe::Miss => {
+                    self.note_watched_read(phys, kind, 2);
+                    let (line, stall) = self.fill_line(phys, kind, bus);
+                    return (cache::extract_u16(&line, phys), stall);
+                }
+                cache::Probe::Bypass => self.note_watched_read(phys, kind, 3),
+            }
+        } else {
             self.note_watched_read(phys, kind, 0);
         }
         bus.read16(phys, kind)
@@ -1255,10 +1275,20 @@ impl Cpu {
             return (!0, 0);
         }
         let (phys, cacheable) = classify(addr);
-        if cacheable && let Some((line, stall)) = self.cache_fill(phys, kind, bus) {
-            return (cache::extract_u32(&line, phys), stall);
-        }
-        if !cacheable {
+        if cacheable {
+            match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
+                cache::Probe::Hit(set, way) => {
+                    self.note_watched_read(phys, kind, 1);
+                    return (cache::extract_u32(self.cache.line_at(set, way), phys), 0);
+                }
+                cache::Probe::Miss => {
+                    self.note_watched_read(phys, kind, 2);
+                    let (line, stall) = self.fill_line(phys, kind, bus);
+                    return (cache::extract_u32(&line, phys), stall);
+                }
+                cache::Probe::Bypass => self.note_watched_read(phys, kind, 3),
+            }
+        } else {
             self.note_watched_read(phys, kind, 0);
         }
         bus.read32(phys, kind)
@@ -1495,48 +1525,28 @@ impl Cpu {
         c.tcr = tcr;
     }
 
-    /// Cache miss-fill. Returns `Some((line, stall))` if the cache is
-    /// active and we successfully obtained a line (hit or freshly filled);
-    /// `None` if the cache is disabled or this access kind is masked off
-    /// (ID/OD) — in which case the caller bypasses to the bus directly.
-    ///
-    /// On a miss we fetch the full 16-byte line aligned to `phys & !0xF`
-    /// via four sequential `bus.read32` calls (the SH7604 burst is four
-    /// 32-bit beats), install it, and return the populated line.
-    fn cache_fill(
+    /// Cache line-fill for a confirmed miss (the `mem_read*` hit/bypass cases
+    /// are handled inline via [`cache::Cache::probe`]). Fetches the full
+    /// 16-byte line aligned to `phys & !0xF` via four sequential `bus.read32`
+    /// calls (the SH7604 burst is four 32-bit beats), installs it, and returns
+    /// the populated line plus the accumulated bus stall.
+    fn fill_line(
         &mut self,
         phys: u32,
         kind: AccessKind,
         bus: &mut impl Bus,
-    ) -> Option<([u8; cache::LINE_BYTES], u32)> {
-        let lookup = match kind {
-            AccessKind::Fetch => self.cache.lookup_fetch(phys),
-            AccessKind::Data | AccessKind::Dma => self.cache.lookup_data(phys),
-        };
-        match lookup {
-            cache::Lookup::Hit(line) => {
-                self.note_watched_read(phys, kind, 1);
-                Some((line, 0))
-            }
-            cache::Lookup::Bypass => {
-                self.note_watched_read(phys, kind, 3);
-                None
-            }
-            cache::Lookup::Miss => {
-                self.note_watched_read(phys, kind, 2);
-                let base = phys & !0xF;
-                let mut line = [0u8; cache::LINE_BYTES];
-                let mut stall = 0u32;
-                for chunk in 0..4u32 {
-                    let (val, s) = bus.read32(base + chunk * 4, kind);
-                    let off = (chunk * 4) as usize;
-                    line[off..off + 4].copy_from_slice(&val.to_be_bytes());
-                    stall += s;
-                }
-                self.cache.install(phys, line);
-                Some((line, stall))
-            }
+    ) -> ([u8; cache::LINE_BYTES], u32) {
+        let base = phys & !0xF;
+        let mut line = [0u8; cache::LINE_BYTES];
+        let mut stall = 0u32;
+        for chunk in 0..4u32 {
+            let (val, s) = bus.read32(base + chunk * 4, kind);
+            let off = (chunk * 4) as usize;
+            line[off..off + 4].copy_from_slice(&val.to_be_bytes());
+            stall += s;
         }
+        self.cache.install(phys, line);
+        (line, stall)
     }
 
     // ----------------------------------------------------------------------

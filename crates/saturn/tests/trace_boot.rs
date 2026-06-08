@@ -3321,6 +3321,83 @@ fn bench_fps() {
     println!("render is {:.0}% of the compute+render frame time", render_share * 100.0);
 }
 
+/// Cache-internals probe: load the heavy Press-Start snapshot, run BENCH_FRAMES
+/// frames compute-only, and report the SH-2 I/D cache hit/miss breakdown for
+/// both CPUs. The point is to attribute `cache_fill`'s ~9.5% self-time: a high
+/// hit rate means the cost is the **per-access hit-path 16-byte line copy**
+/// (optimisable — return the few needed bytes, not the whole line); a high miss
+/// rate means it's the **line-fill** (4× `bus.read32`, inherent to a cold line).
+/// Run with --release.
+///
+///   cargo test --release -p saturn --test trace_boot bench_cache \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "manual: SH-2 cache hit/miss probe (run with --release)"]
+fn bench_cache() {
+    let root = workspace_root();
+    let bios_path = match std::env::var("BIOS") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin"),
+    };
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+    {
+        sat.insert_disc(d);
+    } else {
+        println!("no disc roms/{cue_name}; aborting");
+        return;
+    }
+    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let snap_file =
+        std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
+    const CYC: u64 = 479_151;
+    if !std::path::Path::new(&snap_file).exists() {
+        println!("building snapshot to f{snap_at} (one-time, no-render)…");
+        for _ in 0..snap_at {
+            sat.run_for(CYC);
+        }
+        std::fs::write(&snap_file, sat.save_state()).expect("write snapshot");
+    }
+    let snap = std::fs::read(&snap_file).expect("read snapshot");
+    sat.load_state(&snap).expect("load_state (BIOS/disc must match)");
+
+    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    sat.master_mut().cache.dbg_reset_stats();
+    sat.slave_mut().cache.dbg_reset_stats();
+    for _ in 0..n {
+        sat.run_for(CYC);
+        let _ = sat.take_audio();
+    }
+    let report = |who: &str, s: [u64; 4]| {
+        let [fh, fm, dh, dm] = s;
+        let (hits, misses) = (fh + dh, fm + dm);
+        let total = hits + misses;
+        let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+        println!("--- {who} cache over {n} frames ---");
+        println!("  fetch: {fh} hit / {fm} miss");
+        println!("  data : {dh} hit / {dm} miss");
+        println!("  total: {hits} hit / {misses} miss  ({total} probes, {rate:.3}% hit)");
+        // Hit path copies a full 16-byte line per access; misses also fetch 16 B
+        // (4× read32). Bytes moved through the line buffer ≈ 16 × total probes.
+        println!("  line-bytes copied ≈ {} MiB ({:.1} MiB/frame)",
+            total * 16 / (1024 * 1024), total as f64 * 16.0 / n as f64 / (1024.0 * 1024.0));
+    };
+    report("master", sat.master().cache.dbg_stats());
+    report("slave", sat.slave().cache.dbg_stats());
+}
+
 /// Per-stage fps curve across the opening: boots continuously (compute-only,
 /// draining audio each frame like the frontend) and reports the sustained
 /// compute fps over each WINDOW-frame window — so the Inter-Channel / fade /

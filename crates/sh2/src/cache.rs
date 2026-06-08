@@ -75,6 +75,13 @@ pub struct Cache {
     /// associative purge. Observer-only; never serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     dbg_assoc_purges: u64,
+    /// Debug only: lifetime hit/miss tallies, split by access kind
+    /// (`[fetch_hit, fetch_miss, data_hit, data_miss]`). Observer-only; never
+    /// serialized. Drives the cache-internals perf probe (`bench_cache`): the
+    /// hit *rate* tells whether `cache_fill`'s cost is the rare miss line-fill
+    /// (4× `bus.read32`) or the per-access hit-path line copy.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dbg_stats: [u64; 4],
 }
 
 impl Default for Cache {
@@ -97,6 +104,19 @@ pub enum Lookup {
     Bypass,
 }
 
+/// Outcome of the hot-path [`Cache::probe`] — like [`Lookup`] but a hit
+/// carries the line *location* (`set`, `way`) rather than a copy of its bytes,
+/// so the caller extracts in place via [`Cache::line_at`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Probe {
+    /// Line is resident at `(set, way)`; read it with [`Cache::line_at`].
+    Hit(usize, usize),
+    /// Not resident — caller must fill from the bus and [`install`].
+    Miss,
+    /// Cache disabled or this access kind masked (ID/OD) — go to the bus.
+    Bypass,
+}
+
 impl Cache {
     pub fn new() -> Self {
         let mut lru = [[0u8; WAYS]; SETS];
@@ -110,12 +130,24 @@ impl Cache {
             sets: [[Line::default(); WAYS]; SETS],
             lru,
             dbg_assoc_purges: 0,
+            dbg_stats: [0; 4],
         }
     }
 
     /// Debug only: how many associative purges have been performed.
     pub fn dbg_assoc_purges(&self) -> u64 {
         self.dbg_assoc_purges
+    }
+
+    /// Debug only: lifetime `[fetch_hit, fetch_miss, data_hit, data_miss]`
+    /// tallies (Bypass is not counted — the cache is off or masked, so there is
+    /// no fill cost to attribute). Observer-only.
+    pub fn dbg_stats(&self) -> [u64; 4] {
+        self.dbg_stats
+    }
+    /// Debug only: zero the hit/miss tallies (call before a measured window).
+    pub fn dbg_reset_stats(&mut self) {
+        self.dbg_stats = [0; 4];
     }
 
     #[inline]
@@ -196,6 +228,54 @@ impl Cache {
             return Lookup::Bypass;
         }
         self.lookup(addr)
+    }
+
+    /// Hot-path probe used by the interpreter's `mem_read*`. Returns the
+    /// resident line's **location** (`set`, `way`) on a hit instead of a copy
+    /// of its 16 bytes — the caller then extracts only the 1–4 bytes it needs
+    /// in place via [`Cache::line_at`], avoiding the per-access whole-line copy
+    /// that dominated `cache_fill` (≈99.9 % of accesses hit; see the
+    /// `bench_cache` probe). `fetch` selects the ID vs OD enable mask. LRU is
+    /// refreshed on a hit, exactly as [`Cache::lookup`] does.
+    #[inline]
+    pub fn probe(&mut self, addr: u32, fetch: bool) -> Probe {
+        let masked = if fetch { self.inst_disabled() } else { self.data_disabled() };
+        if !self.enabled() || masked {
+            return Probe::Bypass;
+        }
+        match self.lookup_loc(addr) {
+            Some((set, way)) => {
+                self.dbg_stats[if fetch { 0 } else { 2 }] += 1;
+                Probe::Hit(set, way)
+            }
+            None => {
+                self.dbg_stats[if fetch { 1 } else { 3 }] += 1;
+                Probe::Miss
+            }
+        }
+    }
+
+    /// Borrow the 16 bytes of the line at (`set`, `way`) — used with the
+    /// (`set`, `way`) returned by [`Cache::probe`] to extract in place.
+    #[inline]
+    pub fn line_at(&self, set: usize, way: usize) -> &[u8; LINE_BYTES] {
+        &self.sets[set][way].data
+    }
+
+    /// Hit-only variant of [`Cache::lookup`]: returns the matching (`set`,
+    /// `way`) and refreshes LRU, without copying the line data.
+    #[inline]
+    fn lookup_loc(&mut self, addr: u32) -> Option<(usize, usize)> {
+        let (tag, set_idx) = decompose(addr);
+        let active_ways = if self.two_way() { 2 } else { WAYS };
+        for way in 0..active_ways {
+            let l = &self.sets[set_idx][way];
+            if l.valid && l.tag == tag {
+                self.touch(set_idx, way as u8);
+                return Some((set_idx, way));
+            }
+        }
+        None
     }
 
     fn lookup(&mut self, addr: u32) -> Lookup {
@@ -456,6 +536,52 @@ mod tests {
         // and the region-5 alias (0xA000_0000) works identically.
         c.assoc_purge(0xA000_0000 | 0x0600_9990);
         assert!(matches!(c.lookup_data(b), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn probe_matches_lookup_and_line_at_extracts_in_place() {
+        let mut c = Cache::new();
+        c.set_ccr(0x01); // CE
+        let addr = 0x6000_0040;
+        // Cold: probe misses (no copy, no location).
+        assert_eq!(c.probe(addr, false), Probe::Miss);
+        c.install(addr, line_with(0x10));
+        // Warm: probe returns a location; line_at + extract reads it in place,
+        // matching what the old whole-line Lookup::Hit path would have copied.
+        let Probe::Hit(set, way) = c.probe(addr, false) else {
+            panic!("expected hit");
+        };
+        let line = c.line_at(set, way);
+        assert_eq!(extract_u8(line, addr), 0x10);
+        assert_eq!(extract_u32(line, addr | 0xC), 0x1C1D1E1F);
+        // A fetch probe with ID set bypasses even when the line is resident;
+        // a data probe still hits (OD not set).
+        c.set_ccr(0x01 | 0x02);
+        assert_eq!(c.probe(addr, true), Probe::Bypass);
+        assert!(matches!(c.probe(addr, false), Probe::Hit(_, _)));
+        // Bypass isn't tallied; data has hits + the one cold miss.
+        let [fh, fm, dh, dm] = c.dbg_stats();
+        assert_eq!((fh, fm), (0, 0), "bypassed fetch not tallied");
+        assert!(dh >= 2 && dm == 1, "data: {dh} hit / {dm} miss");
+        c.dbg_reset_stats();
+        assert_eq!(c.dbg_stats(), [0; 4]);
+    }
+
+    #[test]
+    fn probe_refreshes_lru_like_lookup() {
+        // probe must demote the LRU victim identically to lookup, so eviction
+        // order is unchanged by the hot-path switch.
+        let mut c = Cache::new();
+        c.set_ccr(0x01);
+        let base: u32 = 0x6000_0000;
+        for i in 0..4u32 {
+            c.install(base | (i << 10), line_with(i as u8 * 0x10));
+        }
+        // Touch tag 0 via probe → tag 1 becomes LRU; installing tag 4 evicts it.
+        assert!(matches!(c.probe(base, false), Probe::Hit(_, _)));
+        c.install(base | (4 << 10), line_with(0xC0));
+        assert_eq!(c.probe(base | (1 << 10), false), Probe::Miss, "tag 1 evicted");
+        assert!(matches!(c.probe(base, false), Probe::Hit(_, _)), "tag 0 kept");
     }
 
     #[test]
