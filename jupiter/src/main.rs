@@ -280,7 +280,10 @@ fn run(
         audio.current_audio_driver(),
         audio_queue.spec()
     );
-    audio_queue.resume();
+    // Leave the device PAUSED (SDL opens queues paused) until the reserve has
+    // filled once — see the prebuffer gate in the main loop. Resuming here would
+    // let the device drain from t=0 while the queue is still empty during boot,
+    // which under-runs exactly once on a cold start (the "first-play buzz").
     let window = video
         .window("5thPlanet", FRAME_WIDTH as u32 * 2, FRAME_HEIGHT as u32 * 2)
         .position_centered()
@@ -341,6 +344,11 @@ fn run(
         .and_then(|s| s.parse().ok())
         .unwrap_or(120);
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
+    // Prebuffer gate: the audio device stays paused until the queue first
+    // reaches `audio_target_bytes`, so playback begins from a full reserve
+    // instead of draining an empty queue during boot (the cold-start "first-play
+    // buzz"). Set once, then never touched again.
+    let mut audio_started = false;
     // Cap emulated frames run per *displayed* frame. This is the smoothness
     // knob: the burst below advances the machine until audio is buffered, but
     // only the LAST frame of the burst is ever presented — so a large cap turns
@@ -506,6 +514,16 @@ fn run(
                 saturn.advance_frame();
                 audio_queue.queue_audio(&saturn.take_audio()).ok();
                 burst += 1;
+            }
+
+            // Start playback once the reserve has filled for the first time.
+            // Until then the device is paused, so the queue only grows (the
+            // burst above keeps adding 2 frames/iteration through the black boot
+            // screen) and the first sample the device plays sits on a full
+            // buffer — no cold-start under-run.
+            if !audio_started && audio_queue.size() >= audio_target_bytes {
+                audio_queue.resume();
+                audio_started = true;
             }
 
             // Collect the frame the worker rendered while we computed, swap it
