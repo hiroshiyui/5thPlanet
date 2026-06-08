@@ -77,7 +77,21 @@ jupiter/           — SDL2 frontend binary (window + framebuffer upload +
                      menu, ADR-0008) is hand-rolled + software-composited and
                      deliberately sdl2-free/core-free (operates on a `&mut [u8]`
                      RGBA buffer + a `Nav` enum), so it's unit-tested without a
-                     window; `main.rs` bridges SDL events → `Nav`/pad.
+                     window; `main.rs` bridges SDL events → `Nav`/pad. The
+                     `render_pipe` module (`render_pipe.rs`) is a sdl2-free,
+                     unit-tested **render-pipeline worker thread**: each frame
+                     `main.rs` advances the machine (`Saturn::advance_frame`,
+                     the compute half of `run_frame`) while the worker
+                     composites the *previous* frame (clones VDP2 + the VDP1
+                     display fb — `render_frame` is a pure read), overlapping
+                     render onto a 2nd core (the multi-core answer to "1 core at
+                     100%"; displayed frame trails by 1, pixels bit-identical).
+                     **Audio is the pacer, not vsync**: the SCSP 44.1 kHz queue
+                     drains in real time, so `main.rs` bursts emulated frames
+                     until the SDL queue holds `SAT_AUDIO_MS` (default 120 ms) of
+                     reserve — the reserve rides out per-stage compute dips. The
+                     device stays **paused until that reserve first fills**
+                     (prebuffer-before-play) so a cold start can't under-run.
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```

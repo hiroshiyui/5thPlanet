@@ -28,7 +28,7 @@ foundation stays solid.
 | M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
 | M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (pending) |
 
-Current test count: **1011 workspace-wide, 0 failures**, at **~85% line
+Current test count: **1025 workspace-wide, 0 failures**, at **~85% line
 coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
 FFI `physdisc` crate). Task-by-task status lives in
 [`doc/roadmap.md`](doc/roadmap.md).
@@ -72,9 +72,11 @@ That path uses **libcdio** and is the one place the workspace's
 
 **M9 is building an in-window OSD menu** (ZSNES/fwNES-style, ADR-0008): press
 **Esc** for a hand-rolled, software-composited menu — save/load state slots,
-reset, eject/insert disc, quit — drawn with an embedded bitmap font over a
-dimmed frame. The menu logic is `sdl2`-free and unit-tested. Graphics,
-controller, region/BIOS, and cartridge submenus are the remaining M9 phases.
+reset, eject/insert disc, quit, and a **Settings** submenu (Graphics: window
+scale 1×–4× + fullscreen; Region: Japan/NA/EU/Asia; Cartridge: None/Ext-RAM/
+Backup) — drawn with an embedded bitmap font over a dimmed frame. The menu logic
+is `sdl2`-free and unit-tested. A controller-rebind submenu, a persisted config
+file, and in-menu BIOS-image swapping are the remaining M9 phases.
 
 Real BIOS images booting in the SDL2 frontend, rendered pixel-for-pixel against
 the MAME reference — each region's BIOS shows its own splash:
