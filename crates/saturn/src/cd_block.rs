@@ -1277,7 +1277,11 @@ impl CdBlock {
     /// `SeekStart1`+`SeekStart2`+`SeekStart3`, cdb.cpp:1905/1957/2203). Sets the
     /// head geometry, reports `STATUS_SEEK`, and arms the `Seek` phase.
     fn seek_start(&mut self) {
-        let prev = self.cd_curfad;
+        // Visible stopped geometry uses the 0xFFFF_FFFF sentinel, but the
+        // physical pickup remains at `drive_sector`. Using the sentinel as the
+        // next seek's origin turns a stop-then-Play sequence into a multi-day
+        // seek.
+        let prev = self.drive_sector;
         // SeekStart1: resolve the target FAD. The GFS/BIOS read path always
         // uses FAD addressing (bit 0x800000); the track/index form is
         // approximated to the disc start (we don't chase the pickup by track).
@@ -1288,6 +1292,8 @@ impl CdBlock {
         };
         if let Some(t) = self.disc.as_ref().and_then(|d| d.track_at_fad(fad_target)) {
             self.ctrladdr = t.ctrl_addr;
+            self.track = t.number;
+            self.index = 1;
         }
         self.cd_curfad = fad_target;
         self.drive_sector = fad_target;
@@ -3574,6 +3580,25 @@ mod tests {
         cmd(&mut c, 0x10FF, 0xFFFF, 0x00FF, 0xFFFF);
         assert_eq!(c.cur_play_start, prior_start, "start reused");
         assert_eq!(c.cur_play_end, prior_end, "end reused");
+    }
+
+    #[test]
+    fn play_after_seek_stop_uses_physical_pickup_as_seek_origin() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        c.drive_phase = DrivePhase::Idle;
+        c.drive_sector = 150;
+
+        cmd(&mut c, 0x1100, 0x0000, 0x0000, 0x0000); // Seek-to-0 stops drive
+        assert_eq!(c.cd_curfad, 0xFFFF_FFFF, "stopped geometry is visible");
+        assert_eq!(c.drive_sector, 150, "physical pickup position is retained");
+
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        assert_eq!(c.partitions[0].blocks.len(), 2, "Play completes after stop");
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE);
+        assert_eq!(c.track, 1, "seek refreshes target track geometry");
+        assert_eq!(c.index, 1, "seek refreshes target index geometry");
     }
 
     // ===== File-system error/edge branches (0x70 / 0x73 / 0x74) =====

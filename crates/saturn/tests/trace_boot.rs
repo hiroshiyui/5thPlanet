@@ -2117,6 +2117,101 @@ fn vf2_render_state() {
     }
 }
 
+/// VF2 trajectory oracle: guard the stop-then-Play regression that previously
+/// left the game polling forever at FAD 0x085D (2141).
+///
+/// ```sh
+/// FRAMES=3000 cargo test --release -p saturn --test trace_boot -- \
+///   --ignored --nocapture --exact vf2_trajectory
+/// ```
+#[test]
+#[ignore = "manual: VF2 boot/intro trajectory and regression guard"]
+fn vf2_trajectory() {
+    use sh2::bus::{AccessKind, Bus};
+
+    const LATE_GAME_LO: u32 = 0x060B_0000;
+    const LATE_GAME_HI: u32 = 0x0610_0000;
+    const LOADER_STALL_LO: u32 = 0x0604_CE8A;
+    const LOADER_STALL_HI: u32 = 0x0604_CE90;
+    const BIOS_GIVEUP: u32 = 0x0602_8106;
+    const JOB: u32 = 0x060B_1960;
+    const FORMER_STUCK_FAD: u32 = 0x085D;
+
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full.cue")) else {
+        println!("no roms/vf2_full.cue; skipped");
+        return;
+    };
+    let disc =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+            .expect("parse VF2 cue");
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    sat.enable_pctrace(vec![BIOS_GIVEUP]);
+
+    let frames: u32 =
+        std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut first_late_game = None;
+    let mut first_giveup = None;
+    let mut stall_frames = 0u32;
+    let mut max_job_fad = 0u32;
+
+    for f in 1..=frames {
+        sat.run_frame(&mut fb);
+        for (pc, _, _, _) in sat.take_pctrace() {
+            if pc == BIOS_GIVEUP {
+                first_giveup.get_or_insert(f);
+            }
+        }
+        let pc = sat.master().regs.pc;
+        if (LATE_GAME_LO..LATE_GAME_HI).contains(&pc) {
+            first_late_game.get_or_insert(f);
+        }
+        if (LOADER_STALL_LO..LOADER_STALL_HI).contains(&pc) {
+            stall_frames += 1;
+        } else {
+            stall_frames = 0;
+        }
+        let job_fad = sat.bus.read32(JOB + 0x0C, AccessKind::Data).0;
+        if job_fad < 0x80_0000 {
+            max_job_fad = max_job_fad.max(job_fad);
+        }
+        if f % 300 == 0 || f == frames {
+            let job_state = sat.bus.read8(JOB + 4, AccessKind::Data).0 & 0x0F;
+            println!(
+                "frame {f:>4}: pc={pc:08X} job_state={job_state:X} \
+                 job_fad={job_fad} max_job_fad={max_job_fad}",
+            );
+        }
+    }
+
+    println!(
+        "milestones: late_game={first_late_game:?} giveup={first_giveup:?} \
+         max_job_fad={max_job_fad} stall_frames={stall_frames}"
+    );
+    assert!(first_late_game.is_some(), "VF2 never reached late game code");
+    assert!(first_giveup.is_none(), "VF2 entered the BIOS give-up path");
+    assert!(
+        stall_frames < 300,
+        "VF2 remained in the 0x0604CE8A loader stall for at least 300 frames"
+    );
+    assert!(
+        max_job_fad > FORMER_STUCK_FAD,
+        "VF2 CD job never advanced beyond the former FAD 0x085D deadlock"
+    );
+}
+
 /// SCSP audio-output probe (M11): run a disc for FRAMES frames, draining
 /// `take_audio` each frame exactly as the SDL frontend does, and report the
 /// per-window + total absolute sample level — confirms the SCSP produces
