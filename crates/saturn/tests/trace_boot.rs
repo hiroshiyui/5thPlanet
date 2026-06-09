@@ -3303,6 +3303,21 @@ fn menu_savestate_probe() {
             }
         }
         println!("composited output: {out_nonzero} non-black px (of {})", fb.len() / 4);
+        // Optional: write the composited frame as a PPM image for visual inspection.
+        if let Ok(path) = std::env::var("PPM") {
+            let (w, h) = sat.bus.vdp2.regs.screen_dims();
+            let mut img = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    img.push(fb[i]);
+                    img.push(fb[i + 1]);
+                    img.push(fb[i + 2]);
+                }
+            }
+            std::fs::write(&path, &img).expect("write PPM");
+            println!("wrote {w}x{h} PPM -> {path}");
+        }
         // VDP2 VRAM (0x05E00000, 512KB) non-zero count — the NBG layers' data.
         // If empty in the menu but full at press-start, the menu graphics are
         // never composited into NBG VRAM (a CPU-side draw the menu skips).
