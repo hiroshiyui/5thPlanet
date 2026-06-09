@@ -145,6 +145,7 @@ Issue costs returned from `execute()` come from Appendix A of the *SH-1/SH-2 Sof
 - **Doc comments** — public items in `sh2` should cite the SH-2 manual section they implement when the semantics are non-obvious (delay slots, PC base, SR effects, cycle costs). Public items in `saturn` should call out the SH7604 hardware manual section for the peripheral or memory-map detail being modeled.
 - **No `println!`/`eprintln!` in `sh2`** — the crate is `no_std` + `alloc`. Tracing belongs in `debug.rs`.
 - **Commits** — Conventional Commits with scopes `sh2` / `saturn` / `jupiter` / `workspace` / `doc` / `ci`. Reference roadmap task numbers when a commit advances the active milestone (e.g. "advances M3 task #2"). Each task that lands also updates `doc/roadmap.md` in a separate `docs:` commit; don't bundle.
+- **Temporary files I/O** - if temporary files need to be handled, please use the `tmp/` subdirectory within the project. Avoid using the system's `/tmp` directory, as its limited space may lead to storage issues or write failures.
 
 ## Skills available in `.claude/skills/`
 

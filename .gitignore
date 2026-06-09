@@ -22,3 +22,4 @@ roms/
 /cfg/
 /nvram/
 /error.log
+tmp/
