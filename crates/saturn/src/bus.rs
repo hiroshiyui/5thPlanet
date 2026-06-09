@@ -232,7 +232,14 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u3
         let win = *WIN.get_or_init(|| {
             std::env::var("SAT_WWATCH_WIN")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                .and_then(|s| {
+                    let s = s.trim();
+                    // Accept both hex ("0x40") and decimal ("64").
+                    match s.strip_prefix("0x") {
+                        Some(h) => u32::from_str_radix(h, 16).ok(),
+                        None => s.parse().ok(),
+                    }
+                })
                 .unwrap_or(0)
         });
         if fa.wrapping_add(size) > ft.saturating_sub(win) && fa < ft.wrapping_add(win.max(1)) {
