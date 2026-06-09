@@ -3206,15 +3206,27 @@ fn menu_savestate_probe() {
     let mut hits = 0usize;
     let mut first_frame: Option<u32> = None;
     let dump_seq = std::env::var("DUMP_SEQ").is_ok();
+    let dump_vdp = std::env::var("DUMP_VDP").is_ok();
     // States considered "steady" (the idle menu/press-start loop) — everything
     // else is an entry/transition state we want to see time-aligned to START.
     let steady: std::collections::HashSet<u32> = [5u32, 7, 8].into_iter().collect();
     let mut seq_vals: Vec<u32> = Vec::new();
     let mut transitions: Vec<(u32, u32)> = Vec::new(); // (frame, state) for non-steady
+    let mut vdp1_max = (0u32, 0u32, 0u32); // (plots, cmds, px) peak over the window
+    let mut vdp1_last = (0u32, 0u32, 0u32); // last frame's counts
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
     for f in 0..probe_frames {
         let held = if f >= start_at && f < start_at + 6 { 0x0800u16 } else { 0 };
         sat.set_pad1(held);
-        sat.run_for(CYC_PER_FRAME);
+        if dump_vdp {
+            // run_frame to drive the full VDP1 plot + VDP2 composite path
+            sat.run_frame(&mut fb);
+            let (p, c, px) = sat.bus.vdp1.dbg_take_frame();
+            vdp1_last = (p, c, px);
+            vdp1_max = (vdp1_max.0.max(p), vdp1_max.1.max(c), vdp1_max.2.max(px));
+        } else {
+            sat.run_for(CYC_PER_FRAME);
+        }
         let recs = sat.take_seqlog();
         let n = recs.len();
         if n > 0 && first_frame.is_none() {
@@ -3229,6 +3241,89 @@ fn menu_savestate_probe() {
             }
         }
         hits += n;
+    }
+    if dump_vdp {
+        let r = &sat.bus.vdp2.regs;
+        let (w, h) = r.screen_dims();
+        println!("--- VDP state in menu ---");
+        println!(
+            "VDP2: TVMD=0x{:04X} (DISP={}) {}×{}  BGON=0x{:04X}  PRINA=0x{:04X} PRINB=0x{:04X}  SPCTL=0x{:04X}",
+            r.tvmd(), r.display_enabled(), w, h, r.bgon(),
+            r.read16(0x0F8), r.read16(0x0FA), r.read16(0x0E0)
+        );
+        println!(
+            "VDP1 plots/frame: peak (plots={}, cmds={}, px={}); last frame (plots={}, cmds={}, px={})",
+            vdp1_max.0, vdp1_max.1, vdp1_max.2, vdp1_last.0, vdp1_last.1, vdp1_last.2
+        );
+        // VDP1 swap/draw control registers: TVMR(0x00) FBCR(0x02) PTMR(0x04) EDSR(0x10).
+        println!(
+            "VDP1 regs: TVMR=0x{:04X} FBCR=0x{:04X} (FCM={} FCT={}) PTMR=0x{:04X} EDSR=0x{:04X}",
+            sat.bus.vdp1.read16(0x05D0_0000),
+            sat.bus.vdp1.read16(0x05D0_0002),
+            (sat.bus.vdp1.read16(0x05D0_0002) >> 1) & 1,
+            sat.bus.vdp1.read16(0x05D0_0002) & 1,
+            sat.bus.vdp1.read16(0x05D0_0004),
+            sat.bus.vdp1.read16(0x05D0_0010),
+        );
+        // VDP1 display framebuffer: count non-zero 16-bit pixels + distinct values.
+        let fbb = sat.bus.vdp1.display_fb().as_slice();
+        let mut nonzero = 0usize;
+        let mut distinct = std::collections::HashSet::new();
+        for px in fbb.chunks_exact(2) {
+            let v = u16::from_be_bytes([px[0], px[1]]);
+            if v != 0 {
+                nonzero += 1;
+            }
+            distinct.insert(v);
+        }
+        println!(
+            "VDP1 display FB: {} non-zero px of {} ({} distinct pixel values)",
+            nonzero, fbb.len() / 2, distinct.len()
+        );
+        // VDP1 DRAW buffer (self.fb at FB_BASE) — where the plotter writes. If this
+        // has the 15120 px but display is empty, the swap isn't reaching display.
+        let mut draw_nonzero = 0usize;
+        let mut draw_distinct = std::collections::HashSet::new();
+        for off in (0..0x40000u32).step_by(2) {
+            let v = sat.bus.vdp1.read16(0x05C8_0000 + off);
+            if v != 0 {
+                draw_nonzero += 1;
+            }
+            draw_distinct.insert(v);
+        }
+        println!(
+            "VDP1 DRAW buffer (0x05C80000): {} non-zero px ({} distinct values)",
+            draw_nonzero, draw_distinct.len()
+        );
+        // Composited output frame: count non-zero pixels (what reaches the screen).
+        let mut out_nonzero = 0usize;
+        for px in fb.chunks_exact(4) {
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                out_nonzero += 1;
+            }
+        }
+        println!("composited output: {out_nonzero} non-black px (of {})", fb.len() / 4);
+        // VDP2 VRAM (0x05E00000, 512KB) non-zero count — the NBG layers' data.
+        // If empty in the menu but full at press-start, the menu graphics are
+        // never composited into NBG VRAM (a CPU-side draw the menu skips).
+        let mut vram_nonzero = 0usize;
+        for off in (0..0x80000u32).step_by(2) {
+            if sat.bus.vdp2.read16(0x05E0_0000 + off) != 0 {
+                vram_nonzero += 1;
+            }
+        }
+        println!("VDP2 VRAM (0x05E00000): {vram_nonzero} non-zero 16-bit words of {}", 0x80000 / 2);
+        // Full VDP2 register file (0x000..0x120) — diff menu vs press-start to find
+        // the compositing register the menu changes that blanks the screen.
+        if std::env::var("VDP2REGS").is_ok() {
+            for base in (0..0x120u32).step_by(16) {
+                let mut row = format!("  R[{base:03X}]:", );
+                for o in (0..16u32).step_by(2) {
+                    row.push_str(&format!(" {:04X}", sat.bus.vdp2.regs.read16(base + o)));
+                }
+                println!("{row}");
+            }
+        }
     }
     if dump_seq {
         use std::collections::BTreeMap;
