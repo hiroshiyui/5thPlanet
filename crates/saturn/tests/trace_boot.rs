@@ -3384,18 +3384,18 @@ fn menu_savestate_probe() {
             *h.entry(*pc).or_default() += 1;
         }
         let mut v: Vec<_> = h.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
         println!("--- SLAVE most-recent PC window: {} entries, {} distinct ---", tr.len(), v.len());
         for (pc, c) in v.iter().take(16) {
             println!("  slave PC 0x{pc:08X}: {c}×");
         }
         let min = tr.iter().min().copied().unwrap_or(0);
         let max = tr.iter().max().copied().unwrap_or(0);
-        println!("  slave PC range 0x{min:08X}..0x{max:08X}", );
+        println!("  slave PC range 0x{min:08X}..0x{max:08X}");
         println!("  reaches poll 0x060160F2? {}  reaches PROCEED 0x060160FA? {}  reaches CGD-load Jsr 0x06016102? {}",
-            tr.iter().any(|&p| p == 0x0601_60F2),
-            tr.iter().any(|&p| p == 0x0601_60FA),
-            tr.iter().any(|&p| p == 0x0601_6102));
+            tr.contains(&0x0601_60F2),
+            tr.contains(&0x0601_60FA),
+            tr.contains(&0x0601_6102));
     }
 
     if let Ok(spec) = std::env::var("READMEM") {
