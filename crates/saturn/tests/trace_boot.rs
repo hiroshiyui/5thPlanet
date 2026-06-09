@@ -3210,6 +3210,20 @@ fn menu_savestate_probe() {
     if slave_hist {
         sat.enable_slave_pc_trace();
     }
+    // SLAVE_BP=pc[,probe]: break the slave at `pc`, capture R0..15/PR/GBR (and a
+    // bus probe of `probe` — the cache-coherency test: probe = raw bus value, vs
+    // the slave's cached register read of the same addr).
+    let slave_bp: Option<u32> = std::env::var("SLAVE_BP")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.split(',').next().unwrap().trim().trim_start_matches("0x"), 16).ok());
+    if let Some(pc) = slave_bp {
+        sat.set_slave_bp(pc);
+        if let Some(pr) = std::env::var("SLAVE_BP").ok().and_then(|s| {
+            s.split(',').nth(1).and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+        }) {
+            sat.set_slave_bp_probe(Some(pr));
+        }
+    }
     let mut hits = 0usize;
     let mut first_frame: Option<u32> = None;
     let dump_seq = std::env::var("DUMP_SEQ").is_ok();
@@ -3376,6 +3390,19 @@ fn menu_savestate_probe() {
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
     );
+    if slave_bp.is_some() {
+        match sat.take_slave_bp_hit() {
+            Some((r, pr, gbr, _code, probe)) => {
+                println!("SLAVE BP hit @0x{:06X}:", slave_bp.unwrap());
+                for b in (0..16).step_by(4) {
+                    println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
+                        b, r[b], b+1, r[b+1], b+2, r[b+2], b+3, r[b+3]);
+                }
+                println!("  PR={pr:08X} GBR={gbr:08X} probe(bus,no-cache)={probe:08X}");
+            }
+            None => println!("SLAVE BP @0x{:06X} NOT hit", slave_bp.unwrap()),
+        }
+    }
     if slave_hist {
         let tr = sat.take_slave_pc_trace();
         use std::collections::BTreeMap;
