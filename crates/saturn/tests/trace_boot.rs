@@ -3205,15 +3205,45 @@ fn menu_savestate_probe() {
     sat.enable_seqlog(seq_pc, seq_reg);
     let mut hits = 0usize;
     let mut first_frame: Option<u32> = None;
+    let dump_seq = std::env::var("DUMP_SEQ").is_ok();
+    // States considered "steady" (the idle menu/press-start loop) — everything
+    // else is an entry/transition state we want to see time-aligned to START.
+    let steady: std::collections::HashSet<u32> = [5u32, 7, 8].into_iter().collect();
+    let mut seq_vals: Vec<u32> = Vec::new();
+    let mut transitions: Vec<(u32, u32)> = Vec::new(); // (frame, state) for non-steady
     for f in 0..probe_frames {
         let held = if f >= start_at && f < start_at + 6 { 0x0800u16 } else { 0 };
         sat.set_pad1(held);
         sat.run_for(CYC_PER_FRAME);
-        let n = sat.take_seqlog().len();
+        let recs = sat.take_seqlog();
+        let n = recs.len();
         if n > 0 && first_frame.is_none() {
             first_frame = Some(f);
         }
+        if dump_seq {
+            for &(v, _) in &recs {
+                seq_vals.push(v);
+                if !steady.contains(&v) {
+                    transitions.push((f, v));
+                }
+            }
+        }
         hits += n;
+    }
+    if dump_seq {
+        use std::collections::BTreeMap;
+        let mut hist: BTreeMap<u32, usize> = BTreeMap::new();
+        for &v in &seq_vals {
+            *hist.entry(v).or_default() += 1;
+        }
+        println!("distinct SEQ_REG={seq_reg} values @0x{seq_pc:06X} (value: count):");
+        for (v, c) in &hist {
+            println!("  0x{v:X} ({v}): {c}×");
+        }
+        println!("non-steady transition states (frame: state), START at +{start_at}:");
+        for (f, v) in &transitions {
+            println!("  f{f}: 0x{v:X}");
+        }
     }
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
@@ -3233,6 +3263,43 @@ fn menu_savestate_probe() {
                 }
                 println!("{row}");
             }
+        }
+    }
+
+    // Dump a live WRAM range to a binary file (raw bus bytes, big-endian as stored)
+    // for a like-for-like diff vs Mednafen's SS_MEMDUMP. DUMPFILE=addr,len,path.
+    if let Ok(spec) = std::env::var("DUMPFILE") {
+        let parts: Vec<&str> = spec.split(',').collect();
+        if let [a, l, path] = parts[..] {
+            let base = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+            let len = u32::from_str_radix(l.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+            let mut bytes = Vec::with_capacity(len as usize);
+            for off in 0..len {
+                let (b, _) = sat.bus.read8(base + off, sh2::bus::AccessKind::Data);
+                bytes.push(b);
+            }
+            std::fs::write(path, &bytes).expect("write DUMPFILE");
+            println!("wrote {len} bytes @0x{base:08X} -> {path}");
+        }
+    }
+
+    // Disassemble a live WRAM range from the (post-probe) snapshot state, to read
+    // the menu module's control flow — e.g. the bg-builder function around
+    // 0x06011700 that contains both 0x0601172C (brick writer, run 0×) and
+    // 0x0601173A (per-frame handler, run 600×). DISASM=addr[,len].
+    if let Ok(spec) = std::env::var("DISASM") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let from = nums.first().copied().unwrap_or(0);
+        let len = nums.get(1).copied().unwrap_or(0x80);
+        println!("\n=== live disasm @0x{from:08X}..0x{:08X} ===", from + len);
+        for off in (0..len).step_by(2) {
+            let a = from + off;
+            let (w, _) = sat.bus.read16(a, sh2::bus::AccessKind::Fetch);
+            let op = sh2::decoder::decode(w);
+            println!("  0x{a:08X}: {w:04X}  {}", sh2::debug::disasm(op));
         }
     }
 }
