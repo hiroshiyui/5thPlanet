@@ -209,6 +209,28 @@ fn dma_indirect_mode_walks_a_table_of_transfers() {
 }
 
 #[test]
+fn dma_indirect_table_accepts_sh2_cache_through_alias() {
+    let mut sat = build();
+    sat.bus.write32(WRAM, 0xAABB_CCDD, AccessKind::Data);
+
+    let tbl = 0x0600_3000;
+    sat.bus.write32(tbl, 4, AccessKind::Data);
+    sat.bus.write32(tbl + 4, 0x0020_4000, AccessKind::Data);
+    sat.bus
+        .write32(tbl + 8, WRAM | 0x8000_0000, AccessKind::Data);
+
+    sat.bus
+        .write32(D0W, tbl | 0x2000_0000, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(D0MD, (1 << 24) | 7, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    sat.run_for(512);
+
+    let (value, _) = sat.bus.read32(0x0020_4000, AccessKind::Data);
+    assert_eq!(value, 0xAABB_CCDD);
+}
+
+#[test]
 fn dma_with_a_hardware_start_factor_waits_for_the_event() {
     let mut sat = build();
     plant(&mut sat, WRAM, 0x10);

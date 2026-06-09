@@ -146,7 +146,13 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
         let (final_src, final_dst) = if req.indirect {
             // Indirect: `dst` points at {size, dst, src} longword triplets; the
             // last has bit 31 of its source word set. Each triplet is a transfer.
-            let mut index = req.dst;
+            // SCU DMA addresses are 27-bit physical addresses. Games commonly
+            // program the table pointer through an SH-2 cache-through alias
+            // (for example 0x2600_A000 for physical HWRAM 0x0600_A000).
+            // Folding only the payload accesses in `scu_transfer` is not
+            // sufficient: descriptor reads must be folded too, or every entry
+            // reads as zero and the walker runs to its safety limit.
+            let mut index = req.dst & 0x07FF_FFFF;
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
             loop {
