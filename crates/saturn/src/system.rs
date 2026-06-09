@@ -28,6 +28,24 @@ fn us_to_cycles(us: u64) -> u64 {
     us * SH2_CLOCK_HZ / 1_000_000
 }
 
+/// Debug/probe knob (`SAT_SMP_BATCH`): number of master instructions to run
+/// before the slave catches up to the master's timestamp. `1` (the default,
+/// env unset) is the faithful master-leads-slave model; larger values coarsen
+/// the master/slave interleave. Used by the timing-sensitivity probe to test
+/// whether a divergence is interleave-dependent (changes with batch size) or a
+/// deterministic master-side bug (invariant under batch size). Read once.
+fn smp_batch() -> u32 {
+    use std::sync::OnceLock;
+    static BATCH: OnceLock<u32> = OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("SAT_SMP_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
 /// INTBACK SF-busy time in microseconds, computed from the request.
 ///
 /// Reconciled against Mednafen (the LLE reference), which models INTBACK as a
@@ -272,10 +290,23 @@ pub struct Saturn {
     /// sequence for time-aligned diffing vs Mednafen's `SS_LOGSEQ`. `#[serde(skip)]`.
     #[serde(skip)]
     seqlog: Option<SeqLog>,
+    /// Debug-only multi-PC "logic analyzer" (M11 Doukyuusei menu): a set of
+    /// trigger low-24 PCs; whenever the master is about to execute one (not in a
+    /// delay slot), append `(pc_low24, R[0..16], cycle)`. Unlike [`SeqLog`] (one
+    /// PC, one reg) it captures several PCs interleaved in execution order — e.g.
+    /// to see whether the FTI-pulse PC fires between two command-dispatch hits.
+    /// Capped so a hot trigger can't grow unbounded. `#[serde(skip)]`.
+    #[serde(skip)]
+    pctrace: Option<PcTrace>,
 }
 
 /// `(target_low24_pc, reg_index, records[(reg_value, cycle)])` — see [`Saturn::enable_seqlog`].
 type SeqLog = (u32, usize, Vec<(u32, u64)>);
+
+/// `(trigger_low24_pcs, filter, records[(pc_low24, R[0..16], PR, cycle)])` — see
+/// [`Saturn::enable_pctrace`]. `filter = Some((reg, value))` records only when
+/// `R[reg] == value` (lets a hot inner-loop trigger be narrowed to one event).
+type PcTrace = (Vec<u32>, Option<(usize, u32)>, Vec<(u32, [u32; 16], u32, u64)>);
 
 impl Saturn {
     /// Construct with a real BIOS image. Both CPUs start with default
@@ -298,6 +329,7 @@ impl Saturn {
             cd_id,
             master_pcstream: None,
             seqlog: None,
+            pctrace: None,
         }
     }
 
@@ -453,6 +485,31 @@ impl Saturn {
     pub fn take_seqlog(&mut self) -> Vec<(u32, u64)> {
         match self.seqlog.as_mut() {
             Some((_, _, v)) => core::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
+    /// Debug-only multi-PC logic analyzer (M11 Doukyuusei menu): record
+    /// `(pc_low24, R[0..16], cycle)` every time the master is about to execute
+    /// any PC in `pcs` (low-24 masked, delay slots skipped). Several trigger PCs
+    /// are captured interleaved in execution order — e.g. command-dispatch +
+    /// FTI-pulse + handler-entry PCs together, to see which dispatch invocations
+    /// actually reach the pulse. Drain with [`Self::take_pctrace`].
+    pub fn enable_pctrace(&mut self, pcs: Vec<u32>) {
+        let pcs = pcs.into_iter().map(|p| p & 0x00FF_FFFF).collect();
+        self.pctrace = Some((pcs, None, Vec::new()));
+    }
+    /// Like [`enable_pctrace`](Self::enable_pctrace) but records only when
+    /// `R[reg] == value` at the trigger — narrows a hot inner-loop PC to a single
+    /// event (e.g. the one decompressor copy whose dest byte is the script cmd).
+    pub fn enable_pctrace_filtered(&mut self, pcs: Vec<u32>, reg: usize, value: u32) {
+        let pcs = pcs.into_iter().map(|p| p & 0x00FF_FFFF).collect();
+        self.pctrace = Some((pcs, Some((reg, value)), Vec::new()));
+    }
+    /// Drain the logic-analyzer records `(pc_low24, R[0..16], PR, cycle)`, leaving it armed.
+    pub fn take_pctrace(&mut self) -> Vec<(u32, [u32; 16], u32, u64)> {
+        match self.pctrace.as_mut() {
+            Some((_, _, log)) => core::mem::take(log),
             None => Vec::new(),
         }
     }
@@ -880,6 +937,7 @@ impl Saturn {
             cd_id,
             master_pcstream,
             seqlog,
+            pctrace,
             ..
         } = self;
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
@@ -908,77 +966,96 @@ impl Saturn {
                 }
             };
         }
+        // Timing-sensitivity probe knob: run up to `batch` master instructions
+        // before the slave catches up. `1` (default) is the faithful
+        // master-leads-slave model — bit-identical to the prior loop.
+        let batch = smp_batch();
         loop {
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             if mcyc >= target {
                 break;
             }
-            // Peripheral (CD-block) events scheduled at or before the master's
-            // current timestamp fire before the master advances past them.
-            while scheduler.entity(*cd_id).next_deadline() <= mcyc {
-                scheduler.entity_mut(*cd_id).step(bus);
-            }
-            // CD-block external interrupt (Source::Cd, vector 0x50, level 7):
-            // assert/deassert the SCU level from the live CD HIRQ before each
-            // instruction (Mednafen `RecalcIRQOut`). VF2's GFS file library is
-            // driven by this interrupt; without it the intro loops forever.
-            let cd_active = bus.cd_block.irq_active();
-            bus.scu.set_cd_int(cd_active);
-            // Phase 2B: sample the SCU interrupt line at the master's *current*
-            // SR.imask, every instruction. The SCU presents the highest-priority
-            // unmasked pending source as an IRL the master samples each cycle, so
-            // an interrupt becomes deliverable at the exact instruction imask
-            // drops below its level — not up to a full batch late, as the old
-            // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
-            // per-source vector (0x40 + index) is latched, not the 64+level
-            // auto-vector.
-            let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
-            if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
-                scheduler
-                    .entity_mut(*master_id)
-                    .sh2_mut()
-                    .cpu
-                    .onchip
-                    .intc
-                    .raise_external(level, source.vector());
-            }
-            // Master leads by one instruction.
-            before_master(scheduler.entity(*master_id).sh2());
-            // Debug master PC+cycle stream (cost-lockstep vs Mednafen), capped.
-            // Skip delay-slot PCs so the stream is one entry per logical
-            // instruction, matching Mednafen's per-`Step` log (the delay slot's
-            // cost folds into the branch's cycle delta).
-            if let Some(ps) = master_pcstream.as_mut()
-                && ps.len() < 16_000_000
-            {
-                let e = scheduler.entity(*master_id).sh2();
-                if !e.cpu.next_is_delay_slot() {
-                    ps.push((e.cpu.regs.pc, e.cpu.pipeline.cycles));
+            for _ in 0..batch {
+                let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+                if mcyc >= target {
+                    break;
                 }
-            }
-            // Dispatch-index seqlog: record R[reg] when the master is about to
-            // execute the controller's dispatch PC (cycle-stamped for alignment).
-            if let Some((tgt, reg, log)) = seqlog.as_mut() {
-                let e = scheduler.entity(*master_id).sh2();
-                if (e.cpu.regs.pc & 0x00FF_FFFF) == *tgt && !e.cpu.next_is_delay_slot() {
-                    log.push((e.cpu.regs.r[*reg], e.cpu.pipeline.cycles));
+                // Peripheral (CD-block) events scheduled at or before the master's
+                // current timestamp fire before the master advances past them.
+                while scheduler.entity(*cd_id).next_deadline() <= mcyc {
+                    scheduler.entity_mut(*cd_id).step(bus);
                 }
-            }
-            scheduler.entity_mut(*master_id).step(bus);
-            apply_fti!(); // master may have pulsed the slave's (or its own) FTI
-            // If the master's instruction triggered an SCU DMA, run it now and
-            // stall the master for the transfer's cycle-stealing cost — the SCU
-            // holds the bus, so the master can't advance during it (M13 A3). The
-            // slave then catches up to the *stalled* timestamp, i.e. it runs
-            // while the master is DMA-blocked.
-            let dma_cost = drain_dma(bus);
-            if dma_cost != 0 {
-                scheduler
-                    .entity_mut(*master_id)
-                    .sh2_mut()
-                    .cpu
-                    .pipeline
-                    .cycles += dma_cost;
+                // CD-block external interrupt (Source::Cd, vector 0x50, level 7):
+                // assert/deassert the SCU level from the live CD HIRQ before each
+                // instruction (Mednafen `RecalcIRQOut`). VF2's GFS file library is
+                // driven by this interrupt; without it the intro loops forever.
+                let cd_active = bus.cd_block.irq_active();
+                bus.scu.set_cd_int(cd_active);
+                // Phase 2B: sample the SCU interrupt line at the master's *current*
+                // SR.imask, every instruction. The SCU presents the highest-priority
+                // unmasked pending source as an IRL the master samples each cycle, so
+                // an interrupt becomes deliverable at the exact instruction imask
+                // drops below its level — not up to a full batch late, as the old
+                // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
+                // per-source vector (0x40 + index) is latched, not the 64+level
+                // auto-vector.
+                let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
+                if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+                    scheduler
+                        .entity_mut(*master_id)
+                        .sh2_mut()
+                        .cpu
+                        .onchip
+                        .intc
+                        .raise_external(level, source.vector());
+                }
+                // Master leads by one instruction.
+                before_master(scheduler.entity(*master_id).sh2());
+                // Debug master PC+cycle stream (cost-lockstep vs Mednafen), capped.
+                // Skip delay-slot PCs so the stream is one entry per logical
+                // instruction, matching Mednafen's per-`Step` log (the delay slot's
+                // cost folds into the branch's cycle delta).
+                if let Some(ps) = master_pcstream.as_mut()
+                    && ps.len() < 16_000_000
+                {
+                    let e = scheduler.entity(*master_id).sh2();
+                    if !e.cpu.next_is_delay_slot() {
+                        ps.push((e.cpu.regs.pc, e.cpu.pipeline.cycles));
+                    }
+                }
+                // Dispatch-index seqlog: record R[reg] when the master is about to
+                // execute the controller's dispatch PC (cycle-stamped for alignment).
+                if let Some((tgt, reg, log)) = seqlog.as_mut() {
+                    let e = scheduler.entity(*master_id).sh2();
+                    if (e.cpu.regs.pc & 0x00FF_FFFF) == *tgt && !e.cpu.next_is_delay_slot() {
+                        log.push((e.cpu.regs.r[*reg], e.cpu.pipeline.cycles));
+                    }
+                }
+                // Multi-PC logic analyzer: capture full reg state at any trigger PC.
+                if let Some((pcs, filter, log)) = pctrace.as_mut() {
+                    let e = scheduler.entity(*master_id).sh2();
+                    let pc = e.cpu.regs.pc & 0x00FF_FFFF;
+                    let pass = filter.is_none_or(|(reg, val)| e.cpu.regs.r[reg] == val);
+                    if log.len() < 65536 && pass && pcs.contains(&pc) && !e.cpu.next_is_delay_slot() {
+                        log.push((pc, e.cpu.regs.r, e.cpu.regs.pr, e.cpu.pipeline.cycles));
+                    }
+                }
+                scheduler.entity_mut(*master_id).step(bus);
+                apply_fti!(); // master may have pulsed the slave's (or its own) FTI
+                // If the master's instruction triggered an SCU DMA, run it now and
+                // stall the master for the transfer's cycle-stealing cost — the SCU
+                // holds the bus, so the master can't advance during it (M13 A3). The
+                // slave then catches up to the *stalled* timestamp, i.e. it runs
+                // while the master is DMA-blocked.
+                let dma_cost = drain_dma(bus);
+                if dma_cost != 0 {
+                    scheduler
+                        .entity_mut(*master_id)
+                        .sh2_mut()
+                        .cpu
+                        .pipeline
+                        .cycles += dma_cost;
+                }
             }
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
             // Slave catches up to the master's new timestamp.

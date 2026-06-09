@@ -120,6 +120,42 @@ fn run_for_advances_both_cpus_independently() {
 }
 
 #[test]
+fn pctrace_records_register_state_at_trigger_pcs() {
+    // The multi-PC logic analyzer (Saturn::enable_pctrace) must capture the
+    // master's full register file + PR each time it executes a listed trigger
+    // PC, skipping delay slots, and leave non-trigger PCs unrecorded.
+    //
+    // Master program at MASTER_PC:
+    //   MOV #5, R3        ; r3 = 5            (PC+0)
+    //   NOP               ; <-- trigger here  (PC+2)
+    //   BRA -3            ; loop to PC+2      (PC+4)
+    //   NOP               ; BRA delay slot    (PC+6)
+    // After the MOV, +2/+4/+6 cycle forever with r3==5; +2 is the trigger and is
+    // NOT a delay slot, +6 IS (and must never be recorded even if listed).
+    let mut sat = Saturn::with_blank_bios();
+    load(&mut sat.bus, MASTER_PC, &[0xE305, 0x0009, 0xAFFD, 0x0009]);
+    load(&mut sat.bus, SLAVE_PC, &[0x0009, 0x0009, 0xAFFD, 0x0009]); // slave NOP-loops
+    sat.master_mut().regs.pc = MASTER_PC;
+    sat.master_mut().regs.r[15] = 0x0020_8000;
+    sat.slave_mut().regs.pc = SLAVE_PC;
+    sat.slave_mut().regs.r[15] = 0x0020_8400;
+
+    let trigger = MASTER_PC + 2; // the NOP
+    let slot = MASTER_PC + 6; // the BRA delay slot — listed but must be skipped
+    sat.enable_pctrace(vec![trigger, slot]);
+    sat.run_for(300);
+
+    let log = sat.take_pctrace();
+    assert!(!log.is_empty(), "pctrace recorded nothing at the looping trigger PC");
+    for (pc, regs, _pr, _cyc) in &log {
+        assert_eq!(*pc, trigger & 0x00FF_FFFF, "recorded a non-trigger / delay-slot PC");
+        assert_eq!(regs[3], 5, "captured register state wrong (r3 should be the MOV #5 value)");
+    }
+    // take_pctrace drains but leaves the logger armed; an immediate re-take is empty.
+    assert!(sat.take_pctrace().is_empty(), "take_pctrace should drain the buffer");
+}
+
+#[test]
 fn reset_loads_pc_and_sp_from_bios_vector() {
     // Bake known reset-vector values into a BIOS image, construct
     // Saturn from it, call reset, and verify both CPUs picked them up.

@@ -3172,12 +3172,46 @@ fn menu_savestate_probe() {
     }
 
     let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2440);
-    let snap_file =
-        std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
+    // Snapshots live under the workspace `tmp/` (project convention — not the
+    // system /tmp). SNAP_FILE overrides; a relative override resolves against the
+    // workspace root, not the test's cwd (which cargo sets to the crate dir).
+    let tmp_dir = root.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let snap_file = match std::env::var("SNAP_FILE") {
+        Ok(p) if std::path::Path::new(&p).is_absolute() => PathBuf::from(p),
+        Ok(p) => root.join(p),
+        Err(_) => tmp_dir.join(format!("dk_menu_f{snap_at}.sav")),
+    };
+    let snap_file = snap_file.display().to_string();
     // One emulated frame's worth of cycles (system.rs CYCLES_PER_FRAME). Advancing
     // via run_for instead of run_frame skips the 640×224 composite — rendering is
     // observe-only, so the emulation is identical but the boot is faster.
     const CYC_PER_FRAME: u64 = 479_151;
+
+    // BOOT_TRACE=1 (with FORCE_SNAP): arm the PCTRACE logic analyzer BEFORE the
+    // boot so boot-time events (e.g. the decompressor writing the title-script)
+    // are captured. PCTRACE_WHEN=reg,hexval narrows a hot inner-loop trigger to
+    // one event (record only when R[reg]==val). Dumped after the run as usual.
+    let boot_trace = std::env::var("BOOT_TRACE").is_ok();
+    let parse_pcs = |v: &str| -> Vec<u32> {
+        v.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()
+    };
+    let pctrace_when: Option<(usize, u32)> = std::env::var("PCTRACE_WHEN").ok().and_then(|s| {
+        let p: Vec<&str> = s.split(',').collect();
+        match p[..] {
+            [r, v] => Some((r.trim().parse().ok()?, u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?)),
+            _ => None,
+        }
+    });
+    if boot_trace && let Ok(spec) = std::env::var("PCTRACE") {
+        let pcs = parse_pcs(&spec);
+        if !pcs.is_empty() {
+            match pctrace_when {
+                Some((r, v)) => sat.enable_pctrace_filtered(pcs, r, v),
+                None => sat.enable_pctrace(pcs),
+            }
+        }
+    }
 
     if std::env::var("FORCE_SNAP").is_err() && std::path::Path::new(&snap_file).exists() {
         let bytes = std::fs::read(&snap_file).expect("read snapshot");
@@ -3203,6 +3237,33 @@ fn menu_savestate_probe() {
     let probe_frames: u32 =
         std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(340);
     sat.enable_seqlog(seq_pc, seq_reg);
+    // PCTRACE=pc1,pc2,…: multi-PC logic analyzer — capture full master reg state
+    // each time the master executes any listed PC (low-24), interleaved in order.
+    // Used to see which command-dispatch invocations reach the FTI-pulse PC.
+    let pctrace_pcs: Vec<u32> = std::env::var("PCTRACE")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !pctrace_pcs.is_empty() && !boot_trace {
+        match pctrace_when {
+            Some((r, v)) => sat.enable_pctrace_filtered(pctrace_pcs.clone(), r, v),
+            None => sat.enable_pctrace(pctrace_pcs.clone()),
+        }
+    }
+    // PCWIN=cyclo,cychi: capture the full master PC stream and, after the run,
+    // disassemble every instruction executed in that cycle window — to read the
+    // exact branch where ours' control flow diverges.
+    let pcwin: Option<(u64, u64)> = std::env::var("PCWIN").ok().and_then(|s| {
+        let n: Vec<u64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if let [lo, hi] = n[..] { Some((lo, hi)) } else { None }
+    });
+    if pcwin.is_some() {
+        sat.enable_master_pcstream();
+    }
     // SLAVE_HIST=1: histogram the slave's most-recent PC window after the run,
     // to see if ours' slave reaches the menu-CGD-load routine (~0x060160Fx) or
     // is parked in a wait loop (a few PCs = waiting on a master/FTI signal).
@@ -3216,6 +3277,18 @@ fn menu_savestate_probe() {
     let slave_bp: Option<u32> = std::env::var("SLAVE_BP")
         .ok()
         .and_then(|s| u32::from_str_radix(s.split(',').next().unwrap().trim().trim_start_matches("0x"), 16).ok());
+    // MASTER_BP=pc[,probe]: same, for the master (capture R0..15/PR + bus probe).
+    let master_bp: Option<u32> = std::env::var("MASTER_BP")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.split(',').next().unwrap().trim().trim_start_matches("0x"), 16).ok());
+    if let Some(pc) = master_bp {
+        sat.set_master_bp(pc);
+        if let Some(pr) = std::env::var("MASTER_BP").ok().and_then(|s| {
+            s.split(',').nth(1).and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+        }) {
+            sat.set_master_bp_probe(Some(pr));
+        }
+    }
     if let Some(pc) = slave_bp {
         sat.set_slave_bp(pc);
         if let Some(pr) = std::env::var("SLAVE_BP").ok().and_then(|s| {
@@ -3376,6 +3449,22 @@ fn menu_savestate_probe() {
             println!("  f{f}: 0x{v:X}");
         }
     }
+    // Logic-analyzer dump: every trigger-PC hit in execution order, with the
+    // master reg file. Set PCREGS=a,b,… to print only those reg indices (else r0..r9).
+    if !pctrace_pcs.is_empty() {
+        let log = sat.take_pctrace();
+        let regs: Vec<usize> = std::env::var("PCREGS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| (0..10).collect());
+        println!("--- PCTRACE: {} hits over {probe_frames} frames (PCs: {}) ---",
+            log.len(),
+            pctrace_pcs.iter().map(|p| format!("{p:06X}")).collect::<Vec<_>>().join(","));
+        for (pc, r, pr, cyc) in &log {
+            let rs = regs.iter().map(|&i| format!("r{i}={:08X}", r[i])).collect::<Vec<_>>().join(" ");
+            println!("  cyc={cyc:>12} pc=0x{pc:06X} pr=0x{pr:08X}  {rs}");
+        }
+    }
     // Write the full dispatched-value sequence (one hex value per line, all frames)
     // to a file, to diff vs Mednafen's SS_LOGSEQ. Requires DUMP_SEQ=1. SEQ_FILE=path.
     if let Ok(path) = std::env::var("SEQ_FILE") {
@@ -3390,6 +3479,19 @@ fn menu_savestate_probe() {
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
     );
+    if let Some(bp_pc) = master_bp {
+        match sat.take_master_bp_hit() {
+            Some((r, pr, gbr, _code, probe)) => {
+                println!("MASTER BP hit @0x{bp_pc:06X}:");
+                for b in (0..16).step_by(4) {
+                    println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
+                        b, r[b], b+1, r[b+1], b+2, r[b+2], b+3, r[b+3]);
+                }
+                println!("  PR={pr:08X} GBR={gbr:08X} probe(bus,no-cache)={probe:08X}");
+            }
+            None => println!("MASTER BP @0x{bp_pc:06X} NOT hit"),
+        }
+    }
     if let Some(bp_pc) = slave_bp {
         match sat.take_slave_bp_hit() {
             Some((r, pr, gbr, _code, probe)) => {
@@ -3439,6 +3541,36 @@ fn menu_savestate_probe() {
                 }
                 println!("{row}");
             }
+        }
+    }
+
+    if let Some((lo, hi)) = pcwin {
+        let ps = sat.take_master_pcstream();
+        println!("--- PCWIN master trace, cyc [{lo},{hi}] ({} total entries) ---", ps.len());
+        for (pc, cyc) in ps.iter().filter(|(_, c)| *c >= lo && *c <= hi) {
+            let (w, _) = sat.bus.read16(*pc, sh2::bus::AccessKind::Fetch);
+            println!("  cyc={cyc:>12} 0x{pc:08X}: {w:04X}  {}", sh2::debug::disasm(sh2::decoder::decode(w)));
+        }
+    }
+
+    // SEARCH32=base,len,value: scan [base,base+len) on 2-byte steps for a 32-bit
+    // big-endian word == value, printing every hit. Finds e.g. all PC-relative
+    // literal-pool references to a function pointer (= its call sites).
+    if let Ok(spec) = std::env::var("SEARCH32") {
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if let [base, len, needle] = nums[..] {
+            let mut hits = 0;
+            for off in (0..len).step_by(2) {
+                let (v, _) = sat.bus.read32(base + off, sh2::bus::AccessKind::Data);
+                if v == needle {
+                    println!("  SEARCH32 hit: 0x{:08X} == {needle:08X}", base + off);
+                    hits += 1;
+                }
+            }
+            println!("SEARCH32 {needle:08X} in [0x{base:08X},+0x{len:X}): {hits} hit(s)");
         }
     }
 
