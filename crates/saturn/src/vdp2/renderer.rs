@@ -507,12 +507,30 @@ fn window_allows(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, ctl: u8, x: u32, 
 /// of the VDP1 framebuffer pixel is the in-window flag (`area` set → pass inside
 /// it, clear → pass outside). With SPWINEN clear there is no sprite-window data,
 /// so the window passes. (Mednafen `sd = (src >> 15) & 1`.)
-fn sprite_window_pixel(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, x: u32, y: u32, area: bool) -> bool {
+fn sprite_window_pixel(
+    vdp2: &Vdp2,
+    sprite_fb: Option<&Framebuffer>,
+    x: u32,
+    y: u32,
+    area: bool,
+) -> bool {
     if !vdp2.regs.sprite_window_enabled() {
         return true;
     }
-    let inside = sprite_fb.is_some_and(|fb| fb.pixel(x as i32, y as i32) & 0x8000 != 0);
+    let inside =
+        sprite_fb.is_some_and(|fb| fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32) & 0x8000 != 0);
     if area { inside } else { !inside }
+}
+
+/// VDP1 always renders at its native horizontal resolution. In VDP2's
+/// 640/704-dot modes, each VDP1 framebuffer dot occupies two display dots.
+#[inline]
+fn sprite_framebuffer_x(vdp2: &Vdp2, display_x: u32) -> i32 {
+    if vdp2.regs.screen_dims().0 >= 640 {
+        (display_x >> 1) as i32
+    } else {
+        display_x as i32
+    }
 }
 
 /// One window's pass/fail at `(x, y)`: disabled → always pass; `area` set →
@@ -1067,7 +1085,7 @@ fn sprite_cc(vdp2: &Vdp2, pri: u8, ccidx: usize) -> Option<(u8, bool)> {
 /// Returns `None` for a transparent / priority-0 dot, or a [`SpriteDot`]
 /// (colour or MSB shadow).
 fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<SpriteDot> {
-    let pix = fb.pixel(x as i32, y as i32);
+    let pix = fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32);
     if pix == 0 {
         return None; // nothing plotted here
     }
@@ -1342,7 +1360,11 @@ mod tests {
     }
 
     fn pixel(buf: &[u8], x: usize, y: usize) -> [u8; 4] {
-        let o = (y * FRAME_WIDTH + x) * 4;
+        pixel_at_width(buf, FRAME_WIDTH, x, y)
+    }
+
+    fn pixel_at_width(buf: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let o = (y * width + x) * 4;
         [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
     }
 
@@ -1668,6 +1690,21 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn hires_mode_doubles_vdp1_dots_horizontally() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8002); // DISP, 640-dot mode
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x12 * 2, 0x001F); // palette code 0x12 = red
+        let fb = sprite_fb_with(10, 10, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel_at_width(&buf, 640, 19, 10), [0, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 640, 20, 10), [0xFF, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 640, 21, 10), [0xFF, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 640, 22, 10), [0, 0, 0, 0xFF]);
     }
 
     #[test]
