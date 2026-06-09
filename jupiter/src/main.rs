@@ -339,10 +339,15 @@ fn run(
     // twitch/action games. It only delays, not cures, an *indefinitely* lingered
     // sustained deficit (the reserve drains at the deficit rate); the real cure
     // for that is faster compute. Audio samples are unchanged — accuracy-neutral.
+    // Floor at 10 ms: the burst loop below advances the machine only *while*
+    // `audio_queue.size() < audio_target_bytes`, so a target of 0 (SAT_AUDIO_MS=0)
+    // would make that condition never hold and freeze emulation. 10 ms is still
+    // well under one frame of audio, so it stays effectively minimum-latency.
     let audio_ms: u64 = std::env::var("SAT_AUDIO_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(120);
+        .unwrap_or(120)
+        .max(10);
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
     // Prebuffer gate: the audio device stays paused until the queue first
     // reaches `audio_target_bytes`, so playback begins from a full reserve
