@@ -42,6 +42,11 @@ struct Rect {
     max_y: i32,
 }
 
+#[inline]
+fn sign_extend(value: u16, bits: u32) -> i32 {
+    ((value as i32) << (32 - bits)) >> (32 - bits)
+}
+
 /// One quad corner with its texture coordinate and per-vertex gouraud colour
 /// channels (all 16.16 once scaled).
 #[derive(Clone, Copy, Debug, Default)]
@@ -304,9 +309,9 @@ impl<'a> Plotter<'a> {
                     };
                 }
                 0xA => {
-                    // Local coordinate origin (signed).
-                    self.local_x = (self.cmd.xa as i16) as i32;
-                    self.local_y = (self.cmd.ya as i16) as i32;
+                    // Local coordinates are signed 11-bit values.
+                    self.local_x = sign_extend(self.cmd.xa, 11);
+                    self.local_y = sign_extend(self.cmd.ya, 11);
                 }
                 _ => {
                     // Illegal command: hardware prematurely ends the list.
@@ -324,11 +329,11 @@ impl<'a> Plotter<'a> {
 
     #[inline]
     fn x2s(&self, v: u16) -> i32 {
-        (v as i16) as i32 + self.local_x
+        sign_extend(v, 13) + self.local_x
     }
     #[inline]
     fn y2s(&self, v: u16) -> i32 {
-        (v as i16) as i32 + self.local_y
+        sign_extend(v, 13) + self.local_y
     }
 
     /// Pick the pixel writer the way MAME's `vdp1_set_drawpixel` does:
@@ -578,10 +583,10 @@ impl<'a> Plotter<'a> {
         let pd = self.cmd.pattern_addr() as i32;
         let zoom = ((self.cmd.ctrl & 0x0F00) >> 8) as i32;
 
-        let mut x = (self.cmd.xa as i16) as i32;
-        let mut y = (self.cmd.ya as i16) as i32;
-        let mut screen_w = (self.cmd.xb as i16) as i32;
-        let mut screen_h = (self.cmd.yb as i16) as i32;
+        let mut x = sign_extend(self.cmd.xa, 13);
+        let mut y = sign_extend(self.cmd.ya, 13);
+        let mut screen_w = sign_extend(self.cmd.xb, 13);
+        let mut screen_h = sign_extend(self.cmd.yb, 13);
         let mut h_neg = false;
         if screen_w < 0 && zoom != 0 {
             screen_w = -screen_w;
@@ -708,11 +713,11 @@ impl<'a> Plotter<'a> {
 
     #[inline]
     fn x2s_i(&self, v: i32) -> i32 {
-        (v as i16) as i32 + self.local_x
+        v + self.local_x
     }
     #[inline]
     fn y2s_i(&self, v: i32) -> i32 {
-        (v as i16) as i32 + self.local_y
+        v + self.local_y
     }
 
     /// Assign texture coordinates to the four quad corners, honouring

@@ -604,6 +604,77 @@ fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
 }
 
 #[test]
+fn sprite_coordinates_are_signed_13_bit() {
+    let mut v = Vdp1::new();
+    for i in 0..64u32 {
+        v.vram.write16(0x3000 + i * 2, 0x1234);
+    }
+    let srca = (0x3000u32 / 8) as u16;
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0000, 0x0000),
+            w(0x0028, 0x0000),
+            w(srca, 0x0108),
+            w(0x1FFC, 10), // signed 13-bit x = -4
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    assert_eq!(v.fb.pixel(0, 10), 0x1234);
+    assert_eq!(v.fb.pixel(3, 17), 0x1234);
+    assert_eq!(v.fb.pixel(4, 10), 0);
+}
+
+#[test]
+fn local_coordinates_are_signed_11_bit() {
+    let mut v = Vdp1::new();
+    for i in 0..64u32 {
+        v.vram.write16(0x3000 + i * 2, 0x2468);
+    }
+    let srca = (0x3000u32 / 8) as u16;
+    put(
+        &mut v,
+        0,
+        [
+            w(0x000A, 0x0000), // local-coordinate command
+            0,
+            0,
+            w(0, 0x07F0), // signed 11-bit y = -16
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(
+        &mut v,
+        1,
+        [
+            w(0x0000, 0x0000),
+            w(0x0028, 0x0000),
+            w(srca, 0x0108),
+            w(10, 20),
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(&mut v, 2, END);
+    v.process_list();
+
+    assert_eq!(v.fb.pixel(10, 4), 0x2468);
+    assert_eq!(v.fb.pixel(17, 11), 0x2468);
+}
+
+#[test]
 fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
     let mut v = Vdp1::new();
     for i in 0..64u32 {
