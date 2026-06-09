@@ -3390,17 +3390,17 @@ fn menu_savestate_probe() {
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
     );
-    if slave_bp.is_some() {
+    if let Some(bp_pc) = slave_bp {
         match sat.take_slave_bp_hit() {
             Some((r, pr, gbr, _code, probe)) => {
-                println!("SLAVE BP hit @0x{:06X}:", slave_bp.unwrap());
+                println!("SLAVE BP hit @0x{bp_pc:06X}:");
                 for b in (0..16).step_by(4) {
                     println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
                         b, r[b], b+1, r[b+1], b+2, r[b+2], b+3, r[b+3]);
                 }
                 println!("  PR={pr:08X} GBR={gbr:08X} probe(bus,no-cache)={probe:08X}");
             }
-            None => println!("SLAVE BP @0x{:06X} NOT hit", slave_bp.unwrap()),
+            None => println!("SLAVE BP @0x{bp_pc:06X} NOT hit"),
         }
     }
     if slave_hist {
