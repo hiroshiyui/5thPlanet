@@ -3340,6 +3340,17 @@ fn menu_savestate_probe() {
             println!("  f{f}: 0x{v:X}");
         }
     }
+    // Write the full dispatched-value sequence (one hex value per line, all frames)
+    // to a file, to diff vs Mednafen's SS_LOGSEQ. Requires DUMP_SEQ=1. SEQ_FILE=path.
+    if let Ok(path) = std::env::var("SEQ_FILE") {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for v in &seq_vals {
+            let _ = writeln!(s, "{v:X}");
+        }
+        std::fs::write(&path, s).expect("write SEQ_FILE");
+        println!("wrote {} seq values -> {path}", seq_vals.len());
+    }
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
     );
