@@ -1171,6 +1171,16 @@ impl CdBlock {
         if self.disc.is_none() {
             return;
         }
+        // Debug (SAT_CDSEEKLOG): log every seek/read/play target — the CD
+        // "index" (which section/FAD the game reads). Observer-only.
+        if std::env::var("SAT_CDSEEKLOG").is_ok() {
+            let (sfad, efad) = (target & 0x7F_FFFF, end & 0x7F_FFFF);
+            eprintln!(
+                "CDSEEK fad={sfad} (0x{sfad:06X}) lba={} count={} end_fad={efad} repeat={repeat} irq={play_end_irq:04X}",
+                sfad as i64 - 150,
+                efad.wrapping_sub(sfad)
+            );
+        }
         self.play_repeat_counter = 0;
         self.sec_prebuf_in = false; // ClearPendingSec
         self.cur_play_start = target;
