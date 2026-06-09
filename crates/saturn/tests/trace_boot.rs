@@ -3720,3 +3720,39 @@ fn presstart_pchist() {
         println!("  {base:08X}  {:5.1}%", *n as f64 / total as f64 * 100.0);
     }
 }
+
+/// Test #1 of the Doukyuusei menu-bg investigation: does ours' disc reader
+/// return the correct bytes at a menu-asset FAD? Compares ours `Disc::read_sector`
+/// against the raw MODE1/2352 image at several FADs. If they differ, ours has a
+/// FAD→offset/sector-decode bug (the asset-content root). `cargo test -p saturn
+/// --test trace_boot disc_read_content_check -- --ignored --nocapture`
+#[test]
+#[ignore = "manual: verify ours' disc-read content vs the raw image"]
+fn disc_read_content_check() {
+    let root = workspace_root();
+    let cue_name = "Doukyuusei - if (Japan) (1M, 2M).cue";
+    let bin = root.join("roms").join("Doukyuusei - if (Japan) (1M, 2M) (Track 1).bin");
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(cue_name)) else {
+        println!("no cue; skipped"); return;
+    };
+    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok()) else {
+        println!("cue parse failed"); return;
+    };
+    let img = std::fs::read(&bin).expect("read track1.bin");
+    const SECT: usize = 2352;
+    const USER_OFF: usize = 16; // MODE1: 12 sync + 4 header
+    for fad in [150u32, 19951, 19144, 18379, 19324, 10438] {
+        let lba = (fad - 150) as usize;
+        let off = lba * SECT + USER_OFF;
+        let raw = &img[off..off + 2048];
+        let (ok, same, first_diff, head): (bool, bool, Option<usize>, [u8; 8]) =
+            match disc.read_sector(fad) {
+                Some(o) => (true, o == raw, (0..2048).find(|&i| o[i] != raw[i]), o[..8].try_into().unwrap()),
+                None => (false, false, Some(0), [0; 8]),
+            };
+        println!(
+            "fad={fad} lba={lba} read_ok={ok} MATCH={same} first_diff={first_diff:?}  ours[0..8]={head:02X?} raw[0..8]={:02X?}",
+            &raw[..8]
+        );
+    }
+}
