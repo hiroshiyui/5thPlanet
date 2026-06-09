@@ -462,8 +462,18 @@ impl Bus for SaturnBus {
             // Inter-CPU FRT input-capture (FTI) trigger: a 16-bit write to this
             // region pulses the *other* SH-2's free-running-timer input capture
             // (the Saturn slave/master "wake" signal). Drained at the aggregate.
-            SLAVE_FTI_BASE..=SLAVE_FTI_END => self.slave_input_capture = true,
-            MASTER_FTI_BASE..=MASTER_FTI_END => self.master_input_capture = true,
+            SLAVE_FTI_BASE..=SLAVE_FTI_END => {
+                self.slave_input_capture = true;
+                if std::env::var("SAT_FTILOG").is_ok() {
+                    eprintln!("FTI->slave addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
+                }
+            }
+            MASTER_FTI_BASE..=MASTER_FTI_END => {
+                self.master_input_capture = true;
+                if std::env::var("SAT_FTILOG").is_ok() {
+                    eprintln!("FTI->master addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
+                }
+            }
             _ => {}
         }
         waits_for(addr, true) + self.vdp1_draw_stall(addr, true)

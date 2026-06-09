@@ -3203,6 +3203,13 @@ fn menu_savestate_probe() {
     let probe_frames: u32 =
         std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(340);
     sat.enable_seqlog(seq_pc, seq_reg);
+    // SLAVE_HIST=1: histogram the slave's most-recent PC window after the run,
+    // to see if ours' slave reaches the menu-CGD-load routine (~0x060160Fx) or
+    // is parked in a wait loop (a few PCs = waiting on a master/FTI signal).
+    let slave_hist = std::env::var("SLAVE_HIST").is_ok();
+    if slave_hist {
+        sat.enable_slave_pc_trace();
+    }
     let mut hits = 0usize;
     let mut first_frame: Option<u32> = None;
     let dump_seq = std::env::var("DUMP_SEQ").is_ok();
@@ -3369,6 +3376,27 @@ fn menu_savestate_probe() {
     println!(
         "SEQ_PC 0x{seq_pc:06X}: executed {hits}× over {probe_frames} probe frames (START at +{start_at}); first hit at probe-frame {first_frame:?}"
     );
+    if slave_hist {
+        let tr = sat.take_slave_pc_trace();
+        use std::collections::BTreeMap;
+        let mut h: BTreeMap<u32, usize> = BTreeMap::new();
+        for pc in &tr {
+            *h.entry(*pc).or_default() += 1;
+        }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("--- SLAVE most-recent PC window: {} entries, {} distinct ---", tr.len(), v.len());
+        for (pc, c) in v.iter().take(16) {
+            println!("  slave PC 0x{pc:08X}: {c}×");
+        }
+        let min = tr.iter().min().copied().unwrap_or(0);
+        let max = tr.iter().max().copied().unwrap_or(0);
+        println!("  slave PC range 0x{min:08X}..0x{max:08X}", );
+        println!("  reaches poll 0x060160F2? {}  reaches PROCEED 0x060160FA? {}  reaches CGD-load Jsr 0x06016102? {}",
+            tr.iter().any(|&p| p == 0x0601_60F2),
+            tr.iter().any(|&p| p == 0x0601_60FA),
+            tr.iter().any(|&p| p == 0x0601_6102));
+    }
 
     if let Ok(spec) = std::env::var("READMEM") {
         let nums: Vec<u32> = spec
