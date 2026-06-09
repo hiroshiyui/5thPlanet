@@ -256,9 +256,13 @@ impl Cache {
     }
 
     /// Borrow the 16 bytes of the line at (`set`, `way`) — used with the
-    /// (`set`, `way`) returned by [`Cache::probe`] to extract in place.
+    /// (`set`, `way`) returned by [`Cache::probe`] to extract in place. The
+    /// indices **must** come from a `Probe::Hit` of this same cache (they are
+    /// always in range there: `set` is `addr[9:4]` ∈ 0..SETS, `way` < WAYS); the
+    /// `debug_assert!` catches any other caller in debug builds.
     #[inline]
     pub fn line_at(&self, set: usize, way: usize) -> &[u8; LINE_BYTES] {
+        debug_assert!(set < SETS && way < WAYS, "line_at({set}, {way}) out of range — pass Probe::Hit indices");
         &self.sets[set][way].data
     }
 
@@ -582,6 +586,15 @@ mod tests {
         c.install(base | (4 << 10), line_with(0xC0));
         assert_eq!(c.probe(base | (1 << 10), false), Probe::Miss, "tag 1 evicted");
         assert!(matches!(c.probe(base, false), Probe::Hit(_, _)), "tag 0 kept");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn line_at_rejects_out_of_range_indices() {
+        // line_at must only be fed Probe::Hit indices; the debug_assert guards
+        // any other caller (active in the test profile).
+        let c = Cache::new();
+        let _ = c.line_at(SETS, 0);
     }
 
     #[test]
