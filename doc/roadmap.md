@@ -53,7 +53,7 @@ Virtua Fighter 2). See the Milestone 10 section. · **M11 (boot a game to
 gameplay) ✅ complete 2026-06-10** — **Virtua Fighter 2 is playable end-to-end**
 (title → menus → character select with CD-DA BGM → 3D fights to the K.O.
 screen, user-verified); *Doukyuusei ~if~* boots to its title + in-game menu.
-See the Milestone 11 section. Follow-on axis: performance.
+See the Milestone 11 section. Follow-on performance push (`1e1e115`): the VF2 fight (704×448 DD 3D) went 13.8 → 34.7 fps full-path via the renderer `FrameCtx` frame-invariant hoist + the scanline-band parallel composite (bit-identical, golden unchanged); with the frontend render worker the displayed ceiling is ≈63 fps = NTSC real-time. `bench_vf2_fight` is the permanent fight benchmark.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
