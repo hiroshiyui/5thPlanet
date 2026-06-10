@@ -1106,6 +1106,7 @@ impl Saturn {
             // cycle-exactly rather than up to a batch late — see `batch_size`.
             let batch = self.batch_size(now, remaining);
             self.step_cpus(now + batch);
+            self.feed_cd_audio(batch);
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
@@ -1141,6 +1142,7 @@ impl Saturn {
                     pcs.push(cpu.regs.pc);
                 }
             });
+            self.feed_cd_audio(batch);
             self.bus.scsp.run(batch);
             self.update_video_timing();
             self.drain_smpc();
@@ -1580,19 +1582,22 @@ impl Saturn {
     /// Take the SCSP's generated audio for this period (interleaved L,R at
     /// 44.1 kHz). The frontend queues it to the audio device each frame.
     pub fn take_audio(&mut self) -> Vec<i16> {
-        let mut samples = self.bus.scsp.take_audio();
-        // Mix in any CD-DA (Red Book) audio the CD-block decoded this span — at
-        // the aggregate, so neither chip borrows the other. Both streams are
-        // interleaved 16-bit stereo at 44.1 kHz, so they line up frame-for-frame
-        // (the CD FIFO absorbs the 75 Hz sector granularity). CD audio mixes at
-        // full level for now; SCSP CD-input level/pan fidelity is a refinement.
-        if !samples.is_empty() {
-            let cd = self.bus.cd_block.take_cd_audio_buffered(samples.len());
-            for (out, c) in samples.iter_mut().zip(cd) {
-                *out = (*out as i32 + c as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            }
+        self.bus.scsp.take_audio()
+    }
+
+    /// Per-batch EXTS feed: hand the SCSP exactly the CD-DA (Red Book) samples
+    /// its next `run(batch)` will consume, drawn from the CD-block's decoded
+    /// FIFO (through the pre-roll jitter buffer that absorbs the 75 Hz sector
+    /// granularity). The SCSP mixes them per hardware law — slots 16/17's
+    /// EFSDL/EFPAN effect-return (the CD-input volume the game programs) plus
+    /// the effect DSP's EXTS input reads — replacing the old aggregate-level
+    /// full-scale summing, which drowned VF2's in-fight SFX.
+    fn feed_cd_audio(&mut self, batch: u64) {
+        let need = self.bus.scsp.cd_need(batch);
+        if need > 0 {
+            let cd = self.bus.cd_block.take_cd_audio_buffered(need);
+            self.bus.scsp.feed_cd(cd);
         }
-        samples
     }
 }
 

@@ -366,6 +366,16 @@ pub struct ScspCtrl {
     dbg_tt_calls: u32,
     #[serde(skip)]
     dbg_tt_samples: u32,
+    /// CD-DA (Red Book) input queue, interleaved L,R at 44.1 kHz — the SCSP's
+    /// EXTS digital inputs. Fed per scheduler batch from the CD-block
+    /// ([`crate::system::Saturn::run_for`]); [`Self::mix`] consumes one frame per
+    /// output sample into `dsp.exts`, where it (a) mixes to the output through
+    /// slots 16/17's EFSDL/EFPAN effect-return path and (b) is readable by the
+    /// effect DSP as inputs IRA 0x30/0x31 (Mednafen `scsp.inc` `EXTS`).
+    /// `#[serde(skip)]`: transient stream data, re-primed from the CD-block
+    /// after a state load.
+    #[serde(skip)]
+    cd_in: std::collections::VecDeque<i16>,
 }
 
 impl Default for ScspCtrl {
@@ -393,6 +403,7 @@ impl ScspCtrl {
             dbg_timer_of: [0; 3],
             dbg_tt_calls: 0,
             dbg_tt_samples: 0,
+            cd_in: std::collections::VecDeque::new(),
         }
     }
 
@@ -1110,6 +1121,13 @@ impl ScspCtrl {
         let (lp, rp) = &*PAN_TABLES;
         let (mut l, mut r) = (0i32, 0i32);
         let dsp_on = self.dsp.running();
+        // Latch this sample's EXTS (CD-DA) inputs before the slot loop, exactly
+        // as Mednafen calls `CDB_GetCDDA(GetEXTSPtr())` before `RunSample`: the
+        // pair is consumed by slots 16/17's effect-return below and by DSP
+        // input reads (IRA 0x30/0x31).
+        let cl = self.cd_in.pop_front().unwrap_or(0);
+        let cr = self.cd_in.pop_front().unwrap_or(0);
+        self.dsp.exts = [cl, cr];
         // The slot effect-return reads the DSP outputs (EFREG) produced from the
         // *previous* sample's sends — Mednafen's one-sample effect pipeline
         // (`scsp.inc`: the sends collected this pass feed `DSP.step` below, whose
@@ -1123,6 +1141,27 @@ impl ScspCtrl {
             // sample, regardless of slot activity (Mednafen `scsp.inc`: the
             // 17-bit Galois step `(LFSR>>1) | (((LFSR>>5)^LFSR)&1)<<16`).
             self.lfsr = (self.lfsr >> 1) | ((((self.lfsr >> 5) ^ self.lfsr) & 1) << 16);
+            // Effect-return — mixed for EVERY slot, keyed or not (Mednafen
+            // `scsp.inc:1784` runs it unconditionally in the 32-slot loop):
+            // slots 0-15 return the DSP output `EFREG[slot]`; slots 16/17
+            // return the EXTS (CD-DA) inputs — the SCSP's CD-input volume
+            // control; 18-31 return 0. Gating this on slot activity (the old
+            // shape, inside the keyed-slot section below) silenced any DSP/CD
+            // return routed through an un-keyed slot — VF2 returns its CD-DA
+            // BGM through un-keyed slots' EFSDL, so its fight music vanished.
+            let eff = if i < 16 {
+                if dsp_on { efreg[i] as i32 } else { 0 }
+            } else if i < 18 {
+                self.dsp.exts[i & 1] as i32
+            } else {
+                0
+            };
+            if eff != 0 {
+                let reg_b = self.slot_reg(i, 0xB);
+                let eidx = ((((reg_b >> 5) & 7) << 5) | (reg_b & 0x1F)) as usize;
+                l += (eff * lp[eidx]) >> PHASE_SHIFT;
+                r += (eff * rp[eidx]) >> PHASE_SHIFT;
+            }
             if !self.slots[i].active {
                 // Inactive slots still record a 0 into the FM SoundStack and
                 // advance the global slot counter, so the stack stays aligned.
@@ -1139,16 +1178,6 @@ impl ScspCtrl {
             let didx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
             l += (voice * lp[didx]) >> PHASE_SHIFT;
             r += (voice * rp[didx]) >> PHASE_SHIFT;
-            // Effect return: this slot's DSP output `EFREG[i]` (slots 0..15) at
-            // EFSDL send level (bits 7-5) + EFPAN (4-0). Same pan/level table as
-            // the direct path (Mednafen derives both via `SDL_PAN_ToVolume`;
-            // mixed `EFREG[slot] * EffectVolume` per slot, `scsp.inc:1669`).
-            if dsp_on && i < 16 {
-                let eidx = ((((reg_b >> 5) & 7) << 5) | (reg_b & 0x1F)) as usize;
-                let eff = efreg[i] as i32;
-                l += (eff * lp[eidx]) >> PHASE_SHIFT;
-                r += (eff * rp[eidx]) >> PHASE_SHIFT;
-            }
             // Effect send: route the voice into the DSP input mix MIXS[ISEL] at
             // the IMXL level (reg 0xA).
             if dsp_on {
@@ -1512,6 +1541,26 @@ impl Scsp {
     /// queues this to the audio device each frame.
     pub fn take_audio(&mut self) -> Vec<i16> {
         core::mem::take(&mut self.out)
+    }
+
+    /// How many CD-DA (EXTS) input values — interleaved L,R `i16`s — the next
+    /// `run(sh2_cycles)` will consume, given the current sample-clock phase.
+    /// Pure preview of `run`'s quota math; lets the aggregate pull exactly that
+    /// much from the CD-block before stepping (the per-batch EXTS feed).
+    pub fn cd_need(&self, sh2_cycles: u64) -> usize {
+        let samples = (self.sample_frac + sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ))
+            / SH2_CLOCK_HZ;
+        (samples as usize) * 2
+    }
+
+    /// Queue CD-DA samples (interleaved L,R, 44.1 kHz) into the SCSP's EXTS
+    /// digital inputs. Capped (~1 s) so an undrained headless run can't grow
+    /// unboundedly; the mixer consumes one frame per output sample.
+    pub fn feed_cd(&mut self, samples: Vec<i16>) {
+        const CD_IN_CAP: usize = 96_000;
+        if self.ctrl.cd_in.len() + samples.len() <= CD_IN_CAP {
+            self.ctrl.cd_in.extend(samples);
+        }
     }
 
     /// Release the 68k from reset (SMPC `SNDON`): reload SSP/PC from the
@@ -2290,6 +2339,33 @@ mod tests {
 
         assert!(full > 0xF00, "TL 0 → near full scale");
         assert!(attenuated < full / 4, "TL 0x80 sharply attenuates");
+    }
+
+    /// The EXTS (CD-DA) inputs mix to the output through slots 16/17's
+    /// EFSDL/EFPAN effect-return — the SCSP's CD-input volume control — and
+    /// are silent when the game leaves EFSDL at 0 (Mednafen `scsp.inc:1784`).
+    #[test]
+    fn cd_exts_mixes_via_slot16_17_efsdl() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(0x400, 0x000F); // MVOL max
+        // EFSDL=7 on both EXTS slots; pan slot 16 (CD left) hard left and
+        // slot 17 (CD right) hard right, as games do to keep the CD stereo
+        // image (each slot's effect-return otherwise mixes into both sides).
+        s.ctrl.write16(16 * 0x20 + 0x16, 0x00FF); // EFSDL=7 EFPAN=0x1F
+        s.ctrl.write16(17 * 0x20 + 0x16, 0x00EF); // EFSDL=7 EFPAN=0x0F
+        s.feed_cd(vec![8000, -8000]);
+        let (l, r) = s.ctrl.mix(&mut s.ram);
+        assert!(l > 1000, "left CD sample reaches the left output (l={l})");
+        assert!(r < -1000, "right CD sample reaches the right output (r={r})");
+        // EFSDL=0 (the reset value) mutes the CD input entirely.
+        s.ctrl.write16(16 * 0x20 + 0x16, 0x0000);
+        s.ctrl.write16(17 * 0x20 + 0x16, 0x0000);
+        s.feed_cd(vec![8000, -8000]);
+        let (l, r) = s.ctrl.mix(&mut s.ram);
+        assert_eq!((l, r), (0, 0), "EFSDL=0 mutes the CD input");
+        // An empty queue plays silence (and the DSP sees zero EXTS).
+        let (l, r) = s.ctrl.mix(&mut s.ram);
+        assert_eq!((l, r), (0, 0));
     }
 
     #[test]
