@@ -104,6 +104,196 @@ struct FrameCtx {
     vcp: [(u8, u8); 4],
     /// The two rotation parameter sets (A/B) from the RPTA table.
     rot: [RotationParams; 2],
+    /// Per-NBG decoded register state (the per-dot sampler prologue).
+    nbg: [NbgCtx; 4],
+    /// Per-RBG-layer decoded register state.
+    rbg: [RbgCtx; 2],
+    /// Per-rotation-parameter tile geometry.
+    rot_geo: [RotGeo; 2],
+    /// W0/W1 rectangle bounds `(sx, ex, sy, ey)` + line-window enables.
+    win: [((u32, u32, u32, u32), bool); 2],
+}
+
+/// One rotation parameter set's frame-constant tile-geometry decode plus the
+/// per-RBG-layer attributes — the `sample_rot_tile` per-dot register parses
+/// (the VF2 fight floor is RBG0, sampled at every screen dot).
+struct RbgCtx {
+    enabled: bool,
+    priomode: u8,
+    prio: u8,
+    cc: Option<(u8, bool)>,
+    sccm: u8,
+    sfcode: u8,
+    coff: usize,
+    tpon: bool,
+    depth: u8,
+    bitmap: bool,
+}
+
+/// Frame-constant geometry for one rotation parameter set (A/B).
+struct RotGeo {
+    two_cells: bool,
+    plane_base: [u32; 16],
+    pg_tiles: u32,
+    pg_bytes: u32,
+    entry_bytes: u32,
+    pages_x: u32,
+    pages_y: u32,
+    over: u8,
+    fmt: PnFormat,
+}
+
+impl RbgCtx {
+    fn new(vdp2: &Vdp2, which: usize) -> Self {
+        let r = &vdp2.regs;
+        let sf_layer = if which == 0 { 4 } else { 0 };
+        Self {
+            enabled: r.rbg_enabled(which),
+            priomode: r.special_priority_mode(sf_layer),
+            prio: r.rbg_priority(which),
+            cc: r.rbg_color_calc(which),
+            sccm: r.special_color_calc_mode(sf_layer),
+            sfcode: r.special_function_code(sf_layer),
+            coff: r.rbg_color_ram_offset(which),
+            tpon: r.rbg_transparent_pen_solid(which),
+            depth: r.rbg_color_mode(),
+            bitmap: r.rbg_bitmap_enabled(),
+        }
+    }
+}
+
+impl RotGeo {
+    fn new(vdp2: &Vdp2, param: usize) -> Self {
+        let r = &vdp2.regs;
+        let two_cells = r.rbg_char_size_2x2();
+        let one_word = r.rbg_pn_one_word();
+        let plane_size = (r.rbg_plane_size(param) & 3) as u32;
+        let pg_tiles = if two_cells { 32 } else { 64 };
+        let entry_bytes = if one_word { 2 } else { 4 };
+        let pg_bytes = pg_tiles * pg_tiles * entry_bytes;
+        let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
+        let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
+        let shift = [0u32, 1, 2, 2][plane_size as usize];
+        let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
+        let upper_mask = 0x1FF >> upper_shift;
+        let plsize_bytes = pg_bytes * pages_x * pages_y;
+        let plane_base = core::array::from_fn(|p| {
+            (((r.rbg_plane_number(param, p) & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF
+        });
+        Self {
+            two_cells,
+            plane_base,
+            pg_tiles,
+            pg_bytes,
+            entry_bytes,
+            pages_x,
+            pages_y,
+            over: r.rbg_screen_over(param),
+            fmt: PnFormat {
+                one_word,
+                cnsm: r.rbg_pn_cnsm(),
+                spcn: r.rbg_pn_spcn(),
+                splt: r.rbg_pn_splt(),
+                sup_spr: r.rbg_pn_special_priority(),
+                sup_scc: r.rbg_pn_special_calc(),
+            },
+        }
+    }
+}
+
+/// One NBG layer's frame-constant register decode — everything `nbg_layer`,
+/// `sample_nbg`, `sample_bitmap`, and `sample_tile` previously re-parsed from
+/// the register file per dot (×4 layers × every screen dot).
+struct NbgCtx {
+    enabled: bool,
+    winctl: u8,
+    priomode: u8,
+    prio: u8,
+    cc: Option<(u8, bool)>,
+    sccm: u8,
+    sfcode: u8,
+    // sample_nbg: scroll / zoom
+    scroll: (u32, u32),
+    frac: (u8, u8),
+    inc: (u32, u32),
+    line_zoom_x: bool,
+    vcell: bool,
+    depth: u8,
+    bitmap: bool,
+    coff: usize,
+    tpon: bool,
+    // sample_tile: pattern-name geometry (per-plane bases precomputed)
+    two_cells: bool,
+    plane_size: u32,
+    plane_base: [u32; 4],
+    pg_tiles: u32,
+    pg_bytes: u32,
+    entry_bytes: u32,
+    fmt: PnFormat,
+    // sample_bitmap
+    bm_base: u32,
+    bm_dims: (u32, u32),
+    bm_spr: bool,
+    bm_scc: bool,
+}
+
+impl NbgCtx {
+    fn new(vdp2: &Vdp2, n: usize) -> Self {
+        let r = &vdp2.regs;
+        let two_cells = r.nbg_char_size_2x2(n);
+        let one_word = r.nbg_pn_one_word(n);
+        let plane_size = (r.nbg_plane_size(n) & 3) as u32;
+        let pg_tiles = if two_cells { 32 } else { 64 };
+        let entry_bytes = if one_word { 2 } else { 4 };
+        let pg_bytes = pg_tiles * pg_tiles * entry_bytes;
+        let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
+        let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
+        let shift = [0u32, 1, 2, 2][plane_size as usize];
+        let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
+        let upper_mask = 0x1FF >> upper_shift;
+        let plsize_bytes = pg_bytes * pages_x * pages_y;
+        let plane_base = core::array::from_fn(|p| {
+            (((r.nbg_plane_page(n, p) & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF
+        });
+        Self {
+            enabled: r.nbg_enabled(n),
+            winctl: r.nbg_window_control(n),
+            priomode: r.special_priority_mode(n),
+            prio: r.nbg_priority(n),
+            cc: r.nbg_color_calc(n),
+            sccm: r.special_color_calc_mode(n),
+            sfcode: r.special_function_code(n),
+            scroll: r.nbg_scroll(n),
+            frac: r.nbg_scroll_frac(n),
+            inc: r.nbg_coord_inc(n),
+            line_zoom_x: r.nbg_line_zoom_x(n),
+            vcell: r.nbg_vcell_scroll(n),
+            depth: r.nbg_color_mode(n),
+            bitmap: r.nbg_bitmap_enabled(n),
+            coff: r.nbg_color_ram_offset(n),
+            tpon: r.nbg_transparent_pen_solid(n),
+            two_cells,
+            plane_size,
+            plane_base,
+            pg_tiles,
+            pg_bytes,
+            entry_bytes,
+            fmt: PnFormat {
+                one_word,
+                cnsm: r.nbg_pn_cnsm(n),
+                spcn: r.nbg_pn_spcn(n),
+                splt: r.nbg_pn_splt(n),
+                sup_spr: r.nbg_pn_special_priority(n),
+                sup_scc: r.nbg_pn_special_calc(n),
+            },
+            // Bitmap mode exists only on NBG0/1; the accessors' bit math is
+            // undefined for NBG2/3 (they can never be bitmap-enabled).
+            bm_base: if n < 2 { r.nbg_bitmap_base(n) } else { 0 },
+            bm_dims: if n < 2 { bitmap_dims(r.nbg_bitmap_size(n)) } else { (512, 256) },
+            bm_spr: n < 2 && r.nbg_bitmap_special_priority(n),
+            bm_scc: n < 2 && r.nbg_bitmap_special_calc(n),
+        }
+    }
 }
 
 impl FrameCtx {
@@ -112,6 +302,12 @@ impl FrameCtx {
         Self {
             vcp: core::array::from_fn(|n| vdp2.regs.nbg_vcp_fetch_masks(n)),
             rot: core::array::from_fn(|p| RotationParams::read(&vdp2.vram, rpta, p)),
+            nbg: core::array::from_fn(|n| NbgCtx::new(vdp2, n)),
+            rbg: core::array::from_fn(|l| RbgCtx::new(vdp2, l)),
+            rot_geo: core::array::from_fn(|p| RotGeo::new(vdp2, p)),
+            win: core::array::from_fn(|w| {
+                (vdp2.regs.window_rect(w), vdp2.regs.window_line_enabled(w))
+            }),
         }
     }
 }
@@ -140,7 +336,19 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
     // frozen VDP state, and the bands write disjoint rows — output is
     // bit-identical to the sequential loop regardless of thread count (the
     // accuracy-safe "render edge"; the core stays single-threaded).
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    // Band count: leave headroom for the thread that runs the emulation —
+    // the frontend overlaps this composite with `advance_frame`, and
+    // oversubscribing the physical cores starves the emu thread (the in-vivo
+    // "gameplay slows down while paused screens hit 60" regression). Default
+    // to half the logical CPUs, capped at 4 (the composite is partly
+    // memory-bound; returns diminish quickly). `SAT_RENDER_THREADS` overrides.
+    let threads = std::env::var("SAT_RENDER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            (std::thread::available_parallelism().map_or(1, |n| n.get()) / 2).clamp(1, 4)
+        });
     let band_rows = h.div_ceil(threads).max(1);
     std::thread::scope(|sc| {
         for (i, band) in out[..w * h * 4].chunks_mut(band_rows * w * 4).enumerate() {
@@ -178,7 +386,7 @@ fn render_line(
             let mut shadow = false;
 
             // The sprite layer may produce a colour dot or an MSB shadow.
-            if window_allows(vdp2, sprite_fb, vdp2.regs.sprite_window_control(), sx, sy) {
+            if window_allows(vdp2, ctx, sprite_fb, vdp2.regs.sprite_window_control(), sx, sy) {
                 match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
                     Some(SpriteDot::Colour(d)) => {
                         insert_dot(&mut top, &mut second, &mut third, Some(d))
@@ -532,7 +740,14 @@ fn blend(t: (u8, u8, u8), b: (u8, u8, u8), ratio: u8, add: bool) -> (u8, u8, u8)
 /// clear = AND). Disabled windows are neutral; if none are enabled, the dot
 /// passes. The sprite window reads its inside/outside flag from the VDP1
 /// framebuffer (`sprite_fb`).
-fn window_allows(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, ctl: u8, x: u32, y: u32) -> bool {
+fn window_allows(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    sprite_fb: Option<&Framebuffer>,
+    ctl: u8,
+    x: u32,
+    y: u32,
+) -> bool {
     let (w0e, w1e, swe) = (ctl & 0x02 != 0, ctl & 0x08 != 0, ctl & 0x20 != 0);
     if !w0e && !w1e && !swe {
         return true;
@@ -542,10 +757,10 @@ fn window_allows(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, ctl: u8, x: u32, 
     let mut pass = !or_logic;
     let fold = |acc: bool, p: bool| if or_logic { acc || p } else { acc && p };
     if w0e {
-        pass = fold(pass, win_pixel(vdp2, 0, x, y, true, ctl & 0x01 != 0));
+        pass = fold(pass, win_pixel(vdp2, ctx, 0, x, y, true, ctl & 0x01 != 0));
     }
     if w1e {
-        pass = fold(pass, win_pixel(vdp2, 1, x, y, true, ctl & 0x04 != 0));
+        pass = fold(pass, win_pixel(vdp2, ctx, 1, x, y, true, ctl & 0x04 != 0));
     }
     if swe {
         pass = fold(pass, sprite_window_pixel(vdp2, sprite_fb, x, y, ctl & 0x10 != 0));
@@ -611,12 +826,12 @@ fn sprite_framebuffer_x(vdp2: &Vdp2, display_x: u32) -> i32 {
 /// pass inside the window, clear → pass outside. With a line window enabled,
 /// the horizontal start/end come from the per-line table (the vertical bounds
 /// stay from WPSY/WPEY).
-fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) -> bool {
+fn win_pixel(vdp2: &Vdp2, ctx: &FrameCtx, w: usize, x: u32, y: u32, enable: bool, area: bool) -> bool {
     if !enable {
         return true;
     }
-    let (mut sx, mut ex, sy, ey) = vdp2.regs.window_rect(w);
-    if vdp2.regs.window_line_enabled(w) {
+    let ((mut sx, mut ex, sy, ey), line_en) = ctx.win[w];
+    if line_en {
         // One 32-bit entry per line: start X in bits 25..16, end X in bits
         // 9..0 — hi-res dot units, halved in normal modes like the rectangle
         // path (see `window_rect`).
@@ -633,31 +848,23 @@ fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) ->
 /// per-dot special priority / colour-calc function (SFPRMD/SFCCMD) from the
 /// sampled dot's attributes.
 fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
-    if !vdp2.regs.nbg_enabled(n) {
+    let nc = &ctx.nbg[n];
+    if !nc.enabled {
         return None;
     }
-    if !window_allows(vdp2, sprite_fb, vdp2.regs.nbg_window_control(n), x, y) {
+    if !window_allows(vdp2, ctx, sprite_fb, nc.winctl, x, y) {
         return None;
     }
-    let priomode = vdp2.regs.special_priority_mode(n);
-    let prio_reg = vdp2.regs.nbg_priority(n);
     // Priority 0 hides the layer — but only when the special-priority function
     // can't raise the LSB per-dot (mode 0); otherwise resolve and let the
     // compositor drop a resolved priority of 0.
-    if priomode == 0 && prio_reg == 0 {
+    if nc.priomode == 0 && nc.prio == 0 {
         return None;
     }
     // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
     let (mx, my) = vdp2.regs.mosaic_coord(1 << n, x, y);
     let s = sample_nbg(vdp2, ctx, n, mx, my)?;
-    let (pri, cc) = resolve_special(
-        prio_reg,
-        vdp2.regs.nbg_color_calc(n),
-        priomode,
-        vdp2.regs.special_color_calc_mode(n),
-        vdp2.regs.special_function_code(n),
-        &s,
-    );
+    let (pri, cc) = resolve_special(nc.prio, nc.cc, nc.priomode, nc.sccm, nc.sfcode, &s);
     Some(Dot {
         pri,
         rgb: s.rgb,
@@ -671,19 +878,17 @@ fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: us
 /// special-function layer index 4 (SFPRMD/SFCCMD bits 8..9); RBG1 shares NBG0's
 /// slot (index 0).
 fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
-    if !vdp2.regs.rbg_enabled(which) {
+    let rc = &ctx.rbg[which];
+    if !rc.enabled {
         return None;
     }
     // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
     // ungated for now.
-    let gated = which != 0 || window_allows(vdp2, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
+    let gated = which != 0 || window_allows(vdp2, ctx, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
     if !gated {
         return None;
     }
-    let sf_layer = if which == 0 { 4 } else { 0 };
-    let priomode = vdp2.regs.special_priority_mode(sf_layer);
-    let prio_reg = vdp2.regs.rbg_priority(which);
-    if priomode == 0 && prio_reg == 0 {
+    if rc.priomode == 0 && rc.prio == 0 {
         return None;
     }
     // Mosaic (MZCTL bit 4) applies to RBG0 only.
@@ -697,7 +902,7 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
     // to A when RBG1 is active (dual-rotation mode). Modes 2/3 (per-dot coeff /
     // rotation window) fall back to A pending the per-dot coefficient rework.
     let param = if which == 0 {
-        if vdp2.regs.rbg_enabled(1) {
+        if ctx.rbg[1].enabled {
             0
         } else {
             (vdp2.regs.rotation_param_mode() == 1) as usize
@@ -706,14 +911,7 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
         1
     };
     let s = sample_rbg(vdp2, ctx, param, which, mx, my)?;
-    let (pri, cc) = resolve_special(
-        prio_reg,
-        vdp2.regs.rbg_color_calc(which),
-        priomode,
-        vdp2.regs.special_color_calc_mode(sf_layer),
-        vdp2.regs.special_function_code(sf_layer),
-        &s,
-    );
+    let (pri, cc) = resolve_special(rc.prio, rc.cc, rc.priomode, rc.sccm, rc.sfcode, &s);
     Some(Dot {
         pri,
         rgb: s.rgb,
@@ -796,18 +994,19 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
     // that carries reduction/zoom. NBG2/3 are integer scroll — no fraction, no
     // zoom — so their increment stays 1:1 and the maths collapses to the old
     // `scroll + coord`.
-    let (sxi, syi) = vdp2.regs.nbg_scroll(n);
+    let nc = &ctx.nbg[n];
+    let (sxi, syi) = nc.scroll;
     let mut base_x = sxi << 16;
     let mut base_y = syi << 16;
     let (mut xinc, mut yinc) = (1u32 << 16, 1u32 << 16);
     if n < 2 {
-        let (fxf, fyf) = vdp2.regs.nbg_scroll_frac(n);
+        let (fxf, fyf) = nc.frac;
         base_x |= (fxf as u32) << 8;
         base_y |= (fyf as u32) << 8;
         // Whole-layer ZMXN/ZMYN reduction/zoom. A 0 register reads as "unset"
         // → 1:1 (never a collapsed layer); real software always programs it
         // before enabling the layer, so the guard only protects synthetic state.
-        let (zx, zy) = vdp2.regs.nbg_coord_inc(n);
+        let (zx, zy) = nc.inc;
         if zx != 0 {
             xinc = zx;
         }
@@ -819,11 +1018,11 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
         let (dx, dy, lzoom) = line_scroll(vdp2, n, y);
         base_x = base_x.wrapping_add(dx << 16);
         base_y = base_y.wrapping_add(dy << 16);
-        if vdp2.regs.nbg_line_zoom_x(n) {
+        if nc.line_zoom_x {
             xinc = lzoom;
         }
         // Per-column vertical cell scroll (signed; wraps in 16.16).
-        if vdp2.regs.nbg_vcell_scroll(n) {
+        if nc.vcell {
             base_y = base_y.wrapping_add((vcell_scroll(vdp2, n, x) as u32) << 16);
         }
     }
@@ -833,11 +1032,10 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
     let step = |inc: u32, coord: u32| (coord as u64 * inc as u64) as u32;
     let sx = base_x.wrapping_add(step(xinc, x)) >> 16;
     let sy = base_y.wrapping_add(step(yinc, y)) >> 16;
-    let depth = vdp2.regs.nbg_color_mode(n);
-    if vdp2.regs.nbg_bitmap_enabled(n) {
-        sample_bitmap(vdp2, n, depth, sx, sy)
+    if nc.bitmap {
+        sample_bitmap(vdp2, nc, sx, sy)
     } else {
-        sample_tile(vdp2, ctx, n, depth, sx, sy)
+        sample_tile(vdp2, ctx, n, sx, sy)
     }
 }
 
@@ -851,18 +1049,15 @@ fn bitmap_dims(size: u8) -> (u32, u32) {
     }
 }
 
-fn sample_bitmap(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
-    let base = vdp2.regs.nbg_bitmap_base(n);
-    let (w, h) = bitmap_dims(vdp2.regs.nbg_bitmap_size(n));
+fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
+    let base = nc.bm_base;
+    let (w, h) = nc.bm_dims;
     let (px, py) = (sx % w, sy % h);
-    let coff = vdp2.regs.nbg_color_ram_offset(n);
-    let tpon = vdp2.regs.nbg_transparent_pen_solid(n);
+    let coff = nc.coff;
+    let tpon = nc.tpon;
     // Bitmap special-function bits are whole-layer constants (BMSPR/BMSCC).
-    let (spr, scc) = (
-        vdp2.regs.nbg_bitmap_special_priority(n),
-        vdp2.regs.nbg_bitmap_special_calc(n),
-    );
-    match depth {
+    let (spr, scc) = (nc.bm_spr, nc.bm_scc);
+    match nc.depth {
         // 16bpp RGB555 direct colour.
         3 => {
             let off = base + (py * w + px) * 2;
@@ -1035,15 +1230,13 @@ fn sample_pattern_cell(
     })
 }
 
-fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
-    let r = &vdp2.regs;
-    let two_cells = r.nbg_char_size_2x2(n); // 16×16 vs 8×8 character
-    let one_word = r.nbg_pn_one_word(n);
-    let plane_size = (r.nbg_plane_size(n) & 3) as u32;
+fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, sx: u32, sy: u32) -> Option<Sample> {
+    let nc = &ctx.nbg[n];
+    let two_cells = nc.two_cells; // 16×16 vs 8×8 character
+    let plane_size = nc.plane_size;
     let cell_px = if two_cells { 16 } else { 8 };
-    let pg_tiles = if two_cells { 32 } else { 64 }; // PN entries per page edge
-    let entry_bytes = if one_word { 2 } else { 4 };
-    let pg_bytes = pg_tiles * pg_tiles * entry_bytes;
+    let pg_tiles = nc.pg_tiles; // PN entries per page edge
+    let pg_bytes = nc.pg_bytes;
     let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
     let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
 
@@ -1074,36 +1267,21 @@ fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, depth: u8, sx: u32, sy: u3
     }
     let (xoff, yoff) = (tx & (pg_tiles - 1), ty & (pg_tiles - 1));
 
-    // Plane base: align the plane number to the plane size, then scale.
-    let plane_num = r.nbg_plane_page(n, plane as usize);
-    let shift = [0u32, 1, 2, 2][plane_size as usize];
-    let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
-    let upper_mask = 0x1FF >> upper_shift;
-    let plsize_bytes = pg_bytes * pages_x * pages_y;
-    let base = (((plane_num & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF;
-    let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * entry_bytes;
+    // Plane base: precomputed per plane in [`NbgCtx::new`].
+    let base = nc.plane_base[plane as usize];
+    let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * nc.entry_bytes;
 
-    let fmt = PnFormat {
-        one_word,
-        cnsm: r.nbg_pn_cnsm(n),
-        spcn: r.nbg_pn_spcn(n),
-        splt: r.nbg_pn_splt(n),
-        sup_spr: r.nbg_pn_special_priority(n),
-        sup_scc: r.nbg_pn_special_calc(n),
-    };
     // VRAM cycle-pattern gating (CYCA0..CYCB1): a name-table fetch from a bank
     // the VCP table doesn't grant this NBG reads as a transparent dummy tile —
     // and the character fetch is gated likewise inside sample_pattern_cell.
     let (nt_mask, cg_mask) = ctx.vcp[n];
     let nt_bank = ((pn_addr >> 17) & 3) as u8;
     let pat = if nt_mask & (1 << nt_bank) != 0 {
-        decode_pattern(vdp2, pn_addr, fmt, two_cells, depth)
+        decode_pattern(vdp2, pn_addr, nc.fmt, two_cells, nc.depth)
     } else {
         Pattern { cell: 0, palette: 0, hflip: false, vflip: false, spr: false, scc: false }
     };
-    let coff = r.nbg_color_ram_offset(n);
-    let tpon = r.nbg_transparent_pen_solid(n);
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon, Some(cg_mask))
+    sample_pattern_cell(vdp2, &pat, two_cells, nc.depth, in_x, in_y, nc.coff, nc.tpon, Some(cg_mask))
 }
 
 // Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
@@ -1228,11 +1406,10 @@ fn sample_rbg(vdp2: &Vdp2, ctx: &FrameCtx, param: usize, layer: usize, x: u32, y
         }
     }
     let (plane_x, plane_y) = rp.transform(x as i32, y as i32);
-    let depth = vdp2.regs.rbg_color_mode();
-    if vdp2.regs.rbg_bitmap_enabled() {
-        sample_rot_bitmap(vdp2, param, layer, depth, plane_x, plane_y)
+    if ctx.rbg[layer].bitmap {
+        sample_rot_bitmap(vdp2, ctx, param, layer, plane_x, plane_y)
     } else {
-        sample_rot_tile(vdp2, param, layer, depth, plane_x, plane_y)
+        sample_rot_tile(vdp2, ctx, param, layer, plane_x, plane_y)
     }
 }
 
@@ -1285,12 +1462,13 @@ fn rot_line_coeff(vdp2: &Vdp2, which: usize, rp: &RotationParams, y: u32) -> Coe
 
 fn sample_rot_bitmap(
     vdp2: &Vdp2,
+    ctx: &FrameCtx,
     param: usize,
     layer: usize,
-    depth: u8,
     plane_x: i32,
     plane_y: i32,
 ) -> Option<Sample> {
+    let depth = ctx.rbg[layer].depth;
     let base = vdp2.regs.rbg_bitmap_base(param);
     let w: i32 = 512;
     let h: i32 = if vdp2.regs.rbg_bitmap_size() == 0 {
@@ -1354,29 +1532,28 @@ fn sample_rot_bitmap(
 /// (shared with the NBG tile path).
 fn sample_rot_tile(
     vdp2: &Vdp2,
+    ctx: &FrameCtx,
     param: usize,
     layer: usize,
-    depth: u8,
     plane_x: i32,
     plane_y: i32,
 ) -> Option<Sample> {
-    let r = &vdp2.regs;
-    let two_cells = r.rbg_char_size_2x2();
-    let one_word = r.rbg_pn_one_word();
-    let plane_size = (r.rbg_plane_size(param) & 3) as u32;
+    let geo = &ctx.rot_geo[param];
+    let rc = &ctx.rbg[layer];
+    let depth = rc.depth;
+    let two_cells = geo.two_cells;
     let cell_px = if two_cells { 16 } else { 8 };
-    let pg_tiles = if two_cells { 32 } else { 64 };
-    let entry_bytes = if one_word { 2 } else { 4 };
-    let pg_bytes = pg_tiles * pg_tiles * entry_bytes;
-    let pages_x = if plane_size & 1 != 0 { 2 } else { 1 };
-    let pages_y = if plane_size & 2 != 0 { 2 } else { 1 };
+    let pg_tiles = geo.pg_tiles;
+    let pg_bytes = geo.pg_bytes;
+    let pages_x = geo.pages_x;
+    let pages_y = geo.pages_y;
 
     // The 4×4-plane field (each page is 512 px). The screen-over mode decides
     // what happens outside it: repeat (wrap), or transparent.
     let page_px = pg_tiles * cell_px;
     let plane_w = pages_x * page_px;
     let plane_h = pages_y * page_px;
-    let over = vdp2.regs.rbg_screen_over(param);
+    let over = geo.over;
     let (field_w, field_h) = if over == 3 {
         (page_px, page_px) // transparent outside a single 512×512 area
     } else {
@@ -1404,28 +1581,13 @@ fn sample_rot_tile(
     let page = (tx / pg_tiles) + (ty / pg_tiles) * pages_x;
     let (xoff, yoff) = (tx % pg_tiles, ty % pg_tiles);
 
-    // Plane base: align the plane number to the plane size, then scale.
-    let plane_num = r.rbg_plane_number(param, plane_idx);
-    let shift = [0u32, 1, 2, 2][plane_size as usize];
-    let upper_shift = (!one_word as u32) | ((!two_cells as u32) << 1);
-    let upper_mask = 0x1FF >> upper_shift;
-    let plsize_bytes = pg_bytes * pages_x * pages_y;
-    let base = (((plane_num & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF;
-    let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * entry_bytes;
+    // Plane base: precomputed per plane in [`RotGeo::new`].
+    let base = geo.plane_base[plane_idx];
+    let pn_addr = base + page * pg_bytes + (yoff * pg_tiles + xoff) * geo.entry_bytes;
 
-    let fmt = PnFormat {
-        one_word,
-        cnsm: r.rbg_pn_cnsm(),
-        spcn: r.rbg_pn_spcn(),
-        splt: r.rbg_pn_splt(),
-        sup_spr: r.rbg_pn_special_priority(),
-        sup_scc: r.rbg_pn_special_calc(),
-    };
-    let pat = decode_pattern(vdp2, pn_addr, fmt, two_cells, depth);
-    let coff = r.rbg_color_ram_offset(layer);
-    let tpon = r.rbg_transparent_pen_solid(layer);
+    let pat = decode_pattern(vdp2, pn_addr, geo.fmt, two_cells, depth);
     // No VCP gating on the rotation path yet (RDBS bank selection unmodelled).
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, coff, tpon, None)
+    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, rc.coff, rc.tpon, None)
 }
 
 #[cfg(test)]

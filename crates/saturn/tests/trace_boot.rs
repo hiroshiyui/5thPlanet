@@ -4112,3 +4112,65 @@ fn bench_vf2_fight() {
     let (plots, _, _, cmds, px) = sat.bus.vdp1.dbg_plots();
     println!("vdp1: plots={plots} last_cmds={cmds} last_pixels={px}");
 }
+
+/// THROWAWAY (revert): concurrent pipeline benchmark — advance_frame on this
+/// thread while a worker renders the previous frame's clone, replicating the
+/// frontend's render_pipe overlap (the sequential bench can't see the core
+/// contention between the emu thread and the banded render).
+#[test]
+#[ignore = "manual: VF2 concurrent pipeline bench (run with --release)"]
+fn bench_vf2_pipeline() {
+    use std::sync::mpsc;
+    use std::time::Instant;
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        return;
+    };
+    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full_lsb.cue")) else {
+        return;
+    };
+    let disc =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+            .expect("parse cue");
+    let snap = std::fs::read(root.join("tmp/vf2_fight_f2700.sav")).expect("fight snapshot (run bench_vf2_fight once)");
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.insert_disc(disc);
+    sat.load_state(&snap).expect("load fight snapshot");
+
+    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let (tx, rx) = mpsc::sync_channel::<(saturn::Vdp2, saturn::vdp1::Framebuffer)>(1);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+            while let Ok((vdp2, fb)) = rx.recv() {
+                saturn::vdp2::render_frame(&vdp2, Some(&fb), &mut out);
+                done_tx.send(()).ok();
+            }
+        });
+        let mut advance_total = std::time::Duration::ZERO;
+        let t0 = Instant::now();
+        let mut in_flight = false;
+        for _ in 0..n {
+            let t = Instant::now();
+            sat.advance_frame();
+            advance_total += t.elapsed();
+            if in_flight {
+                done_rx.recv().ok(); // wait for the previous render
+            }
+            tx.send((sat.bus.vdp2.clone(), sat.bus.vdp1.display_fb().clone())).ok();
+            in_flight = true;
+        }
+        if in_flight {
+            done_rx.recv().ok();
+        }
+        drop(tx);
+        let total = t0.elapsed();
+        let fps = n as f64 / total.as_secs_f64();
+        println!(
+            "pipelined: {n} frames in {total:?} = {fps:.1} fps | advance avg {:.2} ms",
+            advance_total.as_secs_f64() * 1e3 / n as f64
+        );
+    });
+}
