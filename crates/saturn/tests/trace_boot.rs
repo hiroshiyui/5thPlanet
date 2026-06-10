@@ -4113,10 +4113,15 @@ fn bench_vf2_fight() {
     println!("vdp1: plots={plots} last_cmds={cmds} last_pixels={px}");
 }
 
-/// THROWAWAY (revert): concurrent pipeline benchmark — advance_frame on this
-/// thread while a worker renders the previous frame's clone, replicating the
-/// frontend's render_pipe overlap (the sequential bench can't see the core
-/// contention between the emu thread and the banded render).
+/// Concurrent pipeline benchmark — advance_frame on this thread while a
+/// worker renders the previous frame's clone, replicating the frontend's
+/// render_pipe overlap. The sequential bench can't see the contention between
+/// the emu thread and the banded render (memory bandwidth + all-core boost
+/// clocks), which is what governs the in-vivo frame rate. Needs the
+/// bench_vf2_fight snapshot (run that once first).
+///
+///   cargo test --release -p saturn --test trace_boot bench_vf2_pipeline \
+///     -- --ignored --nocapture
 #[test]
 #[ignore = "manual: VF2 concurrent pipeline bench (run with --release)"]
 fn bench_vf2_pipeline() {
