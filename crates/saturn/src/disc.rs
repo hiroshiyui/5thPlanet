@@ -348,11 +348,59 @@ impl Disc {
         }
         let last = out.last().unwrap();
         let lead_out_fad = last.start_fad + last.length;
-        Ok(Disc {
+        let disc = Disc {
             image,
             tracks: out,
             lead_out_fad,
-        })
+        };
+        // Surface byte-swapped (cdrdao-style) audio at load time — CD-DA from
+        // such an image plays as full-scale noise that is easy to misread as
+        // an emulator bug (it cost a VF2 BGM hunt; see `audio_looks_msb_first`).
+        if disc.audio_looks_msb_first() {
+            eprintln!(
+                "warning: disc audio tracks appear byte-swapped (MSB-first, e.g. a cdrdao \
+                 dump paired with a .cue) — CD-DA will play as noise; regenerate the image \
+                 with LSB-first audio (or byte-swap the audio region of the BIN)"
+            );
+        }
+        Ok(disc)
+    }
+
+    /// Heuristic: do the audio tracks look **MSB-first (byte-swapped)**?
+    /// cdrdao writes its BIN audio big-endian, but a `.cue` implies the Red
+    /// Book LSB-first order (Mednafen's loader makes the same assumption and
+    /// only swaps for cdrdao `.toc` files), so such an image plays CD-DA as
+    /// full-scale noise. Real audio is *smooth* — consecutive samples rarely
+    /// jump by a large fraction of full scale — in exactly one byte order, so
+    /// compare large sample-to-sample jumps of both interpretations a few
+    /// sectors into each audio track (track starts are often silent, and
+    /// silence is order-neutral → undetermined → no flag).
+    pub fn audio_looks_msb_first(&self) -> bool {
+        let (mut le_jumps, mut be_jumps, mut probed) = (0u32, 0u32, 0u32);
+        for t in self.tracks.iter().filter(|t| t.mode == TrackMode::Audio && t.length >= 8) {
+            let mid = t.start_fad + t.length / 2;
+            for s in 0..4 {
+                let Some(raw) = self.read_full_sector(mid + s) else { break };
+                if raw.len() < 2352 {
+                    break;
+                }
+                let (mut ple, mut pbe) = (0i16, 0i16);
+                for (i, fr) in raw.chunks_exact(4).enumerate() {
+                    let le = i16::from_le_bytes([fr[0], fr[1]]);
+                    let be = i16::from_be_bytes([fr[0], fr[1]]);
+                    if i > 0 {
+                        le_jumps += (le.abs_diff(ple) > 12000) as u32;
+                        be_jumps += (be.abs_diff(pbe) > 12000) as u32;
+                    }
+                    ple = le;
+                    pbe = be;
+                }
+                probed += 1;
+            }
+        }
+        // Flag only a decisive contrast: byte-swapped music shows hundreds of
+        // large LE jumps per sector while the BE view shows almost none.
+        probed >= 2 && le_jumps > probed * 50 && be_jumps * 8 < le_jumps
     }
 
     /// The 2048-byte user payload of the sector at `fad`, or `None` if `fad`
@@ -549,6 +597,39 @@ fn parse_int(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Smooth audio (here a slow triangle ramp) is order-decisive: stored
+    /// LSB-first it must not be flagged; the same waveform byte-swapped
+    /// (a cdrdao-style dump) must be. Silence is order-neutral → no flag.
+    #[test]
+    fn detects_msb_first_audio_tracks() {
+        fn audio_disc(fill: impl Fn(usize) -> [u8; 2]) -> Disc {
+            let mut bin = vec![0u8; 2352 * 16];
+            for (i, fr) in bin.chunks_exact_mut(4).enumerate() {
+                let b = fill(i);
+                fr[0..2].copy_from_slice(&b);
+                fr[2..4].copy_from_slice(&b);
+            }
+            Disc::from_cue(
+                "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                |_| Some(bin.clone()),
+            )
+            .unwrap()
+        }
+        let ramp = |i: usize| ((i % 2000) as i16 - 1000) * 30;
+        assert!(
+            !audio_disc(|i| ramp(i).to_le_bytes()).audio_looks_msb_first(),
+            "LSB-first audio is not flagged"
+        );
+        assert!(
+            audio_disc(|i| ramp(i).to_be_bytes()).audio_looks_msb_first(),
+            "byte-swapped audio is flagged"
+        );
+        assert!(
+            !audio_disc(|_| [0, 0]).audio_looks_msb_first(),
+            "silence is order-neutral"
+        );
+    }
 
     #[test]
     fn iso_is_one_mode1_track_from_fad_150() {
