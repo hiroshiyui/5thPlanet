@@ -141,6 +141,8 @@ pub struct Plotter<'a> {
     die: bool,
     /// FBCR bit 2 (DIL) — which field DIE draws (0 = even lines, 1 = odd).
     dil: bool,
+    /// Debug (`SAT_VDP1LOG`): dump each drawn command at plot time.
+    log: bool,
 }
 
 impl<'a> Plotter<'a> {
@@ -169,6 +171,7 @@ impl<'a> Plotter<'a> {
             bpp8,
             die,
             dil,
+            log: std::env::var_os("SAT_VDP1LOG").is_some(),
         }
     }
 
@@ -235,7 +238,8 @@ impl<'a> Plotter<'a> {
 
         while count < MAX_COMMANDS {
             count += 1;
-            self.cmd = Command::read(self.vram, position * 0x20);
+            let cmd_addr = position * 0x20;
+            self.cmd = Command::read(self.vram, cmd_addr);
 
             if self.cmd.is_end() {
                 break;
@@ -290,6 +294,27 @@ impl<'a> Plotter<'a> {
 
             if !draw {
                 continue;
+            }
+
+            // Debug (SAT_VDP1LOG): dump every drawn command at plot time —
+            // the post-swap VRAM rewrite makes after-the-fact list walks
+            // unreliable. Observer-only.
+            if self.log {
+                let (cw, ch) = self.cmd.char_size();
+                eprintln!(
+                    "VDP1CMD @{:05X} ctrl={:04X} pmod={:04X} colr={:04X} srca={:04X} size={cw}x{ch} A=({},{}) B=({},{}) C=({},{})",
+                    cmd_addr,
+                    self.cmd.ctrl,
+                    self.cmd.pmod,
+                    self.cmd.colr,
+                    self.cmd.srca,
+                    self.cmd.xa as i16,
+                    self.cmd.ya as i16,
+                    self.cmd.xb as i16,
+                    self.cmd.yb as i16,
+                    self.cmd.xc as i16,
+                    self.cmd.yc as i16,
+                );
             }
 
             // Clipping mode: CMDPMOD bit 10 selects the user clip,

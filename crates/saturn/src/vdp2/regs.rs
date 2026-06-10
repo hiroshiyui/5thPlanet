@@ -804,9 +804,15 @@ impl Vdp2Regs {
     /// line-window table; hi-res scaling is a later refinement.
     pub fn window_rect(&self, w: usize) -> (u32, u32, u32, u32) {
         let base = if w == 0 { 0x0C0 } else { 0x0C8 };
-        let sx = ((self.read16(base) & 0x3FE) >> 1) as u32;
+        // The X coordinates are programmed in hi-res dot units: in the
+        // 640/704-dot modes they apply as-is, in normal modes they are halved
+        // (Mednafen vdp2_render.cpp: `if(!(HRes & 0x2)) { xs >>= 1; ... }`).
+        // Halving them in hi-res shrank VF2's menu-text window to the left
+        // half, clipping all but the first glyph.
+        let xshift = if self.h_resolution() & 0x2 != 0 { 0 } else { 1 };
+        let sx = ((self.read16(base) & 0x3FF) >> xshift) as u32;
         let sy = (self.read16(base + 2) & 0x3FF) as u32;
-        let ex = ((self.read16(base + 4) & 0x3FE) >> 1) as u32;
+        let ex = ((self.read16(base + 4) & 0x3FF) >> xshift) as u32;
         let ey = (self.read16(base + 6) & 0x3FF) as u32;
         (sx, ex, sy, ey)
     }
@@ -1348,6 +1354,23 @@ mod tests {
         assert!(r.window_line_enabled(0));
         // address = ((hi & 7) << 16 | (lo & 0xFFFE)) << 1 = (0x2_0000) << 1.
         assert_eq!(r.window_line_table(0), 0x2_0000 << 1);
+    }
+
+    /// Window X coordinates are programmed in hi-res dot units: halved in the
+    /// normal (320/352) modes, applied raw in the 640/704-dot modes (Mednafen
+    /// `if(!(HRes & 0x2)) xs >>= 1`). Halving them in hi-res shrank VF2's
+    /// menu-text window to the left half (only "A" of "ARCADE MODE" passed).
+    #[test]
+    fn window_x_is_raw_in_hires_modes_halved_in_normal() {
+        let mut r = Vdp2Regs::new();
+        r.write16(0x0C0, 0x00B8); // W0 sx raw 184
+        r.write16(0x0C2, 0x0158); // sy 344
+        r.write16(0x0C4, 0x0208); // ex raw 520
+        r.write16(0x0C6, 0x0177); // ey 375
+        r.write16(0x000, 0x8001); // 352-dot normal mode → halved
+        assert_eq!(r.window_rect(0), (92, 260, 344, 375));
+        r.write16(0x000, 0x8003); // 704-dot hi-res → raw
+        assert_eq!(r.window_rect(0), (184, 520, 344, 375));
     }
 
     #[test]

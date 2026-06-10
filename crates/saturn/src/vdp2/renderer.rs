@@ -567,12 +567,13 @@ fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) ->
     }
     let (mut sx, mut ex, sy, ey) = vdp2.regs.window_rect(w);
     if vdp2.regs.window_line_enabled(w) {
-        // One 32-bit entry per line: start X in bits 25..16, end X in bits 9..0
-        // (10-bit dots; halved to the renderer's low-res scale, matching the
-        // rectangle path's `& 0x3FE >> 1`).
+        // One 32-bit entry per line: start X in bits 25..16, end X in bits
+        // 9..0 — hi-res dot units, halved in normal modes like the rectangle
+        // path (see `window_rect`).
+        let xshift = if vdp2.regs.h_resolution() & 0x2 != 0 { 0 } else { 1 };
         let word = vdp2.vram.read32(vdp2.regs.window_line_table(w) + y * 4);
-        sx = ((word >> 16) & 0x3FF) >> 1;
-        ex = (word & 0x3FF) >> 1;
+        sx = ((word >> 16) & 0x3FF) >> xshift;
+        ex = (word & 0x3FF) >> xshift;
     }
     let inside = x >= sx && x <= ex && y >= sy && y <= ey;
     if area { inside } else { !inside }
@@ -2731,4 +2732,5 @@ mod tests {
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 3, 0), [0xFF, 0, 0, 0xFF], "cnsm 12-bit char");
     }
+
 }
