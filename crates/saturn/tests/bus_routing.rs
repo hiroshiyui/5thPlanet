@@ -256,3 +256,22 @@ fn unmapped_space_is_open_bus_at_all_widths() {
     assert_eq!(bus.read16(gap, AccessKind::Data).0, 0);
     assert_eq!(bus.read32(gap, AccessKind::Data).0, 0);
 }
+
+#[test]
+fn scsp_region_charges_bbus_wait_states() {
+    // Mednafen `scu.inc` BBusRW: an SH-2 read from the SCSP region is always
+    // two 16-bit B-bus accesses at +24 each (= +48, any width); a write costs
+    // a +17 write-finish. Regression for the VF2 SFX wedge: with 0 waits the
+    // game's sound-request spin-timeout (0x10000 mailbox reads) expired faster
+    // than the 68k driver's IRQ-masked wake-from-sleep re-init, latching its
+    // "sound driver wedged" flag and silently dropping all later SFX.
+    use saturn::bus::SCSP_REGS_BASE;
+    let mut bus = fresh();
+    assert_eq!(bus.read8(SCSP_RAM_BASE, AccessKind::Data).1, 48);
+    assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, 48);
+    assert_eq!(bus.read32(SCSP_RAM_BASE, AccessKind::Data).1, 48);
+    assert_eq!(bus.read16(SCSP_REGS_BASE, AccessKind::Data).1, 48);
+    assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Data), 17);
+    assert_eq!(bus.write32(SCSP_RAM_BASE, 0, AccessKind::Data), 17);
+    assert_eq!(bus.write16(SCSP_REGS_BASE + 0x400, 0, AccessKind::Data), 17);
+}

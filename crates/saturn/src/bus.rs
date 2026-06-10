@@ -309,6 +309,24 @@ fn waits_for(addr: u32, write: bool) -> u32 {
                 20
             }
         }
+        // SCSP sound RAM + registers — B-bus. Mednafen `scu.inc`: a B-bus read
+        // is *always two* 16-bit accesses at +24 each (= +48, any width;
+        // `SCU_FromSH2_BusRW_DB` "B-bus reads are always 32-bit"); a write is
+        // one +17 write-finish per 16-bit half (≈17 for the 8/16-bit accesses
+        // the sound protocol uses). A 0-wait here shrank VF2's sound-request
+        // spin-timeout (0x10000 cache-through mailbox reads, master-side) from
+        // the oracle's ~120 ms to ~21 ms — shorter than the 68k driver's
+        // wake-from-sleep re-init (a 64 KiB sound-RAM fill with all IRQs
+        // masked), so the first request submitted during a wake timed out,
+        // latched the game's "sound driver wedged" flag at 0x060E0017, and
+        // silently dropped every later SFX request (M11).
+        0x05A0_0000..=0x05BF_FFFF => {
+            if write {
+                17
+            } else {
+                48
+            }
+        }
         // A-bus CS2 (`0x05800000..=0x058FFFFF`): the CD-block host registers + its
         // SCU-DMA data port. Mednafen `scu.inc` ABusRW_DB charges the SH-2 **+8**
         // per access (read and write alike). The BIOS audio-CD player polls the
