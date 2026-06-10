@@ -22,7 +22,7 @@ foundation stays solid.
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
 | M7        | CD-block (HLE) + disc recognition + cartridge slot          | ✅ complete  |
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
-| M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
+| M9        | Frontend OSD (in-window menu)                               | ✅ complete  |
 | M10       | Live physical disc + CD audio                               | ✅ complete  |
 | M11       | Boot a commercial game to gameplay                          | ✅ complete  |
 | M12       | Whole-system cycle accuracy vs the reference emulator        | 🚧 active    |
@@ -35,7 +35,8 @@ playable** (graphics, sound effects, and voices), including Shuttle Mouse
 support. Games load from disc images (CUE/BIN, ISO,
 CloneCD) or straight from an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
-in-window menu (Esc) are all in place.
+in-window menu (Esc — save slots, controller rebinding, region/cartridge/BIOS
+switching, all persisted to a config file) are all in place.
 
 Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
@@ -67,10 +68,12 @@ cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
 ## Controls
 
 The SDL2 frontend maps the host keyboard to **port&nbsp;1** (a standard Saturn
-digital control pad) plus a few emulator hotkeys. (Controller rebinding and
-gamepad support are planned M9 phases.)
+digital control pad) plus a few emulator hotkeys. Every pad button can be
+rebound from the menu (**Esc → Settings → Controller**, press-to-bind); the
+bindings persist in the config file. (Host gamepad support is planned with
+the analog-peripheral work.)
 
-### Saturn control pad — port 1
+### Saturn control pad — port 1 (default bindings)
 
 | Saturn button | Keyboard |
 | ------------- | -------- |
@@ -137,7 +140,9 @@ map to the mouse buttons and **Enter** doubles as the mouse's Start button.
   history, and save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
 - [`jupiter`](jupiter) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
-  Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open).
+  Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open) and
+  the persisted config file (`src/config.rs`,
+  `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`).
   `cargo run -p jupiter -- <bios.bin> [disc.cue]`. (The binary is named
   `jupiter` for Jupiter — the 5th planet, hence the project name
   *5thPlanet* — the neighbour of Saturn: closest to it, but not identical.)
