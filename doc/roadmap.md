@@ -58,8 +58,9 @@ gameplay) ✅ complete 2026-06-10, tag `vf2-good-emulation`** — **Virtua
 Fighter 2 is fully playable at a steady 60 fps** (title → menus → character
 select → 3D fights to the K.O. screen, with correct graphics, CD-DA BGM
 through the SCSP EXTS inputs, in-fight SFX at the hardware mix balance, and
-smooth pacing — all user-verified); *Doukyuusei ~if~* boots to its title +
-in-game menu. See the Milestone 11 section. Follow-on performance push (`1e1e115`): the VF2 fight (704×448 DD 3D) went 13.8 → 34.7 fps full-path via the renderer `FrameCtx` frame-invariant hoist + the scanline-band parallel composite (bit-identical, golden unchanged); with the frontend render worker the displayed ceiling is ≈63 fps = NTSC real-time. `bench_vf2_fight` is the permanent fight benchmark.
+smooth pacing — all user-verified); ***Doukyuusei ~if~* is also fully playable**
+(GFX, SFX, and voices all working — user-verified 2026-06-11). See the
+Milestone 11 section. Follow-on performance push (`1e1e115`): the VF2 fight (704×448 DD 3D) went 13.8 → 34.7 fps full-path via the renderer `FrameCtx` frame-invariant hoist + the scanline-band parallel composite (bit-identical, golden unchanged); with the frontend render worker the displayed ceiling is ≈63 fps = NTSC real-time. `bench_vf2_fight` is the permanent fight benchmark.
 
 ## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
 
@@ -581,8 +582,8 @@ original disc from a host drive (see ADR-0009). The security ring is a non-issue
 A discovery milestone (like M4): get a commercial game (*Virtua Fighter 2*, JP
 `GS-9079`) past the BIOS CD player. **Achieved end-to-end**: title → menus →
 character select (CD-DA BGM) → full 3D gameplay to the K.O. screen,
-user-verified in the live frontend. (*Doukyuusei ~if~* boots to its title +
-in-game menu as well.) Follow-ons since closed: **performance** (60 fps via the
+user-verified in the live frontend. (***Doukyuusei ~if~* is also fully
+playable** — GFX, SFX, and voices all working, user-verified 2026-06-11.) Follow-ons since closed: **performance** (60 fps via the
 renderer hoists + scanline-band composite + emu-thread decoupling + the fight-loop
 hot-path cuts `03e842a` + the audio-pacing mirror credit `021dab5`), the
 fight-floor rotation geometry (`5ee3ecb`/`ac712a8`), and the **audio endgame** —
@@ -776,7 +777,7 @@ The output of a **full architecture audit** (2026-06-04, fanned out per chip). T
 emulator is **"boot-complete" but not "hardware-complete"**: it reaches game code
 on the real-BIOS LLE path, but a number of hardware features and timing behaviours
 are stubbed, approximated, or absent. **None of these block the current targets**
-(BIOS boot, VF2, *Doukyuusei ~if~* to title) — which is *why* they're still open —
+(BIOS boot, VF2, *Doukyuusei ~if~* — both games fully playable) — which is *why* they're still open —
 but together they are the path to **broad game compatibility + full cycle-accuracy**.
 
 This is a **prioritized backlog**, not a single-goal sprint: tasks are pulled in

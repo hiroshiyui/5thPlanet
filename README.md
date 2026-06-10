@@ -30,8 +30,9 @@ foundation stays solid.
 
 **What works today:** a real Saturn BIOS boots to its splash screen, and
 commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
-3D fights with CD music and sound effects), and ***Doukyuusei ~if~* runs well**,
-including Shuttle Mouse support. Games load from disc images (CUE/BIN, ISO,
+3D fights with CD music and sound effects), and ***Doukyuusei ~if~* is fully
+playable** (graphics, sound effects, and voices), including Shuttle Mouse
+support. Games load from disc images (CUE/BIN, ISO,
 CloneCD) or straight from an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
 in-window menu (Esc) are all in place.
