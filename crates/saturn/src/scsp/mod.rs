@@ -729,7 +729,15 @@ impl ScspCtrl {
         for i in 0..NUM_SLOTS {
             let data0 = self.slot_reg(i, 0);
             let kyonb = data0 & 0x0800 != 0;
-            let off = !self.slots[i].active || self.slots[i].eg.state == EgState::Release;
+            // A slot is "off" (re-keyable) iff its EG is in RELEASE — exactly
+            // Mednafen's `(EnvPhase == RELEASE) == KeyBit`. NOT `!active`: a
+            // non-loop sample that runs off its LEA stops *fetching* (Mednafen
+            // only clears `WFAllowAccess`) but its EG stays in Attack/Decay, so
+            // a later KYONEX strobe with the stale KYONB=1 must NOT replay it.
+            // (That re-key replayed VF2's "Go" announcer on every punch — each
+            // new SFX note-on strobes all 32 slots.) A key-off on such a slot
+            // takes the branch below, moving it to Release and re-arming it.
+            let off = self.slots[i].eg.state == EgState::Release;
             if kyonb {
                 if off {
                     self.start_slot(i);
@@ -2366,6 +2374,40 @@ mod tests {
         // An empty queue plays silence (and the DSP sees zero EXTS).
         let (l, r) = s.ctrl.mix(&mut s.ram);
         assert_eq!((l, r), (0, 0));
+    }
+
+    /// A non-loop sample that ran off its LEA keeps its EG phase (only the
+    /// fetch stops), so a KYONEX strobe with the stale KYONB=1 must NOT replay
+    /// it — Mednafen keys on only `(EnvPhase == RELEASE) == KeyBit`. A key-off
+    /// moves it to Release, after which a key-on may restart it. (VF2: every
+    /// punch's SFX strobe was replaying the round-start "Go" announcer.)
+    #[test]
+    fn sample_ended_slot_is_not_rekeyed_by_a_stray_strobe() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(0x400, 0x000F);
+        for k in 0..0x40u32 {
+            s.ram.write16(0x1000 + k * 2, 0x4000);
+        }
+        // Non-loop (LPCTL=0) 16-bit sample, 8 samples long, instant attack.
+        s.ctrl.write16(0x02, 0x1000); // SA low
+        s.ctrl.write16(0x04, 0x0000); // LSA
+        s.ctrl.write16(0x06, 0x0008); // LEA
+        s.ctrl.write16(0x08, 0x001F); // AR max
+        s.ctrl.write16(0x10, 0x0000); // OCT=0 FNS=0 -> step = 1 sample/tick
+        s.ctrl.write16(0x00, 0x1800); // KYONEX|KYONB -> key on
+        assert!(s.slot_active(0), "keyed on");
+        for _ in 0..64 {
+            let _ = s.ctrl.mix(&mut s.ram);
+        }
+        assert!(!s.slot_active(0), "ran off its LEA and stopped");
+        // A stray strobe (e.g. another slot keying) with KYONB still set must
+        // NOT replay the dead sample.
+        s.ctrl.write16(0x20, 0x1000); // slot 1: KYONEX, KYONB=0 (pure strobe)
+        assert!(!s.slot_active(0), "stale KYONB does not re-key a sample-ended slot");
+        // Key-off moves it to Release; a fresh key-on then restarts it.
+        s.ctrl.write16(0x00, 0x1000); // KYONEX, KYONB=0 -> key off
+        s.ctrl.write16(0x00, 0x1800); // KYONEX|KYONB -> key on again
+        assert!(s.slot_active(0), "restarts after an explicit key-off");
     }
 
     #[test]
