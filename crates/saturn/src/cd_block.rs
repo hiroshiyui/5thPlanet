@@ -1474,7 +1474,17 @@ impl CdBlock {
             self.cd_curfad = fad; // CurPosInfo.fad = CurSector (cdb.cpp:2389)
             self.fadstoplay = (self.cur_play_end & 0x7F_FFFF) as i64 - fad as i64;
         }
-        self.drive_counter += sector_cyc(self.cd_speed) as i64;
+        // Per-sector period by *sector type* (Mednafen cdb.cpp:2306,
+        // `(44100*256)/((subq&0x40)?150:75)`): CD-DA streams at 1× by
+        // definition — pacing audio at the data speed over-produced the
+        // CD-DA FIFO 2× real-time, overflowing its cap and dropping chunks
+        // (VF2's character-select BGM played as a buzz).
+        let cyc = if self.sec_prebuf_audio {
+            sector_cyc(1)
+        } else {
+            sector_cyc(self.cd_speed)
+        };
+        self.drive_counter += cyc as i64;
     }
 
     /// The per-`PeriodicIdleCounter` work (Mednafen cdb.cpp:2403): resolve the
@@ -3898,6 +3908,34 @@ mod tests {
         assert_ne!(c.status & !STAT_PERI, STAT_PAUSE, "repeat ∞ never pauses");
         let pcm = c.take_cd_audio(2);
         assert_eq!(pcm[0], 0x4321, "track 2 PCM streamed to the CD-DA mixer");
+    }
+
+    /// CD-DA streams at 1× regardless of the programmed data speed (Mednafen
+    /// cdb.cpp:2306, `(44100*256)/((subq&0x40)?150:75)`): pacing audio at the
+    /// 2× data speed over-produced the CD-DA FIFO and dropped chunks — VF2's
+    /// character-select BGM played as a buzz. 75 audio sectors must take ~1 s,
+    /// so a budget that would finish a 2× read leaves the drive still playing.
+    #[test]
+    fn audio_sectors_stream_at_single_speed_even_at_2x_data_speed() {
+        let bin = vec![0u8; 2352 * 80];
+        let disc = Disc::from_cue(
+            "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("cue");
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        c.drive_phase = DrivePhase::Idle;
+        c.drive_sector = 150;
+        assert_eq!(c.cd_speed, 2, "data reads default to 2×");
+        play(&mut c, 150, 75);
+        // Seek (~0.13 s) + 75 sectors at 2× (~0.5 s): at the correct 1×
+        // pacing the read is only about half done.
+        c.tick(8 * sector_cyc(2) + 75 * sector_cyc(2));
+        assert_eq!(c.status & !STAT_PERI, STAT_PLAY, "still streaming at 1×");
+        // The remaining ~0.5 s of 1× time (plus slack) completes it.
+        c.tick(80 * sector_cyc(2) + 8 * sector_cyc(1));
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "range complete");
     }
 
     /// A Play mixing FAD and track addressing forms is rejected with the
