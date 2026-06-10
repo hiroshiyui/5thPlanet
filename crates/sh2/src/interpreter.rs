@@ -336,6 +336,20 @@ impl Cpu {
         5 + s1 + s2 + s3
     }
 
+    /// PC base for PC-relative addressing (`MOV.W/L @(disp,PC)`, `MOVA`):
+    /// normally the instruction's own address + 4 (the SH-2 pipeline PC). In
+    /// the delay slot of a *taken* branch the hardware has already redirected
+    /// PC, so the base is the branch destination + 2 (SH-2 manual, MOVA note:
+    /// "PC = branch destination + 2"; Mednafen `UCDelayBranch` sets
+    /// `PC = target` before the slot executes). A not-taken conditional's
+    /// slot has no pending branch and uses the normal base.
+    fn pcrel_base(&self, instr_pc: u32) -> u32 {
+        match (self.in_delay_slot, self.pending_branch) {
+            (true, Some(target)) => target.wrapping_add(2),
+            _ => instr_pc.wrapping_add(4),
+        }
+    }
+
     fn execute(&mut self, op: Op, instr_pc: u32, bus: &mut impl Bus) -> u32 {
         use Op::*;
         match op {
@@ -368,13 +382,13 @@ impl Cpu {
                 1
             }
             MovWPcRel { rn, disp } => {
-                let addr = instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 1);
+                let addr = self.pcrel_base(instr_pc).wrapping_add((disp as u32) << 1);
                 let (val, s) = self.mem_read16(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val as i16 as i32 as u32;
                 1 + s
             }
             MovLPcRel { rn, disp } => {
-                let addr = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
+                let addr = (self.pcrel_base(instr_pc) & !3).wrapping_add((disp as u32) << 2);
                 let (val, s) = self.mem_read32(addr, AccessKind::Data, bus);
                 self.regs.r[rn as usize] = val;
                 1 + s
@@ -567,7 +581,7 @@ impl Cpu {
             }
 
             Mova { disp } => {
-                self.regs.r[0] = (instr_pc.wrapping_add(4).wrapping_add((disp as u32) << 2)) & !3;
+                self.regs.r[0] = (self.pcrel_base(instr_pc) & !3).wrapping_add((disp as u32) << 2);
                 1
             }
             Movt { rn } => {

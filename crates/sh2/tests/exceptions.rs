@@ -141,3 +141,51 @@ fn higher_priority_interrupt_wins_when_multiple_pending() {
     cpu.step(&mut bus);
     assert_eq!(cpu.regs.pc, 0x0000_6800);
 }
+
+/// PC-relative fetches are legal in a delay slot (Mednafen
+/// `OP_SLOT_ILLEGAL` covers only the branch family) — flagging them
+/// vectored VF2's character loader (`BF/S` + `MOV.L @(disp,PC)` in the
+/// slot) into the BIOS fatal halt. In a *taken* branch's slot the PC base
+/// is the branch destination + 2 (SH-2 manual MOVA note; Mednafen
+/// `UCDelayBranch` redirects PC before the slot executes).
+#[test]
+fn movl_pcrel_in_taken_slot_is_legal_and_uses_branch_target_plus_2() {
+    // 0x1000 BRA +12 (target 0x1010); slot: MOV.L @(1,PC),R1.
+    // Slot base = 0x1010 + 2 → ea = (0x1012 & !3) + 4 = 0x1014.
+    let (mut cpu, mut bus) = make(&[
+        0xA006, 0xD101, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009,
+        0x0009, 0x0009, 0xCAFE, 0xBABE,
+    ]);
+    cpu.step(&mut bus); // BRA (pending)
+    cpu.step(&mut bus); // slot MOV.L — legal, target+2 base
+    assert_eq!(cpu.last_fault, None, "PC-relative MOV in a slot is legal");
+    assert_eq!(cpu.regs.r[1], 0xCAFE_BABE, "literal read from target+2 base");
+    assert_eq!(cpu.regs.pc, 0x1010, "branch retired after the slot");
+}
+
+/// A not-taken conditional's "slot" is just the next sequential
+/// instruction: the PC-relative base stays the instruction's own
+/// address + 4.
+#[test]
+fn movl_pcrel_after_untaken_bfs_uses_the_normal_base() {
+    // 0x1000 BF/S +8 (T=1 → not taken); 0x1002 MOV.L @(0,PC),R1
+    // → ea = (0x1006 & !3) = 0x1004.
+    let (mut cpu, mut bus) = make(&[0x8F04, 0xD100, 0x1234, 0x5678]);
+    cpu.regs.sr.set_t(true);
+    cpu.step(&mut bus); // BF/S not taken
+    cpu.step(&mut bus); // sequential MOV.L
+    assert_eq!(cpu.last_fault, None);
+    assert_eq!(cpu.regs.r[1], 0x1234_5678, "normal instr+4 base");
+}
+
+/// MOVA in a taken slot computes from the branch destination + 2 too.
+#[test]
+fn mova_in_taken_slot_uses_branch_target_plus_2() {
+    // 0x1000 BRA +12 (target 0x1010); slot: MOVA @(1,PC),R0
+    // → R0 = (0x1012 & !3) + 4 = 0x1014.
+    let (mut cpu, mut bus) = make(&[0xA006, 0xC701]);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.last_fault, None, "MOVA in a slot is legal");
+    assert_eq!(cpu.regs.r[0], 0x1014);
+}

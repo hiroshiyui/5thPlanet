@@ -332,12 +332,17 @@ impl Op {
 
     /// True if this instruction must not appear in a delay slot
     /// (SH-2 software manual §6, "Delayed Branch Instructions").
-    /// Only instructions that *rewrite PC* qualify: the branch/jump
-    /// family, TRAPA, and the PC-relative fetches (whose PC base is
-    /// undefined in a slot). Notably `LDC Rm,SR` / `LDC.L @Rm+,SR` are
-    /// **legal** in a delay slot — `RTS; LDC Rm,SR` is the standard
-    /// "restore SR on return" idiom the Saturn BIOS relies on; flagging
-    /// it as illegal vectors the BIOS into its dead-wait handler.
+    /// Only the *branch* family qualifies — Bx/BxS, BRA/BRAF, BSR/BSRF,
+    /// JMP/JSR, RTS/RTE, TRAPA — matching Mednafen's slot decode
+    /// (`sh7095_opdefs.inc` `OP_SLOT_ILLEGAL`). The PC-relative fetches
+    /// (`MOV.W/L @(disp,PC)`, `MOVA`) are **legal** in a slot; their PC
+    /// base becomes the branch destination + 2 when the branch is taken
+    /// (see `Cpu::pcrel_base`) — VF2's character loader runs `BF/S` with
+    /// `MOV.L @(disp,PC)` in the slot, and flagging it vectored the game
+    /// into the BIOS fatal halt. Notably `LDC Rm,SR` / `LDC.L @Rm+,SR`
+    /// are also **legal** in a delay slot — `RTS; LDC Rm,SR` is the
+    /// standard "restore SR on return" idiom the Saturn BIOS relies on;
+    /// flagging it as illegal vectors the BIOS into its dead-wait handler.
     pub fn is_illegal_in_slot(&self) -> bool {
         use Op::*;
         matches!(
@@ -355,9 +360,6 @@ impl Op {
                 | Rts
                 | Rte
                 | Trapa { .. }
-                | MovWPcRel { .. }
-                | MovLPcRel { .. }
-                | Mova { .. }
         )
     }
 }
