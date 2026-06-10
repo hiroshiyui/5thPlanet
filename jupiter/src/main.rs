@@ -337,6 +337,14 @@ fn run(
 
     let sdl = sdl2::init().expect("SDL2 init");
     let video = sdl.video().expect("SDL2 video subsystem");
+    // Host game controllers (the SDL GameController API normalizes every
+    // recognized pad — XInput on Windows, evdev on Linux — to one Xbox-style
+    // layout). Devices are opened on hot-plug events; SDL also delivers an
+    // Added event for each pad already attached at init.
+    let controller_subsystem = sdl
+        .game_controller()
+        .expect("SDL2 game-controller subsystem");
+    let mut controllers: Vec<sdl2::controller::GameController> = Vec::new();
 
     // SCSP audio: a 44.1 kHz stereo S16 queue the SCSP fills each frame.
     let audio = sdl.audio().expect("SDL2 audio subsystem");
@@ -793,6 +801,44 @@ fn run(
                     } if mouse_port.is_some() => {
                         mouse_capture_enabled = !mouse_capture_enabled;
                     }
+                    // Game-controller hot-plug. `which` is a joystick index on
+                    // Added but an instance id on Removed (SDL semantics); the
+                    // dedupe guard makes a startup enumeration + the init-time
+                    // Added events idempotent.
+                    Event::ControllerDeviceAdded { which, .. } => {
+                        match controller_subsystem.open(which) {
+                            Ok(c) => {
+                                if !controllers.iter().any(|o| o.instance_id() == c.instance_id())
+                                {
+                                    eprintln!("controller connected: {}", c.name());
+                                    controllers.push(c);
+                                }
+                            }
+                            Err(e) => eprintln!("controller open failed: {e}"),
+                        }
+                    }
+                    Event::ControllerDeviceRemoved { which, .. } => {
+                        controllers.retain(|c| c.instance_id() != which);
+                    }
+                    // Controller navigation of the open menu: D-pad moves, A
+                    // selects, B backs out, Start toggles. Suppressed while a
+                    // key-capture rebind is armed (that modal owns the input).
+                    Event::ControllerButtonDown { button, .. }
+                        if osd_open.load(Ordering::Relaxed) && rebind_target.is_none() =>
+                    {
+                        use sdl2::controller::Button;
+                        let msg = match button {
+                            Button::DPadUp => Some(EmuIn::Nav(Nav::Up)),
+                            Button::DPadDown => Some(EmuIn::Nav(Nav::Down)),
+                            Button::A => Some(EmuIn::Nav(Nav::Select)),
+                            Button::B => Some(EmuIn::Nav(Nav::Back)),
+                            Button::Start => Some(EmuIn::Toggle),
+                            _ => None,
+                        };
+                        if let Some(m) = msg {
+                            let _ = emu_tx.send(m);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -804,6 +850,52 @@ fn run(
             for (sc, bit) in keymap.iter().zip(PAD_BITS) {
                 if keys.is_scancode_pressed(*sc) {
                     held |= bit;
+                }
+            }
+            // Merge any attached game controllers into the same port-1 pad.
+            // Fixed mapping on SDL's normalized Xbox-style layout, following
+            // Sega's own Saturn-port convention: A/B/C = X/A/B (bottom arc),
+            // X/Y/Z = Y/LB/RB, L/R = the analog triggers (thresholded), D-pad
+            // or left stick = D-pad. Per-button gamepad rebind arrives with
+            // the M13 E2 analog-peripheral work.
+            {
+                use sdl2::controller::{Axis, Button};
+                const TH: i16 = 16384; // half of full deflection
+                for c in &controllers {
+                    for (btn, bit) in [
+                        (Button::DPadUp, pad::UP),
+                        (Button::DPadDown, pad::DOWN),
+                        (Button::DPadLeft, pad::LEFT),
+                        (Button::DPadRight, pad::RIGHT),
+                        (Button::X, pad::A),
+                        (Button::A, pad::B),
+                        (Button::B, pad::C),
+                        (Button::Y, pad::X),
+                        (Button::LeftShoulder, pad::Y),
+                        (Button::RightShoulder, pad::Z),
+                        (Button::Start, pad::START),
+                    ] {
+                        if c.button(btn) {
+                            held |= bit;
+                        }
+                    }
+                    if c.axis(Axis::TriggerLeft) > TH {
+                        held |= pad::L;
+                    }
+                    if c.axis(Axis::TriggerRight) > TH {
+                        held |= pad::R;
+                    }
+                    let (lx, ly) = (c.axis(Axis::LeftX), c.axis(Axis::LeftY));
+                    if lx < -TH {
+                        held |= pad::LEFT;
+                    } else if lx > TH {
+                        held |= pad::RIGHT;
+                    }
+                    if ly < -TH {
+                        held |= pad::UP;
+                    } else if ly > TH {
+                        held |= pad::DOWN;
+                    }
                 }
             }
             let _ = emu_tx.send(EmuIn::Pad(held));
