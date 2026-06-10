@@ -67,7 +67,8 @@ fn main() -> ExitCode {
             eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
             eprintln!("  --cart=rom:<path>      game ROM cart image");
             eprintln!("  --mouse[=1|2]          Shuttle Mouse on port 2 (default) or 1;");
-            eprintln!("                         host mouse + clicks, Return = mouse Start");
+            eprintln!("                         host mouse + clicks, Return = mouse Start,");
+            eprintln!("                         F10 = toggle pointer capture (Esc/OSD also releases)");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -583,6 +584,10 @@ fn run(
         // Shuttle Mouse capture state (only used when --mouse is given).
         let (mut mouse_dx, mut mouse_dy) = (0i32, 0i32);
         let mut mouse_grabbed = false;
+        // F10 toggles capture: released, the pointer behaves as a normal host
+        // mouse again (motion still feeds the game while over the window —
+        // "transparent" mode — but can leave it and hit the screen edge).
+        let mut mouse_capture_enabled = true;
         let mut pl_present = std::time::Duration::ZERO;
         let mut pl_iters = 0u32;
         let mut pl_last = std::time::Instant::now();
@@ -636,6 +641,12 @@ fn run(
                         mouse_dx += xrel;
                         mouse_dy += yrel;
                     }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F10),
+                        ..
+                    } if mouse_port.is_some() => {
+                        mouse_capture_enabled = !mouse_capture_enabled;
+                    }
                     _ => {}
                 }
             }
@@ -671,9 +682,10 @@ fn run(
             // closed, so the host cursor is captured + hidden and the game
             // draws its own; Esc (the OSD) releases the pointer.
             if mouse_port.is_some() {
-                let osd_now_open = osd_open.load(Ordering::Relaxed);
-                if osd_now_open == mouse_grabbed {
-                    mouse_grabbed = !osd_now_open;
+                let want_grab =
+                    mouse_capture_enabled && !osd_open.load(Ordering::Relaxed);
+                if want_grab != mouse_grabbed {
+                    mouse_grabbed = want_grab;
                     sdl.mouse().set_relative_mouse_mode(mouse_grabbed);
                 }
                 let ms = events.mouse_state();
