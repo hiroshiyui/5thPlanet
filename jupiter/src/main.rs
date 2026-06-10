@@ -322,6 +322,21 @@ fn run(
     // latency); `framebuffer` is the main thread's display buffer, the pipe
     // holds the spare, and they swap each frame.
     let mut pipe = render_pipe::RenderPipe::new(FRAMEBUFFER_BYTES);
+    // SAT_PERFLOG=1: print a once-per-second main-loop timing breakdown —
+    // where the frame budget goes in vivo (advance / audio / render-wait /
+    // submit-clone / upload+present), plus the burst histogram (a burst of 2
+    // means an iteration emulated two frames but displayed one — the source
+    // of "feels like 30 fps" when the budget is exceeded). Observer-only.
+    let perflog = std::env::var_os("SAT_PERFLOG").is_some();
+    let mut pl_advance = std::time::Duration::ZERO;
+    let mut pl_audio = std::time::Duration::ZERO;
+    let mut pl_wait = std::time::Duration::ZERO;
+    let mut pl_submit = std::time::Duration::ZERO;
+    let mut pl_present = std::time::Duration::ZERO;
+    let mut pl_bursts = [0u32; 3]; // iterations that emulated 0 / 1 / 2+ frames
+    let mut pl_iters = 0u32;
+    let mut pl_frames = 0u32;
+    let mut pl_last = std::time::Instant::now();
     // Current texture (and frozen-frame) resolution; updated when a game
     // switches video mode so the texture/pitch track the active display size.
     let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
@@ -516,10 +531,17 @@ fn run(
                 // Compute only — the worker composited the *previous* frame
                 // during (and overlapping) this loop; intermediate burst frames
                 // are never displayed, so they're never rendered at all.
+                let t = std::time::Instant::now();
                 saturn.advance_frame();
+                pl_advance += t.elapsed();
+                let t = std::time::Instant::now();
                 audio_queue.queue_audio(&saturn.take_audio()).ok();
+                pl_audio += t.elapsed();
                 burst += 1;
             }
+            pl_iters += 1;
+            pl_frames += burst;
+            pl_bursts[(burst as usize).min(2)] += 1;
 
             // Start playback once the reserve has filled for the first time.
             // Until then the device is paused, so the queue only grows (the
@@ -536,7 +558,10 @@ fn run(
             // (On the very first frame nothing is in flight → keep the black
             // buffer.) The active resolution comes from the rendered frame, so
             // the texture is re-created a frame after a game switches modes.
-            if let Some((rendered, dims)) = pipe.wait() {
+            let t_wait = std::time::Instant::now();
+            let waited = pipe.wait();
+            pl_wait += t_wait.elapsed();
+            if let Some((rendered, dims)) = waited {
                 let old = std::mem::replace(&mut framebuffer, rendered);
                 pipe.recycle(old);
                 if dims != cur_dims {
@@ -552,7 +577,9 @@ fn run(
             }
             // Dispatch this frame's render on the worker; it overlaps the next
             // iteration's compute. (No-op if a buffer isn't free yet.)
+            let t = std::time::Instant::now();
             pipe.submit(&saturn);
+            pl_submit += t.elapsed();
 
             // Present the latest frame (re-presents the last one if the queue was
             // already full and no frame ran). A lingering toast (e.g. "Quicksave")
@@ -565,9 +592,30 @@ fn run(
                 .expect("upload framebuffer");
         }
 
+        let t = std::time::Instant::now();
         canvas.clear();
         canvas.copy(&texture, None, None).expect("blit to canvas");
         canvas.present(); // present_vsync caps us at the display rate
+        pl_present += t.elapsed();
+
+        if perflog && pl_last.elapsed().as_secs() >= 1 && pl_iters > 0 {
+            let per = |d: std::time::Duration| d.as_secs_f64() * 1e3 / pl_iters as f64;
+            eprintln!(
+                "PERF iters/s={} frames/s={} burst[0/1/2]={}/{}/{} | per-iter ms: advance={:.2} audio={:.2} wait={:.2} submit={:.2} present={:.2} | queue={}ms",
+                pl_iters, pl_frames, pl_bursts[0], pl_bursts[1], pl_bursts[2],
+                per(pl_advance), per(pl_audio), per(pl_wait), per(pl_submit), per(pl_present),
+                audio_queue.size() / 176,
+            );
+            pl_advance = std::time::Duration::ZERO;
+            pl_audio = std::time::Duration::ZERO;
+            pl_wait = std::time::Duration::ZERO;
+            pl_submit = std::time::Duration::ZERO;
+            pl_present = std::time::Duration::ZERO;
+            pl_bursts = [0; 3];
+            pl_iters = 0;
+            pl_frames = 0;
+            pl_last = std::time::Instant::now();
+        }
     }
 
     // Persist the internal backup RAM ("battery") so game saves survive.
