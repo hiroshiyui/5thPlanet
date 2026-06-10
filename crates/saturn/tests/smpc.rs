@@ -386,3 +386,78 @@ fn resdisa_command_0x1a_is_recognised_and_drops_sf() {
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF drops after processing");
 }
+
+/// Shuttle Mouse on port 1 (M13 E3): the INTBACK peripheral phase reports ID
+/// `0xE3` with three data bytes — `(flags << 4) | buttons`, X delta low byte,
+/// Y delta low byte (Saturn Y+ = up; `Saturn::feed_mouse` takes host
+/// screen-down Y and negates) — and consuming the report resets the motion
+/// accumulators (Mednafen `input/mouse.cpp` / `smpc.cpp:1421`).
+#[test]
+fn intback_peripheral_reports_the_shuttle_mouse() {
+    use saturn::smpc::{PortDevice, mouse};
+    let mut sat = build();
+    sat.set_port_devices(PortDevice::Mouse, PortDevice::None);
+    // Move right 5, down 3 (host convention) with Left + Start held.
+    sat.feed_mouse(5, 3, mouse::LEFT | mouse::START);
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // CONTINUE
+    sat.run_for(40_000);
+    assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: 1 device, direct");
+    assert_eq!(sat.bus.smpc.oreg[1], 0xE3, "Shuttle Mouse peripheral ID");
+    // dy is negative in Saturn convention (host +3 down = Saturn −3):
+    // flags = Y-negative (bit 1); buttons = Left | Start.
+    assert_eq!(
+        sat.bus.smpc.oreg[2],
+        (0x2 << 4) | mouse::LEFT | mouse::START,
+        "flags<<4 | buttons"
+    );
+    assert_eq!(sat.bus.smpc.oreg[3], 5, "X delta low byte");
+    assert_eq!(sat.bus.smpc.oreg[4], (-3i32 & 0xFF) as u8, "Y delta (up-positive)");
+    assert_eq!(sat.bus.smpc.oreg[5], 0xF0, "port 2: no peripheral");
+
+    // The report consumed the deltas: a second phase reports zero motion
+    // (buttons are level state, still held).
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // CONTINUE (last)
+    sat.run_for(40_000);
+    assert_eq!(sat.bus.smpc.oreg[2], mouse::LEFT | mouse::START, "no motion flags");
+    assert_eq!(sat.bus.smpc.oreg[3], 0, "X accumulator reset");
+    assert_eq!(sat.bus.smpc.oreg[4], 0, "Y accumulator reset");
+}
+
+/// Out-of-range mouse motion clamps to ±256/255 with the overflow flags set
+/// (Mednafen `input/mouse.cpp` clamps and sets flags 0x4/0x8).
+#[test]
+fn mouse_deltas_clamp_with_overflow_flags() {
+    use saturn::smpc::PortDevice;
+    let mut sat = build();
+    sat.set_port_devices(PortDevice::Mouse, PortDevice::None);
+    sat.feed_mouse(1000, 1000, 0); // host down 1000 → Saturn −1000
+    let (b1, x, y) = sat.bus.smpc.take_mouse_report();
+    // X: positive overflow → clamp 255. Y: negative overflow → clamp −256.
+    assert_eq!(b1 >> 4, 0x4 | 0x8 | 0x2, "X-overflow + Y-overflow + Y-negative");
+    assert_eq!(x, 255);
+    assert_eq!(y, (-256i32 & 0xFF) as u8);
+}
+
+/// A pad on port 1 and the mouse on port 2 lay their blocks out back-to-back
+/// (the `--mouse` default keeps the keyboard pad usable).
+#[test]
+fn pad_on_port1_and_mouse_on_port2_pack_sequentially() {
+    use saturn::smpc::{PortDevice, mouse};
+    let mut sat = build();
+    sat.set_port_devices(PortDevice::Pad, PortDevice::Mouse);
+    sat.set_pad1(saturn::smpc::pad::START);
+    sat.feed_mouse(7, 0, mouse::RIGHT);
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data);
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data);
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data);
+    sat.run_for(40_000);
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data);
+    sat.run_for(40_000);
+    let o = &sat.bus.smpc.oreg;
+    assert_eq!(&o[0..4], &[0xF1, 0x02, !0x08, 0xFF], "port 1: pad block");
+    assert_eq!(&o[4..9], &[0xF1, 0xE3, mouse::RIGHT, 7, 0], "port 2: mouse block");
+}

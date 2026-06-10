@@ -142,6 +142,20 @@ pub struct Smpc {
     /// [`pad`] bit positions. The INTBACK peripheral phase reports the
     /// active-low inverse; default 0 = nothing pressed. The frontend sets it.
     pub pad1: u16,
+    /// What is plugged into controller ports 1 and 2 — drives the INTBACK
+    /// peripheral-report layout. Defaults: a digital pad on port 1, nothing
+    /// on port 2 (the original fixed behaviour).
+    pub port1: PortDevice,
+    pub port2: PortDevice,
+    /// Shuttle Mouse held-button mask ([`mouse`] bits, 1 = pressed). One
+    /// mouse, whichever port it is assigned to.
+    pub mouse_buttons: u8,
+    /// Shuttle Mouse motion accumulated since the last INTBACK report, in
+    /// Saturn convention (X+ = right, **Y+ = up** — Mednafen negates the host
+    /// screen Y). Clamped to the reportable −256..=255 with the overflow flag
+    /// at report time; reset by [`Smpc::take_mouse_report`].
+    pub mouse_dx: i32,
+    pub mouse_dy: i32,
     /// Real-time clock value, in seconds since the Unix epoch, as of
     /// `rtc_set_cycle`. The live time is this plus the emulated seconds
     /// elapsed since (see [`Smpc::rtc_oreg`]). Set by the `SETTIME` command or
@@ -181,6 +195,28 @@ pub mod pad {
     pub const Y: u16 = 1 << 5;
     pub const Z: u16 = 1 << 4;
     pub const L: u16 = 1 << 3;
+}
+
+/// Shuttle Mouse button bits for [`Smpc::mouse_buttons`] (1 = pressed) — the
+/// low nibble of the mouse report's first data byte (SMPC manual; Mednafen
+/// `input/mouse.cpp` packs Left/Right/Middle/Start into bits 0..3).
+pub mod mouse {
+    pub const LEFT: u8 = 1 << 0;
+    pub const RIGHT: u8 = 1 << 1;
+    pub const MIDDLE: u8 = 1 << 2;
+    pub const START: u8 = 1 << 3;
+}
+
+/// What is plugged into an SMPC controller port, for the INTBACK peripheral
+/// report ([`crate::Saturn::set_port_devices`]). `Pad` is the standard digital
+/// control pad (ID `0x02`); `Mouse` is the Shuttle Mouse (ID `0xE3`, 3 data
+/// bytes — Mednafen `smpc.cpp:1421` special-cases ID1 class 3 to `0xE3`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PortDevice {
+    #[default]
+    None,
+    Pad,
+    Mouse,
 }
 
 /// Region code for INTBACK OREG9 (SMPC manual area-code table).
@@ -248,6 +284,7 @@ fn rtc_bytes(unix_secs: u64) -> [u8; 7] {
 impl Smpc {
     pub fn new() -> Self {
         Self {
+            port1: PortDevice::Pad,
             region: region::NORTH_AMERICA,
             // Deterministic default clock: 1996-01-01 00:00:00. The frontend
             // overrides it with the host time via `set_rtc_unix`.
@@ -261,6 +298,38 @@ impl Smpc {
     pub fn set_rtc_unix(&mut self, unix_secs: u64, now: u64) {
         self.rtc_secs = unix_secs;
         self.rtc_set_cycle = now;
+    }
+
+    /// Compose and consume one Shuttle Mouse INTBACK report: the three data
+    /// bytes following the `0xE3` peripheral ID. Byte 1 = `(flags << 4) |
+    /// buttons` — flags bit0 = X negative, bit1 = Y negative, bit2 = X
+    /// overflow, bit3 = Y overflow; buttons = Left/Right/Middle/Start in bits
+    /// 0..3. Bytes 2/3 = the X / Y delta low 8 bits (two's complement),
+    /// clamped to −256..=255 with the overflow flag set (Mednafen
+    /// `input/mouse.cpp`). The accumulators reset — on hardware the pickup
+    /// resets them after each transfer (nibble phase 8).
+    pub fn take_mouse_report(&mut self) -> (u8, u8, u8) {
+        let mut flags = 0u8;
+        if self.mouse_dx < 0 {
+            flags |= 0x1;
+        }
+        if self.mouse_dy < 0 {
+            flags |= 0x2;
+        }
+        if self.mouse_dx > 255 || self.mouse_dx < -256 {
+            flags |= 0x4;
+            self.mouse_dx = if self.mouse_dx < 0 { -256 } else { 255 };
+        }
+        if self.mouse_dy > 255 || self.mouse_dy < -256 {
+            flags |= 0x8;
+            self.mouse_dy = if self.mouse_dy < 0 { -256 } else { 255 };
+        }
+        let b1 = (flags << 4) | (self.mouse_buttons & 0x0F);
+        let x = (self.mouse_dx & 0xFF) as u8;
+        let y = (self.mouse_dy & 0xFF) as u8;
+        self.mouse_dx = 0;
+        self.mouse_dy = 0;
+        (b1, x, y)
     }
 
     /// Set the RTC from the seven `SETTIME` IREG bytes (same layout as the

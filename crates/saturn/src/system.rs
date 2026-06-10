@@ -1309,20 +1309,64 @@ impl Saturn {
     }
 
     /// Fill OREG with one INTBACK **peripheral** phase (MAME
-    /// `read_saturn_ports`): with no controller connected, both port-status
-    /// bytes are `0xF0` (peripheral count 0). OREG31 echoes the command.
+    /// `read_saturn_ports`): one block per port, laid out back-to-back. An
+    /// empty port contributes a single `0xF0` status byte (direct connection,
+    /// 0 devices); a populated port contributes `0xF1` + the peripheral ID +
+    /// its data bytes. OREG31 echoes the command.
     fn respond_to_intback_peripheral(&mut self) {
         let s = &mut self.bus.smpc;
-        // Port 1: one directly-connected standard digital pad (ID 0x02 = type
-        // 0, 2 data bytes), reporting the active-low inverse of the pressed
-        // mask. Port 2: no peripheral.
-        let pressed = s.pad1;
-        s.oreg[0] = 0xF1; // direct connection, 1 device
-        s.oreg[1] = 0x02; // standard digital pad
-        s.oreg[2] = !((pressed >> 8) as u8); // first data byte (active low)
-        s.oreg[3] = !(pressed as u8) | 0x07; // second data byte (low 3 bits unused)
-        s.oreg[4] = 0xF0; // port 2: no peripheral
+        let mut o = 0usize;
+        for dev in [s.port1, s.port2] {
+            match dev {
+                crate::smpc::PortDevice::None => {
+                    s.oreg[o] = 0xF0; // no peripheral
+                    o += 1;
+                }
+                crate::smpc::PortDevice::Pad => {
+                    // Standard digital pad (ID 0x02 = type 0, 2 data bytes),
+                    // reporting the active-low inverse of the pressed mask.
+                    let pressed = s.pad1;
+                    s.oreg[o] = 0xF1; // direct connection, 1 device
+                    s.oreg[o + 1] = 0x02;
+                    s.oreg[o + 2] = !((pressed >> 8) as u8); // active low
+                    s.oreg[o + 3] = !(pressed as u8) | 0x07; // low 3 bits unused
+                    o += 4;
+                }
+                crate::smpc::PortDevice::Mouse => {
+                    // Shuttle Mouse (ID 0xE3 = type 0xE "other", 3 data
+                    // bytes): (flags<<4)|buttons, X delta, Y delta — see
+                    // [`crate::smpc::Smpc::take_mouse_report`].
+                    let (b1, x, y) = s.take_mouse_report();
+                    s.oreg[o] = 0xF1;
+                    s.oreg[o + 1] = 0xE3;
+                    s.oreg[o + 2] = b1;
+                    s.oreg[o + 3] = x;
+                    s.oreg[o + 4] = y;
+                    o += 5;
+                }
+            }
+        }
         s.oreg[31] = 0x10;
+    }
+
+    /// Select what is plugged into SMPC controller ports 1 and 2 (the INTBACK
+    /// peripheral report). The default is a digital pad on port 1, nothing on
+    /// port 2; the frontend's `--mouse[=1]` flag plugs in a Shuttle Mouse.
+    pub fn set_port_devices(&mut self, p1: crate::smpc::PortDevice, p2: crate::smpc::PortDevice) {
+        self.bus.smpc.port1 = p1;
+        self.bus.smpc.port2 = p2;
+    }
+
+    /// Feed Shuttle Mouse input: `dx`/`dy_down` are host-screen-convention
+    /// motion since the last call (X+ = right, Y+ = down — negated here to the
+    /// Saturn's Y+ = up, as Mednafen's input layer does), accumulated until
+    /// the next INTBACK report consumes them; `buttons` is the held
+    /// [`crate::smpc::mouse`] mask.
+    pub fn feed_mouse(&mut self, dx: i32, dy_down: i32, buttons: u8) {
+        let s = &mut self.bus.smpc;
+        s.mouse_dx = s.mouse_dx.saturating_add(dx);
+        s.mouse_dy = s.mouse_dy.saturating_sub(dy_down);
+        s.mouse_buttons = buttons;
     }
 
     /// Set the port-1 digital-pad state (a `saturn::smpc::pad` pressed mask).

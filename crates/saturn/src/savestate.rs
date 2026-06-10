@@ -32,8 +32,9 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// rejects mismatches rather than attempting migration. v2 added the CD-block
 /// drive-phase machine fields (`cdb.cpp`-faithful `Drive_Run` port). v3 added
 /// the SH-2 INTC cached highest-priority-pending source (`Intc::best`). v4
-/// added the VDP1 `Framebuffer::hires8` TVM-layout flag.
-const VERSION: u32 = 4;
+/// added the VDP1 `Framebuffer::hires8` TVM-layout flag. v5 added the SMPC
+/// port-device selection + Shuttle Mouse state (M13 E3).
+const VERSION: u32 = 5;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
