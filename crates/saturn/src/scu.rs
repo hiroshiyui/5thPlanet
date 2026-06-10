@@ -530,10 +530,6 @@ impl Scu {
         }
     }
 
-    /// Pop the next channel that has a queued DMA. The caller is
-    /// expected to perform the actual bus transfer and then update
-    /// the channel's `read_addr` / `write_addr` / `transfer_count` to
-    /// reflect completion via [`finish_dma`].
     /// Cheap hot-path probe: is any DMA channel triggered? Sampled once per
     /// master instruction (`step_cpus`) to keep the `drain_dma` call cold.
     #[inline]
@@ -541,6 +537,10 @@ impl Scu {
         self.channels.iter().any(|ch| ch.triggered)
     }
 
+    /// Pop the next channel that has a queued DMA. The caller is
+    /// expected to perform the actual bus transfer and then update
+    /// the channel's `read_addr` / `write_addr` / `transfer_count` to
+    /// reflect completion via [`finish_dma`].
     pub fn take_pending_dma(&mut self) -> Option<DmaRequest> {
         for (i, ch) in self.channels.iter_mut().enumerate() {
             if ch.triggered {

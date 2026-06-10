@@ -646,8 +646,6 @@ impl CdBlock {
         (self.hirq & self.hirq_mask) != 0
     }
 
-
-
     /// Debug-only: true while the drive is still in recognition spin-up
     /// ([`DrivePhase::Startup`]). Lets a boot-timing probe stamp the frame the
     /// drive settles (recognition complete), to localize where ours' boot
