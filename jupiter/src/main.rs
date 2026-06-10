@@ -22,6 +22,7 @@ use saturn::cartridge::Cartridge;
 // The OSD menu is pure logic (no sdl2): compile it for the SDL2 frontend and
 // for tests (so its unit tests run even with `--no-default-features`), but not
 // in a headless non-test build where nothing uses it.
+mod config;
 #[cfg(any(feature = "sdl2-frontend", test))]
 mod osd;
 #[cfg(any(feature = "sdl2-frontend", test))]
@@ -96,7 +97,10 @@ fn main() -> ExitCode {
     // `physical-disc` feature). Loaded in `run` via `insert_from_spec`.
     let disc_spec = positionals.get(1).cloned();
 
-    // Optional expansion cartridge.
+    // Persisted frontend settings (M9). A command-line flag beats the file.
+    let cfg = config::Config::load();
+
+    // Optional expansion cartridge: `--cart=` wins, else the config file.
     let cart = match cart_spec {
         Some(spec) => match parse_cart(&spec) {
             Ok(c) => c,
@@ -105,24 +109,31 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        None => Cartridge::None,
+        None => match cfg.cartridge.as_str() {
+            "none" => Cartridge::None,
+            tok => parse_cart(tok).unwrap_or_else(|e| {
+                eprintln!("config: bad cartridge ({e}); using none");
+                Cartridge::None
+            }),
+        },
     };
 
     // Sibling files for the quicksave state (`.state`) and the persisted
     // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
     let save_base = std::path::PathBuf::from(&bios_path);
 
-    let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region, mouse_port)
+    let region = detect_region(&bios_path, cfg.region.as_deref());
+    run(bios, disc_spec, cart, save_base, region, mouse_port, cfg)
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
-/// overrides; otherwise it's inferred from the BIOS filename (`(JAP)` → Japan,
-/// `(EUR)` → Europe-PAL, else North America). The region must be compatible
-/// with both the BIOS build and the disc's IP.BIN area string, or the BIOS
-/// rejects the disc with "Game disc unsuitable for this system" (until the
-/// M9 region/BIOS picker lands, this keeps a JP BIOS + JP disc booting).
-fn detect_region(bios_path: &str) -> u8 {
+/// overrides; then a region persisted in the config file (the OSD Region
+/// screen writes one); otherwise it's inferred from the BIOS filename
+/// (`(JAP)` → Japan, `(EUR)` → Europe-PAL, else North America). The region
+/// must be compatible with both the BIOS build and the disc's IP.BIN area
+/// string, or the BIOS rejects the disc with "Game disc unsuitable for this
+/// system".
+fn detect_region(bios_path: &str, cfg_region: Option<&str>) -> u8 {
     use saturn::smpc::region;
     if let Ok(r) = std::env::var("SAT_REGION") {
         return match r.trim().to_ascii_uppercase().as_str() {
@@ -130,6 +141,18 @@ fn detect_region(bios_path: &str) -> u8 {
             "T" | "ASIA" => region::ASIA_NTSC,
             "E" | "EU" | "EUR" | "EUROPE" | "PAL" => region::EUROPE_PAL,
             _ => region::NORTH_AMERICA,
+        };
+    }
+    if let Some(tok) = cfg_region {
+        return match tok {
+            "japan" => region::JAPAN,
+            "north-america" => region::NORTH_AMERICA,
+            "europe-pal" => region::EUROPE_PAL,
+            "asia-ntsc" => region::ASIA_NTSC,
+            other => {
+                eprintln!("config: unknown region '{other}'; autodetecting");
+                detect_region(bios_path, None)
+            }
         };
     }
     let up = bios_path.to_ascii_uppercase();
@@ -217,6 +240,7 @@ fn run(
     save_base: std::path::PathBuf,
     region: u8,
     mouse_port: Option<u8>,
+    cfg: config::Config,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -262,8 +286,8 @@ fn run(
     // Remember the launched config so the OSD Settings screens can mark the
     // active region / cartridge and re-apply it across a runtime change.
     let ui = UiState {
-        scale: 2,
-        fullscreen: false,
+        scale: cfg.scale,
+        fullscreen: cfg.fullscreen,
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
     };
@@ -307,7 +331,11 @@ fn run(
     // let the device drain from t=0 while the queue is still empty during boot,
     // which under-runs exactly once on a cold start (the "first-play buzz").
     let window = video
-        .window("5thPlanet", FRAME_WIDTH as u32 * 2, FRAME_HEIGHT as u32 * 2)
+        .window(
+            "5thPlanet",
+            FRAME_WIDTH as u32 * cfg.scale as u32,
+            FRAME_HEIGHT as u32 * cfg.scale as u32,
+        )
         .position_centered()
         .build()
         .expect("create window");
@@ -316,6 +344,11 @@ fn run(
         .present_vsync()
         .build()
         .expect("canvas");
+    if cfg.fullscreen {
+        let _ = canvas
+            .window_mut()
+            .set_fullscreen(sdl2::video::FullscreenType::Desktop);
+    }
     let creator = canvas.texture_creator();
     // ABGR8888 is the SDL packed format whose in-memory byte order on
     // little-endian hosts (which is everything that matters in 2026)
@@ -374,6 +407,37 @@ fn run(
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, mpsc};
 
+    // Saturn pad bits in the fixed `config::BUTTON_NAMES` binding order.
+    const PAD_BITS: [u16; config::PAD_BUTTONS] = [
+        pad::UP,
+        pad::DOWN,
+        pad::LEFT,
+        pad::RIGHT,
+        pad::A,
+        pad::B,
+        pad::C,
+        pad::X,
+        pad::Y,
+        pad::Z,
+        pad::L,
+        pad::R,
+        pad::START,
+    ];
+    // Resolve the configured scancode names; an unknown name falls back to
+    // that button's default binding. Lives on the SDL thread (where the
+    // keyboard is sampled); the emu thread keeps the names for the OSD.
+    let keymap: [Scancode; config::PAD_BUTTONS] = std::array::from_fn(|i| {
+        Scancode::from_name(&cfg.keys[i]).unwrap_or_else(|| {
+            eprintln!(
+                "config: unknown key '{}' for {}; using {}",
+                cfg.keys[i],
+                config::BUTTON_NAMES[i],
+                config::DEFAULT_KEYS[i]
+            );
+            Scancode::from_name(config::DEFAULT_KEYS[i]).expect("default scancode name")
+        })
+    });
+
     let (emu_tx, emu_rx) = mpsc::channel::<EmuIn>();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, (usize, usize))>(2);
     let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
@@ -383,18 +447,24 @@ fn run(
     let osd_open = Arc::new(AtomicBool::new(false));
     let quit_flag = Arc::new(AtomicBool::new(false));
 
+    // Bundle the dispatcher-owned state for the emu thread (the keymap and
+    // window above already consumed what they need from `cfg`).
+    let sess = Session {
+        save_base: save_base.clone(),
+        launched_spec,
+        ui,
+        cfg,
+    };
+
     std::thread::scope(|scope| {
         let emu_mirror = Arc::clone(&audio_mirror);
         let emu_osd_open = Arc::clone(&osd_open);
         let emu_quit = Arc::clone(&quit_flag);
-        let save_base_emu = save_base.clone();
         let emu = scope.spawn(move || -> Saturn {
             let mut saturn = saturn;
             let mut osd = osd;
             let mut pipe = pipe;
-            let mut ui = ui;
-            let slot_path = |n: u8| save_base_emu.with_extension(format!("{n}.state"));
-            let state_path = save_base_emu.with_extension("state");
+            let mut sess = sess;
             let mut held = 0u16;
             // Frame buffers circulating emu → main → recycle; seed enough that
             // the pipe spare + the in-flight frame + the displayed frame never
@@ -421,11 +491,11 @@ fn run(
                 }
                 let ctx = OsdCtx {
                     disc_present: saturn.has_disc(),
-                    slot_used: std::array::from_fn(|n| slot_path(n as u8).exists()),
-                    scale: ui.scale,
-                    fullscreen: ui.fullscreen,
-                    region: ui.region,
-                    cart: ui.cart,
+                    slot_used: std::array::from_fn(|n| sess.slot_path(n as u8).exists()),
+                    scale: sess.ui.scale,
+                    fullscreen: sess.ui.fullscreen,
+                    region: sess.ui.region,
+                    cart: sess.ui.cart,
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
@@ -436,25 +506,18 @@ fn run(
                         }
                         EmuIn::Nav(nav) => {
                             if let Some(action) = osd.handle(nav, &ctx)
-                                && dispatch_osd(
-                                    action,
-                                    &mut osd,
-                                    &mut saturn,
-                                    &save_base_emu,
-                                    &launched_spec,
-                                    &mut ui,
-                                    &ui_tx,
-                                )
+                                && dispatch_osd(action, &mut osd, &mut saturn, &mut sess, &ui_tx)
                             {
                                 let _ = ui_tx.send(UiMsg::Quit);
                                 break 'emu;
                             }
                         }
-                        EmuIn::Quicksave => match fs::write(&state_path, saturn.save_state()) {
+                        EmuIn::Quicksave => match fs::write(sess.state_path(), saturn.save_state())
+                        {
                             Ok(()) => osd.set_toast("Quicksave", 90),
                             Err(e) => eprintln!("save state failed: {e}"),
                         },
-                        EmuIn::Quickload => match fs::read(&state_path) {
+                        EmuIn::Quickload => match fs::read(sess.state_path()) {
                             Ok(bytes) => match saturn.load_state(&bytes) {
                                 Ok(()) => osd.set_toast("Quickload", 90),
                                 Err(e) => eprintln!("load state failed: {e}"),
@@ -650,26 +713,13 @@ fn run(
                     _ => {}
                 }
             }
-            // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
-            // Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter = Start.
+            // Map the host keyboard to the port-1 digital pad through the
+            // rebindable keymap (defaults: arrows = D-pad, Z/X/C = A/B/C,
+            // A/S/D = X/Y/Z, Q/W = L/R, Enter = Start).
             let keys = events.keyboard_state();
             let mut held = 0u16;
-            for (sc, bit) in [
-                (Scancode::Up, pad::UP),
-                (Scancode::Down, pad::DOWN),
-                (Scancode::Left, pad::LEFT),
-                (Scancode::Right, pad::RIGHT),
-                (Scancode::Z, pad::A),
-                (Scancode::X, pad::B),
-                (Scancode::C, pad::C),
-                (Scancode::A, pad::X),
-                (Scancode::S, pad::Y),
-                (Scancode::D, pad::Z),
-                (Scancode::Q, pad::L),
-                (Scancode::W, pad::R),
-                (Scancode::Return, pad::START),
-            ] {
-                if keys.is_scancode_pressed(sc) {
+            for (sc, bit) in keymap.iter().zip(PAD_BITS) {
+                if keys.is_scancode_pressed(*sc) {
                     held |= bit;
                 }
             }
@@ -842,6 +892,27 @@ struct UiState {
     cart: osd::OsdCart,
 }
 
+/// Everything the emu thread's OSD dispatcher owns besides the machine: the
+/// Settings mirrors, the persisted config, the launch disc spec, and the
+/// save-file base path (`<bios>` → `.state` / `.<n>.state` / `.bup` siblings).
+#[cfg(feature = "sdl2-frontend")]
+struct Session {
+    save_base: std::path::PathBuf,
+    launched_spec: Option<String>,
+    ui: UiState,
+    cfg: config::Config,
+}
+
+#[cfg(feature = "sdl2-frontend")]
+impl Session {
+    fn slot_path(&self, n: u8) -> std::path::PathBuf {
+        self.save_base.with_extension(format!("{n}.state"))
+    }
+    fn state_path(&self) -> std::path::PathBuf {
+        self.save_base.with_extension("state")
+    }
+}
+
 #[cfg(feature = "sdl2-frontend")]
 fn region_code_to_osd(code: u8) -> osd::OsdRegion {
     use saturn::smpc::region;
@@ -850,6 +921,28 @@ fn region_code_to_osd(code: u8) -> osd::OsdRegion {
         c if c == region::EUROPE_PAL => osd::OsdRegion::EuropePal,
         c if c == region::ASIA_NTSC => osd::OsdRegion::AsiaNtsc,
         _ => osd::OsdRegion::Japan,
+    }
+}
+
+/// The config-file token for a region (the OSD Region screen persists it).
+#[cfg(feature = "sdl2-frontend")]
+fn osd_region_to_token(r: osd::OsdRegion) -> &'static str {
+    match r {
+        osd::OsdRegion::Japan => "japan",
+        osd::OsdRegion::NorthAmerica => "north-america",
+        osd::OsdRegion::EuropePal => "europe-pal",
+        osd::OsdRegion::AsiaNtsc => "asia-ntsc",
+    }
+}
+
+/// The config-file token for a menu cartridge (same vocabulary as `--cart=`).
+#[cfg(feature = "sdl2-frontend")]
+fn osd_cart_to_token(c: osd::OsdCart) -> &'static str {
+    match c {
+        osd::OsdCart::None => "none",
+        osd::OsdCart::ExtRam1M => "ram1m",
+        osd::OsdCart::ExtRam4M => "ram4m",
+        osd::OsdCart::BackupRam => "bram",
     }
 }
 
@@ -895,13 +988,10 @@ fn dispatch_osd(
     action: osd::OsdAction,
     osd: &mut osd::Osd,
     saturn: &mut saturn::Saturn,
-    save_base: &std::path::Path,
-    launched_spec: &Option<String>,
-    ui: &mut UiState,
+    sess: &mut Session,
     ui_tx: &std::sync::mpsc::Sender<UiMsg>,
 ) -> bool {
     use osd::OsdAction;
-    let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
     match action {
         OsdAction::Resume => osd.close(),
         OsdAction::Quit => return true,
@@ -910,11 +1000,11 @@ fn dispatch_osd(
             osd.set_toast("Reset", 120);
             osd.close();
         }
-        OsdAction::Save(n) => match fs::write(slot_path(n), saturn.save_state()) {
+        OsdAction::Save(n) => match fs::write(sess.slot_path(n), saturn.save_state()) {
             Ok(()) => osd.set_toast(format!("Saved slot {n}"), 120),
             Err(e) => osd.set_toast(format!("Save failed: {e}"), 180),
         },
-        OsdAction::Load(n) => match fs::read(slot_path(n)) {
+        OsdAction::Load(n) => match fs::read(sess.slot_path(n)) {
             Ok(bytes) => match saturn.load_state(&bytes) {
                 Ok(()) => {
                     osd.set_toast(format!("Loaded slot {n}"), 120);
@@ -928,7 +1018,7 @@ fn dispatch_osd(
             saturn.eject_disc();
             osd.set_toast("Disc ejected", 120);
         }
-        OsdAction::ReinsertDisc => match launched_spec {
+        OsdAction::ReinsertDisc => match &sess.launched_spec {
             Some(spec) => match insert_from_spec(saturn, spec) {
                 Ok(()) => osd.set_toast("Disc inserted", 120),
                 Err(e) => osd.set_toast(format!("Insert failed: {e}"), 180),
@@ -936,18 +1026,22 @@ fn dispatch_osd(
             None => osd.set_toast("No disc to insert", 120),
         },
         OsdAction::SetScale(s) => {
-            ui.scale = s;
+            sess.ui.scale = s;
             // Window pixels = base 320×224 × scale; applied on the SDL main
             // thread (the canvas is not Send). The canvas stretches the
             // texture to fill, so no texture re-create is needed.
             let _ = ui_tx.send(UiMsg::Scale(s));
+            sess.cfg.scale = s;
+            sess.cfg.save();
             osd.set_toast(format!("Scale {s}x"), 90);
         }
         OsdAction::ToggleFullscreen => {
-            ui.fullscreen = !ui.fullscreen;
-            let _ = ui_tx.send(UiMsg::Fullscreen(ui.fullscreen));
+            sess.ui.fullscreen = !sess.ui.fullscreen;
+            let _ = ui_tx.send(UiMsg::Fullscreen(sess.ui.fullscreen));
+            sess.cfg.fullscreen = sess.ui.fullscreen;
+            sess.cfg.save();
             osd.set_toast(
-                if ui.fullscreen { "Fullscreen on" } else { "Fullscreen off" },
+                if sess.ui.fullscreen { "Fullscreen on" } else { "Fullscreen off" },
                 90,
             );
         }
@@ -955,10 +1049,12 @@ fn dispatch_osd(
             // A region change is a hardware-level change: reset and re-apply the
             // boot config (region + current cart). The disc stays inserted, so
             // the machine re-boots from it under the new region.
-            ui.region = r;
+            sess.ui.region = r;
             saturn.reset();
             saturn.set_region(osd_region_to_code(r));
-            saturn.insert_cartridge(osd_cart_to_cartridge(ui.cart));
+            saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
+            sess.cfg.region = Some(osd_region_to_token(r).to_string());
+            sess.cfg.save();
             let name = match r {
                 osd::OsdRegion::Japan => "Japan",
                 osd::OsdRegion::NorthAmerica => "North America",
@@ -969,10 +1065,12 @@ fn dispatch_osd(
             osd.close();
         }
         OsdAction::SetCartridge(k) => {
-            ui.cart = k;
+            sess.ui.cart = k;
             saturn.reset();
-            saturn.set_region(osd_region_to_code(ui.region));
+            saturn.set_region(osd_region_to_code(sess.ui.region));
             saturn.insert_cartridge(osd_cart_to_cartridge(k));
+            sess.cfg.cartridge = osd_cart_to_token(k).to_string();
+            sess.cfg.save();
             let name = match k {
                 osd::OsdCart::None => "None",
                 osd::OsdCart::ExtRam1M => "Ext RAM 1M",
@@ -993,7 +1091,10 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    _mouse_port: Option<u8>,
+    mouse_port: Option<u8>,
+    // The config already shaped `cart`/`region` in `main`; headless has no
+    // window or keymap, so nothing else applies.
+    _cfg: config::Config,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};

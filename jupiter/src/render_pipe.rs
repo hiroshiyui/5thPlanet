@@ -126,6 +126,8 @@ impl RenderPipe {
     /// buffer into it. Skipping a submit for lack of a spare must not become
     /// permanent: `wait` only returns buffers for submitted jobs, so the
     /// caller has to check this *outside* the wait path.
+    // Only the SDL2 main loop drives the spare-feed path.
+    #[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
     pub fn needs_spare(&self) -> bool {
         self.spare.is_none() && !self.in_flight
     }
