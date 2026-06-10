@@ -23,63 +23,20 @@ foundation stays solid.
 | M7        | CD-block (HLE) + disc recognition + cartridge slot          | ✅ complete  |
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
-| M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | ✅ complete — **Virtua Fighter 2 is fully playable at a steady 60 fps** (correct graphics incl. the rotation-plane floor, CD-DA BGM through the SCSP EXTS inputs, in-fight SFX at the hardware mix balance; tag `vf2-good-emulation`); *Doukyuusei ~if~* boots to its title + in-game menu |
-| M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
-| M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (🚧 Shuttle Mouse done — used by *Doukyuusei ~if~*; light gun + keyboard pending) |
+| M10       | Live physical disc + CD audio                               | ✅ complete  |
+| M11       | Boot a commercial game to gameplay                          | ✅ complete  |
+| M12       | Whole-system cycle accuracy vs the reference emulator        | 🚧 active    |
+| M13       | Hardware completeness & fidelity-gap backlog                 | 📋 in progress |
 
-Current test count: **1058 workspace-wide, 0 failures**, at **~85% line
-coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
-FFI `physdisc` crate). Task-by-task status lives in
-[`doc/roadmap.md`](doc/roadmap.md).
+**What works today:** a real Saturn BIOS boots to its splash screen, and
+commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
+3D fights with CD music and sound effects), and ***Doukyuusei ~if~* runs well**,
+including Shuttle Mouse support. Games load from disc images (CUE/BIN, ISO,
+CloneCD) or straight from an original disc in a host optical drive; save
+states, the console's battery-backed save memory, expansion cartridges, and an
+in-window menu (Esc) are all in place.
 
-A real BIOS now **boots to the SEGA Saturn splash**, rendered pixel-for-pixel
-against the primary reference emulator (see [Acknowledgements](#acknowledgements)):
-the bright brushed-metal "SEGA SATURN" logo, correct down to the VDP2 colour-RAM
-banking and transparent-pen handling. All eight chips are modelled — the two
-SH-2s, MC68EC000, VDP1 (full sprite/polygon plotter), VDP2 (multi-layer NBG/RBG
-compositor with rotation), SCU + SCU-DSP, and SCSP (slot/FM audio + SCSP-DSP).
-The **CD-block** is high-level-emulated (M7): it mounts a disc image (ISO /
-CUE-BIN / CloneCD), reads the TOC, runs the buffer/filter/partition selector and
-the sector read pump + data transfer, walks the ISO9660 filesystem, and
-authenticates a Saturn disc — pass a game as the second argument. The
-**cartridge slot** rounds out M7: Extension DRAM (1 MB / 4 MB), battery
-backup-RAM, and game ROM carts plug into the rear expansion connector via
-`--cart=` (the 4 MB DRAM cart is what Street Fighter Zero 3 / KOF '97 need).
-
-**M8 adds save states**: `Saturn::save_state` / `load_state` snapshot the entire
-deterministic machine state (both SH-2s, the 68k, every peripheral, all RAM, the
-scheduler) to a versioned `bincode` blob — external media (BIOS, disc, ROM cart)
-is referenced by fingerprint, not embedded. The SDL2 frontend binds **F5
-quicksave / F9 quickload**. M8 also makes the **internal 32 KiB backup RAM** (the
-console's built-in "memory card") hardware-faithful, with the odd-byte packing
-real hardware uses, and persists it to a host `.bup` file so game saves survive a
-restart like a battery-backed console.
-
-**M10 adds CD-audio and live discs.** Games that stream Red Book CD-audio
-tracks as BGM (e.g. Romance of the Three Kingdoms V) now play their music —
-the CD-block decodes audio tracks and mixes them into the SCSP output through
-a small pre-roll jitter buffer (the read pump fills in sector bursts; the host
-drains smoothly per frame), so playback is gap-free. Press **F8** in the
-SDL window to play a disc's CD-audio track live (an audio CD, or a game's
-CD-DA track). The
-CD-block also reads sectors through a `SectorSource` trait, so besides ripped
-images it can read an **original disc from a host optical drive**: build with
-`--features physical-disc` and pass `cdrom:<device>` (e.g. `cdrom:/dev/sr0`).
-That path uses **libcdio** and is the one place the workspace's
-`unsafe_code = "forbid"` is relaxed, confined to the feature-gated
-[`physdisc`](crates/physdisc) crate (see [ADR-0009](doc/adr/0009-physdisc-libcdio-ffi-crate.md)).
-
-**M9 is building an in-window OSD menu** (ZSNES/fwNES-style, ADR-0008): press
-**Esc** for a hand-rolled, software-composited menu — save/load state slots,
-reset, eject/insert disc, quit, and a **Settings** submenu (Graphics: window
-scale 1×–4× + fullscreen; Region: Japan/NA/EU/Asia; Cartridge: None/Ext-RAM/
-Backup) — drawn with an embedded bitmap font over a dimmed frame. The menu logic
-is `sdl2`-free and unit-tested. A controller-rebind submenu, a persisted config
-file, and in-menu BIOS-image swapping are the remaining M9 phases.
-
-Real BIOS images booting in the SDL2 frontend, rendered pixel-for-pixel against
-the MAME reference — each region's BIOS shows its own splash:
+Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md).
 
 | USA BIOS | Japanese BIOS (v1.01) |
 | --- | --- |
@@ -207,52 +164,17 @@ maps onto this project's crates and modules, see
 
 ## Acknowledgements
 
-Several open-source emulators are leaned on as **reference oracles for
-verifying system architecture** — run headless against the same BIOS so
-their master SH-2 instruction traces can be diffed against ours,
-confirming the SH-2 core, cache, SMPC, SCU, and bus reproduce known-good
-behavior and pinpointing boot-sequence bugs down to the exact
-instruction:
+Three open-source emulators serve as **behavioral references**: local builds
+are run against the same BIOS and games so their behavior can be compared
+with ours, instruction by instruction where needed.
 
-- [Mednafen](https://mednafen.github.io/) (Beetle Saturn) — the
-  **accuracy reference for game-level behavior**. Its Saturn module has
-  the highest game compatibility of the open-source emulators (it runs
-  the commercial library, including the dual-SH-2 / SCU-DSP / VDP1 3D
-  titles), so it is the oracle for the game-boot work (M11): a local
-  instrumented build emits VF2's master-SH-2 trace and CD command/HIRQ
-  stream to diff against ours (both running the real BIOS). That diff
-  pinned the M11 root — a spurious `DCHG` (Disc Changed) our CD-block
-  re-raised at `Init`, which made the BIOS loop recognition — and with it
-  fixed, VF2 and Doukyuusei ~if~ now load their 1st-read program and run their
-  own game code. **Doukyuusei ~if~ boots all the way to its title screen**
-  (rendered at its native 640×224 hi-res): its intro slave crash was a SH7604
-  FRT `FTCSR` write-0-to-clear bug (the inter-CPU FRT input-capture handshake),
-  and VDP2 hi-res rendering then displayed it without overflow. Its in-game
-  record-select **menu now renders correctly** too, after two emulation fixes:
-  SCU indirect-DMA table pointers were read through an unfolded SH-2 cache-through
-  alias (so the menu-background DMAs silently moved nothing), and VDP1 framebuffer
-  dots are now horizontally doubled in VDP2's 640/704-dot modes. **Virtua
-  Fighter 2 — the M11 target — is now fully playable** (tag
-  `vf2-good-emulation`): the trace-diff methodology against this oracle
-  carried it through the CD command/seek divergences, the VDP1 8 bpp +
-  double-interlace render modes, an SH-2 delay-slot legality bug, the
-  per-dot rotation coefficients for the 3D floor, and the audio endgame —
-  SH-2→SCSP B-bus wait-states (a game-side spin-timeout silently muted all
-  SFX without them), CD-DA routed through the SCSP **EXTS** inputs at the
-  game's programmed mix level, and KYONEX key-on semantics (only a
-  Release-phase envelope is re-keyable).
-- [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
-  reference. Its Saturn driver models the chips closely (down to a
-  low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
-  behavior, but its *game* compatibility is limited, so it's used for the
-  early boot and subsystem logic rather than full game runs — e.g. it
-  showed a stuck boot was a wrong-path symptom, then that a periodic
-  report was clobbering the CD-block signature the BIOS checks.
-- [Yabause](https://github.com/Yabause/yabause) — the **secondary**
-  reference; the primary during early development (M1–M3) and still a
-  useful second opinion (its `src/bios.c` was the blueprint for a
-  since-removed HLE BIOS experiment). A patched, headless build emits the
-  master PC stream for diffing.
+- [Mednafen](https://mednafen.github.io/) — the accuracy reference for
+  game-level behavior, and the primary oracle for the game-boot and
+  cycle-accuracy work.
+- [MAME](https://github.com/mamedev/mame) — the low-level / early-boot
+  reference for CPU, bus, and peripheral behavior.
+- [Yabause](https://github.com/Yabause/yabause) — the secondary reference,
+  and the primary one during early development.
 
 Each is set up as a local, **never-committed** build (gitignored
 `mednaref/`, `mameref/`, `yabref/`). **No emulator code is included in or

@@ -5,6 +5,10 @@ the foundation is solid before the next chip is added.
 
 The full design rationale lives in `/home/yhh/.claude/plans/temporal-strolling-hollerith.md`.
 
+Current test count: **1058 workspace-wide, 0 failures**, at **~85% line
+coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
+FFI `physdisc` crate).
+
 ## Overview — component status
 
 Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
