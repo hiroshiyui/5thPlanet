@@ -2,7 +2,7 @@
 
 An accuracy-first SEGA Saturn emulator in Rust.
 
-The Saturn is one of the hardest 5th-gen consoles to emulate — eight
+*The Saturn is one of the hardest 5th-gen consoles to emulate* — eight
 processors with tightly-coupled timing (2× SH-2 SH7604, MC68EC000,
 VDP1, VDP2, SCU + SCU-DSP, SCSP M68k + SCSP-DSP, SH-1 CD-block) on a
 shared bus. **Performance is explicitly subordinated to fidelity**:
