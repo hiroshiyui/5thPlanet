@@ -236,6 +236,16 @@ multiple [NBG]/[RBG] backgrounds. M13 Tier C (C9); `vdp2/regs.rs`
 **EXTEN** — VDP2 EXTernal ENable register (external sync / latch).
 Out-of-scope minutia; register-storage only.
 
+**EXTS** — the [SCSP]'s two EXTernal Sound digital inputs — on the Saturn,
+the **CD-DA** stereo pair from the CD-block. They are not summed raw: slots
+**16/17**'s EFSDL/EFPAN fields (slot register word 0xB bits 7–5 / 4–0) are
+the game-controlled CD-input volume/pan (their *effect-return* reads EXTS
+instead of a DSP `EFREG`), and the SCSP-DSP can read EXTS as inputs
+(IRA `0x30`/`0x31`) to process/return the CD mix through other slots. The
+per-slot effect-return mixes for every slot, keyed or not. Implemented in
+`ScspCtrl::mix` + `Scsp::feed_cd`, fed per scheduler batch from the
+[CDDA] FIFO by `Saturn::run_for` (M11; was a full-level aggregate sum).
+
 ---
 
 ## F
@@ -368,6 +378,19 @@ to IREG0..IREG6 before writing [COMREG].
 level-triggered; the SH-2 auto-vectors via VBR + (64 + level) × 4.
 
 ---
+
+## K
+
+**KYONB / KYONEX** — [SCSP] slot key-on bit / key-execute strobe (slot
+register word 0 bits 11 / 12). Writing a slot's first word with KYONEX set
+executes key-on/off across **all 32 slots** from each one's KYONB; the
+strobe self-clears. A slot keys on iff its envelope is in **Release**
+(`(EnvPhase == RELEASE) == KeyBit`, Mednafen `scsp.inc`) — a non-loop
+sample that runs off its LEA only stops *fetching* (its EG keeps its
+Attack/Decay phase), so a later strobe with the stale KYONB=1 must not
+replay it; an explicit key-off moves any non-Release slot to Release,
+re-arming it. Getting this gate wrong replayed VF2's "Go" announcer on
+every punch (each SFX note-on strobes all slots).
 
 ## L
 

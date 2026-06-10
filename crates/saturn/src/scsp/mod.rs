@@ -23,7 +23,16 @@
 //! slot. `slot_sample` yields the raw PCM and `eg_advance` the EG×TL
 //! multiplier — the mixer (next) pairs them and pans to L/R.
 //!
-//! Still to come (M6): the mixer/DAC, SDL2 audio output, the SCSP DSP, MIDI.
+//! **Mixer (M6+):** per slot, the direct output (DISDL/DIPAN) and the
+//! effect-return (EFSDL/EFPAN) are mixed for *every* slot, keyed or not —
+//! slots 0–15 return the effect-DSP outputs `EFREG[slot]`, and **slots 16/17
+//! return the EXTS digital inputs (the CD-DA stereo pair)**, making their
+//! EFSDL/EFPAN the game-controlled CD volume (M11). The CD-block's decoded
+//! audio is fed per scheduler batch ([`Scsp::feed_cd`]) and latched one frame
+//! per output sample into the DSP's EXTS inputs (readable as IRA 0x30/0x31).
+//! Key-on/off is the KYONEX strobe: a slot keys on iff its EG is in Release
+//! (`(EnvPhase == RELEASE) == KeyBit`, Mednafen `scsp.inc`). MIDI is the one
+//! remaining SCSP feature (unused by the Saturn).
 
 mod dsp;
 

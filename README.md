@@ -24,11 +24,11 @@ foundation stays solid.
 | M8        | Save states + battery-backed backup RAM                     | ✅ complete  |
 | M9        | Frontend OSD (in-window menu)                               | 🚧 active    |
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
-| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | 🚧 Doukyuusei ~if~ boots to its title screen (640×224 hi-res) and its in-game menu renders correctly; the disc-present boot animation now plays (CD recognition spin-up); VF2 on a CD-state wall |
+| M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | ✅ complete — **Virtua Fighter 2 is fully playable at a steady 60 fps** (correct graphics incl. the rotation-plane floor, CD-DA BGM through the SCSP EXTS inputs, in-fight SFX at the hardware mix balance; tag `vf2-good-emulation`); *Doukyuusei ~if~* boots to its title + in-game menu |
 | M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
 | M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (pending) |
 
-Current test count: **1032 workspace-wide, 0 failures**, at **~85% line
+Current test count: **1055 workspace-wide, 0 failures**, at **~85% line
 coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
 FFI `physdisc` crate). Task-by-task status lives in
 [`doc/roadmap.md`](doc/roadmap.md).
@@ -217,9 +217,16 @@ instruction:
   record-select **menu now renders correctly** too, after two emulation fixes:
   SCU indirect-DMA table pointers were read through an unfolded SH-2 cache-through
   alias (so the menu-background DMAs silently moved nothing), and VDP1 framebuffer
-  dots are now horizontally doubled in VDP2's 640/704-dot modes. VF2 still loops
-  in its intro on a polled-CD-state divergence — the remaining game-boot
-  blocker — with the CD-HIRQ axis now exhausted for it.
+  dots are now horizontally doubled in VDP2's 640/704-dot modes. **Virtua
+  Fighter 2 — the M11 target — is now fully playable** (tag
+  `vf2-good-emulation`): the trace-diff methodology against this oracle
+  carried it through the CD command/seek divergences, the VDP1 8 bpp +
+  double-interlace render modes, an SH-2 delay-slot legality bug, the
+  per-dot rotation coefficients for the 3D floor, and the audio endgame —
+  SH-2→SCSP B-bus wait-states (a game-side spin-timeout silently muted all
+  SFX without them), CD-DA routed through the SCSP **EXTS** inputs at the
+  game's programmed mix level, and KYONEX key-on semantics (only a
+  Release-phase envelope is re-keyable).
 - [MAME](https://github.com/mamedev/mame) — the **low-level / early-boot**
   reference. Its Saturn driver models the chips closely (down to a
   low-level CD-block SH-1) and is the authority for CPU/bus/peripheral
