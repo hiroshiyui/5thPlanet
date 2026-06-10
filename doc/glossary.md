@@ -633,6 +633,17 @@ count), interlock stalls (load-use + MAC-read), and DMA cycle-stealing
 
 ---
 
+**Shuttle Mouse** — Sega's Saturn mouse (HSS-0114). Reports through the
+[SMPC] INTBACK peripheral phase as ID `0xE3` with three data bytes:
+`(flags << 4) | buttons` (flags: X-negative, Y-negative, X-overflow,
+Y-overflow; buttons: Left/Right/Middle/Start in bits 0–3), then the X and
+Y delta low bytes — deltas accumulated between reports, clamped to
+−256..=255 with the overflow flags, **Y+ = up**, reset on each report
+(Mednafen `input/mouse.cpp`; the SMPC maps the mouse's ID1 class 3 to
+`0xE3`, `smpc.cpp:1421`). Implemented as `smpc::PortDevice::Mouse` +
+`Smpc::take_mouse_report` (M13 E3); jupiter's `--mouse[=1|2]` captures the
+host pointer. *Doukyuusei ~if~* supports it.
+
 ## T
 
 **TOC** — Table Of Contents. The CD's track table; the Saturn form

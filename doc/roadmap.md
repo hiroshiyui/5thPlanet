@@ -865,7 +865,7 @@ that produced this list also closed one gap in passing — the SH-2 associative 
 |---|-----|-------|
 | E1 | **Multitap + port-2 scanning** | No 4/6-player multitap and no port-2 peripheral chain; INTBACK returns "no device" for port 2. `smpc.rs` / INTBACK peripheral phase. |
 | E2 | **Analog peripherals** | 3D Control Pad, Mission Stick, racing controller — no analog peripheral IDs or data formats. |
-| E3 | **Specialty peripherals** | Mouse, light gun (needs raster crosshair position), keyboard. |
+| E3 | **Specialty peripherals** 🚧 mouse ✅ | **Shuttle Mouse done (`638cda7`/`80b7120`)**: SMPC `PortDevice` per-port selection (None/Pad/Mouse), INTBACK block ID `0xE3` + 3 data bytes ((flags<<4)\|buttons, X, Y; ±256/255 clamp + overflow flags, Y+ = up, accumulators reset per report — Mednafen `input/mouse.cpp`/`smpc.cpp:1421`), `Saturn::set_port_devices`/`feed_mouse`, jupiter `--mouse[=1\|2]` with relative-pointer capture (Esc/OSD releases; Return = mouse Start). Savestate v5. For *Doukyuusei ~if~* (mouse-supported per Sega Retro). 3 tests (`smpc.rs`). Remaining: light gun (needs raster crosshair position), keyboard. |
 
 **Tier F — Already-deferred** (cross-referenced)
 
