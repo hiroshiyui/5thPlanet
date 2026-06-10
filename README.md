@@ -67,21 +67,27 @@ cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
 
 ## Controls
 
-The SDL2 frontend maps the host keyboard to **port&nbsp;1** (a standard Saturn
-digital control pad) plus a few emulator hotkeys. Every pad button can be
-rebound from the menu (**Esc → Settings → Controller**, press-to-bind); the
-bindings persist in the config file. (Host gamepad support is planned with
-the analog-peripheral work.)
+The SDL2 frontend maps the host keyboard — and any attached **game
+controller** — to **port&nbsp;1** (a standard Saturn digital control pad) plus
+a few emulator hotkeys. Every pad button can be rebound from the menu
+(**Esc → Settings → Controller**, press-to-bind); the bindings persist in the
+config file. Controllers hot-plug at any time (SDL's GameController layer —
+XInput on Windows, evdev on Linux — so Xbox-style pads just work) and can
+also navigate the menu (D-pad + A/B, Start toggles).
 
 ### Saturn control pad — port 1 (default bindings)
 
-| Saturn button | Keyboard |
-| ------------- | -------- |
-| D-pad ↑ ↓ ← → | Arrow keys |
-| A / B / C     | Z / X / C |
-| X / Y / Z     | A / S / D |
-| L / R         | Q / W |
-| Start         | Enter |
+| Saturn button | Keyboard | Game controller |
+| ------------- | -------- | --------------- |
+| D-pad ↑ ↓ ← → | Arrow keys | D-pad or left stick |
+| A / B / C     | Z / X / C | X / A / B |
+| X / Y / Z     | A / S / D | Y / LB / RB |
+| L / R         | Q / W | LT / RT |
+| Start         | Enter | Start |
+
+The gamepad mapping is fixed for now (it follows Sega's own layout from
+their Xbox Saturn ports); per-button gamepad rebinding arrives with the
+analog-peripheral work. The keyboard map is fully rebindable.
 
 ### Shuttle Mouse (`--mouse[=1|2]`)
 
