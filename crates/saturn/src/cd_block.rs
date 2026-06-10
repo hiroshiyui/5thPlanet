@@ -1178,6 +1178,22 @@ impl CdBlock {
     /// `STATUS_BUSY`, and enters the seek-startup phase. `target`/`end` carry
     /// bit `0x800000` for FAD addressing.
     fn start_seek(&mut self, target: u32, end: u32, repeat: u8, play_end_irq: u16) {
+        self.start_seek_impl(target, end, repeat, play_end_irq, false);
+    }
+
+    /// `no_pickup_change` is Play-mode bit 7 (Mednafen `StartSeek`'s
+    /// `no_pickup_change`): re-arm the play range *without* moving the pickup —
+    /// the read-ahead is kept, and a drive already in `Play` just continues
+    /// (only the range/IRQ changes); otherwise the seek skips the geometry
+    /// resolve (`SeekStart1`) so the settle targets the current head position.
+    fn start_seek_impl(
+        &mut self,
+        target: u32,
+        end: u32,
+        repeat: u8,
+        play_end_irq: u16,
+        no_pickup_change: bool,
+    ) {
         if self.disc.is_none() {
             return;
         }
@@ -1186,21 +1202,35 @@ impl CdBlock {
         if std::env::var("SAT_CDSEEKLOG").is_ok() {
             let (sfad, efad) = (target & 0x7F_FFFF, end & 0x7F_FFFF);
             eprintln!(
-                "CDSEEK fad={sfad} (0x{sfad:06X}) lba={} count={} end_fad={efad} repeat={repeat} irq={play_end_irq:04X}",
+                "CDSEEK fad={sfad} (0x{sfad:06X}) lba={} count={} end_fad={efad} repeat={repeat} irq={play_end_irq:04X} npc={no_pickup_change}",
                 sfad as i64 - 150,
                 efad.wrapping_sub(sfad)
             );
         }
         self.play_repeat_counter = 0;
-        self.sec_prebuf_in = false; // ClearPendingSec
+        if !no_pickup_change {
+            self.sec_prebuf_in = false; // ClearPendingSec
+        }
         self.cur_play_start = target;
         self.cur_play_end = end;
         self.cur_play_repeat = repeat;
         self.play_end_irq = play_end_irq;
+        if no_pickup_change && self.drive_phase == DrivePhase::Play {
+            // Already playing: keep reading from the current position with the
+            // new range (Mednafen cdb.cpp:2025 returns before the phase reset).
+            return;
+        }
         self.status = STAT_BUSY;
-        self.drive_phase = DrivePhase::SeekStart;
+        if no_pickup_change {
+            // Skip SeekStart1 (the geometry resolve): the settle + seek target
+            // the current head position (Mednafen `DRIVEPHASE_SEEK_START2`).
+            self.drive_phase = DrivePhase::SeekSettle;
+            self.drive_counter = (SEEKSTART2_CYC - SEEK_CPI_DELAY_CYC) as i64;
+        } else {
+            self.drive_phase = DrivePhase::SeekStart;
+            self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+        }
         self.periodic_idle = PERIODIC_IDLE_CYC;
-        self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
     }
 
     /// Demo/debug hook: start CD-DA (Red Book) playback of `sectors` sectors
@@ -1292,13 +1322,19 @@ impl CdBlock {
     /// command builder (→ the bogus command `0x24`) where Mednafen's BUSY
     /// (`0x00`) keeps it a clean GetSubcodeQ.
     fn seek_start(&mut self) {
-        // SeekStart1: resolve the target FAD. The GFS/BIOS read path always
-        // uses FAD addressing (bit 0x800000); the track/index form is
-        // approximated to the disc start (we don't chase the pickup by track).
+        // SeekStart1: resolve the target FAD. Data reads use FAD addressing
+        // (bit 0x800000); the track/index form seeks to the commanded track's
+        // *start* (Mednafen `SeekStart1` else-branch, `150 +
+        // toc.tracks[track_target].lba`; the index is approximated to 1 — we
+        // don't model sub-indices). VF2's character-select BGM is
+        // `Play(track 14 idx 1 → track 14 idx 99, repeat ∞)` — a CD-DA track
+        // on loop; the old "approximate to the disc start" played *data*
+        // sectors from FAD 150 instead of the music.
         let fad_target = if self.cur_play_start & 0x80_0000 != 0 {
             (self.cur_play_start & 0x7F_FFFF).max(FAD_OFFSET)
         } else {
-            FAD_OFFSET
+            let tt = ((self.cur_play_start >> 8) & 0xFF) as u8;
+            self.track_start_fad(tt).unwrap_or(FAD_OFFSET)
         };
         if let Some(t) = self.disc.as_ref().and_then(|d| d.track_at_fad(fad_target)) {
             self.ctrladdr = t.ctrl_addr;
@@ -1335,16 +1371,49 @@ impl CdBlock {
         self.drive_counter += seek_cyc as i64;
     }
 
+    /// Start FAD of `track` (clamped to the disc's track range) from the TOC,
+    /// for the Play command's track/index addressing form.
+    fn track_start_fad(&self, track: u8) -> Option<u32> {
+        let d = self.disc.as_ref()?;
+        let t = track.clamp(d.first_track(), d.last_track());
+        let toc = d.toc();
+        let i = (t as usize - 1) * 4;
+        Some(((toc[i + 1] as u32) << 16) | ((toc[i + 2] as u32) << 8) | toc[i + 3] as u32)
+    }
+
+    /// Track number under the play head, for the track-form end checks
+    /// (Mednafen reads it from the per-sector subchannel Q; we resolve it
+    /// from the FAD). Past the lead-out (or with no position) → 0xAA.
+    fn head_track(&self) -> u8 {
+        self.disc
+            .as_ref()
+            .and_then(|d| d.track_at_fad(self.cd_curfad))
+            .map_or(0xAA, |t| t.number)
+    }
+
     /// Whether the play head has reached the end of the commanded range
-    /// (Mednafen `CheckEndMet`, cdb.cpp:2054). FAD form only; the lead-out
-    /// (`track == 0xAA`) and a head behind the start also end it.
+    /// (Mednafen `CheckEndMet`, cdb.cpp:2054): the lead-out, the FAD-form
+    /// bounds, or — in the track/index form — the head crossing past the end
+    /// track (or before the start track).
     fn check_end_met(&self) -> bool {
         let mut end_met = self.track == 0xAA;
-        if self.cur_play_end != 0 && (self.cur_play_end & 0x80_0000) != 0 {
-            end_met |= self.cd_curfad >= (self.cur_play_end & 0x7F_FFFF);
+        if self.cur_play_end != 0 {
+            if self.cur_play_end & 0x80_0000 != 0 {
+                end_met |= self.cd_curfad >= (self.cur_play_end & 0x7F_FFFF);
+            } else if let Some(d) = self.disc.as_ref() {
+                let end_track = (((self.cur_play_end >> 8) & 0xFF) as u8)
+                    .clamp(d.first_track(), d.last_track());
+                // Our index is always 1, so only the track number can exceed
+                // the bound (Mednafen also compares `idx > end_index`).
+                end_met |= self.head_track() > end_track;
+            }
         }
         if self.cur_play_start & 0x80_0000 != 0 {
             end_met |= self.cd_curfad < (self.cur_play_start & 0x7F_FFFF);
+        } else if let Some(d) = self.disc.as_ref() {
+            let start_track =
+                (((self.cur_play_start >> 8) & 0xFF) as u8).clamp(d.first_track(), d.last_track());
+            end_met |= self.head_track() < start_track;
         }
         end_met
     }
@@ -1388,11 +1457,18 @@ impl CdBlock {
         // Read the next sector ahead (only if the prior one was consumed).
         if !self.sec_prebuf_in {
             let fad = self.drive_sector;
-            self.sec_prebuf_audio = self
-                .disc
-                .as_ref()
-                .and_then(|d| d.track_at_fad(fad))
-                .is_some_and(|t| t.is_audio);
+            // Refresh the reported geometry as the head advances (Mednafen
+            // updates `CurPosInfo.tno/ctrl_adr` from the per-sector subchannel
+            // Q) — the host polls the report's track byte, and the track-form
+            // end check follows the head across track boundaries.
+            if let Some(t) = self.disc.as_ref().and_then(|d| d.track_at_fad(fad)) {
+                self.sec_prebuf_audio = t.is_audio;
+                self.ctrladdr = t.ctrl_addr;
+                self.track = t.number;
+                self.index = 1;
+            } else {
+                self.sec_prebuf_audio = false;
+            }
             self.sec_prebuf_fad = fad;
             self.sec_prebuf_in = true;
             self.cd_curfad = fad; // CurPosInfo.fad = CurSector (cdb.cpp:2389)
@@ -2260,6 +2336,20 @@ impl CdBlock {
                 } else if (start & 0x80_0000) != 0 && (end & 0x80_0000) != 0 {
                     end = 0x80_0000 | ((start.wrapping_add(end)) & 0x7F_FFFF);
                 }
+                // Mixed FAD/track addressing forms are rejected with the play
+                // state untouched (Mednafen cdb.cpp:2830: `((psp ^ pep) &
+                // 0x800000) && pep != 0` → `CDStatusResults(true)`). VF2's
+                // character-select BGM setup issues such a Play; accepting it
+                // derailed the drive onto a stale range.
+                if (start ^ end) & 0x80_0000 != 0 && end != 0 {
+                    if std::env::var("SAT_CDSEEKLOG").is_ok() {
+                        eprintln!("CDPLAY-REJECT start={start:06X} end={end:06X}");
+                    }
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                    return;
+                }
                 let repeat = if pm & 0x70 == 0 {
                     pm & 0x0F
                 } else {
@@ -2267,10 +2357,11 @@ impl CdBlock {
                 };
                 self.sectorstore = false;
                 // BUSY now (even with play-mode 0x80); the seek machine drives
-                // BUSY → SEEK → PLAY and raises PEND at the range end.
+                // BUSY → SEEK → PLAY and raises PEND at the range end. Mode
+                // bit 7 = "no pickup change" (see `start_seek_impl`).
                 self.status = STAT_BUSY;
                 self.cd_report();
-                self.start_seek(start, end, repeat, HIRQ_PEND);
+                self.start_seek_impl(start, end, repeat, HIRQ_PEND, pm & 0x80 != 0);
                 self.hirq |= HIRQ_CMOK;
             }
             0x11 => {
@@ -3778,6 +3869,50 @@ mod tests {
         // Type >= 2 is rejected (Mednafen `CDStatusResults(true)`).
         cmd(&mut c, 0x2002, 0x0000, 0x0000, 0x0000);
         assert_eq!(c.cr1, STAT_REJECT, "subcode type >= 2 rejected");
+    }
+
+    /// The Play track/index addressing form (no FAD flag) seeks to the
+    /// commanded track's start and — with repeat ∞ — loops it, streaming an
+    /// audio track to the CD-DA mixer (Mednafen `SeekStart1` else-branch +
+    /// `CheckEndMet` track comparison). VF2's character-select BGM is
+    /// `Play(track 14 idx 1 → track 14 idx 99, mode 0x0F)`; approximating the
+    /// form to the disc start played data sectors instead of the music.
+    #[test]
+    fn play_track_index_form_seeks_to_the_track_and_loops_its_audio() {
+        let mut bin = vec![0u8; 2352 * 8];
+        bin[2352 * 4..2352 * 4 + 2].copy_from_slice(&0x4321i16.to_le_bytes());
+        let disc = Disc::from_cue(
+            "FILE \"a.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:00:04\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("cue");
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        c.drive_phase = DrivePhase::Idle;
+        c.drive_sector = 150;
+        // Start = track 2 index 1, end = track 2 index 99, play mode 0x0F.
+        cmd(&mut c, 0x1000, 0x0201, 0x0F00, 0x0263);
+        assert_ne!(c.cr1, STAT_REJECT, "consistent track forms accepted");
+        pump(&mut c);
+        assert!(c.cd_curfad >= 154, "head in the audio track (FAD {})", c.cd_curfad);
+        assert_ne!(c.status & !STAT_PERI, STAT_PAUSE, "repeat ∞ never pauses");
+        let pcm = c.take_cd_audio(2);
+        assert_eq!(pcm[0], 0x4321, "track 2 PCM streamed to the CD-DA mixer");
+    }
+
+    /// A Play mixing FAD and track addressing forms is rejected with the
+    /// play state untouched (Mednafen cdb.cpp:2830: `((psp ^ pep) & 0x800000)
+    /// && pep != 0` → `CDStatusResults(true)`).
+    #[test]
+    fn play_with_mixed_fad_and_track_forms_is_rejected() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        c.drive_phase = DrivePhase::Idle;
+        let prev_end = c.cur_play_end;
+        cmd(&mut c, 0x1080, 0x0E01, 0x0F00, 0x0E63); // FAD start, track end
+        assert_eq!(c.cr1, STAT_REJECT, "mixed forms rejected");
+        assert_eq!(c.cur_play_end, prev_end, "play state untouched");
+        assert_eq!(c.drive_phase, DrivePhase::Idle, "no seek started");
     }
 
     // ===== File-system error/edge branches (0x70 / 0x73 / 0x74) =====
