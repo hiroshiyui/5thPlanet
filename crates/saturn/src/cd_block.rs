@@ -277,6 +277,16 @@ enum DrivePhase {
     /// Range complete (or buffer-full): a `PauseCounter`-delayed transition to
     /// `STATUS_PAUSE`, at which point `play_end_irq` (`PEND`/`EFLS`) fires.
     Pause,
+    /// The pickup settle between `SeekStart` and `Seek` (Mednafen `SeekStart2`
+    /// → `SEEK_START3`, cdb.cpp:1957): the geometry is already resolved but the
+    /// radial seek hasn't begun, and the host sees **`STATUS_BUSY`** for the
+    /// whole `SEEKSTART2_CYC` (256000-clock) window — only then does the drive
+    /// report `STATUS_SEEK`. VF2's intro probes 1-sector Plays and reads this
+    /// intermediate status into its next command word (`0x2000 | CR1`), so
+    /// reporting SEEK during the settle leaked `0x04` into the command byte
+    /// (`0x24`, not a real command) and derailed it. Declared last so existing
+    /// bincode save states (index-encoded) keep their phase indices.
+    SeekSettle,
 }
 
 // Not `Clone`: holds a `Box<dyn SectorSource>` (image or live drive) that
@@ -1273,15 +1283,15 @@ impl CdBlock {
         self.periodic_idle = i64::MAX;
     }
 
-    /// Resolve the seek target and schedule the seek time (Mednafen
-    /// `SeekStart1`+`SeekStart2`+`SeekStart3`, cdb.cpp:1905/1957/2203). Sets the
-    /// head geometry, reports `STATUS_SEEK`, and arms the `Seek` phase.
+    /// Resolve the seek target and enter the pickup settle (Mednafen
+    /// `SeekStart1`+`SeekStart2`, cdb.cpp:1905/1957). Sets the head geometry
+    /// and holds **`STATUS_BUSY`** for the `SEEKSTART2_CYC` settle — the host
+    /// must not see `STATUS_SEEK` until the radial seek proper begins in
+    /// [`Self::seek_settle_done`] (the `SEEK_START3` stage). Reporting SEEK
+    /// during the settle leaked status `0x04` into VF2's `0x2000 | CR1`
+    /// command builder (→ the bogus command `0x24`) where Mednafen's BUSY
+    /// (`0x00`) keeps it a clean GetSubcodeQ.
     fn seek_start(&mut self) {
-        // Visible stopped geometry uses the 0xFFFF_FFFF sentinel, but the
-        // physical pickup remains at `drive_sector`. Using the sentinel as the
-        // next seek's origin turns a stop-then-Play sequence into a multi-day
-        // seek.
-        let prev = self.drive_sector;
         // SeekStart1: resolve the target FAD. The GFS/BIOS read path always
         // uses FAD addressing (bit 0x800000); the track/index form is
         // approximated to the disc start (we don't chase the pickup by track).
@@ -1296,17 +1306,32 @@ impl CdBlock {
             self.index = 1;
         }
         self.cd_curfad = fad_target;
-        self.drive_sector = fad_target;
-        // SeekStart2/3: BUSY → SEEK, with a seek time dominated by the fixed
-        // settle (cdb.cpp:2213) plus a per-FAD-delta term.
+        // SeekStart2 (cdb.cpp:1957): BUSY through the settle. The physical
+        // pickup (`drive_sector`) stays put until the settle completes — it is
+        // the seek-distance origin read by `seek_settle_done`. (Mednafen
+        // subtracts the already-elapsed `SeekCPIUpdateDelay` from the settle.)
         self.is_cdrom = false;
         self.repcnt = self.play_repeat_counter & 0x0F;
-        // Total seek time = the SeekStart2 settle (256000) + the SeekStart3 seek
-        // time (fixed 12·(44100·256)/150 plus a per-FAD-delta term; cdb.cpp:2213).
+        self.status = STAT_BUSY;
+        self.drive_phase = DrivePhase::SeekSettle;
+        self.drive_counter += (SEEKSTART2_CYC - SEEK_CPI_DELAY_CYC) as i64;
+    }
+
+    /// The settle elapsed: schedule the radial seek time and report
+    /// `STATUS_SEEK` (Mednafen `SEEK_START3`, cdb.cpp:2218). Seek time =
+    /// fixed 12·(44100·256)/150 plus a per-FAD-delta term (cdb.cpp:2227).
+    fn seek_settle_done(&mut self) {
+        // Visible stopped geometry uses the 0xFFFF_FFFF sentinel, but the
+        // physical pickup remains at `drive_sector`. Using the sentinel as the
+        // next seek's origin turns a stop-then-Play sequence into a multi-day
+        // seek.
+        let prev = self.drive_sector;
+        let fad_target = self.cd_curfad;
         let delta = fad_target.abs_diff(prev) as u64;
-        let seek_cyc = SEEKSTART2_CYC + cd2m(12 * CD_CLOCK_HZ / 150) + cd2m(delta * 27);
+        let seek_cyc = cd2m(12 * CD_CLOCK_HZ / 150) + cd2m(delta * 27);
         self.status = STAT_SEEK;
         self.drive_phase = DrivePhase::Seek;
+        self.drive_sector = fad_target;
         self.drive_counter += seek_cyc as i64;
     }
 
@@ -1441,8 +1466,16 @@ impl CdBlock {
             }
         }
         // Emit the unsolicited periodic report (SCDQ), unless a command response
-        // is still unread (cs2.c `_command` / Mednafen `ResultsRead`).
-        if self.host_initialized && !self.command_pending {
+        // is still unread (cs2.c `_command` / Mednafen `ResultsRead`) **or the
+        // host is mid-way through composing a command** (`cr_written != 0`).
+        // The hardware keeps host-written command words and block-written
+        // results in separate register files (Mednafen `CTR.CD[]` vs
+        // `Results[]`; MAME gates on `cmd_pending`), so a periodic can never
+        // corrupt a half-written command. Our shared CR1–4 must emulate that:
+        // without this guard the report clobbered VF2's GetSubcodeQ between
+        // its CR1 and CR4 writes, dispatching the report's own status byte as
+        // a bogus command (0x21 = PAUSE|PERI, 0x24 = SEEK|PERI).
+        if self.host_initialized && !self.command_pending && self.cr_written == 0 {
             self.status |= STAT_PERI;
             self.cd_report();
         }
@@ -1482,6 +1515,7 @@ impl CdBlock {
                         self.periodic_idle = PERIODIC_IDLE_CYC;
                     }
                     DrivePhase::SeekStart => self.seek_start(),
+                    DrivePhase::SeekSettle => self.seek_settle_done(),
                     DrivePhase::Seek => {
                         self.play_sector_processed = false;
                         self.sec_prebuf_in = false;
@@ -2280,6 +2314,66 @@ impl CdBlock {
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK;
             }
+            0x20 => {
+                // Get Subcode (Mednafen cdb.cpp `COMMAND_GET_SUBCODE`): CR1
+                // low byte = type (0 = channel Q, 1 = channels R–W); stages
+                // the subcode bytes for a FIFO transfer like GetToc, with the
+                // word count in CR2 and the DTREQ bit (our `STAT_TRANS`) in
+                // the status. VF2's intro polls the Q channel while its
+                // 1-sector probe Plays seek. Types >= 2 are rejected.
+                match self.cr1 & 0xFF {
+                    0 => {
+                        // Q: 10 bytes / 5 words — [ctrl/adr, tno, idx,
+                        // rel-FAD (3 bytes), 0, abs-FAD (3 bytes)] from the
+                        // current head geometry, binary not BCD (Mednafen
+                        // `SubCodeQBuf`, cdb.cpp:2525).
+                        let fad = self.cd_curfad;
+                        let rel = self
+                            .disc
+                            .as_ref()
+                            .and_then(|d| d.track_at_fad(fad))
+                            .map_or(0, |t| fad.wrapping_sub(t.start_fad));
+                        self.xfer = vec![
+                            self.ctrladdr,
+                            self.track,
+                            self.index,
+                            (rel >> 16) as u8,
+                            (rel >> 8) as u8,
+                            rel as u8,
+                            0,
+                            (fad >> 16) as u8,
+                            (fad >> 8) as u8,
+                            fad as u8,
+                        ];
+                        self.xfer_pos = 0;
+                        self.xfer_done = 0;
+                        self.transfer_request = true;
+                        self.cr1 = self.cd_stat();
+                        self.cr2 = 0x0005;
+                        self.cr3 = 0x0000;
+                        self.cr4 = 0x0000;
+                        self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
+                    }
+                    1 => {
+                        // R–W: 24 bytes / 12 words; content unimplemented in
+                        // the reference too (Mednafen fills 0xFF).
+                        self.xfer = vec![0xFF; 24];
+                        self.xfer_pos = 0;
+                        self.xfer_done = 0;
+                        self.transfer_request = true;
+                        self.cr1 = self.cd_stat();
+                        self.cr2 = 0x000C;
+                        self.cr3 = 0x0000;
+                        self.cr4 = 0x0000;
+                        self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
+                    }
+                    _ => {
+                        self.cd_report();
+                        self.cr1 = STAT_REJECT;
+                        self.hirq |= HIRQ_CMOK;
+                    }
+                }
+            }
             0x60 => {
                 // Set sector length (CR1 low = input code, CR2 high = output).
                 let len = |code: u16| match code {
@@ -2575,9 +2669,11 @@ impl CdBlock {
     /// the report when `_command` is set.
     fn emit_periodic(&mut self) {
         // Hold the power-on signature until the host has engaged the block
-        // with a command (see `host_initialized`); and never clobber an
-        // unread command response (`command_pending`, cs2.c's `_command`).
-        if !self.host_initialized || self.command_pending {
+        // with a command (see `host_initialized`); never clobber an unread
+        // command response (`command_pending`, cs2.c's `_command`); and never
+        // clobber a command the host is mid-way through composing
+        // (`cr_written != 0` — see the matching guard in `drive_periodic`).
+        if !self.host_initialized || self.command_pending || self.cr_written != 0 {
             return;
         }
         self.status |= STAT_PERI;
@@ -3542,8 +3638,9 @@ mod tests {
     fn unimplemented_command_returns_a_status_report_and_cmok() {
         let mut c = CdBlock::new();
         c.hirq = 0;
-        // 0x20 is not handled → the default arm: a plain status report + CMOK.
-        cmd(&mut c, 0x2000, 0x0000, 0x0000, 0x0000);
+        // 0x21 is not a real command → the default arm: a plain status report
+        // + CMOK. (0x20 Get Subcode is now implemented; see the subcode tests.)
+        cmd(&mut c, 0x2100, 0x0000, 0x0000, 0x0000);
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK, "default arm sets CMOK");
         // No disc → the report is the NODISC status, zero geometry.
         assert_eq!(c.read16(0x0018), 0x0700, "CR1 = NODISC status report");
@@ -3599,6 +3696,88 @@ mod tests {
         assert_eq!(c.status & !STAT_PERI, STAT_PAUSE);
         assert_eq!(c.track, 1, "seek refreshes target track geometry");
         assert_eq!(c.index, 1, "seek refreshes target index geometry");
+    }
+
+    /// A Play's seek must report `STATUS_BUSY` through the whole `SeekStart2`
+    /// settle (`SEEKSTART2_CYC`, 256000 CD clocks) and only then `STATUS_SEEK`
+    /// — matching Mednafen, where `SEEK_START1/2/3` are all BUSY and only the
+    /// `SEEK` phase reports SEEK. VF2's intro probes 1-sector Plays and builds
+    /// its next command as `0x2000 | <status report CR1>`; SEEK (0x04) leaking
+    /// in during the settle produced the bogus command `0x24` and derailed it.
+    #[test]
+    fn seek_holds_busy_through_the_seekstart2_settle_before_reporting_seek() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        c.drive_phase = DrivePhase::Idle;
+        c.drive_sector = 150;
+
+        play(&mut c, 151, 1);
+        assert_eq!(c.status & !STAT_PERI, STAT_BUSY, "BUSY at Play accept");
+        c.tick(cd2m(128_000));
+        assert_eq!(c.status & !STAT_PERI, STAT_BUSY, "still BUSY mid-settle");
+        // Past the settle, inside the radial seek proper.
+        c.tick(cd2m(256_000));
+        assert_eq!(c.status & !STAT_PERI, STAT_SEEK, "SEEK only after the settle");
+        // The split phases don't break end-to-end completion.
+        pump(&mut c);
+        assert_eq!(c.partitions[0].blocks.len(), 1, "sector buffered");
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE);
+    }
+
+    /// The unsolicited periodic report must not clobber a command the host is
+    /// mid-way through composing (`cr_written != 0`). The hardware keeps
+    /// host-written command words and block-written results in separate
+    /// register files (Mednafen `CTR.CD[]` vs `Results[]`); our shared CR1–4
+    /// emulated the report into a half-written command, so VF2's GetSubcodeQ
+    /// (CR1=0x2000 written, CR4 still pending) dispatched as the report's own
+    /// status byte — the bogus command 0x24 (`SEEK|PERI`) / 0x21 (`PAUSE|PERI`).
+    #[test]
+    fn periodic_report_does_not_clobber_a_half_composed_command() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        c.drive_phase = DrivePhase::Idle;
+        cmd(&mut c, 0x0000, 0x0000, 0x0000, 0x0000); // engage (GetStatus)
+        let _ = c.read16(0x0024); // consume response (clears command_pending)
+
+        c.write16(0x0018, 0x2000); // CR1 of a GetSubcodeQ — command half-composed
+        c.tick(cd2m(500_000)); // several periodic reports elapse
+        assert_eq!(c.cr1, 0x2000, "periodic must not overwrite the pending CR1");
+
+        c.write16(0x001C, 0x0000);
+        c.write16(0x0020, 0x0000);
+        c.write16(0x0024, 0x0000); // CR4 completes + dispatches the command
+        assert_eq!(c.cr2, 0x0005, "the intended GetSubcodeQ executed (5 words)");
+        assert_eq!(c.cr1 & STAT_TRANS, STAT_TRANS, "subcode staged for transfer");
+    }
+
+    /// Get Subcode (0x20) type 0 stages the 10-byte Q channel — [ctrl/adr,
+    /// tno, idx, rel-FAD, 0, abs-FAD] — for FIFO reads, with CR2 = 5 words and
+    /// the DTREQ/TRANS bit set (Mednafen `COMMAND_GET_SUBCODE`).
+    #[test]
+    fn get_subcode_q_stages_the_head_position_for_fifo_read() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        let fad = c.cd_curfad;
+        let rel = fad - 150;
+
+        cmd(&mut c, 0x2000, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.cr1 & STAT_TRANS, STAT_TRANS, "DTREQ in the status");
+        assert_eq!(c.cr2, 0x0005, "5 words of subcode Q");
+        assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY, "data ready");
+        assert_eq!(c.read16(0x8000), 0x4101, "ctrl/adr 0x41, track 1");
+        assert_eq!(c.read16(0x8000), 0x0100 | ((rel >> 16) & 0xFF) as u16, "index 1 + rel hi");
+        assert_eq!(c.read16(0x8000), (rel & 0xFFFF) as u16, "rel-FAD");
+        assert_eq!(c.read16(0x8000), ((fad >> 16) & 0xFF) as u16, "abs hi");
+        assert_eq!(c.read16(0x8000), (fad & 0xFFFF) as u16, "abs-FAD");
+        // End Data Transfer reports the 5 words read back.
+        cmd(&mut c, 0x0600, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.cr2, 5, "host read 5 words");
+
+        // Type >= 2 is rejected (Mednafen `CDStatusResults(true)`).
+        cmd(&mut c, 0x2002, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.cr1, STAT_REJECT, "subcode type >= 2 rejected");
     }
 
     // ===== File-system error/edge branches (0x70 / 0x73 / 0x74) =====
