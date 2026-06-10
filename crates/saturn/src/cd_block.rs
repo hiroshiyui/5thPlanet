@@ -646,6 +646,8 @@ impl CdBlock {
         (self.hirq & self.hirq_mask) != 0
     }
 
+
+
     /// Debug-only: true while the drive is still in recognition spin-up
     /// ([`DrivePhase::Startup`]). Lets a boot-timing probe stamp the frame the
     /// drive settles (recognition complete), to localize where ours' boot
@@ -793,7 +795,7 @@ impl CdBlock {
                 // loader branches on at the post-IP.BIN read-file-vs-re-recognize
                 // decision. Deduped so the constant status-poll doesn't flood.
                 #[cfg(not(test))]
-                if std::env::var_os("CD_RWATCH").is_some() {
+                if cd_rwatch() {
                     use std::sync::atomic::{AtomicU16, Ordering};
                     static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
                     if LAST.swap(self.hirq, Ordering::Relaxed) != self.hirq {
@@ -805,7 +807,7 @@ impl CdBlock {
             0x000C => self.hirq_mask,
             0x0018 => {
                 #[cfg(not(test))]
-                if std::env::var_os("CD_RWATCH").is_some() {
+                if cd_rwatch() {
                     use std::sync::atomic::{AtomicU16, Ordering};
                     static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
                     if LAST.swap(self.cr1, Ordering::Relaxed) != self.cr1 {
@@ -820,7 +822,7 @@ impl CdBlock {
                 // Reading CR4 consumes a command response; periodic
                 // reports may resume (cs2.c clears `_command` here).
                 #[cfg(not(test))]
-                if std::env::var_os("CD_RWATCH").is_some() {
+                if cd_rwatch() {
                     use std::sync::atomic::{AtomicU16, Ordering};
                     static LAST: AtomicU16 = AtomicU16::new(0xFFFF);
                     if LAST.swap(self.cr4, Ordering::Relaxed) != self.cr4 {
@@ -4204,4 +4206,13 @@ mod tests {
         let _ = c.read8(0x0024);
         assert!(!c.command_pending, "reading CR4 consumed the response");
     }
+}
+
+/// Cached `CD_RWATCH` env flag — the call sites sit in the host's HIRQ/CR
+/// status-poll read path (hit thousands of times per frame), and `env::var_os`
+/// takes a process-global lock on every call.
+#[cfg(not(test))]
+fn cd_rwatch() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("CD_RWATCH").is_some())
 }

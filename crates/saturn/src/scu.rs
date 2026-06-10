@@ -534,6 +534,13 @@ impl Scu {
     /// expected to perform the actual bus transfer and then update
     /// the channel's `read_addr` / `write_addr` / `transfer_count` to
     /// reflect completion via [`finish_dma`].
+    /// Cheap hot-path probe: is any DMA channel triggered? Sampled once per
+    /// master instruction (`step_cpus`) to keep the `drain_dma` call cold.
+    #[inline]
+    pub fn dma_pending(&self) -> bool {
+        self.channels.iter().any(|ch| ch.triggered)
+    }
+
     pub fn take_pending_dma(&mut self) -> Option<DmaRequest> {
         for (i, ch) in self.channels.iter_mut().enumerate() {
             if ch.triggered {
@@ -710,6 +717,11 @@ impl Scu {
         // Replicate that so the CD interrupt honours its real mask bit while
         // the internal sources (bits 0..13) keep their own mask bits.
         let unmasked = self.fresh_assertions & !(self.ims as i16 as i32 as u32);
+        // Hot path: this is sampled once per master instruction (Phase 2B), and
+        // almost always nothing is pending — skip the per-source priority walk.
+        if unmasked == 0 {
+            return None;
+        }
         for &source in ALL_SOURCES {
             let bit = 1 << source.bit();
             if unmasked & bit == 0 {

@@ -135,8 +135,12 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 /// of treating the DMA as free (M13 A3).
 fn drain_dma(bus: &mut SaturnBus) -> u64 {
     let mut cost = 0u64;
+    // Cached: this runs per pending DMA on the per-instruction hot path, and
+    // `env::var` takes a process-global lock + allocates on every call.
+    static DMALOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dmalog = *DMALOG.get_or_init(|| std::env::var_os("DMALOG").is_some());
     while let Some(req) = bus.scu.take_pending_dma() {
-        if std::env::var("DMALOG").is_ok() {
+        if dmalog {
             eprintln!(
                 "DMA ch{} src={:08X} dst={:08X} bytes={:X} indirect={}",
                 req.channel, req.src, req.dst, req.bytes, req.indirect
@@ -1053,7 +1057,7 @@ impl Saturn {
                 // holds the bus, so the master can't advance during it (M13 A3). The
                 // slave then catches up to the *stalled* timestamp, i.e. it runs
                 // while the master is DMA-blocked.
-                let dma_cost = drain_dma(bus);
+                let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
                 if dma_cost != 0 {
                     scheduler
                         .entity_mut(*master_id)
@@ -1072,7 +1076,7 @@ impl Saturn {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
                 // A slave-triggered DMA stalls the slave for the same reason.
-                let dma_cost = drain_dma(bus);
+                let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
                 if dma_cost != 0 {
                     scheduler
                         .entity_mut(*slave_id)
