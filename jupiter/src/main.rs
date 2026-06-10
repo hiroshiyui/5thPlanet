@@ -40,9 +40,14 @@ fn main() -> ExitCode {
     // Split flags (`--cart=…`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
+    let mut mouse_port: Option<u8> = None;
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
+        } else if arg == "--mouse" || arg == "--mouse=2" {
+            mouse_port = Some(2);
+        } else if arg == "--mouse=1" {
+            mouse_port = Some(1);
         } else {
             positionals.push(arg);
         }
@@ -61,6 +66,8 @@ fn main() -> ExitCode {
             eprintln!("  --cart=ram1m | ram4m   Extension DRAM cart (1 MiB / 4 MiB)");
             eprintln!("  --cart=bram[4|8|16|32] battery backup-RAM cart (Mbit; default 32)");
             eprintln!("  --cart=rom:<path>      game ROM cart image");
+            eprintln!("  --mouse[=1|2]          Shuttle Mouse on port 2 (default) or 1;");
+            eprintln!("                         host mouse + clicks, Return = mouse Start");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -105,7 +112,7 @@ fn main() -> ExitCode {
     let save_base = std::path::PathBuf::from(&bios_path);
 
     let region = detect_region(&bios_path);
-    run(bios, disc_spec, cart, save_base, region)
+    run(bios, disc_spec, cart, save_base, region, mouse_port)
 }
 
 /// Pick the SMPC area (region) code. A `SAT_REGION` env var (`J`/`U`/`T`/`E`)
@@ -208,6 +215,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    mouse_port: Option<u8>,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
     use sdl2::event::Event;
@@ -224,6 +232,20 @@ fn run(
     let mut saturn = Saturn::new(bios);
     saturn.reset();
     saturn.set_region(region);
+    // Plug the Shuttle Mouse into the requested port. On port 2 (the default)
+    // the keyboard pad stays on port 1; --mouse=1 replaces the pad (the
+    // mouse's Start button is on the Return key either way).
+    match mouse_port {
+        Some(1) => saturn.set_port_devices(
+            saturn::smpc::PortDevice::Mouse,
+            saturn::smpc::PortDevice::None,
+        ),
+        Some(_) => saturn.set_port_devices(
+            saturn::smpc::PortDevice::Pad,
+            saturn::smpc::PortDevice::Mouse,
+        ),
+        None => {}
+    }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
@@ -407,6 +429,7 @@ fn run(
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
                         EmuIn::Pad(p) => held = p,
+                        EmuIn::Mouse(dx, dy, buttons) => saturn.feed_mouse(dx, dy, buttons),
                         EmuIn::Toggle => {
                             let _ = osd.toggle();
                         }
@@ -557,6 +580,9 @@ fn run(
 
         // ---- SDL main loop: events, audio, present -----------------------
         let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+        // Shuttle Mouse capture state (only used when --mouse is given).
+        let (mut mouse_dx, mut mouse_dy) = (0i32, 0i32);
+        let mut mouse_grabbed = false;
         let mut pl_present = std::time::Duration::ZERO;
         let mut pl_iters = 0u32;
         let mut pl_last = std::time::Instant::now();
@@ -606,6 +632,10 @@ fn run(
                     } => {
                         let _ = emu_tx.send(EmuIn::PlayCdda);
                     }
+                    Event::MouseMotion { xrel, yrel, .. } if mouse_port.is_some() => {
+                        mouse_dx += xrel;
+                        mouse_dy += yrel;
+                    }
                     _ => {}
                 }
             }
@@ -633,6 +663,37 @@ fn run(
                 }
             }
             let _ = emu_tx.send(EmuIn::Pad(held));
+
+            // Shuttle Mouse: this iteration's accumulated relative motion plus
+            // the held buttons (host Left/Right/Middle clicks; Return doubles
+            // as the mouse's Start button so --mouse=1 — no pad — can still
+            // start/pause). Relative-mouse mode is enabled while the OSD is
+            // closed, so the host cursor is captured + hidden and the game
+            // draws its own; Esc (the OSD) releases the pointer.
+            if mouse_port.is_some() {
+                let osd_now_open = osd_open.load(Ordering::Relaxed);
+                if osd_now_open == mouse_grabbed {
+                    mouse_grabbed = !osd_now_open;
+                    sdl.mouse().set_relative_mouse_mode(mouse_grabbed);
+                }
+                let ms = events.mouse_state();
+                let mut buttons = 0u8;
+                if ms.left() {
+                    buttons |= saturn::smpc::mouse::LEFT;
+                }
+                if ms.right() {
+                    buttons |= saturn::smpc::mouse::RIGHT;
+                }
+                if ms.middle() {
+                    buttons |= saturn::smpc::mouse::MIDDLE;
+                }
+                if keys.is_scancode_pressed(Scancode::Return) {
+                    buttons |= saturn::smpc::mouse::START;
+                }
+                let _ = emu_tx.send(EmuIn::Mouse(mouse_dx, mouse_dy, buttons));
+                mouse_dx = 0;
+                mouse_dy = 0;
+            }
 
             // Queue the emu thread's audio and refresh the depth mirror it
             // paces on. Start playback once the reserve has first filled, so
@@ -745,6 +806,9 @@ enum EmuIn {
     Quickload,
     /// F8: play the disc's first CD-DA track.
     PlayCdda,
+    /// Shuttle Mouse: motion since the last message (host convention,
+    /// X+ right / Y+ down) + the held `saturn::smpc::mouse` button mask.
+    Mouse(i32, i32, u8),
 }
 
 /// Messages from the emulation thread back to the SDL main thread —
@@ -917,6 +981,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
+    _mouse_port: Option<u8>,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -931,6 +996,20 @@ fn run(
     let mut saturn = Saturn::new(bios);
     saturn.reset();
     saturn.set_region(region);
+    // Plug the Shuttle Mouse into the requested port. On port 2 (the default)
+    // the keyboard pad stays on port 1; --mouse=1 replaces the pad (the
+    // mouse's Start button is on the Return key either way).
+    match mouse_port {
+        Some(1) => saturn.set_port_devices(
+            saturn::smpc::PortDevice::Mouse,
+            saturn::smpc::PortDevice::None,
+        ),
+        Some(_) => saturn.set_port_devices(
+            saturn::smpc::PortDevice::Pad,
+            saturn::smpc::PortDevice::Mouse,
+        ),
+        None => {}
+    }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
     saturn.set_rtc_unix(host_unix_secs());
