@@ -4038,3 +4038,77 @@ fn disc_read_content_check() {
         );
     }
 }
+
+/// VF2 fight-scene benchmark (the 704×448 double-density 3D load — the
+/// heaviest render mode). Scripts input to the fight (Start at title, A at
+/// menu, A to confirm Akira), snapshots at FIGHT_AT (cached under tmp/), then
+/// measures compute-only vs compute+render fps over BENCH_FRAMES.
+///
+///   cargo test --release -p saturn --test trace_boot bench_vf2_fight \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "manual: VF2 fight benchmark (run with --release)"]
+fn bench_vf2_fight() {
+    use std::time::Instant;
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        return;
+    };
+    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full_lsb.cue")) else {
+        return;
+    };
+    let disc =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+            .expect("parse cue");
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let fight_at: u32 =
+        std::env::var("FIGHT_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2700);
+    let snap_file = format!("tmp/vf2_fight_f{fight_at}.sav");
+    const CYC: u64 = 479_151;
+    let snap = if std::path::Path::new(&root.join(&snap_file)).exists() {
+        std::fs::read(root.join(&snap_file)).expect("read snapshot")
+    } else {
+        println!("building fight snapshot to f{fight_at} (one-time)…");
+        let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+        for f in 1..=fight_at {
+            match f {
+                1300 => sat.set_pad1(saturn::smpc::pad::START),
+                1320 | 1470 | 1920 => sat.set_pad1(0),
+                1450 | 1900 => sat.set_pad1(saturn::smpc::pad::A),
+                _ => {}
+            }
+            sat.run_frame(&mut fb); // render too: the fight needs PTM=2 swaps
+        }
+        let b = sat.save_state();
+        std::fs::write(root.join(&snap_file), &b).expect("write snapshot");
+        b
+    };
+    sat.load_state(&snap).expect("load fight snapshot");
+
+    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let t0 = Instant::now();
+    for _ in 0..n {
+        sat.run_for(CYC);
+    }
+    let compute = t0.elapsed();
+    sat.load_state(&snap).expect("reload");
+    let t1 = Instant::now();
+    let mut dims = (0usize, 0usize);
+    for _ in 0..n {
+        dims = sat.run_frame(&mut fb);
+    }
+    let rendered = t1.elapsed();
+    let cfps = n as f64 / compute.as_secs_f64();
+    let rfps = n as f64 / rendered.as_secs_f64();
+    println!("--- VF2 fight (snapshot f{fight_at}, {}x{}) ---", dims.0, dims.1);
+    println!("compute-only  : {n} frames in {compute:?} = {cfps:.1} fps");
+    println!("compute+render: {n} frames in {rendered:?} = {rfps:.1} fps");
+    println!("render share  : {:.0}%", (1.0 - compute.as_secs_f64() / rendered.as_secs_f64()) * 100.0);
+    let (plots, _, _, cmds, px) = sat.bus.vdp1.dbg_plots();
+    println!("vdp1: plots={plots} last_cmds={cmds} last_pixels={px}");
+}

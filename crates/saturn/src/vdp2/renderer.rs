@@ -94,6 +94,28 @@ pub const FRAMEBUFFER_BYTES: usize = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
 /// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
 /// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
 /// frame buffer to read). Panics if `out`'s length isn't [`FRAMEBUFFER_BYTES`].
+/// Frame-constant state hoisted out of the per-dot samplers. Inside
+/// [`render_frame`] the VDP registers and VRAM are frozen (it is a pure read
+/// of a snapshot), so anything derived only from them is loop-invariant —
+/// recomputing it per dot dominated the VF2-fight profile
+/// (`nbg_vcp_fetch_masks` 12%, `RotationParams::read` 8.5% of frame time).
+struct FrameCtx {
+    /// Per-NBG VRAM cycle-pattern grants `(name_table, character)`.
+    vcp: [(u8, u8); 4],
+    /// The two rotation parameter sets (A/B) from the RPTA table.
+    rot: [RotationParams; 2],
+}
+
+impl FrameCtx {
+    fn new(vdp2: &Vdp2) -> Self {
+        let rpta = vdp2.regs.rotation_table_addr();
+        Self {
+            vcp: core::array::from_fn(|n| vdp2.regs.nbg_vcp_fetch_masks(n)),
+            rot: core::array::from_fn(|p| RotationParams::read(&vdp2.vram, rpta, p)),
+        }
+    }
+}
+
 pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) -> (usize, usize) {
     // Active resolution from TVMD (320/352/640/704 × 224/240/256[×2]). The
     // content is packed tightly with row stride = `w`, so the caller uploads
@@ -113,10 +135,36 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
         return (w, h);
     }
 
-    for y in 0..h {
-        // The backdrop is the VDP2 back screen — RGB555 read from VRAM at the
-        // BKTA table, per scanline (the real Saturn backdrop, not CRAM[0]). In
-        // per-line-colour mode the table advances one word per line (gradients).
+    let ctx = FrameCtx::new(vdp2);
+    // Scanline-band parallel composite: every dot is a pure function of the
+    // frozen VDP state, and the bands write disjoint rows — output is
+    // bit-identical to the sequential loop regardless of thread count (the
+    // accuracy-safe "render edge"; the core stays single-threaded).
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let band_rows = h.div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (i, band) in out[..w * h * 4].chunks_mut(band_rows * w * 4).enumerate() {
+            let ctx = &ctx;
+            sc.spawn(move || {
+                for (dy, row) in band.chunks_exact_mut(w * 4).enumerate() {
+                    render_line(vdp2, ctx, sprite_fb, i * band_rows + dy, w, row);
+                }
+            });
+        }
+    });
+    (w, h)
+}
+
+/// Composite one scanline into its `w * 4`-byte RGBA `row` (the per-dot body
+/// of [`render_frame`], line-independent by construction).
+fn render_line(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    sprite_fb: Option<&Framebuffer>,
+    y: usize,
+    w: usize,
+    row: &mut [u8],
+) {
         let backdrop = back_color(vdp2, y);
         for x in 0..w {
             let (sx, sy) = (x as u32, y as u32);
@@ -139,12 +187,12 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
                     None => {}
                 }
             }
-            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 2, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, sprite_fb, 3, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 2, sx, sy));
+            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 3, sx, sy));
 
             let mut rgb = match top {
                 Some(t) => match t.cc {
@@ -186,10 +234,12 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
                     rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
                 }
             }
-            put_pixel(out, x, y, w, rgb.0, rgb.1, rgb.2);
+            let dst = x * 4;
+            row[dst] = rgb.0;
+            row[dst + 1] = rgb.1;
+            row[dst + 2] = rgb.2;
+            row[dst + 3] = 0xFF;
         }
-    }
-    (w, h)
 }
 
 /// Which screen produced a dot — used by the per-layer enables (line-colour
@@ -582,7 +632,7 @@ fn win_pixel(vdp2: &Vdp2, w: usize, x: u32, y: u32, enable: bool, area: bool) ->
 /// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`. Resolves the
 /// per-dot special priority / colour-calc function (SFPRMD/SFCCMD) from the
 /// sampled dot's attributes.
-fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
+fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.nbg_enabled(n) {
         return None;
     }
@@ -599,7 +649,7 @@ fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: 
     }
     // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
     let (mx, my) = vdp2.regs.mosaic_coord(1 << n, x, y);
-    let s = sample_nbg(vdp2, n, mx, my)?;
+    let s = sample_nbg(vdp2, ctx, n, mx, my)?;
     let (pri, cc) = resolve_special(
         prio_reg,
         vdp2.regs.nbg_color_calc(n),
@@ -620,7 +670,7 @@ fn nbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: 
 /// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`. RBG0 uses
 /// special-function layer index 4 (SFPRMD/SFCCMD bits 8..9); RBG1 shares NBG0's
 /// slot (index 0).
-fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
+fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
     if !vdp2.regs.rbg_enabled(which) {
         return None;
     }
@@ -655,7 +705,7 @@ fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32,
     } else {
         1
     };
-    let s = sample_rbg(vdp2, param, which, mx, my)?;
+    let s = sample_rbg(vdp2, ctx, param, which, mx, my)?;
     let (pri, cc) = resolve_special(
         prio_reg,
         vdp2.regs.rbg_color_calc(which),
@@ -673,14 +723,6 @@ fn rbg_layer(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, which: usize, x: u32,
     })
 }
 
-#[inline]
-fn put_pixel(out: &mut [u8], x: usize, y: usize, stride: usize, r: u8, g: u8, b: u8) {
-    let dst = (y * stride + x) * 4;
-    out[dst] = r;
-    out[dst + 1] = g;
-    out[dst + 2] = b;
-    out[dst + 3] = 0xFF;
-}
 
 /// Per-line scroll for NBG0/NBG1 at screen line `y`, read from the line-scroll
 /// table (SCRCTL/LSTAn): `(dx, dy, zoom_x)`, where `dx`/`dy` are integer scroll
@@ -748,7 +790,7 @@ fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
 }
 
 /// Sample NBG`n` at screen `(x, y)`, returning `None` for a transparent dot.
-fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Sample> {
+fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<Sample> {
     // Source position as 16.16 fixed point: whole-layer scroll (integer plus,
     // for NBG0/1, an 8-bit fraction) walked by a per-dot coordinate increment
     // that carries reduction/zoom. NBG2/3 are integer scroll — no fraction, no
@@ -795,7 +837,7 @@ fn sample_nbg(vdp2: &Vdp2, n: usize, x: u32, y: u32) -> Option<Sample> {
     if vdp2.regs.nbg_bitmap_enabled(n) {
         sample_bitmap(vdp2, n, depth, sx, sy)
     } else {
-        sample_tile(vdp2, n, depth, sx, sy)
+        sample_tile(vdp2, ctx, n, depth, sx, sy)
     }
 }
 
@@ -993,7 +1035,7 @@ fn sample_pattern_cell(
     })
 }
 
-fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
+fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sample> {
     let r = &vdp2.regs;
     let two_cells = r.nbg_char_size_2x2(n); // 16×16 vs 8×8 character
     let one_word = r.nbg_pn_one_word(n);
@@ -1052,7 +1094,7 @@ fn sample_tile(vdp2: &Vdp2, n: usize, depth: u8, sx: u32, sy: u32) -> Option<Sam
     // VRAM cycle-pattern gating (CYCA0..CYCB1): a name-table fetch from a bank
     // the VCP table doesn't grant this NBG reads as a transparent dummy tile —
     // and the character fetch is gated likewise inside sample_pattern_cell.
-    let (nt_mask, cg_mask) = r.nbg_vcp_fetch_masks(n);
+    let (nt_mask, cg_mask) = ctx.vcp[n];
     let nt_bank = ((pn_addr >> 17) & 3) as u8;
     let pat = if nt_mask & (1 << nt_bank) != 0 {
         decode_pattern(vdp2, pn_addr, fmt, two_cells, depth)
@@ -1173,8 +1215,8 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
 /// RBG layer, 0/1) for the per-layer colour attributes (CRAM offset, transparent
 /// pen). RBG0 may drive itself from either parameter set via RPMD; RBG1 is fixed
 /// to set B — hence the two indices are kept distinct.
-fn sample_rbg(vdp2: &Vdp2, param: usize, layer: usize, x: u32, y: u32) -> Option<Sample> {
-    let mut rp = RotationParams::read(&vdp2.vram, vdp2.regs.rotation_table_addr(), param);
+fn sample_rbg(vdp2: &Vdp2, ctx: &FrameCtx, param: usize, layer: usize, x: u32, y: u32) -> Option<Sample> {
+    let mut rp = ctx.rot[param];
     // Per-line coefficient table: overrides kx/ky (giving perspective) or makes
     // the whole line transparent.
     match rot_line_coeff(vdp2, param, &rp, y) {
