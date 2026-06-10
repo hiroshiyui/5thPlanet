@@ -238,7 +238,7 @@ fn run(
     let launched_spec = disc_spec;
     // Remember the launched config so the OSD Settings screens can mark the
     // active region / cartridge and re-apply it across a runtime change.
-    let mut ui = UiState {
+    let ui = UiState {
         scale: 2,
         fullscreen: false,
         region: region_code_to_osd(region),
@@ -249,7 +249,6 @@ fn run(
     // Save-state quickslot and the persisted battery (internal backup RAM),
     // both keyed to the BIOS path. F5/F9 use the former; the latter is the
     // console's "memory card", loaded here and written back on exit.
-    let state_path = save_base.with_extension("state");
     let battery_path = save_base.with_extension("bup");
     if let Ok(bytes) = fs::read(&battery_path) {
         saturn.load_internal_backup(&bytes);
@@ -311,187 +310,288 @@ fn run(
     let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
-    // Scratch buffer for compositing the OSD without corrupting the frozen
-    // last frame (we redraw the menu over the same frame while it's open).
-    let mut compose = vec![0u8; FRAMEBUFFER_BYTES];
-    let mut osd = Osd::new();
+    let osd = Osd::new();
     // Render-pipeline worker: composites each frame on a second core from a
     // cloned VDP snapshot, overlapped with the next frame's emulation, so the
     // displayed rate rises from the compute+render rate toward compute-only.
     // The displayed frame trails the emulated frame by one (standard pipeline
     // latency); `framebuffer` is the main thread's display buffer, the pipe
     // holds the spare, and they swap each frame.
-    let mut pipe = render_pipe::RenderPipe::new(FRAMEBUFFER_BYTES);
-    // SAT_PERFLOG=1: print a once-per-second main-loop timing breakdown —
-    // where the frame budget goes in vivo (advance / audio / render-wait /
-    // submit-clone / upload+present), plus the burst histogram (a burst of 2
-    // means an iteration emulated two frames but displayed one — the source
-    // of "feels like 30 fps" when the budget is exceeded). Observer-only.
-    let perflog = std::env::var_os("SAT_PERFLOG").is_some();
-    let mut pl_advance = std::time::Duration::ZERO;
-    let mut pl_audio = std::time::Duration::ZERO;
-    let mut pl_wait = std::time::Duration::ZERO;
-    let mut pl_submit = std::time::Duration::ZERO;
-    let mut pl_present = std::time::Duration::ZERO;
-    let mut pl_bursts = [0u32; 3]; // iterations that emulated 0 / 1 / 2+ frames
-    let mut pl_iters = 0u32;
-    let mut pl_frames = 0u32;
-    let mut pl_last = std::time::Instant::now();
-    // Current texture (and frozen-frame) resolution; updated when a game
-    // switches video mode so the texture/pitch track the active display size.
-    let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
-    // Audio-paced emulation: keep ~`SAT_AUDIO_MS` of SCSP output buffered in the
-    // SDL queue (44.1 kHz × 2 channels × 2 bytes = 176_400 bytes/s). The audio
-    // draining in real time — not the display vsync — sets the emulator speed,
-    // and this buffer is the reserve that rides out compute dips below real-time.
+    let pipe = render_pipe::RenderPipe::new(FRAMEBUFFER_BYTES);
+    // ------------------------------------------------------------------
+    // Emu-thread decoupling: the Saturn (advance + audio pacing + OSD) runs
+    // on a dedicated thread; this main thread keeps everything SDL —
+    // events, audio queueing, texture upload, vsync present. The emulation
+    // core itself stays strictly single-threaded; it just no longer shares
+    // a thread with the ~4-5 ms SDL present cost, which together with a
+    // ~12-15 ms frame sat exactly on the 16.7 ms vsync budget and tipped
+    // half the iterations into the emulate-2-display-1 burst (the "smooth
+    // but ~30 fps" regime).
     //
-    // The default 120 ms is low-latency. A *larger* buffer (e.g. `SAT_AUDIO_MS=
-    // 1000`) is pre-filled during the surplus stages and then drains across a
-    // heavy stage, so it covers a normal pass through a sub-real-time screen
-    // (e.g. a software-rendered title's "Press Start") without the audio queue
-    // under-running into the "buzz" — at the cost of that much audio latency.
-    // Ideal for latency-tolerant games (visual novels); keep it small for
-    // twitch/action games. It only delays, not cures, an *indefinitely* lingered
-    // sustained deficit (the reserve drains at the deficit rate); the real cure
-    // for that is faster compute. Audio samples are unchanged — accuracy-neutral.
-    // Floor at 10 ms: the burst loop below advances the machine only *while*
-    // `audio_queue.size() < audio_target_bytes`, so a target of 0 (SAT_AUDIO_MS=0)
-    // would make that condition never hold and freeze emulation. 10 ms is still
-    // well under one frame of audio, so it stays effectively minimum-latency.
+    //   main:  events → EmuIn msgs   audio chunks → SDL queue (+ depth
+    //          mirror)               latest frame → texture → present
+    //   emu:   pad/Nav/cmds ← msgs   advance_frame paced on the mirrored
+    //          queue depth           render pipe → frame (+ OSD overlay)
+    //
+    // Audio pacing uses an AtomicU32 mirror of the SDL queue depth that the
+    // main thread refreshes every iteration (the SDL audio handles are not
+    // Send), plus the bytes produced inside the current burst — at most one
+    // vsync stale, bounded by the burst cap, and self-correcting either way.
     let audio_ms: u64 = std::env::var("SAT_AUDIO_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(120)
         .max(10);
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
-    // Prebuffer gate: the audio device stays paused until the queue first
-    // reaches `audio_target_bytes`, so playback begins from a full reserve
-    // instead of draining an empty queue during boot (the cold-start "first-play
-    // buzz"). Set once, then never touched again.
     let mut audio_started = false;
-    // Cap emulated frames run per *displayed* frame. This is the smoothness
-    // knob: the burst below advances the machine until audio is buffered, but
-    // only the LAST frame of the burst is ever presented — so a large cap turns
-    // a throughput deficit into a big visual lurch (run 8, show 1 = motion jumps
-    // 8 frames at once, the "heavy frame-skip" symptom). A small cap keeps each
-    // displayed frame within a few emulated frames of the last, so motion stays
-    // smooth even when the core can't sustain full real-time; the trade is that
-    // audio catch-up after a stall (menu close, state load, slow CD seek) takes
-    // a few more iterations instead of one gallop. 2 keeps the visual jump to at
-    // most one extra frame while still allowing modest catch-up.
-    let max_frames_per_burst = 2;
+    let max_frames_per_burst = 2u32;
 
-    // Per-slot save-state path: `<bios>.<n>.state` (the F5/F9 quickslot keeps
-    // the slot-less `<bios>.state`).
-    let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
+    let perflog = std::env::var_os("SAT_PERFLOG").is_some();
 
-    'main: loop {
-        // The host SDL2 library on a modern Linux desktop emits event
-        // codes 0.37's binding doesn't recognise — notably 0x207
-        // (SDL_DISPLAYEVENT_MOVED on SDL ≥ 2.28). `poll_iter` panics
-        // (non-unwinding, because the call originates inside an
-        // `extern "C"` callback) when it sees one, aborting the
-        // process. Flushing the whole 0x201..=0x20F range from the
-        // queue before each poll drops them safely without needing
-        // raw FFI. Range covers all the post-2.28 top-level display
-        // events; widen if a future SDL adds more.
-        event_subsystem.flush_events(0x201, 0x20F);
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, mpsc};
 
-        // Live context for the menu (disc presence + which slots are filled).
-        let ctx = OsdCtx {
-            disc_present: saturn.has_disc(),
-            slot_used: std::array::from_fn(|n| slot_path(n as u8).exists()),
-            scale: ui.scale,
-            fullscreen: ui.fullscreen,
-            region: ui.region,
-            cart: ui.cart,
-        };
+    let (emu_tx, emu_rx) = mpsc::channel::<EmuIn>();
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, (usize, usize))>(2);
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>();
+    let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
+    let audio_mirror = Arc::new(AtomicU32::new(0));
+    let osd_open = Arc::new(AtomicBool::new(false));
+    let quit_flag = Arc::new(AtomicBool::new(false));
 
-        for ev in events.poll_iter() {
-            match ev {
-                Event::Quit { .. } => break 'main,
-                Event::KeyDown {
-                    keycode: Some(kc), ..
-                } if osd.is_open() => {
-                    // Menu navigation. Esc/Backspace backs out (closing at root).
-                    let action = match kc {
-                        Keycode::Up => osd.handle(Nav::Up, &ctx),
-                        Keycode::Down => osd.handle(Nav::Down, &ctx),
-                        Keycode::Return | Keycode::Z => osd.handle(Nav::Select, &ctx),
-                        Keycode::Backspace | Keycode::X => osd.handle(Nav::Back, &ctx),
-                        Keycode::Escape => osd.toggle(),
-                        _ => None,
-                    };
-                    if let Some(action) = action
-                        && dispatch_osd(
-                            action,
-                            &mut osd,
-                            &mut saturn,
-                            &save_base,
-                            &launched_spec,
-                            &mut ui,
-                            &mut canvas,
-                        )
-                    {
-                        break 'main; // Quit
+    std::thread::scope(|scope| {
+        let emu_mirror = Arc::clone(&audio_mirror);
+        let emu_osd_open = Arc::clone(&osd_open);
+        let emu_quit = Arc::clone(&quit_flag);
+        let save_base_emu = save_base.clone();
+        let emu = scope.spawn(move || -> Saturn {
+            let mut saturn = saturn;
+            let mut osd = osd;
+            let mut pipe = pipe;
+            let mut ui = ui;
+            let slot_path = |n: u8| save_base_emu.with_extension(format!("{n}.state"));
+            let state_path = save_base_emu.with_extension("state");
+            let mut held = 0u16;
+            // Frame buffers circulating emu → main → recycle; seed enough that
+            // the pipe spare + the in-flight frame + the displayed frame never
+            // starve the pool (a dip just skips one frame's hand-off).
+            let mut pool: Vec<Vec<u8>> = vec![
+                vec![0u8; FRAMEBUFFER_BYTES],
+                vec![0u8; FRAMEBUFFER_BYTES],
+            ];
+            // The last composited frame, retained so the OSD freeze-screen can
+            // dim/overlay it while emulation is paused (toast-free copy).
+            let mut last_frame = vec![0u8; FRAMEBUFFER_BYTES];
+            let mut last_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+            let mut pl_advance = std::time::Duration::ZERO;
+            let mut pl_frames = 0u32;
+            let mut pl_bursts = [0u32; 3];
+            let mut pl_last = std::time::Instant::now();
+            'emu: loop {
+                if emu_quit.load(Ordering::Relaxed) {
+                    break;
+                }
+                while let Ok(b) = recycle_rx.try_recv() {
+                    pool.push(b);
+                }
+                let ctx = OsdCtx {
+                    disc_present: saturn.has_disc(),
+                    slot_used: std::array::from_fn(|n| slot_path(n as u8).exists()),
+                    scale: ui.scale,
+                    fullscreen: ui.fullscreen,
+                    region: ui.region,
+                    cart: ui.cart,
+                };
+                while let Ok(msg) = emu_rx.try_recv() {
+                    match msg {
+                        EmuIn::Pad(p) => held = p,
+                        EmuIn::Toggle => {
+                            let _ = osd.toggle();
+                        }
+                        EmuIn::Nav(nav) => {
+                            if let Some(action) = osd.handle(nav, &ctx)
+                                && dispatch_osd(
+                                    action,
+                                    &mut osd,
+                                    &mut saturn,
+                                    &save_base_emu,
+                                    &launched_spec,
+                                    &mut ui,
+                                    &ui_tx,
+                                )
+                            {
+                                let _ = ui_tx.send(UiMsg::Quit);
+                                break 'emu;
+                            }
+                        }
+                        EmuIn::Quicksave => match fs::write(&state_path, saturn.save_state()) {
+                            Ok(()) => osd.set_toast("Quicksave", 90),
+                            Err(e) => eprintln!("save state failed: {e}"),
+                        },
+                        EmuIn::Quickload => match fs::read(&state_path) {
+                            Ok(bytes) => match saturn.load_state(&bytes) {
+                                Ok(()) => osd.set_toast("Quickload", 90),
+                                Err(e) => eprintln!("load state failed: {e}"),
+                            },
+                            Err(e) => eprintln!("no state to load ({e})"),
+                        },
+                        EmuIn::PlayCdda => {
+                            if saturn.dbg_play_first_audio_track() {
+                                osd.set_toast("Playing CD audio", 120);
+                            } else {
+                                osd.set_toast("No CD audio track", 120);
+                            }
+                        }
                     }
                 }
-                // Esc opens the menu (when closed).
-                Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => {
-                    osd.toggle();
+                emu_osd_open.store(osd.is_open(), Ordering::Relaxed);
+
+                if osd.is_open() {
+                    // Frozen: don't advance the machine or feed the pad.
+                    // Composite the menu over the retained last frame.
+                    saturn.set_pad1(0);
+                    osd.tick_toast();
+                    if let Some(mut buf) = pool.pop() {
+                        buf.copy_from_slice(&last_frame);
+                        let (w, h) = last_dims;
+                        osd.render_overlay(&mut buf, w, h, &ctx);
+                        if let Err(e) = frame_tx.try_send((buf, last_dims)) {
+                            let (b, _) = match e {
+                                mpsc::TrySendError::Full(v) => v,
+                                mpsc::TrySendError::Disconnected(v) => v,
+                            };
+                            pool.push(b);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    continue;
                 }
-                // F5/F9 quick save/load to the slot-less quickslot.
-                Event::KeyDown {
-                    keycode: Some(Keycode::F5),
-                    ..
-                } => match fs::write(&state_path, saturn.save_state()) {
-                    Ok(()) => osd.set_toast("Quicksave", 90),
-                    Err(e) => eprintln!("save state failed: {e}"),
-                },
-                Event::KeyDown {
-                    keycode: Some(Keycode::F9),
-                    ..
-                } => match fs::read(&state_path) {
-                    Ok(bytes) => match saturn.load_state(&bytes) {
-                        Ok(()) => osd.set_toast("Quickload", 90),
-                        Err(e) => eprintln!("load state failed: {e}"),
-                    },
-                    Err(e) => eprintln!("no state to load ({e})"),
-                },
-                // F8: play the disc's first CD-DA (Red Book audio) track through
-                // the live SCSP-mixed output. Lets an audio disc actually play in
-                // the window without the BIOS issuing Play (the LLE-68k trigger
-                // wall) — the CDDA→SCSP path is faithful; only the trigger is
-                // missing. A no-op (toast) if the disc has no audio track.
-                Event::KeyDown {
-                    keycode: Some(Keycode::F8),
-                    ..
-                } => {
-                    if saturn.dbg_play_first_audio_track() {
-                        osd.set_toast("Playing CD audio", 120);
-                    } else {
-                        osd.set_toast("No CD audio track", 120);
+
+                saturn.set_pad1(held);
+                // Audio-paced burst: run frames until the (mirrored) SDL queue
+                // depth plus what this burst just produced reaches the target.
+                // The cap keeps a sub-real-time stretch from turning into a big
+                // visual lurch (run 2, show 1 at worst).
+                let mut depth = emu_mirror.load(Ordering::Relaxed);
+                let mut burst = 0u32;
+                while depth < audio_target_bytes && burst < max_frames_per_burst {
+                    let t = std::time::Instant::now();
+                    saturn.advance_frame();
+                    pl_advance += t.elapsed();
+                    let chunk = saturn.take_audio();
+                    depth += (chunk.len() * 2) as u32;
+                    let _ = audio_tx.send(chunk);
+                    burst += 1;
+                }
+                pl_frames += burst;
+                pl_bursts[(burst as usize).min(2)] += 1;
+
+                // Collect the frame the worker rendered while we computed,
+                // overlay any toast, and hand it to the main thread; then
+                // dispatch this frame's render to overlap the next iteration.
+                // Only when the machine actually advanced — the idle loop
+                // (audio reserve full) spins at ~kHz and re-submitting the
+                // same state would keep the worker re-rendering an identical
+                // frame, burning a core and memory bandwidth for nothing.
+                if burst > 0 {
+                if let Some((mut rendered, dims)) = pipe.wait() {
+                    last_frame.copy_from_slice(&rendered);
+                    last_dims = dims;
+                    osd.tick_toast();
+                    osd.render_overlay(&mut rendered, dims.0, dims.1, &ctx);
+                    match frame_tx.try_send((rendered, dims)) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full((b, _)))
+                        | Err(mpsc::TrySendError::Disconnected((b, _))) => pool.push(b),
+                    }
+                    if let Some(b) = pool.pop() {
+                        pipe.recycle(b);
                     }
                 }
-                _ => {}
+                pipe.submit(&saturn);
+                } else {
+                    // Audio reserve full: nothing to do until it drains a bit.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+
+                if perflog && pl_last.elapsed().as_secs() >= 1 {
+                    let total: u32 = pl_bursts.iter().sum();
+                    eprintln!(
+                        "EMU  frames/s={pl_frames} burst[0/1/2]={}/{}/{} | advance avg {:.2} ms/frame",
+                        pl_bursts[0],
+                        pl_bursts[1],
+                        pl_bursts[2],
+                        if pl_frames > 0 {
+                            pl_advance.as_secs_f64() * 1e3 / pl_frames as f64
+                        } else {
+                            0.0
+                        },
+                    );
+                    let _ = total;
+                    pl_advance = std::time::Duration::ZERO;
+                    pl_frames = 0;
+                    pl_bursts = [0; 3];
+                    pl_last = std::time::Instant::now();
+                }
             }
-        }
+            saturn
+        });
 
-        if osd.is_open() {
-            // Frozen: don't advance the machine or feed the pad. Composite the
-            // menu over a dimmed copy of the last frame.
-            saturn.set_pad1(0);
-            osd.tick_toast();
-            let (w, h) = cur_dims;
-            compose.copy_from_slice(&framebuffer);
-            osd.render_overlay(&mut compose, w, h, &ctx);
-            texture
-                .update(None, &compose, w * 4)
-                .expect("upload framebuffer");
-        } else {
+        // ---- SDL main loop: events, audio, present -----------------------
+        let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+        let mut pl_present = std::time::Duration::ZERO;
+        let mut pl_iters = 0u32;
+        let mut pl_last = std::time::Instant::now();
+        'main: loop {
+            // (See the event-range flush note in the git history: SDL ≥ 2.28
+            // emits display events 0.37's binding panics on.)
+            event_subsystem.flush_events(0x201, 0x20F);
+            for ev in events.poll_iter() {
+                match ev {
+                    Event::Quit { .. } => break 'main,
+                    Event::KeyDown {
+                        keycode: Some(kc), ..
+                    } if osd_open.load(Ordering::Relaxed) => {
+                        let msg = match kc {
+                            Keycode::Up => Some(EmuIn::Nav(Nav::Up)),
+                            Keycode::Down => Some(EmuIn::Nav(Nav::Down)),
+                            Keycode::Return | Keycode::Z => Some(EmuIn::Nav(Nav::Select)),
+                            Keycode::Backspace | Keycode::X => Some(EmuIn::Nav(Nav::Back)),
+                            Keycode::Escape => Some(EmuIn::Toggle),
+                            _ => None,
+                        };
+                        if let Some(m) = msg {
+                            let _ = emu_tx.send(m);
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::Toggle);
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F5),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::Quicksave);
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F9),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::Quickload);
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F8),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::PlayCdda);
+                    }
+                    _ => {}
+                }
+            }
             // Map the host keyboard to the port-1 digital pad: arrows = D-pad,
             // Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter = Start.
             let keys = events.keyboard_state();
@@ -515,55 +615,58 @@ fn run(
                     held |= bit;
                 }
             }
-            saturn.set_pad1(held);
+            let _ = emu_tx.send(EmuIn::Pad(held));
 
-            // Audio-paced emulation: run frames until the SDL audio queue holds
-            // the target latency, then stop. The SCSP's 44.1 kHz output drains in
-            // real time, so *the audio device* sets the emulator's speed — not the
-            // display vsync — and the queue never under-runs (smooth BGM on any
-            // refresh rate). *All* audio is queued (no dropping). The burst is
-            // capped so a slow frame / stalled device can't starve the render; it
-            // just falls a little behind and catches up next iteration. The TVMD
-            // resolution can change mid-burst (a hi-res title), so re-create the
-            // texture on change.
-            let mut burst = 0;
-            while audio_queue.size() < audio_target_bytes && burst < max_frames_per_burst {
-                // Compute only — the worker composited the *previous* frame
-                // during (and overlapping) this loop; intermediate burst frames
-                // are never displayed, so they're never rendered at all.
-                let t = std::time::Instant::now();
-                saturn.advance_frame();
-                pl_advance += t.elapsed();
-                let t = std::time::Instant::now();
-                audio_queue.queue_audio(&saturn.take_audio()).ok();
-                pl_audio += t.elapsed();
-                burst += 1;
+            // Queue the emu thread's audio and refresh the depth mirror it
+            // paces on. Start playback once the reserve has first filled, so
+            // a cold start never drains an empty queue (the prebuffer gate).
+            while let Ok(chunk) = audio_rx.try_recv() {
+                let _ = audio_queue.queue_audio(&chunk);
             }
-            pl_iters += 1;
-            pl_frames += burst;
-            pl_bursts[(burst as usize).min(2)] += 1;
-
-            // Start playback once the reserve has filled for the first time.
-            // Until then the device is paused, so the queue only grows (the
-            // burst above keeps adding 2 frames/iteration through the black boot
-            // screen) and the first sample the device plays sits on a full
-            // buffer — no cold-start under-run.
+            audio_mirror.store(audio_queue.size(), Ordering::Relaxed);
             if !audio_started && audio_queue.size() >= audio_target_bytes {
                 audio_queue.resume();
                 audio_started = true;
             }
 
-            // Collect the frame the worker rendered while we computed, swap it
-            // in as the display buffer, and hand the old one back as the spare.
-            // (On the very first frame nothing is in flight → keep the black
-            // buffer.) The active resolution comes from the rendered frame, so
-            // the texture is re-created a frame after a game switches modes.
-            let t_wait = std::time::Instant::now();
-            let waited = pipe.wait();
-            pl_wait += t_wait.elapsed();
-            if let Some((rendered, dims)) = waited {
-                let old = std::mem::replace(&mut framebuffer, rendered);
-                pipe.recycle(old);
+            // Window-affecting OSD actions are applied here (the canvas is
+            // not Send); Quit comes back the same way.
+            let mut quit = false;
+            while let Ok(m) = ui_rx.try_recv() {
+                match m {
+                    UiMsg::Scale(sc) => {
+                        let _ = canvas.window_mut().set_size(
+                            FRAME_WIDTH as u32 * sc as u32,
+                            FRAME_HEIGHT as u32 * sc as u32,
+                        );
+                    }
+                    UiMsg::Fullscreen(on) => {
+                        use sdl2::video::FullscreenType;
+                        let mode = if on {
+                            FullscreenType::Desktop
+                        } else {
+                            FullscreenType::Off
+                        };
+                        let _ = canvas.window_mut().set_fullscreen(mode);
+                    }
+                    UiMsg::Quit => quit = true,
+                }
+            }
+            if quit {
+                break 'main;
+            }
+
+            // Take the newest frame (recycling any it superseded), upload,
+            // and present at the display rate.
+            let mut newest = None;
+            while let Ok(f) = frame_rx.try_recv() {
+                if let Some((old, _)) = newest.replace(f) {
+                    let _ = recycle_tx.send(old);
+                }
+            }
+            if let Some((buf, dims)) = newest {
+                let old = std::mem::replace(&mut framebuffer, buf);
+                let _ = recycle_tx.send(old);
                 if dims != cur_dims {
                     texture = creator
                         .create_texture_streaming(
@@ -575,58 +678,65 @@ fn run(
                     cur_dims = dims;
                 }
             }
-            // Dispatch this frame's render on the worker; it overlaps the next
-            // iteration's compute. (No-op if a buffer isn't free yet.)
             let t = std::time::Instant::now();
-            pipe.submit(&saturn);
-            pl_submit += t.elapsed();
-
-            // Present the latest frame (re-presents the last one if the queue was
-            // already full and no frame ran). A lingering toast (e.g. "Quicksave")
-            // is drawn over it.
-            let (w, h) = cur_dims;
-            osd.tick_toast();
-            osd.render_overlay(&mut framebuffer, w, h, &ctx);
+            let (w, _) = cur_dims;
             texture
                 .update(None, &framebuffer, w * 4)
                 .expect("upload framebuffer");
+            canvas.clear();
+            canvas.copy(&texture, None, None).expect("blit to canvas");
+            canvas.present(); // present_vsync caps us at the display rate
+            pl_present += t.elapsed();
+            pl_iters += 1;
+            if perflog && pl_last.elapsed().as_secs() >= 1 && pl_iters > 0 {
+                eprintln!(
+                    "MAIN iters/s={pl_iters} | present avg {:.2} ms | queue={}ms",
+                    pl_present.as_secs_f64() * 1e3 / pl_iters as f64,
+                    audio_queue.size() / 176,
+                );
+                pl_present = std::time::Duration::ZERO;
+                pl_iters = 0;
+                pl_last = std::time::Instant::now();
+            }
         }
 
-        let t = std::time::Instant::now();
-        canvas.clear();
-        canvas.copy(&texture, None, None).expect("blit to canvas");
-        canvas.present(); // present_vsync caps us at the display rate
-        pl_present += t.elapsed();
-
-        if perflog && pl_last.elapsed().as_secs() >= 1 && pl_iters > 0 {
-            let per = |d: std::time::Duration| d.as_secs_f64() * 1e3 / pl_iters as f64;
+        quit_flag.store(true, Ordering::Relaxed);
+        // Unblock and join the emu thread, then persist the battery from the
+        // final machine state.
+        let saturn = emu.join().expect("emu thread");
+        if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
             eprintln!(
-                "PERF iters/s={} frames/s={} burst[0/1/2]={}/{}/{} | per-iter ms: advance={:.2} audio={:.2} wait={:.2} submit={:.2} present={:.2} | queue={}ms",
-                pl_iters, pl_frames, pl_bursts[0], pl_bursts[1], pl_bursts[2],
-                per(pl_advance), per(pl_audio), per(pl_wait), per(pl_submit), per(pl_present),
-                audio_queue.size() / 176,
+                "failed to persist backup RAM to {}: {e}",
+                battery_path.display()
             );
-            pl_advance = std::time::Duration::ZERO;
-            pl_audio = std::time::Duration::ZERO;
-            pl_wait = std::time::Duration::ZERO;
-            pl_submit = std::time::Duration::ZERO;
-            pl_present = std::time::Duration::ZERO;
-            pl_bursts = [0; 3];
-            pl_iters = 0;
-            pl_frames = 0;
-            pl_last = std::time::Instant::now();
         }
-    }
+        ExitCode::SUCCESS
+    })
+}
 
-    // Persist the internal backup RAM ("battery") so game saves survive.
-    if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
-        eprintln!(
-            "failed to persist backup RAM to {}: {e}",
-            battery_path.display()
-        );
-    }
+/// Messages from the SDL main thread to the emulation thread.
+#[cfg(feature = "sdl2-frontend")]
+enum EmuIn {
+    /// Current held pad-1 bits (sampled from the keyboard each iteration).
+    Pad(u16),
+    /// OSD menu navigation (only sent while the menu is open).
+    Nav(osd::Nav),
+    /// Toggle the OSD menu.
+    Toggle,
+    /// F5/F9 quickslot save/load.
+    Quicksave,
+    Quickload,
+    /// F8: play the disc's first CD-DA track.
+    PlayCdda,
+}
 
-    ExitCode::SUCCESS
+/// Messages from the emulation thread back to the SDL main thread —
+/// window-affecting OSD actions (the canvas is not Send) and quit.
+#[cfg(feature = "sdl2-frontend")]
+enum UiMsg {
+    Scale(u8),
+    Fullscreen(bool),
+    Quit,
 }
 
 /// Mutable frontend display/config state the Settings screens read (for their
@@ -695,11 +805,9 @@ fn dispatch_osd(
     save_base: &std::path::Path,
     launched_spec: &Option<String>,
     ui: &mut UiState,
-    canvas: &mut sdl2::render::WindowCanvas,
+    ui_tx: &std::sync::mpsc::Sender<UiMsg>,
 ) -> bool {
     use osd::OsdAction;
-    use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH};
-    use sdl2::video::FullscreenType;
     let slot_path = |n: u8| save_base.with_extension(format!("{n}.state"));
     match action {
         OsdAction::Resume => osd.close(),
@@ -736,21 +844,15 @@ fn dispatch_osd(
         },
         OsdAction::SetScale(s) => {
             ui.scale = s;
-            // Window pixels = base 320×224 × scale; the canvas stretches the
+            // Window pixels = base 320×224 × scale; applied on the SDL main
+            // thread (the canvas is not Send). The canvas stretches the
             // texture to fill, so no texture re-create is needed.
-            let _ = canvas
-                .window_mut()
-                .set_size(FRAME_WIDTH as u32 * s as u32, FRAME_HEIGHT as u32 * s as u32);
+            let _ = ui_tx.send(UiMsg::Scale(s));
             osd.set_toast(format!("Scale {s}x"), 90);
         }
         OsdAction::ToggleFullscreen => {
             ui.fullscreen = !ui.fullscreen;
-            let mode = if ui.fullscreen {
-                FullscreenType::Desktop
-            } else {
-                FullscreenType::Off
-            };
-            let _ = canvas.window_mut().set_fullscreen(mode);
+            let _ = ui_tx.send(UiMsg::Fullscreen(ui.fullscreen));
             osd.set_toast(
                 if ui.fullscreen { "Fullscreen on" } else { "Fullscreen off" },
                 90,
