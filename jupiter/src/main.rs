@@ -426,7 +426,7 @@ fn run(
     // Resolve the configured scancode names; an unknown name falls back to
     // that button's default binding. Lives on the SDL thread (where the
     // keyboard is sampled); the emu thread keeps the names for the OSD.
-    let keymap: [Scancode; config::PAD_BUTTONS] = std::array::from_fn(|i| {
+    let mut keymap: [Scancode; config::PAD_BUTTONS] = std::array::from_fn(|i| {
         Scancode::from_name(&cfg.keys[i]).unwrap_or_else(|| {
             eprintln!(
                 "config: unknown key '{}' for {}; using {}",
@@ -496,6 +496,7 @@ fn run(
                     fullscreen: sess.ui.fullscreen,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
+                    pad_keys: sess.cfg.keys.clone(),
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
@@ -529,6 +530,21 @@ fn run(
                                 osd.set_toast("Playing CD audio", 120);
                             } else {
                                 osd.set_toast("No CD audio track", 120);
+                            }
+                        }
+                        EmuIn::BindResult(b, captured) => {
+                            osd.end_capture();
+                            let i = b as usize % config::PAD_BUTTONS;
+                            match captured {
+                                Some(name) => {
+                                    osd.set_toast(
+                                        format!("{} = {name}", config::BUTTON_NAMES[i]),
+                                        120,
+                                    );
+                                    sess.cfg.keys[i] = name;
+                                    sess.cfg.save();
+                                }
+                                None => osd.set_toast("Rebind cancelled", 90),
                             }
                         }
                     }
@@ -644,6 +660,8 @@ fn run(
 
         // ---- SDL main loop: events, audio, present -----------------------
         let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+        // OSD rebind: which pad button (if any) captures the next keypress.
+        let mut rebind_target: Option<u8> = None;
         // Shuttle Mouse capture state (only used when --mouse is given).
         let (mut mouse_dx, mut mouse_dy) = (0i32, 0i32);
         let mut mouse_grabbed = false;
@@ -661,6 +679,25 @@ fn run(
             for ev in events.poll_iter() {
                 match ev {
                     Event::Quit { .. } => break 'main,
+                    // An armed rebind owns the next keypress (before the OSD
+                    // nav arm — the menu is open during capture). Esc cancels.
+                    Event::KeyDown {
+                        keycode: Some(kc),
+                        scancode,
+                        ..
+                    } if rebind_target.is_some() => {
+                        let b = rebind_target.take().expect("armed");
+                        if kc == Keycode::Escape {
+                            let _ = emu_tx.send(EmuIn::BindResult(b, None));
+                        } else if let Some(sc) = scancode {
+                            keymap[b as usize % config::PAD_BUTTONS] = sc;
+                            let _ =
+                                emu_tx.send(EmuIn::BindResult(b, Some(sc.name().to_string())));
+                        } else {
+                            // A key with no scancode: keep waiting.
+                            rebind_target = Some(b);
+                        }
+                    }
                     Event::KeyDown {
                         keycode: Some(kc), ..
                     } if osd_open.load(Ordering::Relaxed) => {
@@ -789,6 +826,13 @@ fn run(
                         };
                         let _ = canvas.window_mut().set_fullscreen(mode);
                     }
+                    UiMsg::ArmRebind(b) => rebind_target = Some(b),
+                    UiMsg::ResetKeymap => {
+                        keymap = std::array::from_fn(|i| {
+                            Scancode::from_name(config::DEFAULT_KEYS[i])
+                                .expect("default scancode name")
+                        });
+                    }
                     UiMsg::Quit => quit = true,
                 }
             }
@@ -871,6 +915,9 @@ enum EmuIn {
     /// Shuttle Mouse: motion since the last message (host convention,
     /// X+ right / Y+ down) + the held `saturn::smpc::mouse` button mask.
     Mouse(i32, i32, u8),
+    /// A key-capture rebind finished on the SDL thread: the pad-button index
+    /// and the captured scancode name (`None` = cancelled with Esc).
+    BindResult(u8, Option<String>),
 }
 
 /// Messages from the emulation thread back to the SDL main thread —
@@ -879,6 +926,10 @@ enum EmuIn {
 enum UiMsg {
     Scale(u8),
     Fullscreen(bool),
+    /// Capture the next host keypress for this pad button (OSD rebind).
+    ArmRebind(u8),
+    /// Restore the default keyboard→pad bindings.
+    ResetKeymap,
     Quit,
 }
 
@@ -1063,6 +1114,19 @@ fn dispatch_osd(
             };
             osd.set_toast(format!("Region: {name} (reset)"), 150);
             osd.close();
+        }
+        OsdAction::StartRebind(b) => {
+            // Modal: the OSD shows "press a key" and swallows nav; the SDL
+            // thread (which owns the keyboard) captures the next keypress and
+            // answers with EmuIn::BindResult.
+            osd.begin_capture(b);
+            let _ = ui_tx.send(UiMsg::ArmRebind(b));
+        }
+        OsdAction::ResetBinds => {
+            sess.cfg.keys = config::DEFAULT_KEYS.map(str::to_string);
+            sess.cfg.save();
+            let _ = ui_tx.send(UiMsg::ResetKeymap);
+            osd.set_toast("Default keys restored", 120);
         }
         OsdAction::SetCartridge(k) => {
             sess.ui.cart = k;

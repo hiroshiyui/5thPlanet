@@ -10,6 +10,7 @@
 
 mod font;
 
+use crate::config::{BUTTON_NAMES, PAD_BUTTONS};
 use font::{Canvas, Rgb};
 
 /// Number of save-state slots the menu exposes.
@@ -73,11 +74,17 @@ pub enum OsdAction {
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
     SetCartridge(OsdCart),
+    /// Rebind a pad button ([`crate::config::BUTTON_NAMES`] index): the
+    /// frontend captures the next host key and reports back via
+    /// [`Osd::end_capture`].
+    StartRebind(u8),
+    /// Restore the default key bindings.
+    ResetBinds,
 }
 
 /// Dynamic context the frontend supplies each draw so labels reflect live
 /// state without the OSD depending on the core.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OsdCtx {
     pub disc_present: bool,
     /// Whether each save slot already has a file on disk.
@@ -90,6 +97,9 @@ pub struct OsdCtx {
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
     pub cart: OsdCart,
+    /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
+    /// the Controller screen lists them.
+    pub pad_keys: [String; PAD_BUTTONS],
 }
 
 /// Which screen is on top of the stack.
@@ -103,6 +113,7 @@ enum Screen {
     /// Settings hub → Graphics / Region / Cartridge.
     Settings,
     Graphics,
+    Controller,
     Region,
     Cartridge,
 }
@@ -128,6 +139,10 @@ pub struct Osd {
     stack: Vec<(Screen, usize)>,
     /// Transient status line: (message, frames remaining).
     toast: Option<(String, u32)>,
+    /// Key-capture mode: the pad button (a [`BUTTON_NAMES`] index) awaiting
+    /// the frontend's next host keypress. While set, navigation is ignored
+    /// and the panel shows a "press a key" prompt.
+    capturing: Option<u8>,
 }
 
 impl Default for Osd {
@@ -142,7 +157,19 @@ impl Osd {
             open: false,
             stack: vec![(Screen::Main, 0)],
             toast: None,
+            capturing: None,
         }
+    }
+
+    /// Enter key-capture mode for a pad button (the frontend grabs the next
+    /// host keypress). Entered via [`OsdAction::StartRebind`].
+    pub fn begin_capture(&mut self, button: u8) {
+        self.capturing = Some(button);
+    }
+
+    /// Leave key-capture mode (the frontend captured a key or cancelled).
+    pub fn end_capture(&mut self) {
+        self.capturing = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -170,6 +197,7 @@ impl Osd {
     pub fn close(&mut self) {
         self.open = false;
         self.stack = vec![(Screen::Main, 0)];
+        self.capturing = None;
     }
 
     fn back(&mut self) -> Option<OsdAction> {
@@ -230,6 +258,7 @@ impl Osd {
             }
             Screen::Settings => vec![
                 mk("Graphics", Select::Push(Screen::Graphics)),
+                mk("Controller", Select::Push(Screen::Controller)),
                 mk("Region", Select::Push(Screen::Region)),
                 mk("Cartridge", Select::Push(Screen::Cartridge)),
                 mk("Back", Select::Close),
@@ -248,6 +277,20 @@ impl Osd {
                     ),
                     mk("Back", Select::Close),
                 ]
+            }
+            Screen::Controller => {
+                // One row per pad button: "<button>  <bound key>"; selecting
+                // it asks the frontend to capture the next host keypress.
+                let mut v = Vec::with_capacity(PAD_BUTTONS + 2);
+                for (i, name) in BUTTON_NAMES.iter().enumerate() {
+                    v.push(mk(
+                        &format!("{name:<6} {}", ctx.pad_keys[i]),
+                        Select::Emit(OsdAction::StartRebind(i as u8)),
+                    ));
+                }
+                v.push(mk("Reset Defaults", Select::Emit(OsdAction::ResetBinds)));
+                v.push(mk("Back", Select::Close));
+                v
             }
             Screen::Region => {
                 // The active region is marked with a leading '*'.
@@ -286,6 +329,7 @@ impl Osd {
             Screen::Slots { saving: false } => "Load State",
             Screen::Settings => "Settings",
             Screen::Graphics => "Graphics",
+            Screen::Controller => "Controller",
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
         }
@@ -303,7 +347,9 @@ impl Osd {
 
     /// Handle a navigation input. Returns an action for the frontend to run.
     pub fn handle(&mut self, nav: Nav, ctx: &OsdCtx) -> Option<OsdAction> {
-        if !self.open {
+        if !self.open || self.capturing.is_some() {
+            // In key-capture mode every host key belongs to the frontend's
+            // capture (it ends via `end_capture`), not to navigation.
             return None;
         }
         let screen = self.screen();
@@ -358,6 +404,22 @@ impl Osd {
     fn draw(&self, c: &mut Canvas, ctx: &OsdCtx) {
         if !self.open {
             // Even when closed, a lingering toast is still shown.
+            self.draw_toast(c);
+            return;
+        }
+        // Key-capture mode replaces the items with a modal prompt.
+        if let Some(b) = self.capturing {
+            let name = BUTTON_NAMES[b as usize % PAD_BUTTONS];
+            let line1 = format!("Press a key for {name}");
+            let pw = 180usize;
+            let ph = 44usize;
+            let px = c.w.saturating_sub(pw) / 2;
+            let py = c.h.saturating_sub(ph) / 2;
+            c.fill_rect(px, py, pw, ph, PANEL_BG);
+            c.rect_outline(px, py, pw, ph, PANEL_BORDER);
+            c.draw_text(px + (pw - Canvas::text_width(&line1)) / 2, py + 10, &line1, TITLE);
+            let line2 = "(Esc cancels)";
+            c.draw_text(px + (pw - Canvas::text_width(line2)) / 2, py + 26, line2, ITEM);
             self.draw_toast(c);
             return;
         }
@@ -422,6 +484,7 @@ mod tests {
             fullscreen: false,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
+            pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
         }
     }
 
@@ -600,6 +663,54 @@ mod tests {
             select_main(&mut osd, &c, "  Ext RAM 4M"),
             Some(OsdAction::SetCartridge(OsdCart::ExtRam4M))
         );
+    }
+
+    #[test]
+    fn controller_screen_lists_bindings_and_starts_a_rebind() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Controller");
+        // Rows are "<button> <key>" in BUTTON_NAMES order; row 4 = A on Z.
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label == "A      Z"));
+        assert_eq!(
+            select_main(&mut osd, &c, "Start  Return"),
+            Some(OsdAction::StartRebind(12))
+        );
+        // Selection stays on Start (12); one Down reaches Reset Defaults.
+        osd.handle(Nav::Down, &c);
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ResetBinds));
+    }
+
+    #[test]
+    fn capture_mode_swallows_navigation_until_ended() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Controller");
+        osd.begin_capture(12);
+        // While capturing, nav does nothing — not even Back.
+        assert_eq!(osd.handle(Nav::Back, &c), None);
+        assert_eq!(osd.handle(Nav::Select, &c), None);
+        assert!(osd.is_open());
+        // The frontend reports the capture finished; nav works again.
+        osd.end_capture();
+        assert_eq!(osd.handle(Nav::Back, &c), None); // pops to Settings
+        assert!(osd.is_open());
+    }
+
+    #[test]
+    fn capture_mode_draws_the_prompt() {
+        let (w, h) = (320usize, 224usize);
+        let mut osd = Osd::new();
+        osd.toggle();
+        osd.begin_capture(0);
+        let mut buf = vec![0u8; w * h * 4];
+        osd.render_overlay(&mut buf, w, h, &ctx(true));
+        assert!(buf.iter().any(|&b| b != 0), "capture prompt paints pixels");
     }
 
     #[test]
