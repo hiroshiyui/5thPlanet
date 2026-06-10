@@ -517,9 +517,33 @@ fn sprite_window_pixel(
     if !vdp2.regs.sprite_window_enabled() {
         return true;
     }
-    let inside =
-        sprite_fb.is_some_and(|fb| fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32) & 0x8000 != 0);
+    let inside = sprite_fb.is_some_and(|fb| sprite_fb_word(vdp2, fb, x, y) & 0x8000 != 0);
     if area { inside } else { !inside }
+}
+
+/// Fetch the sprite-layer source word for display `(x, y)`: the VDP1
+/// frame-buffer word, or — when the buffer was plotted in the TVM 8bpp
+/// layout — the dot's byte widened to `0xFF00 | byte` (Mednafen
+/// `T_DrawSpriteData`, `vdp1_hires8`). A hi-res display picks the byte by
+/// screen-x parity (each fb word holds two dots); a normal display reads
+/// each word's high byte (every other 8bpp dot). In double-density
+/// interlace the display has twice the lines of the 256-line frame buffer
+/// (VDP1 plots the fields at `y >> 1` via FBCR.DIE), so each fb line spans
+/// two display lines — without the halving the lower half of the screen
+/// wraps back to the top of the buffer.
+fn sprite_fb_word(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> u16 {
+    let y = if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 { y >> 1 } else { y };
+    let word = fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32);
+    if fb.hires8() {
+        let byte = if vdp2.regs.screen_dims().0 >= 640 {
+            (word >> (((x & 1) ^ 1) << 3)) & 0xFF
+        } else {
+            word >> 8
+        };
+        0xFF00 | byte
+    } else {
+        word
+    }
 }
 
 /// VDP1 always renders at its native horizontal resolution. In VDP2's
@@ -1085,7 +1109,7 @@ fn sprite_cc(vdp2: &Vdp2, pri: u8, ccidx: usize) -> Option<(u8, bool)> {
 /// Returns `None` for a transparent / priority-0 dot, or a [`SpriteDot`]
 /// (colour or MSB shadow).
 fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<SpriteDot> {
-    let pix = fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32);
+    let mut pix = sprite_fb_word(vdp2, fb, x, y);
     if pix == 0 {
         return None; // nothing plotted here
     }
@@ -1110,6 +1134,16 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
                 is_rgb: true,
             })
         });
+    }
+
+    // The 8-bit sprite types (8–F) take their whole attribute word from one
+    // frame-buffer byte (Mednafen `T_DrawSpriteData`: `if(SpriteType & 0x8)
+    // src &= 0xFF`); a zero byte is transparent.
+    if stype & 0x8 != 0 {
+        pix &= 0x00FF;
+        if pix == 0 {
+            return None;
+        }
     }
 
     // Palette code: priority bits index PRISA..PRISD; the masked low bits are
@@ -1663,6 +1697,45 @@ mod tests {
         let mut fb = Framebuffer::new();
         fb.set_pixel(x, y, dot);
         fb
+    }
+
+    /// TVM 8bpp framebuffer + an 8-bit sprite type: each sprite dot is one
+    /// byte; a normal-resolution display samples each fb word's *high* byte
+    /// (Mednafen `T_DrawSpriteData` `vdp1_hires8`, non-hires).
+    #[test]
+    fn tvm_8bpp_sprite_layer_reads_one_byte_per_dot() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP, 320 dots
+        v.regs.write16(0x0E0, 0x000C); // SPCTL: sprite type 0xC (8-bit)
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x12 * 2, 0x001F); // colour code 0x12 = red
+        let mut fb = Framebuffer::new();
+        fb.set_hires8(true);
+        fb.set_pixel8(20, 10, 0x12); // byte 20 = word 10's high byte
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF], "byte 2x → dot x");
+        assert_eq!(pixel(&buf, 11, 10), [0, 0, 0, 0xFF], "zero byte transparent");
+    }
+
+    /// In double-density interlace the display has twice the lines of the
+    /// 256-line VDP1 framebuffer, so each fb line spans two display lines —
+    /// without the halving the lower half wraps back to the buffer top (was
+    /// VF2's "PRESS START BUTTON" rendering over the logo + at the bottom).
+    #[test]
+    fn double_density_interlace_samples_the_sprite_fb_at_half_y() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x80C3); // DISP | LSMD=11 (DD) | HRESO=3 (704)
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x12 * 2, 0x001F); // code 0x12 = red
+        let fb = sprite_fb_with(10, 100, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        // 704-dot: display x 20/21 ← fb x 10; DD: display y 200/201 ← fb 100.
+        assert_eq!(pixel_at_width(&buf, 704, 20, 200), [0xFF, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 704, 21, 201), [0xFF, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 704, 20, 202), [0, 0, 0, 0xFF]);
+        assert_eq!(pixel_at_width(&buf, 704, 20, 100), [0, 0, 0, 0xFF]);
     }
 
     #[test]

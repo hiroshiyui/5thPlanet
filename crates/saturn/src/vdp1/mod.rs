@@ -326,7 +326,14 @@ impl Vdp1 {
         self.erase_framebuffer();
         self.regs.cef_clear();
         let Vdp1 { vram, fb, regs, .. } = self;
-        let mut plotter = Plotter::new(&*vram, fb);
+        // TVMR bit 0 selects the 8 bits/pixel frame buffer; FBCR bits 3/2
+        // (DIE/DIL) select double-interlace plotting. Latch the pixel layout
+        // onto the draw buffer so the swap publishes it to the VDP2 sprite
+        // layer (see `Framebuffer::hires8`).
+        let bpp8 = regs.read16(0x00) & 0x1 != 0;
+        let fbcr = regs.read16(0x02);
+        fb.set_hires8(bpp8);
+        let mut plotter = Plotter::new(&*vram, fb, bpp8, fbcr & 0x8 != 0, fbcr & 0x4 != 0);
         let result = plotter.process_list();
         regs.set_command_addrs(prev_copr, result.copr);
         result

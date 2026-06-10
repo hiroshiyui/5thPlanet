@@ -1340,3 +1340,61 @@ fn timed_draw_end_fires_after_the_draw_duration_via_run_for() {
         "draw-end latched after the modelled draw duration"
     );
 }
+
+#[test]
+fn tvm_8bpp_polygon_writes_one_byte_per_dot() {
+    let mut v = Vdp1::new();
+    v.regs.write16(0x00, 0x0001); // TVMR.TVM = 8 bits/pixel framebuffer
+    // Polygon colour 0x125F over (600,10)-(610,20) — x beyond the 16bpp
+    // 512-dot stride, reachable only in the 1024-byte-wide 8bpp layout.
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0004, 0x0000),
+            w(0x0080, 0x125F),
+            w(0x0000, 0x0000),
+            w(600, 10),
+            w(610, 10),
+            w(610, 20),
+            w(600, 20),
+            0,
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    assert!(v.fb.hires8(), "draw buffer latched the 8bpp layout");
+    assert_eq!(v.fb.pixel8(605, 15), 0x5F, "low 8 bits of CMDCOLR, byte layout");
+    assert_eq!(v.fb.pixel8(599, 15), 0, "outside the polygon");
+    assert_eq!(v.fb.pixel8(605, 25), 0, "outside the polygon");
+}
+
+#[test]
+fn die_double_interlace_plots_the_selected_field_at_half_y() {
+    let mut v = Vdp1::new();
+    v.regs.write16(0x02, 0x0008); // FBCR: DIE=1, DIL=0 (even field)
+    // Polygon over source lines 100..=103: the even lines 100/102 land at
+    // fb lines 50/51; the odd field's lines are dropped.
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0004, 0x0000),
+            w(0x0080, 0x001F),
+            w(0x0000, 0x0000),
+            w(10, 100),
+            w(20, 100),
+            w(20, 103),
+            w(10, 103),
+            0,
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+
+    assert_eq!(v.fb.pixel(15, 50), 0x001F, "source line 100 → fb line 50");
+    assert_eq!(v.fb.pixel(15, 51), 0x001F, "source line 102 → fb line 51");
+    assert_eq!(v.fb.pixel(15, 100), 0, "not plotted at the source y");
+    assert_eq!(v.fb.pixel(15, 52), 0, "odd-field lines dropped");
+}

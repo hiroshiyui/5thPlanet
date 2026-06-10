@@ -132,17 +132,28 @@ pub struct Plotter<'a> {
     gouraud: Option<[(i32, i32, i32); 4]>,
     /// Count of frame-buffer dots processed (drives the draw-duration model).
     pixels: u32,
+    /// TVMR bit 0 — the frame buffer is 8 bits/pixel (1024×256 bytes); dots
+    /// are written as single bytes and gouraud / colour-calc don't apply
+    /// (Mednafen `PlotPixel` bpp8).
+    bpp8: bool,
+    /// FBCR bit 3 (DIE) — double-interlace plotting: only the DIL-selected
+    /// field's lines are drawn, at half the y coordinate.
+    die: bool,
+    /// FBCR bit 2 (DIL) — which field DIE draws (0 = even lines, 1 = odd).
+    dil: bool,
 }
 
 impl<'a> Plotter<'a> {
-    pub fn new(vram: &'a Vram, fb: &'a mut Framebuffer) -> Self {
-        // Default clip is the whole 512×256 frame buffer; command 0x09
-        // (system clipping) narrows it, command 0x08 sets the user one.
+    pub fn new(vram: &'a Vram, fb: &'a mut Framebuffer, bpp8: bool, die: bool, dil: bool) -> Self {
+        // Default clip is the whole frame buffer — 512×256 dots, doubled
+        // horizontally in the 8bpp layout and vertically under DIE (source-y
+        // space is two fields). Command 0x09 (system clipping) narrows it,
+        // command 0x08 sets the user one.
         let full = Rect {
             min_x: 0,
-            max_x: FB_STRIDE - 1,
+            max_x: if bpp8 { FB_STRIDE * 2 } else { FB_STRIDE } - 1,
             min_y: 0,
-            max_y: FB_HEIGHT - 1,
+            max_y: if die { FB_HEIGHT * 2 } else { FB_HEIGHT } - 1,
         };
         Self {
             vram,
@@ -155,6 +166,42 @@ impl<'a> Plotter<'a> {
             mode: PixelMode::Generic,
             gouraud: None,
             pixels: 0,
+            bpp8,
+            die,
+            dil,
+        }
+    }
+
+    /// Resolve the destination frame-buffer line for source `y`, honouring
+    /// double-interlace plotting (Mednafen `PlotPixel` `die`): with FBCR.DIE
+    /// only the DIL-selected field is drawn, at `y >> 1`; the other field's
+    /// dots are dropped.
+    #[inline]
+    fn fb_y(&self, y: i32) -> Option<i32> {
+        if self.die {
+            if (y & 1) != self.dil as i32 {
+                return None;
+            }
+            Some(y >> 1)
+        } else {
+            Some(y)
+        }
+    }
+
+    /// Write one frame-buffer dot at the *resolved* line `fy`, honouring the
+    /// TVM 8bpp layout: a byte at the 1024-wide stride (the low 8 bits of the
+    /// colour), or the default 16-bit RGB555 word (Mednafen `PlotPixel`).
+    #[inline]
+    fn fb_put(&mut self, x: i32, fy: i32, pix: u16) {
+        if !(0..FB_HEIGHT).contains(&fy) {
+            return;
+        }
+        if self.bpp8 {
+            if (0..FB_STRIDE * 2).contains(&x) {
+                self.fb.set_pixel8(x, fy, pix as u8);
+            }
+        } else if (0..FB_STRIDE).contains(&x) {
+            self.fb.set_pixel(x, fy, pix);
         }
     }
 
@@ -361,8 +408,8 @@ impl<'a> Plotter<'a> {
     fn draw_pixel(&mut self, x: i32, y: i32, pd: i32, off: i32, shade: Option<(i32, i32, i32)>) {
         self.pixels += 1; // a processed dot, drawn or clipped, costs draw time
         if self.mode == PixelMode::Poly {
-            if (0..FB_STRIDE).contains(&x) && (0..FB_HEIGHT).contains(&y) {
-                self.fb.set_pixel(x, y, self.cmd.colr);
+            if let Some(fy) = self.fb_y(y) {
+                self.fb_put(x, fy, self.cmd.colr);
             }
             return;
         }
@@ -383,10 +430,15 @@ impl<'a> Plotter<'a> {
     ) {
         let pmod = self.cmd.pmod;
         let mesh = pmod & 0x100 != 0;
+        // Mesh keys off the *source* y (Mednafen `PlotPixel` applies it
+        // before the interlace line-halving).
         if mesh && (x ^ y) & 1 == 0 {
             return;
         }
-        if !((0..FB_STRIDE).contains(&x) && (0..FB_HEIGHT).contains(&y)) {
+        let Some(fy) = self.fb_y(y) else { return };
+        let in_bounds = (0..FB_HEIGHT).contains(&fy)
+            && (0..if self.bpp8 { FB_STRIDE * 2 } else { FB_STRIDE }).contains(&x);
+        if !in_bounds {
             return;
         }
         let spd = pmod & 0x40 != 0; // transparent-pixel disable
@@ -485,6 +537,21 @@ impl<'a> Plotter<'a> {
             return;
         }
 
+        // TVM 8bpp frame buffer: one byte per dot — gouraud and the
+        // colour-calc blends don't apply; MSBON instead read-modifies the
+        // dot's byte from its containing word with bit 15 forced (Mednafen
+        // `PlotPixel` bpp8 path, vdp1_common.h:231).
+        if self.bpp8 {
+            let b = if pmod & 0x8000 != 0 {
+                let word = self.fb.pixel(x >> 1, fy);
+                (word | 0x8000) >> (((x & 1) ^ 1) << 3)
+            } else {
+                pix
+            };
+            self.fb.set_pixel8(x, fy, b as u8);
+            return;
+        }
+
         // Gouraud shading (CMDPMOD bit 2): offset each RGB555 channel by the
         // interpolated correction (centred at 16 → no change), clamped 0..31.
         if let Some((gr, gg, gb)) = shade {
@@ -493,25 +560,25 @@ impl<'a> Plotter<'a> {
 
         // Colour-calc mode: CMDPMOD bits 1-0.
         match pmod & 0x3 {
-            0 => self.fb.set_pixel(x, y, pix), // replace
+            0 => self.fb.set_pixel(x, fy, pix), // replace
             1 => {
                 // shadow: halve the destination if its MSB is set.
-                let d = self.fb.pixel(x, y);
+                let d = self.fb.pixel(x, fy);
                 if d & 0x8000 != 0 {
-                    self.fb.set_pixel(x, y, ((d & !0x8421) >> 1) | 0x8000);
+                    self.fb.set_pixel(x, fy, ((d & !0x8421) >> 1) | 0x8000);
                 }
             }
             2 => {
                 // half luminance.
-                self.fb.set_pixel(x, y, ((pix & !0x8421) >> 1) | 0x8000);
+                self.fb.set_pixel(x, fy, ((pix & !0x8421) >> 1) | 0x8000);
             }
             3 => {
                 // half transparent: blend with destination if its MSB set.
-                let d = self.fb.pixel(x, y);
+                let d = self.fb.pixel(x, fy);
                 if d & 0x8000 != 0 {
-                    self.fb.set_pixel(x, y, alpha_blend_rgb555(d, pix) | 0x8000);
+                    self.fb.set_pixel(x, fy, alpha_blend_rgb555(d, pix) | 0x8000);
                 } else {
-                    self.fb.set_pixel(x, y, pix);
+                    self.fb.set_pixel(x, fy, pix);
                 }
             }
             _ => unreachable!(),

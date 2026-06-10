@@ -20,6 +20,13 @@ pub const FB_HEIGHT: i32 = 256;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Framebuffer {
     bytes: Vec<u8>,
+    /// The TVM mode this buffer's contents were plotted in: `true` = the
+    /// 8 bits/pixel layout (TVMR bit 0 — 1024×256 bytes, one byte per dot)
+    /// instead of the default 512×256 RGB555. Latched onto the draw buffer
+    /// at plot time and carried through the buffer swap, so the VDP2 sprite
+    /// layer decodes the *displayed* frame in the mode it was drawn
+    /// (Mednafen latches the same per line into `LIB[].vdp1_hires8`).
+    hires8: bool,
 }
 
 impl Default for Framebuffer {
@@ -32,11 +39,31 @@ impl Framebuffer {
     pub fn new() -> Self {
         Self {
             bytes: vec![0u8; FRAMEBUFFER_BYTES],
+            hires8: false,
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Whether this buffer was plotted in the TVM 8 bits/pixel layout.
+    pub fn hires8(&self) -> bool {
+        self.hires8
+    }
+
+    pub fn set_hires8(&mut self, on: bool) {
+        self.hires8 = on;
+    }
+
+    /// Read the 8-bit dot at `(x, y)` in the 1024×256 TVM-8bpp layout.
+    pub fn pixel8(&self, x: i32, y: i32) -> u8 {
+        self.read8((y * FB_STRIDE * 2 + x) as u32)
+    }
+
+    /// Write the 8-bit dot at `(x, y)` in the 1024×256 TVM-8bpp layout.
+    pub fn set_pixel8(&mut self, x: i32, y: i32, val: u8) {
+        self.write8((y * FB_STRIDE * 2 + x) as u32, val);
     }
 
     fn idx(&self, offset: u32) -> usize {
