@@ -1160,7 +1160,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
     let ccidx = ((pix >> SPRITE_CCR_SHIFT[stype]) & SPRITE_CCR_MASK[stype]) as usize;
     Some(SpriteDot::Colour(Dot {
         pri,
-        rgb: cram(vdp2, code),
+        rgb: cram(vdp2, (vdp2.regs.sprite_color_ram_offset() + code) & 0x7FF),
         cc: sprite_cc(vdp2, pri, ccidx),
         layer: Layer::Sprite,
         is_rgb: false,
@@ -1716,6 +1716,24 @@ mod tests {
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF], "byte 2x → dot x");
         assert_eq!(pixel(&buf, 11, 10), [0, 0, 0, 0xFF], "zero byte transparent");
+    }
+
+    /// The sprite layer's palette codes go through the CRAOFB.SPCAOS colour-RAM
+    /// address offset (Mednafen `ColorCache[(cao + dc) & 0x7FF]`) — VF2's title
+    /// text palettes live at offset 3 (CRAM 0x300+); without it they resolved
+    /// to the black 0x000 bank (the "outline only" PRESS START).
+    #[test]
+    fn sprite_palette_applies_the_spcaos_cram_offset() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.regs.write16(0x0E6, 0x0030); // CRAOFB.SPCAOS = 3 → CRAM 0x300+
+        v.cram.write16(0x012 * 2, 0x7C00); // unoffset bank: blue (the bug)
+        v.cram.write16(0x312 * 2, 0x001F); // offset bank: red (correct)
+        let fb = sprite_fb_with(10, 10, 0x0012);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF], "code + SPCAOS<<8");
     }
 
     /// In double-density interlace the display has twice the lines of the

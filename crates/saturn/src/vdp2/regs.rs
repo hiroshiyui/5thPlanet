@@ -307,6 +307,15 @@ impl Vdp2Regs {
         (((self.read16(0x0E4) >> (n * 4)) & 0x7) as usize) << 8
     }
 
+    /// Colour-RAM address offset for the VDP1 sprite layer (CRAOFB.SPCAOS,
+    /// 0x0E6 bits 6:4): added to every sprite palette code before the CRAM
+    /// lookup, modulo the 0x800-entry space (Mednafen `CRAMAddrOffs_Sprite`,
+    /// `ColorCache[(cao + dc) & 0x7FF]`). VF2's title puts its text palettes
+    /// at offset 3 (CRAM 0x300+); without this they read the black 0x000 bank.
+    pub fn sprite_color_ram_offset(&self) -> usize {
+        (((self.read16(0x0E6) >> 4) & 0x7) as usize) << 8
+    }
+
     /// Colour-RAM address offset for rotation `which` (CRAOFB, 0x0E6 — RBG0 at
     /// bits 2:0). RBG1 (rare) reuses NBG0's offset.
     pub fn rbg_color_ram_offset(&self, which: usize) -> usize {
