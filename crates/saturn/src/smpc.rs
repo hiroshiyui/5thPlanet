@@ -14,12 +14,16 @@
 //! 5. Software polls SF until it reads 0 and then inspects OREG0..31
 //!    and SR for the response.
 //!
-//! M3 implements the register surface plus the slave-control commands
-//! (`SSHON` / `SSHOFF`); other commands are recognised, queued, and
-//! treated as immediate no-ops so BIOS init code doesn't deadlock.
-//! `INTBACK` peripheral-data return is a placeholder that reports "no
-//! controller connected" — full peripheral protocol arrives in M4
-//! alongside the SDL2 keyboard binding.
+//! Implemented commands: the slave-control pair (`SSHON`/`SSHOFF`),
+//! `SNDON`/`SNDOFF` (the SCSP 68k), `SETTIME`/`SETSMEM`, `NMIREQ`,
+//! `RESENAB`/`RESDISA`, and the full staged `INTBACK` (status phase —
+//! RTC/region/SMEM — plus CONTINUE-driven peripheral phases). The
+//! peripheral report lays out one block per controller port from the
+//! [`PortDevice`] selection: the standard digital pad (ID `0x02`,
+//! [`pad`] bits, active-low) and the Shuttle Mouse (ID `0xE3`,
+//! [`mouse`] bits + X/Y deltas — see [`Smpc::take_mouse_report`];
+//! M13 E3). Unrecognised commands are queued and complete as no-ops so
+//! BIOS init code doesn't deadlock.
 //!
 //! Register layout (offsets from `SMPC_BASE = 0x0010_0000`):
 //!

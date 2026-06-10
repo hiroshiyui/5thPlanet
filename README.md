@@ -26,9 +26,9 @@ foundation stays solid.
 | M10       | Live physical disc + CDDA→SCSP audio                        | ✅ complete  |
 | M11       | Boot a game to gameplay (real-BIOS LLE, trace-diffed vs Mednafen) | ✅ complete — **Virtua Fighter 2 is fully playable at a steady 60 fps** (correct graphics incl. the rotation-plane floor, CD-DA BGM through the SCSP EXTS inputs, in-fight SFX at the hardware mix balance; tag `vf2-good-emulation`); *Doukyuusei ~if~* boots to its title + in-game menu |
 | M12       | Whole-system cycle accuracy (cycle-exact timing vs Mednafen)  | 🚧 **BIOS BGM now plays** — root was an `m68k` `ADDA.L`/`SUBA.L` decode bug (mis-decoded as `ADDX`/`SUBX`) collapsing the SCSP note-ring; per-access SH-2 bus-timing model still open |
-| M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (pending) |
+| M13       | Hardware completeness & fidelity-gap backlog                 | 📋 prioritized backlog (boot-complete, not yet hardware-complete): Tier A whole-system timing (push closed), Tier B SCSP features (done), Tier C VDP2/VDP1 rendering (in progress), Tier D CPU & SCU peripherals (✅ complete), Tier E input devices (🚧 Shuttle Mouse done — used by *Doukyuusei ~if~*; light gun + keyboard pending) |
 
-Current test count: **1055 workspace-wide, 0 failures**, at **~85% line
+Current test count: **1058 workspace-wide, 0 failures**, at **~85% line
 coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
 FFI `physdisc` crate). Task-by-task status lives in
 [`doc/roadmap.md`](doc/roadmap.md).
@@ -122,6 +122,19 @@ gamepad support are planned M9 phases.)
 | L / R         | Q / W |
 | Start         | Enter |
 
+### Shuttle Mouse (`--mouse[=1|2]`)
+
+Plug Sega's Saturn mouse into port&nbsp;2 (`--mouse`, keeping the keyboard pad
+on port&nbsp;1) or port&nbsp;1 (`--mouse=1`, replacing the pad) for games that
+support it — e.g. *Doukyuusei ~if~*. The host pointer is captured and hidden
+while playing (the game draws its own cursor); host Left/Right/Middle clicks
+map to the mouse buttons and **Enter** doubles as the mouse's Start button.
+
+| Action                                   | Key |
+| ---------------------------------------- | --- |
+| Toggle pointer capture (free the cursor) | F10 |
+| Release the pointer (menu open)          | Esc |
+
 ### Emulator hotkeys
 
 | Action                            | Key |
@@ -130,6 +143,7 @@ gamepad support are planned M9 phases.)
 | Quick save (to the quick slot)    | F5 |
 | Quick load (from the quick slot)  | F9 |
 | Play the disc's CD-audio track    | F8 |
+| Toggle Shuttle Mouse capture      | F10 (with `--mouse`) |
 | Quit                              | Close the window, or Esc → **Quit** |
 
 ### On-screen menu (while it is open)
