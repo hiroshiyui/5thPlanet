@@ -53,10 +53,12 @@ pub struct RotationParams {
     pub my: i32,
     pub kx: i32,
     pub ky: i32,
-    /// Coefficient-table start address (16.16; integer part = entry index) and
-    /// its per-line delta, for the line-coefficient table.
+    /// Coefficient-table start address (16.16; integer part = entry index),
+    /// its per-line delta, and its per-dot delta (DKAx — drives the per-dot
+    /// coefficient mode when a VRAM bank is RDBS-granted / CRKTE is set).
     pub kast: i32,
     pub dkast: i32,
+    pub dkax: i32,
 }
 
 impl RotationParams {
@@ -122,20 +124,31 @@ impl RotationParams {
             // (word 22, signed 26-bit).
             kast: (w(21) & 0xFFFF_FFC0) as i32,
             dkast: field(w(22), 0x03FF_FFC0, 0x0200_0000, 0xFC00_0000),
+            dkax: field(w(23), 0x03FF_FFC0, 0x0200_0000, 0xFC00_0000),
         }
     }
 
     /// Map screen dot `(sx, sy)` to a rotation-plane coordinate (integer
-    /// pixels). Constant-`kx`/`ky` scaling (no line-coefficient table).
+    /// pixels). Constant-`kx`/`ky` scaling (no coefficient table).
     pub fn transform(&self, sx: i32, sy: i32) -> (i32, i32) {
+        self.transform_k(sx, sy, self.kx, self.ky, None)
+    }
+
+    /// [`transform`] with per-dot coefficient overrides: `kx`/`ky` replace the
+    /// parameter-table scales, and `xp` (when set, 16.16) replaces the
+    /// viewpoint X term — the coefficient table's mode-3 payload (VDP2 manual
+    /// "Coefficient Table"; Mednafen `case 3: Xp = sext << 2`).
+    pub fn transform_k(&self, sx: i32, sy: i32, kx: i32, ky: i32, xp_ovr: Option<i32>) -> (i32, i32) {
         let dx = mfx(self.a, self.dx) + mfx(self.b, self.dy);
         let dy = mfx(self.d, self.dx) + mfx(self.e, self.dy);
 
-        let xp = mfx(self.a, self.px - self.cx)
-            + mfx(self.b, self.py - self.cy)
-            + mfx(self.c, self.pz - self.cz)
-            + self.cx
-            + self.mx;
+        let xp = xp_ovr.unwrap_or_else(|| {
+            mfx(self.a, self.px - self.cx)
+                + mfx(self.b, self.py - self.cy)
+                + mfx(self.c, self.pz - self.cz)
+                + self.cx
+                + self.mx
+        });
         let yp = mfx(self.d, self.px - self.cx)
             + mfx(self.e, self.py - self.cy)
             + mfx(self.f, self.pz - self.cz)
@@ -151,8 +164,8 @@ impl RotationParams {
             + mfx(self.f, self.zst - self.pz);
 
         // Per-dot step is `mfx(k, d)`, accumulated `sx` times across the line.
-        let xs = mfx(self.kx, xsp) + xp + sx.wrapping_mul(mfx(self.kx, dx));
-        let ys = mfx(self.ky, ysp) + yp + sx.wrapping_mul(mfx(self.ky, dy));
+        let xs = mfx(kx, xsp) + xp + sx.wrapping_mul(mfx(kx, dx));
+        let ys = mfx(ky, ysp) + yp + sx.wrapping_mul(mfx(ky, dy));
         (xs >> 16, ys >> 16)
     }
 }

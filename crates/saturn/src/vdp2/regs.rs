@@ -972,6 +972,33 @@ impl Vdp2Regs {
         let shift = if which == 0 { 2 } else { 10 };
         ((self.read16(0x0B4) >> shift) & 0x3) as u8
     }
+    /// RAMCTL.CRKTE (bit 15): the rotation coefficient table lives in the
+    /// upper half of CRAM instead of VRAM (Mednafen `CRKTE = (V >> 15) & 1`).
+    pub fn coeff_in_cram(&self) -> bool {
+        self.read16(0x00E) & 0x8000 != 0
+    }
+    /// KTAOF coefficient-table address offset for parameter set `which`
+    /// (raw 3-bit value; the accumulator folds it in as `ktaof << 26`).
+    pub fn rbg_coeff_addr_offset(&self, which: usize) -> u32 {
+        let ktaof = self.read16(0x0B6);
+        (if which == 0 { ktaof } else { ktaof >> 8 } & 0x7) as u32
+    }
+    /// Which VRAM banks (A0/A1/B0/B1) the RDBS rotation-data designation
+    /// grants for **coefficient** reads (RAMCTL bits 7..0, value 1 = COEFF;
+    /// an unsplit bank A/B follows its lower half — Mednafen `bank_tab`).
+    /// Any granted bank (or CRKTE) enables the per-dot coefficient mode.
+    pub fn rotation_coeff_banks(&self) -> [bool; 4] {
+        let ramctl = self.read16(0x00E);
+        let mut b: [bool; 4] = core::array::from_fn(|i| (ramctl >> (i * 2)) & 3 == 1);
+        if ramctl & 0x100 == 0 {
+            b[1] = b[0]; // VRAM A unsplit: A1 follows A0
+        }
+        if ramctl & 0x200 == 0 {
+            b[3] = b[2]; // VRAM B unsplit: B1 follows B2
+        }
+        b
+    }
+
     /// Byte address in VRAM of the coefficient table (KTAOF address offset ×
     /// the per-size bank). Assumes the table is in VRAM (RAMCTL.CRKTE = 0).
     pub fn rbg_coeff_table_base(&self, which: usize) -> u32 {

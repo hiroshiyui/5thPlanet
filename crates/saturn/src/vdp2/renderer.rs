@@ -110,6 +110,8 @@ struct FrameCtx {
     rbg: [RbgCtx; 2],
     /// Per-rotation-parameter tile geometry.
     rot_geo: [RotGeo; 2],
+    /// Per-rotation-parameter coefficient-table context.
+    coeff: [CoeffCtx; 2],
     /// W0/W1 rectangle bounds `(sx, ex, sy, ey)` + line-window enables.
     win: [((u32, u32, u32, u32), bool); 2],
 }
@@ -128,6 +130,100 @@ struct RbgCtx {
     tpon: bool,
     depth: u8,
     bitmap: bool,
+}
+
+/// One rotation parameter set's coefficient-table context (VDP2 manual
+/// "Coefficient Table"; Mednafen `SetupRotVars`/`GetCoeffAddr`/`ReadCoeff`).
+/// The address accumulator walks `(KTAOF << 26) + KAst + DKAst·line +
+/// DKAx·dot` in 1/1024-entry units; the **per-dot** term applies only when a
+/// VRAM bank is RDBS-granted for coefficient reads or CRKTE puts the table in
+/// CRAM — otherwise the line-start coefficient holds for the whole line.
+/// VF2's fight floor needs the per-dot walk (RDBS grants bank A1): with a
+/// per-line-only read the perspective scale is wrong across each line and the
+/// plane coordinate runs off the map — the floor cut off short of the horizon.
+struct CoeffCtx {
+    enabled: bool,
+    one_word: bool,
+    mode: u8,
+    crkte: bool,
+    per_dot: bool,
+    bank_ok: [bool; 4],
+    /// Accumulator base in Mednafen units (1/1024 of a table entry).
+    base: u32,
+    dkast: i32,
+    dkax: i32,
+}
+
+impl CoeffCtx {
+    fn new(vdp2: &Vdp2, param: usize) -> Self {
+        let r = &vdp2.regs;
+        let rp = RotationParams::read(&vdp2.vram, r.rotation_table_addr(), param);
+        let crkte = r.coeff_in_cram();
+        let bank_ok = if crkte { [true; 4] } else { r.rotation_coeff_banks() };
+        Self {
+            enabled: r.rbg_coeff_enabled(param),
+            one_word: r.rbg_coeff_size_word(param),
+            mode: r.rbg_coeff_mode(param),
+            crkte,
+            per_dot: crkte || bank_ok.iter().any(|&b| b),
+            bank_ok,
+            base: (r.rbg_coeff_addr_offset(param) << 26)
+                .wrapping_add((rp.kast as u32) >> 6),
+            dkast: rp.dkast >> 6,
+            dkax: rp.dkax >> 6,
+        }
+    }
+
+    /// Raw coefficient word for dot `(x, y)`, or the per-line value when the
+    /// per-dot mode is off. Bit 31 = transparent; low 24 bits = signed value.
+    fn read(&self, vdp2: &Vdp2, x: u32, y: u32) -> u32 {
+        let mut accum = self
+            .base
+            .wrapping_add((self.dkast as u32).wrapping_mul(y));
+        if self.per_dot {
+            accum = accum.wrapping_add((self.dkax as u32).wrapping_mul(x));
+        }
+        // 1/1024 units → entry index → u16-word index (32-bit entries span 2).
+        let mut idx = accum >> 10;
+        if !self.one_word {
+            idx <<= 1;
+        }
+        if self.crkte {
+            // Upper 2 KiB of CRAM (Mednafen `&CRAM[0x400]`), 0x3FF-word window.
+            idx &= 0x3FF;
+            let read16 = |i: u32| vdp2.cram.read16(0x800 + ((idx + i) & 0x3FF) * 2) as u32;
+            if self.one_word {
+                widen_coeff16(read16(0))
+            } else {
+                (read16(0) << 16) | read16(1)
+            }
+        } else {
+            idx &= 0x3_FFFF;
+            // Per-dot reads come only from RDBS-granted banks; an ungranted
+            // bank reads as 0 (Mednafen `bank_tab` rule). The per-line base
+            // read is not bank-gated.
+            if self.per_dot && !self.bank_ok[(idx >> 16) as usize] {
+                return 0;
+            }
+            let read16 = |i: u32| vdp2.vram.read16((((idx + i) & 0x3_FFFF) * 2) & 0x7_FFFF) as u32;
+            if self.one_word {
+                widen_coeff16(read16(0))
+            } else {
+                (read16(0) << 16) | read16(1)
+            }
+        }
+    }
+}
+
+/// Widen a 1-word (16-bit) coefficient to the canonical 32-bit form: bit 15 →
+/// the bit-31 transparent flag, the signed 15-bit value scaled to 8.16
+/// (Mednafen `ReadCoeff`: `sign_x_to_s32(21, tmp << 6) & 0xFFFFFF`).
+fn widen_coeff16(tmp: u32) -> u32 {
+    let mut v = (tmp & 0x7FFF) << 6;
+    if v & 0x10_0000 != 0 {
+        v |= 0xFFE0_0000; // sign-extend bit 20
+    }
+    (v & 0x00FF_FFFF) | ((tmp & 0x8000) << 16)
 }
 
 /// Frame-constant geometry for one rotation parameter set (A/B).
@@ -305,6 +401,7 @@ impl FrameCtx {
             nbg: core::array::from_fn(|n| NbgCtx::new(vdp2, n)),
             rbg: core::array::from_fn(|l| RbgCtx::new(vdp2, l)),
             rot_geo: core::array::from_fn(|p| RotGeo::new(vdp2, p)),
+            coeff: core::array::from_fn(|p| CoeffCtx::new(vdp2, p)),
             win: core::array::from_fn(|w| {
                 (vdp2.regs.window_rect(w), vdp2.regs.window_line_enabled(w))
             }),
@@ -1394,69 +1491,37 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
 /// pen). RBG0 may drive itself from either parameter set via RPMD; RBG1 is fixed
 /// to set B — hence the two indices are kept distinct.
 fn sample_rbg(vdp2: &Vdp2, ctx: &FrameCtx, param: usize, layer: usize, x: u32, y: u32) -> Option<Sample> {
-    let mut rp = ctx.rot[param];
-    // Per-line coefficient table: overrides kx/ky (giving perspective) or makes
-    // the whole line transparent.
-    match rot_line_coeff(vdp2, param, &rp, y) {
-        Coeff::Off => {}
-        Coeff::Transparent => return None,
-        Coeff::Set(kx, ky) => {
-            rp.kx = kx;
-            rp.ky = ky;
+    let rp = &ctx.rot[param];
+    let cc = &ctx.coeff[param];
+    // Coefficient table: per-dot (or per-line) kx/ky/Xp override giving
+    // perspective, with bit 31 marking the dot transparent.
+    let (mut kx, mut ky, mut xp) = (rp.kx, rp.ky, None);
+    if cc.enabled {
+        let coeff = cc.read(vdp2, x, y);
+        if coeff & 0x8000_0000 != 0 {
+            return None;
+        }
+        let mut v = (coeff & 0x00FF_FFFF) as i32;
+        if v & 0x0080_0000 != 0 {
+            v |= !0x00FF_FFFF; // sign-extend bit 23 (8.16)
+        }
+        match cc.mode {
+            0 => {
+                kx = v;
+                ky = v;
+            }
+            1 => kx = v,
+            2 => ky = v,
+            // Mode 3: the payload replaces the viewpoint X term (Mednafen
+            // `Xp = sext << 2` in .10 units = `<< 8` in our 16.16).
+            _ => xp = Some(v << 8),
         }
     }
-    let (plane_x, plane_y) = rp.transform(x as i32, y as i32);
+    let (plane_x, plane_y) = rp.transform_k(x as i32, y as i32, kx, ky, xp);
     if ctx.rbg[layer].bitmap {
         sample_rot_bitmap(vdp2, ctx, param, layer, plane_x, plane_y)
     } else {
         sample_rot_tile(vdp2, ctx, param, layer, plane_x, plane_y)
-    }
-}
-
-/// Outcome of a rotation line-coefficient lookup.
-enum Coeff {
-    /// No coefficient table — use the parameter table's kx/ky.
-    Off,
-    /// The coefficient's MSB flags this line as transparent.
-    Transparent,
-    /// Override (kx, ky) for this line.
-    Set(i32, i32),
-}
-
-/// Read the per-line rotation coefficient for `which` at screen line `y` and
-/// turn it into a kx/ky override (modes 0/1/2) per KTCTL. The table index is
-/// `(kast + dkast·y) >> 16`; longword entries are 24-bit 8.16 fixed, word
-/// entries 15-bit `<<6`. The coefficient table is assumed to live in VRAM
-/// (RAMCTL.CRKTE = 0); mode 3 (Xp override) is a later refinement.
-fn rot_line_coeff(vdp2: &Vdp2, which: usize, rp: &RotationParams, y: u32) -> Coeff {
-    if !vdp2.regs.rbg_coeff_enabled(which) {
-        return Coeff::Off;
-    }
-    let idx = ((rp.kast.wrapping_add(rp.dkast.wrapping_mul(y as i32))) >> 16) as u32;
-    let base = vdp2.regs.rbg_coeff_table_base(which);
-    let (val, transparent) = if vdp2.regs.rbg_coeff_size_word(which) {
-        let w = vdp2.vram.read16(base + idx * 2) as u32;
-        let mut v = (w & 0x7FFF) as i32;
-        if v & 0x4000 != 0 {
-            v |= !0x7FFF; // sign-extend bit 14
-        }
-        (v << 6, w & 0x8000 != 0) // <<6 → 16.16
-    } else {
-        let w = vdp2.vram.read32(base + idx * 4);
-        let mut v = (w & 0x00FF_FFFF) as i32;
-        if v & 0x0080_0000 != 0 {
-            v |= !0x00FF_FFFF; // sign-extend bit 23 (already 8.16)
-        }
-        (v, w & 0x8000_0000 != 0)
-    };
-    if transparent {
-        return Coeff::Transparent;
-    }
-    match vdp2.regs.rbg_coeff_mode(which) {
-        0 => Coeff::Set(val, val),
-        1 => Coeff::Set(val, rp.ky),
-        2 => Coeff::Set(rp.kx, val),
-        _ => Coeff::Off, // mode 3 (Xp) — refinement
     }
 }
 

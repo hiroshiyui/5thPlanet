@@ -571,3 +571,89 @@ fn vram_cycle_pattern_gates_a_tile_layers_character_fetch() {
     sat.run_frame(&mut out);
     assert_eq!(&out[px..px + 4], &[0, 0, 255, 0xFF], "no CG grant → NBG0 char blanks → backdrop");
 }
+
+/// Per-dot rotation coefficients (VF2's fight floor): with a VRAM bank
+/// RDBS-granted for coefficient reads, the coefficient address walks
+/// `DKAx` per dot — here two dots of one line read different table
+/// entries, one of them transparent (bit 15 of the 1-word form). A
+/// per-line-only read could never make dots of one line differ.
+#[test]
+fn rotation_coefficients_walk_per_dot_when_a_bank_is_granted() {
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0 only
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // CHCTLB: R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR = 1
+    // RDBS: bank A1 = coefficient (value 1 at bits 3-2), banks split.
+    sat.bus.write16(0x05F8_000E, 0x0304, AccessKind::Data); // RAMCTL: VRxMD split + A1=COEFF
+    // Rotation table at 0x40000 (bank B0): identity + KAst pointing at the
+    // coefficient table in bank A1 (byte 0x20000 → entry 0x10000 → KAst raw
+    // = entry << 16).
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
+    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
+    }
+    sat.bus.vdp2.vram.write32(0x40000 + 23 * 4, 0x0001_0000); // DKAx = 1 entry/dot (.10 units ×1024, raw <<6)
+    // KTCTL: RBG0 coefficient enable + 1-word size, mode 0 (kx & ky).
+    sat.bus.write16(0x05F8_00B4, 0x0003, AccessKind::Data);
+    // KTAOF param A = 1: the accumulator's `ktaof << 26` lands the table at
+    // u16-word 0x10000 = byte 0x20000 = bank A1 (KAst alone spans one bank).
+    sat.bus.write16(0x05F8_00B6, 0x0001, AccessKind::Data);
+    // Coefficient table at bank A1 byte 0x20000 (KTAOF=1): dot 0 → 1.0
+    // (0x0400 in the 1-word 5.10 form), dot 1 → transparent (bit 15).
+    sat.bus.vdp2.vram.write16(0x20000, 0x0400);
+    sat.bus.vdp2.vram.write16(0x20002, 0x8400);
+    sat.bus.vdp2.vram.write16(0x20004, 0x0400);
+    // Bitmap row 10: red dots everywhere (code 1).
+    sat.bus.vdp2.cram.write16(2, 0x001F);
+    for x in 0..16u32 {
+        sat.bus.vdp2.vram.write8(10 * 512 + x, 1);
+    }
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+    let px = |x: usize| (10 * FRAME_WIDTH + x) * 4;
+    assert_eq!(&out[px(0)..px(0) + 4], &[0xFF, 0, 0, 0xFF], "dot 0: coeff 1.0 → red");
+    assert_ne!(
+        &out[px(1)..px(1) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "dot 1: per-dot transparent coefficient"
+    );
+    assert_eq!(&out[px(2)..px(2) + 4], &[0xFF, 0, 0, 0xFF], "dot 2: visible again");
+}
+
+/// RAMCTL.CRKTE: the coefficient table reads from the upper half of CRAM.
+#[test]
+fn rotation_coefficients_read_from_cram_when_crkte() {
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data);
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data);
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data);
+    sat.bus.write16(0x05F8_000E, 0x8000, AccessKind::Data); // RAMCTL.CRKTE
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data);
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data);
+    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
+    }
+    sat.bus.write16(0x05F8_00B4, 0x0003, AccessKind::Data); // coeff on, 1-word
+    // CRAM upper half entry 0: transparent → the whole layer vanishes; a
+    // VRAM-resident table would have read 0 (opaque, scale 0) instead.
+    sat.bus.vdp2.cram.write16(0x800, 0x8400);
+    sat.bus.vdp2.cram.write16(2, 0x001F);
+    sat.bus.vdp2.vram.write8(10 * 512 + 10, 1);
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+    let px = (10 * FRAME_WIDTH + 10) * 4;
+    assert_ne!(
+        &out[px..px + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "CRKTE coefficient (transparent) must gate the dot"
+    );
+}
