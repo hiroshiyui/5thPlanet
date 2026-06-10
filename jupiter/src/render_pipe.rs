@@ -121,6 +121,15 @@ impl RenderPipe {
         }
     }
 
+    /// Whether the pipe has neither a spare buffer nor a render in flight —
+    /// i.e. it cannot accept a [`submit`] until the caller [`recycle`]s a
+    /// buffer into it. Skipping a submit for lack of a spare must not become
+    /// permanent: `wait` only returns buffers for submitted jobs, so the
+    /// caller has to check this *outside* the wait path.
+    pub fn needs_spare(&self) -> bool {
+        self.spare.is_none() && !self.in_flight
+    }
+
     /// Return a buffer to the pipe as the next spare (the caller's previous
     /// display buffer, free once the new one has been swapped in).
     pub fn recycle(&mut self, buf: Vec<u8>) {

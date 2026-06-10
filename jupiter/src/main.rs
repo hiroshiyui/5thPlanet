@@ -388,6 +388,7 @@ fn run(
             let mut pl_frames = 0u32;
             let mut pl_bursts = [0u32; 3];
             let mut pl_last = std::time::Instant::now();
+
             'emu: loop {
                 if emu_quit.load(Ordering::Relaxed) {
                     break;
@@ -505,9 +506,16 @@ fn run(
                         Err(mpsc::TrySendError::Full((b, _)))
                         | Err(mpsc::TrySendError::Disconnected((b, _))) => pool.push(b),
                     }
-                    if let Some(b) = pool.pop() {
-                        pipe.recycle(b);
-                    }
+                }
+                // Feed the pipe a spare whenever it lacks one — this must be
+                // independent of the wait() result above: if a submit was ever
+                // skipped for want of a spare, wait() yields None from then
+                // on, and a recycle gated behind it would never run again
+                // (the black-screen pipeline deadlock).
+                if pipe.needs_spare()
+                    && let Some(b) = pool.pop()
+                {
+                    pipe.recycle(b);
                 }
                 pipe.submit(&saturn);
                 } else {
