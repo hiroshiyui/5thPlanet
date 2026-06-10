@@ -186,6 +186,39 @@ fn parse_cart(spec: &str) -> Result<Cartridge, String> {
     }
 }
 
+/// Find the BIOS images the OSD BIOS screen can power-cycle into: every
+/// `.bin` of exactly 512 KiB in the launched image's directory, sorted.
+/// Returns the list and the launched image's index in it (the launched path
+/// is prepended if the scan somehow misses it, e.g. a non-`.bin` extension).
+#[cfg(feature = "sdl2-frontend")]
+fn scan_bios_images(launched: &std::path::Path) -> (Vec<std::path::PathBuf>, usize) {
+    let dir = launched
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut list: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("bin"))
+                && fs::metadata(&p).is_ok_and(|m| m.len() == 512 * 1024)
+            {
+                list.push(p);
+            }
+        }
+    }
+    list.sort();
+    let canon = |p: &std::path::Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(launched);
+    match list.iter().position(|p| canon(p) == target) {
+        Some(i) => (list, i),
+        None => {
+            list.insert(0, launched.to_path_buf());
+            (list, 0)
+        }
+    }
+}
+
 /// Open a disc spec and insert it into the machine. A `cdrom:<device>` spec
 /// opens a live optical drive (via the `physdisc` crate; errors without the
 /// `physical-disc` feature); anything else is an image path. Both the launch
@@ -449,18 +482,29 @@ fn run(
 
     // Bundle the dispatcher-owned state for the emu thread (the keymap and
     // window above already consumed what they need from `cfg`).
+    let (bios_paths, bios_active) = scan_bios_images(&save_base);
+    let bios_names: Vec<String> = bios_paths
+        .iter()
+        .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+        .collect();
     let sess = Session {
         save_base: save_base.clone(),
         launched_spec,
         ui,
         cfg,
+        bios_paths,
+        bios_names,
+        bios_active,
+        mouse_port,
     };
 
     std::thread::scope(|scope| {
         let emu_mirror = Arc::clone(&audio_mirror);
         let emu_osd_open = Arc::clone(&osd_open);
         let emu_quit = Arc::clone(&quit_flag);
-        let emu = scope.spawn(move || -> Saturn {
+        // Returns the machine plus the final save base — a BIOS swap re-keys
+        // the battery file mid-session, so the exit persist must follow it.
+        let emu = scope.spawn(move || -> (Saturn, std::path::PathBuf) {
             let mut saturn = saturn;
             let mut osd = osd;
             let mut pipe = pipe;
@@ -497,6 +541,8 @@ fn run(
                     region: sess.ui.region,
                     cart: sess.ui.cart,
                     pad_keys: sess.cfg.keys.clone(),
+                    bios_names: sess.bios_names.clone(),
+                    bios_active: sess.bios_active,
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
@@ -655,7 +701,7 @@ fn run(
                     pl_last = std::time::Instant::now();
                 }
             }
-            saturn
+            (saturn, sess.save_base)
         });
 
         // ---- SDL main loop: events, audio, present -----------------------
@@ -886,8 +932,10 @@ fn run(
 
         quit_flag.store(true, Ordering::Relaxed);
         // Unblock and join the emu thread, then persist the battery from the
-        // final machine state.
-        let saturn = emu.join().expect("emu thread");
+        // final machine state — keyed to the final save base (a BIOS swap
+        // re-keys it mid-session).
+        let (saturn, final_base) = emu.join().expect("emu thread");
+        let battery_path = final_base.with_extension("bup");
         if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
             eprintln!(
                 "failed to persist backup RAM to {}: {e}",
@@ -952,6 +1000,14 @@ struct Session {
     launched_spec: Option<String>,
     ui: UiState,
     cfg: config::Config,
+    /// The swappable BIOS images beside the launched one (paths + display
+    /// stems, index-matched) and which one is running. A swap re-keys
+    /// `save_base` to the new image.
+    bios_paths: Vec<std::path::PathBuf>,
+    bios_names: Vec<String>,
+    bios_active: usize,
+    /// Which port carries the Shuttle Mouse (re-applied across a power cycle).
+    mouse_port: Option<u8>,
 }
 
 #[cfg(feature = "sdl2-frontend")]
@@ -1114,6 +1170,59 @@ fn dispatch_osd(
             };
             osd.set_toast(format!("Region: {name} (reset)"), 150);
             osd.close();
+        }
+        OsdAction::SetBios(i) => {
+            let i = i as usize;
+            let Some(path) = sess.bios_paths.get(i).cloned() else {
+                osd.set_toast("No such BIOS image", 120);
+                return false;
+            };
+            match fs::read(&path) {
+                Err(e) => osd.set_toast(format!("BIOS read failed: {e}"), 180),
+                Ok(bytes) => {
+                    // Persist the outgoing machine's battery before it drops,
+                    // then power-cycle into the new image, mirroring the
+                    // launch path: region, ports, RTC, disc, cartridge. (A
+                    // `--cart=rom:` cart has no Settings equivalent and is
+                    // not re-created — same as the Cartridge screen.)
+                    let old_bup = sess.save_base.with_extension("bup");
+                    if let Err(e) = fs::write(&old_bup, saturn.internal_backup()) {
+                        eprintln!("failed to persist backup RAM to {}: {e}", old_bup.display());
+                    }
+                    *saturn = saturn::Saturn::new(bytes);
+                    saturn.reset();
+                    saturn.set_region(osd_region_to_code(sess.ui.region));
+                    match sess.mouse_port {
+                        Some(1) => saturn.set_port_devices(
+                            saturn::smpc::PortDevice::Mouse,
+                            saturn::smpc::PortDevice::None,
+                        ),
+                        Some(_) => saturn.set_port_devices(
+                            saturn::smpc::PortDevice::Pad,
+                            saturn::smpc::PortDevice::Mouse,
+                        ),
+                        None => {}
+                    }
+                    saturn.set_rtc_unix(host_unix_secs());
+                    if let Some(spec) = &sess.launched_spec
+                        && let Err(e) = insert_from_spec(saturn, spec)
+                    {
+                        osd.set_toast(format!("Disc re-insert failed: {e}"), 180);
+                    }
+                    saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
+                    // Save files re-key to the new image; adopt its battery.
+                    sess.save_base = path;
+                    sess.bios_active = i;
+                    if let Ok(b) = fs::read(sess.save_base.with_extension("bup")) {
+                        saturn.load_internal_backup(&b);
+                    }
+                    osd.set_toast(
+                        format!("BIOS: {} (power cycle)", sess.bios_names[i]),
+                        150,
+                    );
+                    osd.close();
+                }
+            }
         }
         OsdAction::StartRebind(b) => {
             // Modal: the OSD shows "press a key" and swallows nav; the SDL

@@ -80,6 +80,8 @@ pub enum OsdAction {
     StartRebind(u8),
     /// Restore the default key bindings.
     ResetBinds,
+    /// Power-cycle into another BIOS image (an [`OsdCtx::bios_names`] index).
+    SetBios(u8),
 }
 
 /// Dynamic context the frontend supplies each draw so labels reflect live
@@ -100,6 +102,11 @@ pub struct OsdCtx {
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
     pub pad_keys: [String; PAD_BUTTONS],
+    /// Display names of the BIOS images found beside the launched one; the
+    /// BIOS screen lists them and marks [`OsdCtx::bios_active`].
+    pub bios_names: Vec<String>,
+    /// Index of the currently-running BIOS in [`OsdCtx::bios_names`].
+    pub bios_active: usize,
 }
 
 /// Which screen is on top of the stack.
@@ -116,6 +123,7 @@ enum Screen {
     Controller,
     Region,
     Cartridge,
+    Bios,
 }
 
 /// One menu item: its label is computed from [`OsdCtx`] at draw time.
@@ -261,6 +269,7 @@ impl Osd {
                 mk("Controller", Select::Push(Screen::Controller)),
                 mk("Region", Select::Push(Screen::Region)),
                 mk("Cartridge", Select::Push(Screen::Cartridge)),
+                mk("BIOS", Select::Push(Screen::Bios)),
                 mk("Back", Select::Close),
             ],
             Screen::Graphics => {
@@ -319,6 +328,24 @@ impl Osd {
                     mk("Back", Select::Close),
                 ]
             }
+            Screen::Bios => {
+                // One row per discovered 512-KiB image; '*' marks the running
+                // one. Long file stems are truncated to fit the panel.
+                let mut v = Vec::with_capacity(ctx.bios_names.len() + 1);
+                for (i, name) in ctx.bios_names.iter().enumerate() {
+                    let mark = if i == ctx.bios_active { "* " } else { "  " };
+                    let short: String = name.chars().take(18).collect();
+                    v.push(mk(
+                        &format!("{mark}{short}"),
+                        Select::Emit(OsdAction::SetBios(i as u8)),
+                    ));
+                }
+                if v.is_empty() {
+                    v.push(mk("(no images found)", Select::Close));
+                }
+                v.push(mk("Back", Select::Close));
+                v
+            }
         }
     }
 
@@ -332,6 +359,7 @@ impl Osd {
             Screen::Controller => "Controller",
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
+            Screen::Bios => "BIOS",
         }
     }
 
@@ -485,6 +513,8 @@ mod tests {
             region: OsdRegion::Japan,
             cart: OsdCart::None,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
+            bios_names: vec!["sega_101".into(), "mpr-17933".into()],
+            bios_active: 0,
         }
     }
 
@@ -711,6 +741,36 @@ mod tests {
         let mut buf = vec![0u8; w * h * 4];
         osd.render_overlay(&mut buf, w, h, &ctx(true));
         assert!(buf.iter().any(|&b| b != 0), "capture prompt paints pixels");
+    }
+
+    #[test]
+    fn bios_screen_marks_active_and_emits_swap() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // bios_active = 0 (sega_101)
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "BIOS");
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label == "* sega_101"));
+        assert_eq!(
+            select_main(&mut osd, &c, "  mpr-17933"),
+            Some(OsdAction::SetBios(1))
+        );
+    }
+
+    #[test]
+    fn bios_screen_with_no_images_offers_only_back() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.bios_names.clear();
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "BIOS");
+        let items = osd.items(osd.screen(), &c);
+        assert_eq!(items.len(), 2); // "(no images found)" + Back
+        // Selecting the placeholder just pops back to Settings.
+        assert_eq!(osd.handle(Nav::Select, &c), None);
+        assert!(osd.is_open());
     }
 
     #[test]
