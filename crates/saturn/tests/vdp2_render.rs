@@ -657,3 +657,48 @@ fn rotation_coefficients_read_from_cram_when_crkte() {
         "CRKTE coefficient (transparent) must gate the dot"
     );
 }
+
+/// In double-density interlace the rotation accumulators advance once per
+/// *field* line (display line >> 1) — feeding the raw display line walks the
+/// coefficient table at twice the hardware rate (VF2's fight floor started
+/// at 31% of the screen instead of ~61%, with a doubly-steep perspective).
+/// Coefficient table: entry 0 transparent, entry 1 solid, DKAst = 1
+/// entry/line → display lines 0-1 must be transparent and 2-3 solid.
+#[test]
+fn rotation_coefficient_lines_halve_in_double_density_interlace() {
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x80C0, AccessKind::Data); // DISP | LSMD=11 (DD), 320
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR = 1
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTA → 0x40000
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data);
+    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
+    }
+    sat.bus.vdp2.vram.write32(0x40000 + 22 * 4, 0x0001_0000); // DKAst = 1 entry/line
+    sat.bus.write16(0x05F8_00B4, 0x0003, AccessKind::Data); // coeff on, 1-word, mode 0
+    sat.bus.write16(0x05F8_00B6, 0x0001, AccessKind::Data); // KTAOF=1 → bank A1
+    sat.bus.vdp2.vram.write16(0x20000, 0x8400); // line 0: transparent
+    sat.bus.vdp2.vram.write16(0x20002, 0x0400); // line 1: 1.0
+    sat.bus.vdp2.vram.write16(0x20004, 0x0400);
+    sat.bus.write16(0x05F8_000E, 0x0304, AccessKind::Data); // RDBS A1=COEFF (per-dot on, DKAx=0)
+    // Solid red bitmap everywhere.
+    sat.bus.vdp2.cram.write16(2, 0x001F);
+    for y in 0..4u32 {
+        for x in 0..8u32 {
+            sat.bus.vdp2.vram.write8(y * 512 + x, 1);
+        }
+    }
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+    let px = |x: usize, y: usize| (y * 320 + x) * 4;
+    let red = [0xFFu8, 0, 0, 0xFF];
+    assert_ne!(&out[px(4, 0)..px(4, 0) + 4], &red, "display 0 → coeff line 0 (transparent)");
+    assert_ne!(&out[px(4, 1)..px(4, 1) + 4], &red, "display 1 → still coeff line 0");
+    assert_eq!(&out[px(4, 2)..px(4, 2) + 4], &red, "display 2 → coeff line 1 (solid)");
+    assert_eq!(&out[px(4, 3)..px(4, 3) + 4], &red, "display 3 → still coeff line 1");
+}

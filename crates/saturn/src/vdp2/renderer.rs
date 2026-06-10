@@ -883,6 +883,29 @@ fn sprite_window_pixel(
     if area { inside } else { !inside }
 }
 
+/// RPMD mode 3: rotation parameter A/B selection for one dot from the
+/// rotation-parameter window — WCTLD's low byte (W0/W1 enable+area bits and
+/// the AND/OR logic bit; the sprite-window bits don't apply — Mednafen
+/// `GetWinRotAB`/`GetCWV` with `WinControl[WINLAYER_ROTPARAM] & 0x8F`).
+/// `false` = parameter A, `true` = parameter B. A disabled window contributes
+/// the logic-neutral element (AND → true, OR → false), so with no windows
+/// enabled the result is the logic bit itself, matching the reference.
+fn rot_param_window_b(vdp2: &Vdp2, ctx: &FrameCtx, x: u32, y: u32) -> bool {
+    let ctl = vdp2.regs.read16(0x0D6) & 0x8F;
+    let logic_and = ctl & 0x80 != 0;
+    let term = |en_bit: u16, area_bit: u16, w: usize| -> bool {
+        if ctl & en_bit == 0 {
+            return logic_and;
+        }
+        // Raw inside-test of window `w` (rect or line table).
+        let inside = win_pixel(vdp2, ctx, w, x, y, true, true);
+        inside ^ (ctl & area_bit != 0)
+    };
+    let w0 = term(0x02, 0x01, 0);
+    let w1 = term(0x08, 0x04, 1);
+    if logic_and { w0 && w1 } else { w0 || w1 }
+}
+
 /// Fetch the sprite-layer source word for display `(x, y)`: the VDP1
 /// frame-buffer word, or — when the buffer was plotted in the TVM 8bpp
 /// layout — the dot's byte widened to `0xFF00 | byte` (Mednafen
@@ -989,20 +1012,42 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
         return None;
     }
     // Mosaic (MZCTL bit 4) applies to RBG0 only.
-    let (mx, my) = if which == 0 {
+    let (mx, mut my) = if which == 0 {
         vdp2.regs.mosaic_coord(0x10, x, y)
     } else {
         (x, y)
     };
-    // Rotation parameter set (geometry/coefficient/plane): RBG0 picks per RPMD —
-    // A (0) or B (1) whole-layer — while RBG1 is fixed to param B. RPMD is forced
-    // to A when RBG1 is active (dual-rotation mode). Modes 2/3 (per-dot coeff /
-    // rotation window) fall back to A pending the per-dot coefficient rework.
+    // Double-density interlace: the rotation accumulators (DXst per line,
+    // DKAst per coefficient line) advance once per *field* line — half the
+    // display lines (Mednafen accumulates per rendered field line; cf. the
+    // sprite-framebuffer y>>1). Feeding the raw display line advanced the
+    // coefficient table at twice the hardware rate: VF2's fight floor began
+    // at display 31% instead of ~61% with a doubly-steep perspective.
+    if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 {
+        my >>= 1;
+    }
+    // Rotation parameter set (geometry/coefficient/plane): RBG0 picks per
+    // RPMD — A (0), B (1), per-dot by parameter A's coefficient MSB (2), or
+    // per-dot by the rotation-parameter window (3) — while RBG1 is fixed to
+    // param B and forces RPMD to A (dual-rotation mode). VF2's fight ground
+    // runs mode 3: the stone courtyard (param A, screen-over transparent
+    // outside its map) and the distant flat ground (param B) split per dot by
+    // the window — rendering everything with param A paved the whole frame
+    // in courtyard stones up to a too-high horizon.
     let param = if which == 0 {
         if ctx.rbg[1].enabled {
             0
         } else {
-            (vdp2.regs.rotation_param_mode() == 1) as usize
+            match vdp2.regs.rotation_param_mode() {
+                0 => 0,
+                1 => 1,
+                // Mode 2: parameter A's coefficient MSB switches the dot to
+                // parameter B (Mednafen `SetupRotVars` EffRPMD == 2).
+                2 => (ctx.coeff[0].enabled
+                    && ctx.coeff[0].read(vdp2, mx, my) & 0x8000_0000 != 0)
+                    as usize,
+                _ => rot_param_window_b(vdp2, ctx, mx, my) as usize,
+            }
         }
     } else {
         1
