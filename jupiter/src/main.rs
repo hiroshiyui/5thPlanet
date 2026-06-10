@@ -481,7 +481,16 @@ fn run(
                     saturn.advance_frame();
                     pl_advance += t.elapsed();
                     let chunk = saturn.take_audio();
-                    depth += (chunk.len() * 2) as u32;
+                    let bytes = (chunk.len() * 2) as u32;
+                    depth += bytes;
+                    // Credit the in-flight bytes into the shared mirror too: the
+                    // main thread refreshes it only once per vsync, so without
+                    // this every emu iteration in between re-reads the same stale
+                    // depth and over-produces (~3% fast bursts, then an overshoot
+                    // stall — visible as alternating fast/slow gameplay). The
+                    // main thread's authoritative `store` re-anchors the mirror
+                    // to the real SDL queue size each frame.
+                    emu_mirror.fetch_add(bytes, Ordering::Relaxed);
                     let _ = audio_tx.send(chunk);
                     burst += 1;
                 }
