@@ -96,7 +96,12 @@ impl RotationParams {
             d: mc(w(10)),
             e: mc(w(11)),
             f: mc(w(12)),
-            px: field(w13, 0x3FFF_0000, 0x3000_0000, 0xC000_0000),
+            // s14 at bits 29..16 — the sign is bit 29 ONLY (Mednafen
+            // `sign_x_to_s32(14, ...)`). A 0x3000_0000 sign mask here once
+            // corrupted every Px in [4096, 8191] into a large negative,
+            // displacing VF2's ring floor by a per-line kx-graded offset
+            // (fighters looked "ring out" while inside).
+            px: field(w13, 0x3FFF_0000, 0x2000_0000, 0xC000_0000),
             py: {
                 let v = (w13 & 0x0000_3FFF) << 16;
                 if v & 0x2000_0000 != 0 {
@@ -242,6 +247,27 @@ mod tests {
             0,
         );
         assert_eq!(rp.transform(10, 4), (-4, 10));
+    }
+
+    /// Px is a signed 14-bit integer at bits 29..16 whose sign is bit 29
+    /// ONLY (Mednafen `sign_x_to_s32(14, ...)`). The regression: values in
+    /// [4096, 8191] — bit 28 set, bit 29 clear — are POSITIVE; a sign mask
+    /// that also tested bit 28 corrupted them to large negatives, displacing
+    /// the rotation plane by a per-line kx-graded offset (VF2's ring floor —
+    /// fighters appeared "ring out" while inside).
+    #[test]
+    fn px_in_the_4096_8191_range_stays_positive() {
+        // Word 13 packs Px (high 16 bits) and Py (low 14): Px = 4096.
+        let rp = RotationParams::read(&table(&[(13, 4096 << 16)]), 0, 0);
+        assert_eq!(rp.px, 4096 << 16, "Px=+4096 must read positive 16.16");
+        // The genuine sign bit still works: Px = -4096 (raw 14-bit 0x3000).
+        let rp = RotationParams::read(&table(&[(13, 0x3000 << 16)]), 0, 0);
+        assert_eq!(rp.px, -4096 << 16);
+        // And +8191 / the most-negative -8192.
+        let rp = RotationParams::read(&table(&[(13, 8191 << 16)]), 0, 0);
+        assert_eq!(rp.px, 8191 << 16);
+        let rp = RotationParams::read(&table(&[(13, 0x2000 << 16)]), 0, 0);
+        assert_eq!(rp.px, -8192 << 16);
     }
 
     #[test]
