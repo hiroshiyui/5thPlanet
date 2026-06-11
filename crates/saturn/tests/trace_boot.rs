@@ -220,7 +220,9 @@ fn gen_vf2_pc_trace() {
         println!("no JP BIOS at {}; skipped", bios_path.display());
         return;
     };
-    let cue_path = root.join("roms/vf2_full_lsb.cue");
+    let cue_path = root
+        .join("roms")
+        .join(std::env::var("CUE").unwrap_or_else(|_| "vf2_full_lsb.cue".into()));
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
         println!("no {}; skipped (copyrighted fixture)", cue_path.display());
         return;
