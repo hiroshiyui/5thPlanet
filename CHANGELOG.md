@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-11
+
+Milestone 9 (frontend OSD) is complete and Milestone 12 task #8 (the
+per-access bus-timing model) landed; a chain of user-verified accuracy fixes
+followed — VF2's "phantom ring-out" floor displacement, an audio-pacing
+starvation, and a CD report-tearing bug found booting Panzer Dragoon Zwei.
+Save states: format v8 (older states are rejected, not migrated).
+
+### Added
+
+- **M9 complete — frontend OSD**: a persisted config file
+  (`$XDG_CONFIG_HOME/5thplanet/jupiter.toml`: scale, fullscreen, region,
+  cartridge, keymap; CLI flag > config > autodetect), a **Settings →
+  Controller** screen with press-to-bind keyboard remapping (Reset Defaults
+  included), and a **Settings → BIOS** screen that power-cycles into any
+  sibling 512-KiB image, re-keying the save files.
+- **Game-controller support**: hot-plug SDL GameController (XInput/evdev)
+  merged into the port-1 pad with a fixed Xbox-style mapping
+  (A/B/C = X/A/B, X/Y/Z = Y/LB/RB, L/R = triggers, D-pad or left stick),
+  plus controller navigation of the OSD.
+- **M12 task #8 — per-access BSC bus-timing model** (a faithful Mednafen
+  port, implemented bus-side): CS0 as a 16-bit bus with per-transaction
+  costs, CS3 SDRAM read/write with the array-busy window, cache-line fills
+  as one burst (`AccessKind::LineFill`), the SH-2 write buffer, bus
+  turnaround, A-bus cartridge cost from live ASR0, and a shared bus
+  timestamp giving CPU↔CPU arbitration. The `bios_boot` golden was
+  unchanged; the BGM-phase metric moved toward the reference.
+
+### Fixed
+
+- **VDP2 rotation — the VF2 "phantom ring-out"**: in 640/704-dot hi-res
+  modes the rotation layer renders at normal dot resolution (each rotation
+  dot spans two display dots); ours stepped per display dot, compressing
+  the floor 2× toward screen-left. Also a one-bit sign-mask typo that
+  corrupted rotation viewpoint X values in [4096, 8191].
+- **Audio pacing**: the SCSP is fed the master's actual cycle advance (the
+  batch-edge overshoot was silently dropped — fights starved the audio
+  reserve and felt slowed), delivered in fixed 256-cycle chunks so the
+  Timer-B rate stays locked to the reference (88.000 samples/tick); SCSP
+  output is resampled when the audio device opens at a non-44.1 kHz rate.
+- **CD-block report tearing**: the periodic status report now holds until
+  the host consumes it by reading CR4 (Mednafen's `ResultsRead` gate) —
+  previously it recomposed per sector during playback and could tear a
+  reader's CR1..CR4 sequence (found via Panzer Dragoon Zwei's BIOS
+  disc-validity check).
+
+### Changed
+
+- Save-state format v6→v8 across the bus-timing, `ResultsRead`, and
+  SCSP-feed changes; older states are rejected with a clear error.
+- Debug tooling: CD command-log ring widened to 8192 entries; the VF2
+  PC-trace and disc-content probes are now CUE-parameterized.
+
 ## [0.1.0] - 2026-06-11
 
 First release. 5thPlanet is an accuracy-first SEGA Saturn emulator in Rust:
