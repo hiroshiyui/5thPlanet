@@ -1993,7 +1993,7 @@ impl CdBlock {
                     .last()
                     .is_some_and(|e| e.cmd == 0x00 && e.caller_pc == self.caller_pc);
             if !collapse {
-                if self.cmd_log.len() >= 1024 {
+                if self.cmd_log.len() >= 8192 {
                     self.cmd_log.remove(0);
                 }
                 self.cmd_log.push(CmdTrace {
