@@ -333,6 +333,15 @@ pub struct CdBlock {
     /// before — falsely processes partial register pokes as commands,
     /// clobbering the power-on signature the BIOS later checks.
     cr_written: u8,
+    /// Whether the host has consumed the current CR1-4 results (it read CR4).
+    /// The block composes a NEW result set - command response or periodic
+    /// report - only into consumed registers (Mednafen `ResultsRead`,
+    /// cdb.cpp: set on the Results[3] read, cleared by `MakeReport`/
+    /// `BasicResults`, periodic gated `if(ResultsRead)`). Without it the
+    /// per-sector periodic recomposed CR1-4 between a reader's CR1 and CR4
+    /// accesses during PLAY - Panzer Dragoon Zwei's BIOS disc-validity
+    /// service reads the report twice and requires identical tuples.
+    results_read: bool,
 
     /// Free-running accumulator (SH-2 master cycles) toward the next
     /// periodic report, advanced by [`tick`](Self::tick). Mirrors cs2.c's
@@ -625,6 +634,7 @@ impl CdBlock {
             firstfile: 0,
             command_pending: false,
             cr_written: 0,
+            results_read: true,
             periodic_accum: 0,
             host_initialized: false,
             cmd_log: Vec::new(),
@@ -828,6 +838,7 @@ impl CdBlock {
                     }
                 }
                 self.command_pending = false;
+                self.results_read = true;
                 self.cr4
             }
             _ => 0,
@@ -948,6 +959,7 @@ impl CdBlock {
 
     /// Write a standard CD status report into CR1..CR4 (cs2.c `doCDReport`).
     fn cd_report(&mut self) {
+        self.results_read = false;
         // The reported FAD is the drive's *current* head position, which the
         // read pump advances (`cd_curfad`) — not the static `fad` set only at
         // insert/eject. Reporting the stale `fad` left the BIOS boot loader
@@ -1561,7 +1573,11 @@ impl CdBlock {
         // without this guard the report clobbered VF2's GetSubcodeQ between
         // its CR1 and CR4 writes, dispatching the report's own status byte as
         // a bogus command (0x21 = PAUSE|PERI, 0x24 = SEEK|PERI).
-        if self.host_initialized && !self.command_pending && self.cr_written == 0 {
+        if self.host_initialized
+            && !self.command_pending
+            && self.cr_written == 0
+            && self.results_read
+        {
             self.status |= STAT_PERI;
             self.cd_report();
         }
@@ -2010,6 +2026,7 @@ impl CdBlock {
     }
 
     fn dispatch_inner(&mut self, command: u8, _cr_in: [u16; 4]) {
+        self.results_read = false;
         match command {
             0x00 => {
                 // Get CD status.
@@ -2774,7 +2791,11 @@ impl CdBlock {
         // command response (`command_pending`, cs2.c's `_command`); and never
         // clobber a command the host is mid-way through composing
         // (`cr_written != 0` — see the matching guard in `drive_periodic`).
-        if !self.host_initialized || self.command_pending || self.cr_written != 0 {
+        if !self.host_initialized
+            || self.command_pending
+            || self.cr_written != 0
+            || !self.results_read
+        {
             return;
         }
         self.status |= STAT_PERI;
@@ -3849,6 +3870,36 @@ mod tests {
         c.write16(0x0024, 0x0000); // CR4 completes + dispatches the command
         assert_eq!(c.cr2, 0x0005, "the intended GetSubcodeQ executed (5 words)");
         assert_eq!(c.cr1 & STAT_TRANS, STAT_TRANS, "subcode staged for transfer");
+    }
+
+    /// The periodic report composes into CR1–4 only after the host CONSUMED
+    /// the previous results by reading CR4 (Mednafen `ResultsRead`). During an
+    /// active PLAY the per-sector periodic would otherwise recompose the
+    /// report between a reader's CR1 and CR4 accesses — Panzer Dragoon Zwei's
+    /// BIOS disc-validity service reads the report tuple twice and requires
+    /// identical values; perpetual tearing failed it 100/100 → "invalid
+    /// disc" → exit to the BIOS CD player.
+    #[test]
+    fn periodic_report_holds_until_the_host_consumes_it() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        c.drive_phase = DrivePhase::Idle;
+        cmd(&mut c, 0x0000, 0x0000, 0x0000, 0x0000); // engage (GetStatus)
+        let _ = c.read16(0x0024); // consume → periodic may emit
+
+        // A long PLAY: the head advances every sector, so an ungated periodic
+        // would change the report's FAD continuously.
+        play(&mut c, 150, 300);
+        c.tick(cd2m(2_000_000)); // deep into the stream; ≥1 periodic emitted
+        let a = (c.read16(0x0018), c.read16(0x001C), c.read16(0x0020));
+        c.tick(cd2m(2_000_000)); // more sectors pass — report must HOLD
+        let b = (c.read16(0x0018), c.read16(0x001C), c.read16(0x0020));
+        assert_eq!(a, b, "unconsumed report must not be recomposed");
+
+        let _ = c.read16(0x0024); // CR4 read = consumption
+        c.tick(cd2m(2_000_000)); // next periodic recomposes with the new FAD
+        let after = (c.read16(0x0018), c.read16(0x001C), c.read16(0x0020));
+        assert_ne!(a, after, "after consumption the periodic must publish a fresh report");
     }
 
     /// Get Subcode (0x20) type 0 stages the 10-byte Q channel — [ctrl/adr,

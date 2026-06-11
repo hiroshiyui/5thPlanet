@@ -36,8 +36,9 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// port-device selection + Shuttle Mouse state (M13 E3). v6 added the
 /// `SaturnBus::timing` per-access BSC bus-timing state (M12 task #8) —
 /// serialized so a loaded state continues on the same bus timeline as the
-/// original (the round-trip determinism contract).
-const VERSION: u32 = 6;
+/// original (the round-trip determinism contract). v7 added the CD-block
+/// `results_read` latch (the Mednafen `ResultsRead` periodic gate).
+const VERSION: u32 = 7;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
