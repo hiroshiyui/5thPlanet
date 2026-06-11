@@ -1110,8 +1110,17 @@ impl Saturn {
             // cycle-exactly rather than up to a batch late — see `batch_size`.
             let batch = self.batch_size(now, remaining);
             self.step_cpus(now + batch);
-            self.feed_cd_audio(batch);
-            self.bus.scsp.run(batch);
+            // Feed the SCSP the master's ACTUAL advance, not the planned batch:
+            // the last instruction overshoots the batch edge by its cost (up to
+            // ~50 cycles of M12-t8 wait-states against a <=256-cycle batch), and
+            // a per-batch `run(batch)` dropped that overshoot from the SCSP
+            // timeline forever - in VF2 fights (mailbox polls at +48/read) the
+            // sound subsystem fell ~25% behind real time: slow BGM, and audio
+            // production of ~553 samples/frame vs 738 starved the frontend's
+            // pacing reserve (the user-felt "FPS downgrade").
+            let advanced = self.now() - now;
+            self.feed_cd_audio(advanced);
+            self.bus.scsp.run(advanced);
             self.update_video_timing();
             self.drain_smpc();
             let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
@@ -1146,8 +1155,9 @@ impl Saturn {
                     pcs.push(cpu.regs.pc);
                 }
             });
-            self.feed_cd_audio(batch);
-            self.bus.scsp.run(batch);
+            let advanced = self.now() - now; // see run_for: actual advance
+            self.feed_cd_audio(advanced);
+            self.bus.scsp.run(advanced);
             self.update_video_timing();
             self.drain_smpc();
             let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)

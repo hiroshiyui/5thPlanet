@@ -4111,6 +4111,23 @@ fn bench_vf2_fight() {
     println!("render share  : {:.0}%", (1.0 - compute.as_secs_f64() / rendered.as_secs_f64()) * 100.0);
     let (plots, _, _, cmds, px) = sat.bus.vdp1.dbg_plots();
     println!("vdp1: plots={plots} last_cmds={cmds} last_pixels={px}");
+    // Audio-production probe (the fight audio-starvation hunt): the frontend
+    // paces on take_audio output, so the per-frame sample count must average
+    // ~738 (44.1 kHz / 59.76 fps). A shortfall here = core-side starvation;
+    // steady = the loss is frontend-side.
+    let mut counts = Vec::with_capacity(300);
+    for _ in 0..300 {
+        sat.advance_frame();
+        counts.push(sat.take_audio().len() / 2);
+    }
+    let total: usize = counts.iter().sum();
+    let (mn, mx) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+    let short = counts.iter().filter(|&&c| c < 700).count();
+    println!(
+        "audio: {} samples/300 frames = {:.1}/frame (min {mn}, max {mx}, frames<700: {short})",
+        total,
+        total as f64 / 300.0
+    );
 }
 
 /// Concurrent pipeline benchmark — advance_frame on this thread while a
