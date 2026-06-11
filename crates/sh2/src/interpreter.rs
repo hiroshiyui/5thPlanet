@@ -1554,7 +1554,12 @@ impl Cpu {
         let mut line = [0u8; cache::LINE_BYTES];
         let mut stall = 0u32;
         for chunk in 0..4u32 {
-            let (val, s) = bus.read32(base + chunk * 4, kind);
+            // The fill is one bus burst: the first beat carries the access's
+            // own kind (and pays the full first-access cost); the remaining
+            // three are `LineFill` continuation beats, which an SDRAM host
+            // charges nothing for (SH7604 burst read — Mednafen `BurstHax`).
+            let beat_kind = if chunk == 0 { kind } else { AccessKind::LineFill };
+            let (val, s) = bus.read32(base + chunk * 4, beat_kind);
             let off = (chunk * 4) as usize;
             line[off..off + 4].copy_from_slice(&val.to_be_bytes());
             stall += s;

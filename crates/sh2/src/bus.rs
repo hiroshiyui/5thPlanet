@@ -16,6 +16,13 @@ pub enum AccessKind {
     Data,
     /// On-chip DMAC cycle-stealing or burst transfer.
     Dma,
+    /// Continuation beat of a cache-line fill: longwords 2–4 of the 16-byte
+    /// burst (the first beat carries the original `Fetch`/`Data` kind). The
+    /// SH7604 fills lines as one SDRAM burst, so a synchronous-DRAM host
+    /// charges these beats nothing (Mednafen `BurstHax`); buses without a
+    /// burst mode (the Saturn's 16-bit CS0 ROM/DRAM, the B-bus) charge each
+    /// beat in full.
+    LineFill,
 }
 
 /// External memory bus seen by the SH-2 core.
