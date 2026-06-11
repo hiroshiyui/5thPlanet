@@ -381,6 +381,41 @@ fn rpmd_selects_rotation_parameter_set_for_rbg0() {
 }
 
 #[test]
+fn hires_mode_renders_the_rotation_layer_at_half_dot_resolution() {
+    // In the 640/704-dot modes the rotation layer renders at *normal* dot
+    // resolution: each rotation dot spans two display dots (Mednafen draws
+    // the RBG line buffer 352 wide, `LB.rotabsel[x >> 1]`). With an identity
+    // transform, plane dot N must appear at display x = 2N and 2N+1.
+    // Regression for VF2's "phantom ring-out": stepping the rotation walk
+    // per display dot compressed the 704-dot fight floor 2× to screen-left.
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8002, AccessKind::Data); // HRESO=2: 640×224
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0 only
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // CHCTLB: R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR = 1
+    sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
+    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
+    }
+    sat.bus.vdp2.cram.write16(2, 0x001F); // code 1 = red
+    // One red plane dot at (10, 10).
+    sat.bus.vdp2.vram.write8(10 * 512 + 10, 1);
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    let (w, _) = sat.run_frame(&mut out);
+    assert_eq!(w, 640);
+    let px = |x: usize| (10 * w + x) * 4;
+    // Plane dot 10 occupies display dots 20 and 21 — and nothing else nearby.
+    assert_eq!(&out[px(20)..px(20) + 4], &[0xFF, 0, 0, 0xFF], "first half of the doubled dot");
+    assert_eq!(&out[px(21)..px(21) + 4], &[0xFF, 0, 0, 0xFF], "second half of the doubled dot");
+    assert_ne!(&out[px(10)..px(10) + 4], &[0xFF, 0, 0, 0xFF], "x=10 would be the un-doubled bug");
+    assert_ne!(&out[px(22)..px(22) + 4], &[0xFF, 0, 0, 0xFF]);
+}
+
+#[test]
 fn special_color_calc_mode3_uses_cram_msb_in_rgb888_mode() {
     // SFCCMD mode 3 on a paletted dot keys colour calc on the CRAM entry's
     // colour-calc MSB. In RGB888 CRAM mode (RAMCTL.CRMD=2) that MSB is bit 31 of

@@ -1012,7 +1012,7 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
         return None;
     }
     // Mosaic (MZCTL bit 4) applies to RBG0 only.
-    let (mx, mut my) = if which == 0 {
+    let (mut mx, mut my) = if which == 0 {
         vdp2.regs.mosaic_coord(0x10, x, y)
     } else {
         (x, y)
@@ -1025,6 +1025,20 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
     // at display 31% instead of ~61% with a doubly-steep perspective.
     if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 {
         my >>= 1;
+    }
+    // Window tests stay in display-dot units (hi-res window X coordinates
+    // are raw — see `window_x_is_raw_in_hires_modes_halved_in_normal`).
+    let wx = mx;
+    // Hi-res 640/704-dot modes: the rotation layer renders at *normal* dot
+    // resolution and each rotation dot spans two display dots (Mednafen
+    // draws the RBG line buffer 352 wide — `LB.rotabsel[x >> 1]`, the walk
+    // stepping dX once per display-dot *pair*; cf. `sprite_framebuffer_x`).
+    // Without the halving the per-dot step advances twice per hardware dot
+    // and the whole rotation plane compresses 2× toward screen-left — VF2's
+    // ring floor slid out from under the (correctly placed) fighters, the
+    // "phantom ring-out".
+    if vdp2.regs.screen_dims().0 >= 640 {
+        mx >>= 1;
     }
     // Rotation parameter set (geometry/coefficient/plane): RBG0 picks per
     // RPMD — A (0), B (1), per-dot by parameter A's coefficient MSB (2), or
@@ -1046,7 +1060,7 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
                 2 => (ctx.coeff[0].enabled
                     && ctx.coeff[0].read(vdp2, mx, my) & 0x8000_0000 != 0)
                     as usize,
-                _ => rot_param_window_b(vdp2, ctx, mx, my) as usize,
+                _ => rot_param_window_b(vdp2, ctx, wx, my) as usize,
             }
         }
     } else {
