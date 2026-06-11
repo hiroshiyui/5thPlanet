@@ -367,6 +367,28 @@ fn run(
         audio.current_audio_driver(),
         audio_queue.spec()
     );
+    // The device may have opened at a different rate (PipeWire/Pulse commonly
+    // force 48 kHz). A 48 kHz device consumes our 44.1 kHz stream ~9% fast:
+    // the BGM pitches up and — worse — the pacing reserve never fills, so the
+    // queue rides near 0 ms and every compute dip becomes an audible underrun
+    // and a felt slowdown. Convert each chunk to the device rate before
+    // queueing, and keep all pacing math in source (44.1 kHz) units by
+    // scaling the mirror back.
+    let dev_freq = audio_queue.spec().freq as u32;
+    let resample: Option<sdl2::audio::AudioCVT> = if dev_freq != 44_100 {
+        eprintln!("SDL audio: device at {dev_freq} Hz — resampling 44100 -> {dev_freq}");
+        sdl2::audio::AudioCVT::new(
+            sdl2::audio::AudioFormat::S16LSB,
+            2,
+            44_100,
+            sdl2::audio::AudioFormat::S16LSB,
+            2,
+            dev_freq as i32,
+        )
+        .ok()
+    } else {
+        None
+    };
     // Leave the device PAUSED (SDL opens queues paused) until the reserve has
     // filled once — see the prebuffer gate in the main loop. Resuming here would
     // let the device drain from t=0 while the queue is still empty during boot,
@@ -932,14 +954,33 @@ fn run(
                 mouse_dy = 0;
             }
 
-            // Queue the emu thread's audio and refresh the depth mirror it
-            // paces on. Start playback once the reserve has first filled, so
-            // a cold start never drains an empty queue (the prebuffer gate).
+            // Queue the emu thread's audio (resampled to the device rate when
+            // it differs) and refresh the depth mirror it paces on — in
+            // SOURCE-rate units, so the 44.1 kHz pacing math holds on a
+            // 48 kHz device. Start playback once the reserve has first
+            // filled, so a cold start never drains an empty queue.
             while let Ok(chunk) = audio_rx.try_recv() {
-                let _ = audio_queue.queue_audio(&chunk);
+                match &resample {
+                    Some(cvt) => {
+                        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+                        for s in &chunk {
+                            bytes.extend_from_slice(&s.to_le_bytes());
+                        }
+                        let out = cvt.convert(bytes);
+                        let samples: Vec<i16> = out
+                            .chunks_exact(2)
+                            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        let _ = audio_queue.queue_audio(&samples);
+                    }
+                    None => {
+                        let _ = audio_queue.queue_audio(&chunk);
+                    }
+                }
             }
-            audio_mirror.store(audio_queue.size(), Ordering::Relaxed);
-            if !audio_started && audio_queue.size() >= audio_target_bytes {
+            let src_size = (audio_queue.size() as u64 * 44_100 / dev_freq as u64) as u32;
+            audio_mirror.store(src_size, Ordering::Relaxed);
+            if !audio_started && src_size >= audio_target_bytes {
                 audio_queue.resume();
                 audio_started = true;
             }
@@ -1014,7 +1055,7 @@ fn run(
                 eprintln!(
                     "MAIN iters/s={pl_iters} | present avg {:.2} ms | queue={}ms",
                     pl_present.as_secs_f64() * 1e3 / pl_iters as f64,
-                    audio_queue.size() / 176,
+                    (audio_queue.size() as u64 * 44_100 / dev_freq as u64 / 176) as u32,
                 );
                 pl_present = std::time::Duration::ZERO;
                 pl_iters = 0;
