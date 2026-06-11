@@ -290,6 +290,15 @@ pub struct Saturn {
     master_id: EntityId,
     slave_id: EntityId,
     cd_id: EntityId,
+    /// SCSP/CD-feed cycle debt: the master's actual per-batch advance
+    /// (including the final instruction's overshoot past the batch edge) is
+    /// banked here and paid to the sound subsystem in FIXED 256-cycle chunks.
+    /// Feeding raw variable-length batches let the 68k↔sample interleave's
+    /// per-call boundary effects drift the Timer-B period (88.0 → 88.128
+    /// samples/tick); dropping the overshoot (the pre-1a30fbd code) starved
+    /// the timeline ~25% in fights. Uniform chunks + a carried remainder give
+    /// both rate lock and conservation (lag bound: 255 cycles).
+    scsp_debt: u64,
     /// Debug-only: per-instruction master-SH-2 PC + accumulated cycle stream, for
     /// a cost-per-instruction lockstep vs Mednafen's `SS_MASTER_PCSTREAM` (the
     /// master-side analog of the 68k `pcstream`). `#[serde(skip)]`.
@@ -337,6 +346,7 @@ impl Saturn {
             master_id,
             slave_id,
             cd_id,
+            scsp_debt: 0,
             master_pcstream: None,
             seqlog: None,
             pctrace: None,
@@ -1118,9 +1128,13 @@ impl Saturn {
             // sound subsystem fell ~25% behind real time: slow BGM, and audio
             // production of ~553 samples/frame vs 738 starved the frontend's
             // pacing reserve (the user-felt "FPS downgrade").
-            let advanced = self.now() - now;
-            self.feed_cd_audio(advanced);
-            self.bus.scsp.run(advanced);
+            self.scsp_debt += self.now() - now;
+            const SCSP_CHUNK: u64 = 256;
+            while self.scsp_debt >= SCSP_CHUNK {
+                self.feed_cd_audio(SCSP_CHUNK);
+                self.bus.scsp.run(SCSP_CHUNK);
+                self.scsp_debt -= SCSP_CHUNK;
+            }
             self.update_video_timing();
             self.drain_smpc();
             let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
@@ -1155,9 +1169,14 @@ impl Saturn {
                     pcs.push(cpu.regs.pc);
                 }
             });
-            let advanced = self.now() - now; // see run_for: actual advance
-            self.feed_cd_audio(advanced);
-            self.bus.scsp.run(advanced);
+            // See run_for: banked debt, paid in fixed chunks.
+            self.scsp_debt += self.now() - now;
+            const SCSP_CHUNK: u64 = 256;
+            while self.scsp_debt >= SCSP_CHUNK {
+                self.feed_cd_audio(SCSP_CHUNK);
+                self.bus.scsp.run(SCSP_CHUNK);
+                self.scsp_debt -= SCSP_CHUNK;
+            }
             self.update_video_timing();
             self.drain_smpc();
             let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)

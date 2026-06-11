@@ -37,8 +37,9 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// `SaturnBus::timing` per-access BSC bus-timing state (M12 task #8) —
 /// serialized so a loaded state continues on the same bus timeline as the
 /// original (the round-trip determinism contract). v7 added the CD-block
-/// `results_read` latch (the Mednafen `ResultsRead` periodic gate).
-const VERSION: u32 = 7;
+/// `results_read` latch (the Mednafen `ResultsRead` periodic gate). v8 added
+/// `Saturn::scsp_debt` (fixed-chunk SCSP feed).
+const VERSION: u32 = 8;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
