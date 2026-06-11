@@ -33,8 +33,11 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// drive-phase machine fields (`cdb.cpp`-faithful `Drive_Run` port). v3 added
 /// the SH-2 INTC cached highest-priority-pending source (`Intc::best`). v4
 /// added the VDP1 `Framebuffer::hires8` TVM-layout flag. v5 added the SMPC
-/// port-device selection + Shuttle Mouse state (M13 E3).
-const VERSION: u32 = 5;
+/// port-device selection + Shuttle Mouse state (M13 E3). v6 added the
+/// `SaturnBus::timing` per-access BSC bus-timing state (M12 task #8) —
+/// serialized so a loaded state continues on the same bus timeline as the
+/// original (the round-trip determinism contract).
+const VERSION: u32 = 6;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.

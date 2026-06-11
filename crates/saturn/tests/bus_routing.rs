@@ -271,7 +271,95 @@ fn scsp_region_charges_bbus_wait_states() {
     assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, 48);
     assert_eq!(bus.read32(SCSP_RAM_BASE, AccessKind::Data).1, 48);
     assert_eq!(bus.read16(SCSP_REGS_BASE, AccessKind::Data).1, 48);
-    assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Data), 17);
-    assert_eq!(bus.write32(SCSP_RAM_BASE, 0, AccessKind::Data), 17);
-    assert_eq!(bus.write16(SCSP_REGS_BASE + 0x400, 0, AccessKind::Data), 17);
+    // Writes go through the SH-2 write buffer (M12 task #8): a lone store
+    // returns 0 — its +17 bus time runs in the background — and a store
+    // issued while the previous one is still on the bus stalls for the
+    // remainder. At cycle 2000 the store's bus slot ends at 2017; the next
+    // store, one cycle later, waits 2017 − 2001 = 16.
+    bus.cycle = 2000;
+    assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Data), 0);
+    bus.cycle = 2001;
+    assert_eq!(bus.write32(SCSP_RAM_BASE, 0, AccessKind::Data), 16);
+}
+
+// ---- M12 task #8: the per-access BSC bus-timing model ----------------------
+// Costs and semantics are a faithful port of Mednafen `sh7095.inc`
+// `BSC_BusRead/Write` + `ss.cpp` `BusRW_DB_CS0`; each test pins one mechanism.
+
+#[test]
+fn bsc_cs0_is_a_16bit_bus_so_32bit_accesses_pay_twice() {
+    let mut bus = fresh();
+    bus.cycle = 1000;
+    assert_eq!(bus.read16(BIOS_BASE, AccessKind::Data).1, 8);
+    bus.cycle = 1100;
+    assert_eq!(bus.read32(BIOS_BASE, AccessKind::Data).1, 16);
+    bus.cycle = 1200;
+    assert_eq!(bus.read16(LOW_WRAM_BASE, AccessKind::Data).1, 7);
+    bus.cycle = 1300;
+    assert_eq!(bus.read32(LOW_WRAM_BASE, AccessKind::Data).1, 14);
+    bus.cycle = 1400;
+    assert_eq!(bus.read32(BACKUP_BASE, AccessKind::Data).1, 16);
+}
+
+#[test]
+fn bsc_high_wram_sdram_read7_and_write_buffered_with_array_busy_window() {
+    let mut bus = fresh();
+    bus.cycle = 1000;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7);
+    // A lone store is free to the CPU (the write buffer)...
+    bus.cycle = 1100;
+    assert_eq!(bus.write32(HIGH_WRAM_BASE, 0, AccessKind::Data), 0);
+    // ...but the SDRAM array stays busy 2 cycles past the bus handoff: a
+    // read one cycle later waits out the store (1 bus + 2 array) + its own 7.
+    bus.cycle = 1101;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 10);
+}
+
+#[test]
+fn bsc_line_fill_burst_beats_are_free_on_sdram_full_price_on_cs0() {
+    let mut bus = fresh();
+    // CS3: the fill is one SDRAM burst — only the first beat pays.
+    bus.cycle = 1000;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7);
+    assert_eq!(bus.read32(HIGH_WRAM_BASE + 4, AccessKind::LineFill).1, 0);
+    // CS0 (BIOS ROM): no burst mode — every beat pays both 16-bit halves.
+    bus.cycle = 2000;
+    assert_eq!(bus.read32(BIOS_BASE, AccessKind::Data).1, 16);
+    assert_eq!(bus.read32(BIOS_BASE + 4, AccessKind::LineFill).1, 16);
+}
+
+#[test]
+fn bsc_bus_turnaround_charges_one_cycle_on_back_to_back_region_change() {
+    let mut bus = fresh();
+    bus.cycle = 1000;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7); // CS3
+    // A CS0 read right behind it (same instruction): +1 turnaround before
+    // the BIOS transaction.
+    assert_eq!(bus.read16(BIOS_BASE, AccessKind::Data).1, 9); // 1 + 8
+}
+
+#[test]
+fn bsc_shared_timestamp_makes_a_cpu_wait_for_the_siblings_access() {
+    let mut bus = fresh();
+    // One CPU reads at cycle 1000 — the bus is busy until 1007.
+    bus.cycle = 1000;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7);
+    // The sibling issues its own read at 1002: it queues behind the first
+    // access (5 cycles) and then pays its own 7 — the CPU↔CPU arbitration
+    // that emerges from the shared timestamp.
+    bus.cycle = 1002;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE + 8, AccessKind::Data).1, 12);
+}
+
+#[test]
+fn bsc_dma_accesses_are_cost_only_and_dont_disturb_cpu_bus_state() {
+    let mut bus = fresh();
+    bus.cycle = 1000;
+    // SH-2 DMAC / SCU-DMA timeline costs (Mednafen `SH2DMAHax`).
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Dma).1, 6);
+    assert_eq!(bus.write32(HIGH_WRAM_BASE, 0, AccessKind::Dma), 3);
+    assert_eq!(bus.read32(LOW_WRAM_BASE, AccessKind::Dma).1, 14);
+    // A CPU access right after pays only its own cost — the DMA charges
+    // never touched the shared bus state.
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7);
 }

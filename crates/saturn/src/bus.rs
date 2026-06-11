@@ -68,13 +68,149 @@ pub const MASTER_FTI_END: u32 = 0x01FF_FFFF;
 pub const HIGH_WRAM_BASE: u32 = 0x0600_0000;
 pub const HIGH_WRAM_END: u32 = 0x06FF_FFFF;
 
-/// Wait states added on top of the inherent access cycles. Numbers are
-/// the per-region defaults documented in the SH7604 / Saturn manuals.
-const BIOS_WAITS: u32 = 10;
-const BACKUP_WAITS: u32 = 6;
-const LOW_WRAM_WAITS: u32 = 3;
-const HIGH_WRAM_WAITS: u32 = 1;
-const STUB_WAITS: u32 = 0;
+/// SH7604 BSC external-bus timing state (M12 task #8) — a faithful port of
+/// Mednafen's per-access model (`sh7095.inc` `BSC_BusRead`/`BSC_BusWrite` +
+/// `ss.cpp` `BusRW_DB_CS0`). One instance lives in the bus and is shared by
+/// **both** SH-2s, so CPU↔CPU bus arbitration emerges from the shared
+/// timestamp exactly as from Mednafen's `SH7095_mem_timestamp` (at our
+/// per-instruction `cycle` granularity).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BusTiming {
+    /// When the external bus becomes free (global cycles). Each access first
+    /// raises it to the accessing CPU's current cycle, then pays its cost on
+    /// top — an access never starts while the bus is still busy.
+    mem_ts: u64,
+    /// Completion time of the most recent CPU store. The SH-2 write buffer:
+    /// a store stalls the CPU only while the *previous* store is still on
+    /// the bus (Mednafen `write_finish_timestamp` → `MA_until`).
+    write_finish: u64,
+    /// High-WRAM SDRAM busy-until: a write occupies the SDRAM array 2 cycles
+    /// past the bus handoff; the next CS3 access waits for it
+    /// (Mednafen `BSC.sdram_finish_time`).
+    sdram_finish: u64,
+    /// Last access bookkeeping for the bus-turnaround penalty: +1 on a read
+    /// issued in the same cycle as a previous access to a *different* CS
+    /// region, +1 on a write issued in the same cycle as a previous *read*.
+    last_time: u64,
+    last_addr: u32,
+    last_was_read: bool,
+    /// Incremental-charge bookkeeping: the bus returns per-access stalls that
+    /// the CPU *sums* into one instruction, while the model's truth is "the
+    /// CPU lands at `mem_ts`". So each access returns only the delta beyond
+    /// what this instruction (identified by its `cycle`) already paid —
+    /// multiple accesses (a line fill's 4 beats, RTE's two pops) total
+    /// exactly `mem_ts − cycle`, never more.
+    cycle_seen: u64,
+    charged: u64,
+}
+
+impl Default for BusTiming {
+    fn default() -> Self {
+        Self {
+            mem_ts: 0,
+            write_finish: 0,
+            sdram_finish: 0,
+            // "No previous access": a sentinel that can never equal `mem_ts`,
+            // so a fresh bus's first access pays no turnaround penalty.
+            last_time: u64::MAX,
+            last_addr: 0,
+            last_was_read: false,
+            cycle_seen: u64::MAX,
+            charged: 0,
+        }
+    }
+}
+
+impl BusTiming {
+    /// Charge the CPU up to `target` on the global timeline, returning only
+    /// the not-yet-paid portion for the instruction at `now`.
+    #[inline]
+    fn pay(&mut self, now: u64, target: u64) -> u32 {
+        if self.cycle_seen != now {
+            self.cycle_seen = now;
+            self.charged = 0;
+        }
+        let due = target.saturating_sub(now);
+        let inc = due.saturating_sub(self.charged);
+        self.charged += inc;
+        inc as u32
+    }
+}
+
+/// CS0 (`< 0x0200_0000`) cost **per 16-bit transaction** — the CS0 bus is
+/// 16 bits wide, so a 32-bit access pays twice (Mednafen `BusRW_DB_CS0`).
+#[inline]
+fn cs0_half_cost(addr: u32) -> u64 {
+    match addr {
+        BIOS_BASE..=BIOS_END => 8,
+        SMPC_BASE..=SMPC_END => 0,
+        BACKUP_BASE..=BACKUP_END => 8,
+        // Low work RAM (the full 2 MiB hardware window incl. the
+        // revision-dependent upper mirror).
+        0x0020_0000..=0x003F_FFFF => 7,
+        // The inter-CPU FRT-trigger window.
+        SLAVE_FTI_BASE..=MASTER_FTI_END => 8,
+        // Unknown/unmapped CS0 (incl. the 0x0040_0000 stub region).
+        _ => 4,
+    }
+}
+
+/// Number of 16-bit bus transactions a CS0 / A-bus access of `width` bytes
+/// performs.
+#[inline]
+fn halves(width: u32) -> u64 {
+    if width == 4 { 2 } else { 1 }
+}
+
+/// CS1/CS2 (`0x0200_0000..=0x05FF_FFFF`) access cost: the A-bus costs are
+/// per-16-bit-transaction from Mednafen `scu.inc ABusRW_DB` (the cartridge
+/// window's from the live ASR0 strobe/wait fields); the B-bus values are the
+/// flat per-access totals carried over from the M11/M13-A4 model (the exact
+/// B-bus deferred-write serialization is a later refinement).
+#[inline]
+fn cs12_cost(addr: u32, width: u32, write: bool, asr0: u32) -> u64 {
+    match addr {
+        // A-bus CS0/CS1: the cartridge window. Cost is programmed in ASR0
+        // (high half = CS0 below 0x0400_0000, low half = CS1 above):
+        // 5 + inter-cycle waits (bits 7:4) + the read/write strobe wait.
+        0x0200_0000..=0x04FF_FFFF => {
+            let cfg = if addr & 0x0400_0000 != 0 { asr0 & 0xFFFF } else { asr0 >> 16 };
+            let strobe = (cfg >> (13 + write as u32)) & 1;
+            u64::from(5 + ((cfg >> 4) & 0xF) + strobe) * halves(width)
+        }
+        // A-bus dummy region: no CPU-visible cost (Mednafen charges only the
+        // DMA timelines here).
+        0x0500_0000..=0x057F_FFFF => 0,
+        // A-bus CS2: the CD-block. +8 per 16-bit transaction.
+        0x0580_0000..=0x058F_FFFF => 8 * halves(width),
+        // B-bus SCSP: a read is always two 16-bit accesses at +24 each (= +48,
+        // any width); a write ≈ +17 write-finish (see the M11 SFX wedge).
+        0x05A0_0000..=0x05BF_FFFF => {
+            if write {
+                17
+            } else {
+                48
+            }
+        }
+        // B-bus VDP1: read +14, write +2 immediate + 9 deferred ≈ 11.
+        0x05C0_0000..=0x05D7_FFFF => {
+            if write {
+                11
+            } else {
+                14
+            }
+        }
+        // B-bus VDP2: read +20, write +2 immediate + 3 deferred ≈ 5.
+        0x05E0_0000..=0x05FB_FFFF => {
+            if write {
+                5
+            } else {
+                20
+            }
+        }
+        _ => 0,
+    }
+}
 
 // Not `Clone`: the CD-block holds a `Box<dyn SectorSource>` (an image or a
 // live drive) that isn't cloneable, and nothing clones the bus anyway.
@@ -96,6 +232,8 @@ pub struct SaturnBus {
     pub cartridge: Cartridge,
     pub abus_bbus: StubRegisterBank,
     pub high_wram: Ram,
+    /// Per-access external-bus timing (M12 task #8); shared by both CPUs.
+    pub timing: BusTiming,
     /// Current global cycle, refreshed by the scheduler before each CPU
     /// step (see `Sh2Entity::step`). Lets time-varying peripheral reads —
     /// notably the SMPC `SF` flag's INTBACK completion — resolve at the
@@ -170,6 +308,7 @@ impl SaturnBus {
             cartridge: Cartridge::None,
             abus_bbus: StubRegisterBank::new("A/B-BUS"),
             high_wram: Ram::new(1024 * 1024),
+            timing: BusTiming::default(),
             cycle: 0,
             step_pc: 0,
             slave_input_capture: false,
@@ -282,64 +421,99 @@ fn read_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32
     }
 }
 
-#[inline]
-fn waits_for(addr: u32, write: bool) -> u32 {
-    match addr {
-        BIOS_BASE..=BIOS_END => BIOS_WAITS,
-        BACKUP_BASE..=BACKUP_END => BACKUP_WAITS,
-        LOW_WRAM_BASE..=LOW_WRAM_END => LOW_WRAM_WAITS,
-        HIGH_WRAM_BASE..=HIGH_WRAM_END => HIGH_WRAM_WAITS,
-        // VDP1 VRAM / framebuffer / registers — the B-bus charges the SH-2 a base
-        // access cost (separate from, and on top of, the draw-slowdown). Mednafen
-        // `scu.inc` BBusRW: a read costs +14; a write +2 immediate + 9 deferred
-        // write-finish (≈11 for the back-to-back writes the BIOS animation does).
-        0x05C0_0000..=0x05D7_FFFF => {
+impl SaturnBus {
+    /// Per-access external-bus cost (M12 task #8): the BSC state machine.
+    ///
+    /// A CPU access (`Fetch`/`Data`) raises the shared bus timestamp to the
+    /// caller's cycle, pays the turnaround penalty and the region cost on the
+    /// bus timeline, and returns the CPU-visible stall: a **read** waits
+    /// until the data arrives (`mem_ts − now`); a **write** goes through the
+    /// SH-2 write buffer and stalls only while the *previous* store is still
+    /// on the bus. `LineFill` continuation beats ride the SDRAM burst (free
+    /// on CS3, full price elsewhere; no turnaround/bookkeeping — Mednafen
+    /// `BurstHax`). `Dma` accesses are cost-only — the DMA engines keep their
+    /// own timeline (Mednafen `SH2DMAHax`) and must not disturb the CPU bus
+    /// state (CS3 DMA: read 6 / write 3).
+    fn charge(&mut self, addr: u32, width: u32, write: bool, kind: AccessKind) -> u32 {
+        // SH-2↔VDP1-VRAM draw contention (M12 #6) rides on top of the base
+        // cost; it is 0 outside the VDP1 window.
+        let draw = u64::from(self.vdp1_draw_stall(addr, write));
+        if kind == AccessKind::Dma {
+            let c = match addr {
+                0x0600_0000..=0x07FF_FFFF => {
+                    if write {
+                        3
+                    } else {
+                        6
+                    }
+                }
+                a if a < 0x0200_0000 => cs0_half_cost(a) * halves(width),
+                a => cs12_cost(a, width, write, self.scu.asr0),
+            };
+            return (c + draw) as u32;
+        }
+        let burst = kind == AccessKind::LineFill;
+        let now = self.cycle;
+        let asr0 = self.scu.asr0;
+        let t = &mut self.timing;
+        if t.mem_ts < now {
+            t.mem_ts = now;
+        }
+        if !burst {
+            // Bus turnaround: one dead cycle when the bus switches CS region
+            // between back-to-back reads, or direction read→write.
+            let same_cycle = t.mem_ts == t.last_time;
             if write {
-                11
+                t.mem_ts += u64::from(same_cycle && t.last_was_read);
             } else {
-                14
+                t.mem_ts += u64::from(same_cycle && ((t.last_addr ^ addr) & 0x0600_0000) != 0);
             }
         }
-        // VDP2 VRAM / CRAM / registers — read +20, write +2 immediate + 3 deferred
-        // (≈5). The asymmetry (slow reads) matches Mednafen `scu.inc` BBusRW.
-        0x05E0_0000..=0x05FB_FFFF => {
-            if write {
-                5
-            } else {
-                20
+        match addr {
+            a if a < 0x0200_0000 => {
+                t.mem_ts += cs0_half_cost(a) * halves(width);
+            }
+            // CS3: high work RAM, 32-bit synchronous DRAM. Any width is one
+            // SDRAM operation; a write completes in the array 2 cycles after
+            // the bus handoff and blocks the next CS3 access until then.
+            0x0600_0000..=0x07FF_FFFF => {
+                if !burst {
+                    if t.mem_ts < t.sdram_finish {
+                        t.mem_ts = t.sdram_finish;
+                    }
+                    if write {
+                        t.mem_ts += 2;
+                        t.sdram_finish = t.mem_ts + 2;
+                    } else {
+                        t.mem_ts += 7;
+                    }
+                }
+            }
+            a => {
+                t.mem_ts += cs12_cost(a, width, write, asr0) + draw;
             }
         }
-        // SCSP sound RAM + registers — B-bus. Mednafen `scu.inc`: a B-bus read
-        // is *always two* 16-bit accesses at +24 each (= +48, any width;
-        // `SCU_FromSH2_BusRW_DB` "B-bus reads are always 32-bit"); a write is
-        // one +17 write-finish per 16-bit half (≈17 for the 8/16-bit accesses
-        // the sound protocol uses). A 0-wait here shrank VF2's sound-request
-        // spin-timeout (0x10000 cache-through mailbox reads, master-side) from
-        // the oracle's ~120 ms to ~21 ms — shorter than the 68k driver's
-        // wake-from-sleep re-init (a 64 KiB sound-RAM fill with all IRQs
-        // masked), so the first request submitted during a wake timed out,
-        // latched the game's "sound driver wedged" flag at 0x060E0017, and
-        // silently dropped every later SFX request (M11).
-        0x05A0_0000..=0x05BF_FFFF => {
-            if write {
-                17
-            } else {
-                48
-            }
+        if !burst {
+            t.last_addr = addr;
+            t.last_was_read = !write;
+            t.last_time = t.mem_ts;
         }
-        // A-bus CS2 (`0x05800000..=0x058FFFFF`): the CD-block host registers + its
-        // SCU-DMA data port. Mednafen `scu.inc` ABusRW_DB charges the SH-2 **+8**
-        // per access (read and write alike). The BIOS audio-CD player polls the
-        // CD HIRQ / CR1–4 status here every panel loop, so a 0-wait here let the
-        // master outrun the LLE reference (the BGM-trigger phase lead — the master
-        // reaches its BGM command ~43 Timer-B ticks early).
-        0x0580_0000..=0x058F_FFFF => 8,
-        _ => STUB_WAITS,
+        // A read stalls the CPU until the data arrives; a write only until
+        // the *previous* store cleared the write buffer (its own bus time
+        // runs in the background — the SH-2 write buffer). `pay` makes
+        // repeated charges within one instruction incremental.
+        if write {
+            let target = t.write_finish; // the previous store's completion
+            t.write_finish = t.mem_ts;
+            t.pay(now, target)
+        } else {
+            t.pay(now, t.mem_ts)
+        }
     }
 }
 
 impl Bus for SaturnBus {
-    fn read8(&mut self, addr: u32, _k: AccessKind) -> (u8, u32) {
+    fn read8(&mut self, addr: u32, k: AccessKind) -> (u8, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read8(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
@@ -363,11 +537,11 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read8(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
-        read_watch(addr, 1, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
+        read_watch(addr, 1, v as u32, k, self.cycle, self.step_pc);
+        (v, self.charge(addr, 1, false, k))
     }
 
-    fn read16(&mut self, addr: u32, _k: AccessKind) -> (u16, u32) {
+    fn read16(&mut self, addr: u32, k: AccessKind) -> (u16, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read16(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
@@ -391,11 +565,11 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read16(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
-        read_watch(addr, 2, v as u32, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
+        read_watch(addr, 2, v as u32, k, self.cycle, self.step_pc);
+        (v, self.charge(addr, 2, false, k))
     }
 
-    fn read32(&mut self, addr: u32, _k: AccessKind) -> (u32, u32) {
+    fn read32(&mut self, addr: u32, k: AccessKind) -> (u32, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read32(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
@@ -421,12 +595,12 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.read32(addr - HIGH_WRAM_BASE),
             _ => 0,
         };
-        read_watch(addr, 4, v, _k, self.cycle, self.step_pc);
-        (v, waits_for(addr, false) + self.vdp1_draw_stall(addr, false))
+        read_watch(addr, 4, v, k, self.cycle, self.step_pc);
+        (v, self.charge(addr, 4, false, k))
     }
 
-    fn write8(&mut self, addr: u32, val: u8, _k: AccessKind) -> u32 {
-        write_watch(addr, 1, val as u32, _k, self.cycle, self.step_pc);
+    fn write8(&mut self, addr: u32, val: u8, k: AccessKind) -> u32 {
+        write_watch(addr, 1, val as u32, k, self.cycle, self.step_pc);
         self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
@@ -448,11 +622,11 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
+        self.charge(addr, 1, true, k)
     }
 
-    fn write16(&mut self, addr: u32, val: u16, _k: AccessKind) -> u32 {
-        write_watch(addr, 2, val as u32, _k, self.cycle, self.step_pc);
+    fn write16(&mut self, addr: u32, val: u16, k: AccessKind) -> u32 {
+        write_watch(addr, 2, val as u32, k, self.cycle, self.step_pc);
         self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
@@ -494,11 +668,11 @@ impl Bus for SaturnBus {
             }
             _ => {}
         }
-        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
+        self.charge(addr, 2, true, k)
     }
 
-    fn write32(&mut self, addr: u32, val: u32, _k: AccessKind) -> u32 {
-        write_watch(addr, 4, val, _k, self.cycle, self.step_pc);
+    fn write32(&mut self, addr: u32, val: u32, k: AccessKind) -> u32 {
+        write_watch(addr, 4, val, k, self.cycle, self.step_pc);
         self.note_write(addr, val);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
@@ -520,6 +694,6 @@ impl Bus for SaturnBus {
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
             _ => {}
         }
-        waits_for(addr, true) + self.vdp1_draw_stall(addr, true)
+        self.charge(addr, 4, true, k)
     }
 }

@@ -364,6 +364,10 @@ impl Saturn {
             slave_id,
             ..
         } = self;
+        // The CPUs' cycle counters restart at 0 (`Pipeline::new`), so the
+        // bus-timing timestamps anchored to them must restart too — a stale
+        // mem_ts far in the "future" would stall the reset machine for ages.
+        bus.timing = Default::default();
         scheduler.entity_mut(*master_id).sh2_mut().cpu.reset(bus);
         scheduler.entity_mut(*slave_id).sh2_mut().cpu.reset(bus);
         // The slave SH-2 reads BCR1 bit 15 (SH7604 master/slave bit) = 1, so the
