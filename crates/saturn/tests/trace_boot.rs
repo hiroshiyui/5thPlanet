@@ -117,7 +117,7 @@ fn gen_master_pc_trace() {
 /// ```
 /// Then capture MAME's side (bounded to ~30M instrs to catch the first
 /// divergence): `mameref/saturn saturnjp -bios 101 -rompath mameref/roms \
-///   -cdrom roms/vf2_full.cue -debug`, console `trace vf2.tr,maincpu` then `go`,
+///   -cdrom roms/vf2_full_lsb.cue -debug`, console `trace vf2.tr,maincpu` then `go`,
 /// stop after ~10 s, and diff the PC columns to the first sustained divergence.
 /// M11 perf probe: time each `run_frame` of the VF2 boot to find frames that
 /// overrun the 16.6 ms vsync budget (which the SDL frontend shows as an
@@ -142,7 +142,7 @@ fn frame_timing() {
     };
     // CUE=<name> overrides the disc image (default VF2), so the same boot probe
     // can be pointed at other commercial fixtures.
-    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full_lsb.cue".into());
     let cue_path = root.join("roms").join(&cue_name);
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
         println!("no roms/{cue_name}; skipped");
@@ -220,7 +220,7 @@ fn gen_vf2_pc_trace() {
         println!("no JP BIOS at {}; skipped", bios_path.display());
         return;
     };
-    let cue_path = root.join("roms/vf2_full.cue");
+    let cue_path = root.join("roms/vf2_full_lsb.cue");
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
         println!("no {}; skipped (copyrighted fixture)", cue_path.display());
         return;
@@ -336,7 +336,7 @@ fn dump_giveup_state() {
     };
     // CUE=<name> overrides the disc image (default VF2), so the same boot probe
     // can be pointed at other commercial fixtures.
-    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full_lsb.cue".into());
     let cue_path = root.join("roms").join(&cue_name);
     let Ok(cue) = std::fs::read_to_string(&cue_path) else {
         println!("no roms/{cue_name}; skipped");
@@ -1976,7 +1976,7 @@ fn vf2_render_state() {
         println!("no JP BIOS; skipped");
         return;
     };
-    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full.cue".into());
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full_lsb.cue".into());
     let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
         println!("no roms/{cue_name}; skipped");
         return;
@@ -2142,8 +2142,8 @@ fn vf2_trajectory() {
         println!("no JP BIOS; skipped");
         return;
     };
-    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full.cue")) else {
-        println!("no roms/vf2_full.cue; skipped");
+    let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full_lsb.cue")) else {
+        println!("no roms/vf2_full_lsb.cue; skipped");
         return;
     };
     let disc =
