@@ -4012,8 +4012,13 @@ fn presstart_pchist() {
 #[ignore = "manual: verify ours' disc-read content vs the raw image"]
 fn disc_read_content_check() {
     let root = workspace_root();
-    let cue_name = "Doukyuusei - if (Japan) (1M, 2M).cue";
-    let bin = root.join("roms").join("Doukyuusei - if (Japan) (1M, 2M) (Track 1).bin");
+    // CUE=/BIN= point at another image; FADS=comma list overrides the probe set.
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    let bin = root.join("roms").join(
+        std::env::var("BIN")
+            .unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M) (Track 1).bin".into()),
+    );
     let Ok(cue) = std::fs::read_to_string(root.join("roms").join(cue_name)) else {
         println!("no cue; skipped"); return;
     };
@@ -4023,7 +4028,10 @@ fn disc_read_content_check() {
     let img = std::fs::read(&bin).expect("read track1.bin");
     const SECT: usize = 2352;
     const USER_OFF: usize = 16; // MODE1: 12 sync + 4 header
-    for fad in [150u32, 19951, 19144, 18379, 19324, 10438] {
+    let fads: Vec<u32> = std::env::var("FADS")
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_else(|_| vec![150u32, 19951, 19144, 18379, 19324, 10438]);
+    for fad in fads {
         let lba = (fad - 150) as usize;
         let off = lba * SECT + USER_OFF;
         let raw = &img[off..off + 2048];
