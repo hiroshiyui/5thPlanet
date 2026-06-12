@@ -1656,10 +1656,6 @@ impl Saturn {
     /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
     /// pixels are packed tightly with row stride = `width`, so the caller uploads
     /// `width × height` with a `width × 4` pitch.
-    ///
-    /// In double-density interlace each call composites only the current
-    /// field's rows ([`crate::vdp2::render_frame`], roadmap P5) — reuse the
-    /// same `out` across frames so consecutive fields weave the full picture.
     /// Advance one NTSC frame of emulation **without rendering** — the compute
     /// half of [`Self::run_frame`]. The frontend's render-pipeline worker
     /// composites the frame on another core from a cloned VDP snapshot, so the
