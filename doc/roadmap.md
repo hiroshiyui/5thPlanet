@@ -31,7 +31,7 @@ Current test count: **1058 workspace-wide, 0 failures**, ~85% line coverage
 | Backup RAM (battery) | ✅ | Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
 | On-screen menu (OSD) | ✅ | Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
-**Milestones:** M1–M11 ✅ · M12 (cycle accuracy) 🚧 · M13 (fidelity backlog) 📋.
+**Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
 Two commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
 `vf2-good-emulation`) and *Doukyuusei ~if~*.
 
@@ -203,7 +203,7 @@ status `is_cdrom` bit; CD-block SCU external interrupt (vector 0x50, level 7,
 `57a1066`); the **`sdbg`** interactive debugger (`crates/debugger` — see
 project conventions).
 
-## Milestone 12 — Whole-system cycle accuracy 🚧
+## Milestone 12 — Whole-system cycle accuracy ✅ complete (2026-06-12)
 
 Close residual whole-system timing gaps vs the LLE reference (Mednafen) so
 timing-gated behaviour matches even when code/data are byte-identical.
@@ -222,8 +222,8 @@ timing-gated behaviour matches even when code/data are byte-identical.
 | 3 | 68k↔SCSP per-sample interleave granularity | ⏸ not the BGM root (→ landed as M13 A2) |
 | 4 | 68k instruction cycle audit | ⏸ not the BGM root (→ landed as M13 D4) |
 | 5–6 | VDP1 draw-slowdown hypothesis: `Write_/Read_CheckDrawSlowdown` ported (`9934411`) but proven a no-op for the BGM (our modelled draw duration was ~100× too short to overlap). **Draw-DURATION model landed (`ce1ec2c`, savestate v9):** a Mednafen-faithful draw-cycle walk (`vdp1/timing.rs` — per-command fetch/setup, per-span setup + pre-clip, per-pixel 1/6 cy + AA + the drawn_ac early exit, AdjustDrawTiming ×(1+48/256), persistent clip/local registers) sizes `begin_plot`; validated vs mednaref `SS_VDP1DRAW` (boot anim 96,778 vs 97,206 cy @654 cmds; CD-player panel 258,132 vs ~258,400 cy @226 cmds). The RW slowdown itself is now **opt-in** (`set_rw_slowdown`, default off) — in the oracle it's a per-game hack (`HORRIBLEHACK_VDP1RWDRAWSLOWDOWN`: VF1 yes, VF2/BIOS no). Confirmed not the BGM-phase lever (seq-ticks unchanged) | ✅ duration model landed (2026-06-12) |
-| 8 | **Per-access BSC bus-timing model** — faithful Mednafen `BSC_BusRead/Write` port, done bus-side (`57cbfe5`+`006187a`, savestate v6): CS0 16-bit per-transaction costs, CS3 SDRAM + write buffer + line-fill burst + turnaround, A-bus from live ASR0, B-bus flat totals, shared bus timestamp (CPU↔CPU arbitration). Golden unchanged; BGM phase 4179→4204 vs oracle 4497; VF2/Doukyuusei stable. Residual ~293-tick gap = recognition/INTBACK-class timing (the `REVIEW(magic)` values), not the bus. Remaining refinements: exact B-bus deferred-write serialization, SCU A/B-bus arbitration | ✅ landed (2026-06-11) |
-| 9 | Validate: BGM phase matches, *Doukyuusei* stable, master PC-trace aligned over a multi-second run, golden + suite green | 🚧 residual phase gap open |
+| 8 | **Per-access BSC bus-timing model** — faithful Mednafen `BSC_BusRead/Write` port, done bus-side (`57cbfe5`+`006187a`, savestate v6): CS0 16-bit per-transaction costs, CS3 SDRAM + write buffer + line-fill burst + turnaround, A-bus from live ASR0, B-bus flat totals, shared bus timestamp (CPU↔CPU arbitration). Golden unchanged; BGM phase 4179→4204 vs oracle 4497; VF2/Doukyuusei stable. Residual gap chased below. **Both remaining refinements landed 2026-06-12:** (a) **exact B-bus deferred-write serialization** (`6973ce8`) — a B-bus write hands off in +2 CPU cycles and posts its device-side completion (SCSP +17/+13, VDP1 +9/+1, VDP2 +3/+1 per 16-bit half) on `BusTiming::bbus_write_finish`, which only the *next B-bus access* waits out; B-bus reads are always two 16-bit halves (VDP1 28/VDP2 40 — the flat model undercharged those by half); (b) **SCU A/B/C-bus DMA arbitration** (`a101f15`) — DMA-timeline costs corrected to Mednafen `dma_time_thing` (B-bus VDP1/VDP2 **1**, SCSP 13 per 16-bit access; C-bus read 6/write free — the old flat values overpriced DMA writes up to 11×), and a C-bus-endpoint transfer now halts **both** SH-2s for its paced duration (`RecalcDMAHalt`/`SetExtHalt`) while a pure A↔B transfer halts neither (our instant completion ≈ Mednafen's `CheckForceDMAFinish` force-finish hack; the DMA-end interrupt timestamp at trigger-time is the documented boundary) | ✅ landed (2026-06-11/12) |
+| 9 | Validate: BGM phase matches, *Doukyuusei* stable, master PC-trace aligned over a multi-second run, golden + suite green | ✅ (2026-06-12) BGM-phase seq-ticks **+182 → −47 vs the oracle** (4450 vs a same-day re-measured 4497, ~1%): the DMA cost model (#8b) was the dominant term. The residual decomposes into (a) a **discrete ~14-frame recognition-handshake offset** (boot-anim start f125 vs oracle f111; recognition/INTBACK `REVIEW(magic)`-class — ours' Startup also skips the oracle's post-spin-up `StartSeek(0x800096)`) and (b) a **diffuse component dominated by a 68k-gated mailbox poll loop** (master PC `0x06032D02`, store-then-poll-until-cleared) — poll-loop *phase*, i.e. oracle-approximation territory per the M4 stop rule. Both documented as follow-up threads, not per-instruction cost errors. `bios_boot` golden unchanged through all of M12; Timer-B period locked (88.0009); VF2 trajectory (late_game f999, 0 stalls) + Doukyuusei title BGM (avg \|amplitude\| 1203) healthy |
 
 The full BGM/phase trace-down (probes, lockstep tools, refuted hypotheses) is
 in `doc/bootstrapping.md §B.7`.
@@ -243,7 +243,7 @@ pulled when a game or accuracy need surfaces, golden-safe throughout.
 | A1 | Continuous event timeline (kill batch-drain jitter) | 🚧 VDP1 draw-end, SCU Timer-0, FTI converted to exact events; remaining: write-triggered SMPC/SCSP side effects (needs the queue-and-drain borrow lifted), HBlank edges, then lift `SMPC_POLL_QUANTUM` |
 | A2 | SCSP per-sample interleave with the 68k | ✅ (`d539341`) |
 | A3 | SCU-DMA cycle-stealing (CPU stalls for the real transfer cost) | ✅ (`80551c2`+`7d997b1`) |
-| A4 | Bus contention / VDP timing | ✅ base B-bus waits (`864ce3b`); VRAM *contention* deliberately dropped (the oracle has none); shared-timestamp CPU↔CPU arbitration resolved by M12 #8. Remaining: B-bus deferred-write serialization, SCU A/B-bus arbitration |
+| A4 | Bus contention / VDP timing | ✅ base B-bus waits (`864ce3b`); VRAM *contention* deliberately dropped (the oracle has none); shared-timestamp CPU↔CPU arbitration resolved by M12 #8. Remaining items closed by M12 #8 residuals (2026-06-12): B-bus deferred-write serialization + SCU A/B-bus DMA arbitration |
 | A5 | Real HBlank dot-count (per-mode `HTimings`) | ✅ (`7207810`) |
 | A6 | VDP1 command-list divergence | ✅ closed — refuted: frame-aligned diff proves the lists match byte-for-byte; the BGM lead is not a VDP1 phenomenon |
 | A7 | Sound-68k timing | ✅ 2 fixes (`729bfc3` sound-RAM access wait, `d755708` interleave budget carry), oracle-validated; built the cross-emulator signal "oscilloscope" (`tools/scope_diff.py`) |
