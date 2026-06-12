@@ -27,6 +27,7 @@ pub mod command;
 pub mod framebuffer;
 pub mod plotter;
 pub mod regs;
+pub mod timing;
 pub mod vram;
 
 pub use command::Command;
@@ -41,14 +42,6 @@ pub const FB_BASE: u32 = 0x05C8_0000;
 pub const FB_END: u32 = 0x05CB_FFFF;
 pub const REGS_BASE: u32 = 0x05D0_0000;
 pub const REGS_END: u32 = 0x05D0_0017;
-
-/// Per-command setup and per-dot cost of a plot, in SH-2 master cycles.
-/// REVIEW(magic): the VDP1 draws roughly one dot per video-clock cycle plus
-/// per-command overhead; these are modelled coefficients (not from a manual
-/// table) chosen so a full-screen plot takes most of a frame while a tiny
-/// list completes quickly. They give draw-end a realistic, non-zero latency.
-const DRAW_CMD_CYCLES: u64 = 16;
-const DRAW_PIXEL_CYCLES: u64 = 1;
 
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -70,6 +63,14 @@ pub struct Vdp1 {
     /// Cycle of the last SH-2 access that incurred a draw-slowdown stall — the
     /// cap reference for [`Self::draw_slowdown`] (Mednafen `LastRWTS`).
     last_rw_ts: u64,
+    /// Opt-in gate for [`Self::draw_slowdown`]. In the reference the RW
+    /// slowdown is a **per-game hack** (Mednafen `db.cpp`
+    /// `HORRIBLEHACK_VDP1RWDRAWSLOWDOWN` — applied to e.g. Virtua Fighter 1,
+    /// but *not* VF2 nor the BIOS), so the oracle's default is off and ours
+    /// must match or the master's draw-loop timing diverges from the
+    /// trace-diff reference. Host configuration, not machine state.
+    #[serde(skip)]
+    rw_slowdown: bool,
     /// Debug-only: lifetime
     /// `(total VDP1 accesses, accesses-while-drawing, stall hits, stall cycles)`.
     #[serde(skip)]
@@ -77,12 +78,16 @@ pub struct Vdp1 {
     /// Debug-only: lifetime `(begin_plot calls, summed duration, max duration)`.
     #[serde(skip)]
     dbg_plots: (u32, u64, u64, u32, u32),
+    /// Persistent draw-cycle state (clip/local registers + refresh-overhead
+    /// residue) for the duration model — see [`timing::DrawTiming`].
+    timing: timing::DrawTiming,
     /// Debug-only: per-frame plot accumulator `(plots, max command_count,
-    /// max pixels)` since the last [`Self::dbg_take_frame`]. The audio-CD BGM
-    /// probe drains this once per `run_frame` to get a per-frame VDP1
-    /// command-count series (A6: the command-list divergence vs Mednafen).
+    /// max pixels, max duration)` since the last [`Self::dbg_take_frame`].
+    /// The audio-CD BGM probe drains this once per `run_frame` to get a
+    /// per-frame VDP1 command-count/duration series (A6 + M12 #6: the
+    /// command-list and draw-span comparison vs mednaref `SS_VDP1DRAW`).
     #[serde(skip)]
-    dbg_frame: (u32, u32, u32),
+    dbg_frame: (u32, u32, u32, u64),
 }
 
 impl Default for Vdp1 {
@@ -102,9 +107,11 @@ impl Vdp1 {
             now: 0,
             busy_until: None,
             last_rw_ts: 0,
+            rw_slowdown: false,
+            timing: timing::DrawTiming::new(),
             dbg_slowdown: (0, 0, 0, 0),
             dbg_plots: (0, 0, 0, 0, 0),
-            dbg_frame: (0, 0, 0),
+            dbg_frame: (0, 0, 0, 0),
         }
     }
 
@@ -119,7 +126,7 @@ impl Vdp1 {
     /// 0-wait VDP1 VRAM lets graphics-drawing code outrun the reference (M12 #6).
     pub fn draw_slowdown(&mut self, addr: u32, now: u64, write: bool) -> u32 {
         self.dbg_slowdown.0 += 1;
-        if self.busy_until.is_none() || now <= self.last_rw_ts {
+        if !self.rw_slowdown || self.busy_until.is_none() || now <= self.last_rw_ts {
             return 0;
         }
         self.dbg_slowdown.1 += 1;
@@ -140,6 +147,13 @@ impl Vdp1 {
             self.dbg_slowdown.3 += stall as u64;
         }
         stall
+    }
+
+    /// Enable/disable the per-game SH-2↔VDP1 RW draw-slowdown (see the
+    /// `rw_slowdown` field — off by default, matching the oracle's
+    /// per-game-hack gating).
+    pub fn set_rw_slowdown(&mut self, on: bool) {
+        self.rw_slowdown = on;
     }
 
     /// Debug-only: lifetime
@@ -325,7 +339,7 @@ impl Vdp1 {
         let prev_copr = self.regs.read16(0x14);
         self.erase_framebuffer();
         self.regs.cef_clear();
-        let Vdp1 { vram, fb, regs, .. } = self;
+        let Vdp1 { vram, fb, regs, timing, .. } = self;
         // TVMR bit 0 selects the 8 bits/pixel frame buffer; FBCR bits 3/2
         // (DIE/DIL) select double-interlace plotting. Latch the pixel layout
         // onto the draw buffer so the swap publishes it to the VDP2 sprite
@@ -334,7 +348,7 @@ impl Vdp1 {
         let fbcr = regs.read16(0x02);
         fb.set_hires8(bpp8);
         let mut plotter = Plotter::new(&*vram, fb, bpp8, fbcr & 0x8 != 0, fbcr & 0x4 != 0);
-        let result = plotter.process_list();
+        let result = plotter.process_list(timing);
         regs.set_command_addrs(prev_copr, result.copr);
         result
     }
@@ -352,8 +366,11 @@ impl Vdp1 {
     /// before this runs (see [`Self::tick`]).
     pub fn begin_plot(&mut self) {
         let r = self.render_list();
-        let duration =
-            r.command_count as u64 * DRAW_CMD_CYCLES + r.pixels as u64 * DRAW_PIXEL_CYCLES;
+        // Duration from the Mednafen-faithful draw-cycle walk (M12 task #6):
+        // the boot animation runs ~26k cycles, the BIOS CD-player panel
+        // ~240k (≈ half a frame) — matching the oracle's DrawingActive spans
+        // so EDSR.CEF and the sprite-draw-end interrupt land when its do.
+        let duration = r.cycles;
         self.busy_until = Some(self.now + duration);
         self.dbg_plots.0 += 1;
         self.dbg_plots.1 += duration;
@@ -373,12 +390,16 @@ impl Vdp1 {
         if r.pixels > self.dbg_frame.2 {
             self.dbg_frame.2 = r.pixels;
         }
+        if duration > self.dbg_frame.3 {
+            self.dbg_frame.3 = duration;
+        }
     }
 
     /// Debug-only: drain the per-frame plot accumulator `(plots, max
-    /// command_count, max pixels)` and reset it. The BGM probe calls this once
-    /// per `run_frame` to build a per-frame VDP1 command-count series (A6).
-    pub fn dbg_take_frame(&mut self) -> (u32, u32, u32) {
+    /// command_count, max pixels, max duration)` and reset it. The BGM probe
+    /// calls this once per `run_frame` to build a per-frame VDP1
+    /// command-count/duration series (A6 + M12 #6).
+    pub fn dbg_take_frame(&mut self) -> (u32, u32, u32, u64) {
         core::mem::take(&mut self.dbg_frame)
     }
 

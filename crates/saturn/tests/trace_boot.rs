@@ -2463,7 +2463,7 @@ fn bios_audio_probe() {
     // Each entry is (frame, plots, max command_count, max pixels). VDP1_OUT=<f>
     // additionally dumps the full series for a frame-by-frame diff.
     let vdp1log = std::env::var("VDP1LOG").is_ok();
-    let mut vdp1_series: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut vdp1_series: Vec<(u32, u32, u32, u32, u64)> = Vec::new();
     let mut pcm: Vec<u8> = Vec::new();
     let (mut total, mut n): (i64, u64) = (0, 0);
     let mut peak_slots = 0usize;
@@ -2489,8 +2489,8 @@ fn bios_audio_probe() {
         sat.run_frame(&mut fb);
 
         if vdp1log {
-            let (plots, cmds, px) = sat.bus.vdp1.dbg_take_frame();
-            vdp1_series.push((f, plots, cmds, px));
+            let (plots, cmds, px, dur) = sat.bus.vdp1.dbg_take_frame();
+            vdp1_series.push((f, plots, cmds, px, dur));
         }
 
         let active = (0..32).filter(|&i| sat.bus.scsp.slot_active(i)).count();
@@ -2530,17 +2530,17 @@ fn bios_audio_probe() {
             .unwrap_or_else(|| "NEVER/not-in-startup".into())
     );
     if vdp1log {
-        let drawn: Vec<&(u32, u32, u32, u32)> =
-            vdp1_series.iter().filter(|&&(_, p, _, _)| p > 0).collect();
-        let max_cmds = drawn.iter().map(|&&(_, _, c, _)| c).max().unwrap_or(0);
+        let drawn: Vec<&(u32, u32, u32, u32, u64)> =
+            vdp1_series.iter().filter(|&&(_, p, _, _, _)| p > 0).collect();
+        let max_cmds = drawn.iter().map(|&&(_, _, c, _, _)| c).max().unwrap_or(0);
         println!(
             "  VDP1 per-frame: {} of {} frames drew; peak command_count={max_cmds}",
             drawn.len(),
             vdp1_series.len()
         );
         for tier in [16u32, 64, 128, 256, 371] {
-            match drawn.iter().find(|&&&(_, _, c, _)| c >= tier) {
-                Some(&&(f, _, c, _)) => {
+            match drawn.iter().find(|&&&(_, _, c, _, _)| c >= tier) {
+                Some(&&(f, _, c, _, _)) => {
                     println!("    first frame with >= {tier} cmds: f{f} (cmds={c})")
                 }
                 None => println!("    never reached {tier} cmds"),
@@ -2549,7 +2549,7 @@ fn bios_audio_probe() {
         if let Ok(p) = std::env::var("VDP1_OUT") {
             let s: String = vdp1_series
                 .iter()
-                .map(|(f, p, c, x)| format!("{f} {p} {c} {x}\n"))
+                .map(|(f, p, c, x, d)| format!("{f} {p} {c} {x} {d}\n"))
                 .collect();
             std::fs::write(&p, s).unwrap();
             println!(
@@ -3412,7 +3412,7 @@ fn menu_savestate_probe() {
         if dump_vdp {
             // run_frame to drive the full VDP1 plot + VDP2 composite path
             sat.run_frame(&mut fb);
-            let (p, c, px) = sat.bus.vdp1.dbg_take_frame();
+            let (p, c, px, _) = sat.bus.vdp1.dbg_take_frame();
             vdp1_last = (p, c, px);
             vdp1_max = (vdp1_max.0.max(p), vdp1_max.1.max(c), vdp1_max.2.max(px));
         } else {

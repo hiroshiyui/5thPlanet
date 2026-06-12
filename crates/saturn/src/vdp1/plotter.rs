@@ -114,6 +114,10 @@ pub struct PlotResult {
     pub command_count: u32,
     /// Number of frame-buffer dots processed (per-pixel cost in draw timing).
     pub pixels: u32,
+    /// Modelled draw duration in SH-2 cycles — the Mednafen-faithful cost
+    /// walk ([`super::timing::DrawTiming`], M12 task #6). Drives
+    /// [`super::Vdp1::begin_plot`]'s `busy_until`.
+    pub cycles: u64,
     /// Final command-table position (>>3 form for COPR).
     pub copr: u16,
 }
@@ -230,16 +234,24 @@ impl<'a> Plotter<'a> {
     /// Walk the command table from offset 0 and draw every command.
     /// Mirrors MAME's `vdp1_process_list`: the position advances per
     /// CMDCTRL jump mode, with a single level of call/return nesting.
-    pub fn process_list(&mut self) -> PlotResult {
+    /// `timing` is the persistent draw-cycle accumulator (clip/local state
+    /// survives across plots — see [`super::timing::DrawTiming`]).
+    pub fn process_list(&mut self, timing: &mut super::timing::DrawTiming) -> PlotResult {
         const MAX_COMMANDS: u32 = 16383;
         let mut position: u32 = 0;
         let mut count: u32 = 0;
         let mut nest: Option<u32> = None;
+        timing.set_bpp8(self.bpp8);
+        let mut cycles: u64 = 0;
 
         while count < MAX_COMMANDS {
             count += 1;
             let cmd_addr = position * 0x20;
             self.cmd = Command::read(self.vram, cmd_addr);
+            // Draw-cycle model: charge every fetched command (end and
+            // skip-flagged ones cost their 16-cycle fetch too).
+            let cmd_cycles = timing.command(self.vram, cmd_addr);
+            cycles += cmd_cycles;
 
             if self.cmd.is_end() {
                 break;
@@ -302,7 +314,7 @@ impl<'a> Plotter<'a> {
             if self.log {
                 let (cw, ch) = self.cmd.char_size();
                 eprintln!(
-                    "VDP1CMD @{:05X} ctrl={:04X} pmod={:04X} colr={:04X} srca={:04X} size={cw}x{ch} A=({},{}) B=({},{}) C=({},{})",
+                    "VDP1CMD @{:05X} cost={cmd_cycles} ctrl={:04X} pmod={:04X} colr={:04X} srca={:04X} size={cw}x{ch} A=({},{}) B=({},{}) C=({},{})",
                     cmd_addr,
                     self.cmd.ctrl,
                     self.cmd.pmod,
@@ -395,6 +407,7 @@ impl<'a> Plotter<'a> {
         PlotResult {
             command_count: count,
             pixels: self.pixels,
+            cycles,
             copr: ((position * 0x20) >> 3) as u16,
         }
     }
