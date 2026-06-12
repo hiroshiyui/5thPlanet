@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-12
+
+**Milestone 12 (whole-system cycle accuracy) is complete.** The three
+remaining timing models landed — the VDP1 draw-duration walk, the exact
+B-bus deferred-write serialization, and the SCU A/B/C-bus DMA arbitration —
+bringing the whole-system BGM-phase metric from a +182 seq-tick divergence
+to within ~1% of the LLE reference (4450 vs 4497). Virtua Fighter 2 and
+Doukyuusei ~if~ remain fully playable (user-verified under the new timing).
+Save states: format v9 (older states are rejected, not migrated).
+
+### Added
+
+- **M12 task #6 — VDP1 draw-duration model**: a Mednafen-faithful
+  draw-cycle walk (`vdp1/timing.rs`) runs alongside the instant
+  rasterisation and sizes every plot — per-command fetch/setup, per-span
+  clip costs, per-pixel charges with anti-aliasing and the leave-clip early
+  exit, and the fractional refresh-overhead scaling. `EDSR.CEF` and the
+  sprite-draw-end interrupt now land when the reference's do (the BIOS
+  CD-player panel draw spans ~258k cycles ≈ half a frame, matching the
+  oracle within 0.3%). The VDP1 clip/local registers are modelled as the
+  persistent hardware state they are, serialized with the machine.
+- **M12 task #8 residual — exact B-bus deferred-write serialization**: an
+  SH-2 B-bus write hands off in +2 CPU cycles and posts its device-side
+  completion (SCSP +17/+13, VDP1 +9/+1, VDP2 +3/+1 per 16-bit half) on a
+  separate timeline that only the next B-bus access waits out; B-bus reads
+  are always two 16-bit halves (VDP1/VDP2 reads were undercharged by half).
+- **M12 task #8 residual — SCU A/B/C-bus DMA arbitration**: DMA-timeline
+  costs corrected to the reference's per-access values (B-bus VDP1/VDP2 1,
+  SCSP 13 per 16-bit access; C-bus SDRAM read 6 per word, write free — the
+  old flat values overpriced DMA writes up to 11×), and a C-bus-endpoint
+  transfer now halts **both** SH-2s for its paced duration (the SCU owns
+  the CPU bus) while a pure A↔B transfer halts neither. This was the
+  dominant lever for the M12 phase residual.
+
+### Changed
+
+- The SH-2↔VDP1 RW draw-slowdown is now **opt-in** (`set_rw_slowdown`,
+  default off), matching the reference where it is a per-game hack
+  (applied to e.g. Virtua Fighter 1 — not VF2, not the BIOS).
+- Save-state format bumped to **v9** (`Vdp1` draw-timing state +
+  `BusTiming::bbus_write_finish`); older states are rejected on load.
+- The M12 residual (~1%) is documented and closed under the stop rule: a
+  discrete ~14-frame recognition-handshake offset plus a 68k-gated mailbox
+  poll loop — oracle-approximation territory, recorded as follow-up
+  threads in the roadmap.
+
 ## [0.2.0] - 2026-06-11
 
 Milestone 9 (frontend OSD) is complete and Milestone 12 task #8 (the
