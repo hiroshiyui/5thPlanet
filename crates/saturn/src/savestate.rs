@@ -38,9 +38,11 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// serialized so a loaded state continues on the same bus timeline as the
 /// original (the round-trip determinism contract). v7 added the CD-block
 /// `results_read` latch (the Mednafen `ResultsRead` periodic gate). v8 added
-/// `Saturn::scsp_debt` (fixed-chunk SCSP feed). v9 added `Vdp1::timing`, the
-/// persistent draw-cycle state of the M12 #6 draw-duration model (clip/local
-/// registers + the refresh-overhead residue).
+/// `Saturn::scsp_debt` (fixed-chunk SCSP feed). v9 added `Vdp1::timing` (the
+/// persistent draw-cycle state of the M12 #6 draw-duration model: clip/local
+/// registers + the refresh-overhead residue) and
+/// `BusTiming::bbus_write_finish` (the exact B-bus deferred-write
+/// serialization, the M12 #8 residual).
 const VERSION: u32 = 9;
 
 /// Fixed-size prologue identifying the format and the media the state was

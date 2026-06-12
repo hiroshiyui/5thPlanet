@@ -88,6 +88,13 @@ pub struct BusTiming {
     /// past the bus handoff; the next CS3 access waits for it
     /// (Mednafen `BSC.sdram_finish_time`).
     sdram_finish: u64,
+    /// B-bus (SCSP/VDP1/VDP2) write-completion time (Mednafen scu.inc
+    /// `BBus_SH2_WriteFinishTS`): an SH-2 B-bus write costs the CPU only +2
+    /// cycles while the device-side completion lands here — and only the
+    /// *next B-bus access* (read or write) waits it out. CS0/CS3 traffic in
+    /// between is unaffected; this is the exact deferred-write serialization
+    /// the flat per-access write totals approximated (M12 #8 residual).
+    bbus_write_finish: u64,
     /// Last access bookkeeping for the bus-turnaround penalty: +1 on a read
     /// issued in the same cycle as a previous access to a *different* CS
     /// region, +1 on a write issued in the same cycle as a previous *read*.
@@ -110,6 +117,7 @@ impl Default for BusTiming {
             mem_ts: 0,
             write_finish: 0,
             sdram_finish: 0,
+            bbus_write_finish: 0,
             // "No previous access": a sentinel that can never equal `mem_ts`,
             // so a fresh bus's first access pays no turnaround penalty.
             last_time: u64::MAX,
@@ -162,11 +170,30 @@ fn halves(width: u32) -> u64 {
     if width == 4 { 2 } else { 1 }
 }
 
-/// CS1/CS2 (`0x0200_0000..=0x05FF_FFFF`) access cost: the A-bus costs are
-/// per-16-bit-transaction from Mednafen `scu.inc ABusRW_DB` (the cartridge
-/// window's from the live ASR0 strobe/wait fields); the B-bus values are the
-/// flat per-access totals carried over from the M11/M13-A4 model (the exact
-/// B-bus deferred-write serialization is a later refinement).
+/// B-bus per-region costs (Mednafen `scu.inc BBusRW_DB`):
+/// `(read_per_half, write_finish_first, write_finish_second)`. A B-bus read
+/// is always two 16-bit halves regardless of access width; a write's
+/// device-side completion costs land on `BusTiming::bbus_write_finish`
+/// (first half always, second only for a 32-bit access).
+#[inline]
+fn bbus_cost(addr: u32) -> (u64, u64, u64) {
+    match addr {
+        // SCSP (the +24/half read and +17 first-half write finish are the
+        // M11 VF2 SFX-wedge values).
+        0x05A0_0000..=0x05BF_FFFF => (24, 17, 13),
+        // VDP1: the register window's second write half is free.
+        0x05C0_0000..=0x05D7_FFFF => (14, 9, u64::from(addr & 0x10_0000 == 0)),
+        // VDP2.
+        0x05E0_0000..=0x05FB_FFFF => (20, 3, 1),
+        // Unknown B-bus: only the +2 CPU write prologue applies.
+        _ => (0, 0, 0),
+    }
+}
+
+/// CS1/CS2 A-bus access cost (per-16-bit-transaction, from Mednafen
+/// `scu.inc ABusRW_DB`; the cartridge window's from the live ASR0
+/// strobe/wait fields). The DMA path also uses the legacy flat B-bus totals
+/// here — the SH-2 path goes through [`bbus_cost`] instead.
 #[inline]
 fn cs12_cost(addr: u32, width: u32, write: bool, asr0: u32) -> u64 {
     match addr {
@@ -488,6 +515,25 @@ impl SaturnBus {
                         t.mem_ts += 7;
                     }
                 }
+            }
+            // B-bus: SCSP / VDP1 / VDP2 (Mednafen scu.inc BBusRW_DB). Every
+            // access first waits out the previous B-bus write's device-side
+            // completion; a write then costs the CPU only +2 and posts its
+            // own completion on `bbus_write_finish`; a read is always two
+            // 16-bit halves at the region's per-half latency.
+            a @ 0x05A0_0000..=0x05FB_FFFF => {
+                if t.mem_ts < t.bbus_write_finish {
+                    t.mem_ts = t.bbus_write_finish;
+                }
+                let (rd_half, wf_first, wf_second) = bbus_cost(a);
+                if write {
+                    t.mem_ts += 2;
+                    t.bbus_write_finish =
+                        t.mem_ts + wf_first + if width == 4 { wf_second } else { 0 };
+                } else {
+                    t.mem_ts += rd_half * 2;
+                }
+                t.mem_ts += draw;
             }
             a => {
                 t.mem_ts += cs12_cost(a, width, write, asr0) + draw;

@@ -271,15 +271,38 @@ fn scsp_region_charges_bbus_wait_states() {
     assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, 48);
     assert_eq!(bus.read32(SCSP_RAM_BASE, AccessKind::Data).1, 48);
     assert_eq!(bus.read16(SCSP_REGS_BASE, AccessKind::Data).1, 48);
-    // Writes go through the SH-2 write buffer (M12 task #8): a lone store
-    // returns 0 — its +17 bus time runs in the background — and a store
-    // issued while the previous one is still on the bus stalls for the
-    // remainder. At cycle 2000 the store's bus slot ends at 2017; the next
-    // store, one cycle later, waits 2017 − 2001 = 16.
+    // Writes (the exact B-bus deferred-write model, Mednafen scu.inc
+    // BBusRW_DB): a store hands off to the B-bus in +2 CPU cycles and the
+    // +17 (+13 for the second 16-bit half) device-side completion lands on
+    // `bbus_write_finish`. A lone store returns 0 (write buffer); the next
+    // store stalls only until the previous one's +2 handoff (2002 − 2001);
+    // the +30 completion serializes the *next B-bus access* instead.
     bus.cycle = 2000;
     assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Data), 0);
     bus.cycle = 2001;
-    assert_eq!(bus.write32(SCSP_RAM_BASE, 0, AccessKind::Data), 16);
+    assert_eq!(bus.write32(SCSP_RAM_BASE, 0, AccessKind::Data), 1);
+    // The 32-bit store handed off at 2021 and completes at 2021 + 17 + 13 =
+    // 2051; a read right after waits that out, then pays its own two halves.
+    bus.cycle = 2002;
+    assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, (2051 - 2002) + 48);
+}
+
+#[test]
+fn bbus_write_completion_does_not_block_cs3_traffic() {
+    // The deferred B-bus write completion is B-bus-local: WRAM work between
+    // two SCSP stores pays only its own cost (the old flat model charged the
+    // whole bus for the +17, overcharging mixed-region sequences).
+    let mut bus = fresh();
+    bus.cycle = 3000;
+    assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Data), 0);
+    // High-WRAM read one cycle later: waits the +2 handoff (to 3002), +1
+    // turnaround (back-to-back region change), then its own SDRAM +7 — but
+    // NOT the +17 SCSP completion.
+    bus.cycle = 3001;
+    assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 9);
+    // The SCSP completion (3019) still gates the next B-bus access.
+    bus.cycle = 3011;
+    assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, (3019 - 3011) + 48);
 }
 
 // ---- M12 task #8: the per-access BSC bus-timing model ----------------------
