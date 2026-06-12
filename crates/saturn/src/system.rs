@@ -128,13 +128,25 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 // Behaviour is unchanged: still a synchronous block transfer at the drain point.
 
 /// Run every DMA the SCU queued. Direct or indirect (table-driven) mode; a
-/// transfer sourced from the BIOS A-bus is illegal and moves nothing. Returns
-/// the **cycle-stealing cost** — the sum of the per-access bus wait-states the
-/// transfer incurs (the same `waits_for` the CPU pays for those addresses), so
-/// the caller can stall the triggering CPU for the transfer's duration instead
-/// of treating the DMA as free (M13 A3).
+/// transfer sourced from the BIOS A-bus is illegal and moves nothing.
+///
+/// Returns the **CPU-halting cost** — the SCU A/B/C-bus arbitration (M12 #8
+/// residual, Mednafen `RecalcDMAHalt`): while a DMA with a **C-bus endpoint**
+/// (high Work RAM) runs, the SCU owns the CPU bus and **both** SH-2s halt
+/// (`CPU[0/1].SetExtHalt`), so such a transfer's paced duration (the
+/// `dma_time_thing` per-access costs) is charged to both CPUs by the caller.
+/// A pure A↔B transfer halts neither CPU — and since Mednafen force-finishes
+/// an active DMA the moment a CPU touches the A/B-bus (`CheckForceDMAFinish`,
+/// its own "kind of hacky" arbitration), our synchronous instant completion
+/// is equivalent for everything except the DMA-end interrupt's timestamp,
+/// which we raise at the trigger rather than the paced finish.
 fn drain_dma(bus: &mut SaturnBus) -> u64 {
-    let mut cost = 0u64;
+    let mut halt_cost = 0u64;
+    // A transfer halts the CPUs iff either endpoint is on the C-bus
+    // (Mednafen `d->WriteBus == 2 || d->ReadFunc == DMA_ReadCBus`).
+    let halting = |src: u32, dst: u32| {
+        scu_dma_bus(src) == Some(2) || scu_dma_bus(dst) == Some(2)
+    };
     // Cached: this runs per pending DMA on the per-instruction hot path, and
     // `env::var` takes a process-global lock + allocates on every call.
     static DMALOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -159,17 +171,26 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             let mut index = req.dst & 0x07FF_FFFF;
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
+            // Descriptor reads halt the CPUs when the table itself is in
+            // C-bus work RAM (the common case).
+            let table_halting = scu_dma_bus(req.dst) == Some(2);
             loop {
                 let (size, s0) = bus.read32(index, AccessKind::Dma);
                 let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
                 let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                cost += (s0 + s1 + s2) as u64;
+                if table_halting {
+                    halt_cost += (s0 + s1 + s2) as u64;
+                }
                 let last = isrc_raw & 0x8000_0000 != 0;
                 let isrc = isrc_raw & 0x07FF_FFFF;
                 let idst = idst & 0x07FF_FFFF;
                 let count = dma_count(req.channel, size);
                 if !bios_src(isrc) {
+                    let mut cost = 0u64;
                     scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
+                    if halting(isrc, idst) {
+                        halt_cost += cost;
+                    }
                 }
                 index = index.wrapping_add(0xC);
                 walked += 1;
@@ -188,7 +209,8 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             (req.src, req.dst)
         } else {
             let count = dma_count(req.channel, req.bytes);
-            scu_transfer(
+            let mut cost = 0u64;
+            let ends = scu_transfer(
                 bus,
                 req.src,
                 req.dst,
@@ -196,11 +218,15 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 req.src_add,
                 req.dst_add,
                 &mut cost,
-            )
+            );
+            if halting(req.src, req.dst) {
+                halt_cost += cost;
+            }
+            ends
         };
         bus.scu.finish_dma(req.channel, final_src, final_dst);
     }
-    cost
+    halt_cost
 }
 
 /// Which of the three SCU DMA buses an address belongs to, or `None` if it maps
@@ -1066,11 +1092,11 @@ impl Saturn {
                 }
                 scheduler.entity_mut(*master_id).step(bus);
                 apply_fti!(); // master may have pulsed the slave's (or its own) FTI
-                // If the master's instruction triggered an SCU DMA, run it now and
-                // stall the master for the transfer's cycle-stealing cost — the SCU
-                // holds the bus, so the master can't advance during it (M13 A3). The
-                // slave then catches up to the *stalled* timestamp, i.e. it runs
-                // while the master is DMA-blocked.
+                // If the master's instruction triggered an SCU DMA, run it now.
+                // A C-bus-endpoint transfer halts BOTH SH-2s for its paced
+                // duration — the SCU owns the CPU bus (Mednafen
+                // `RecalcDMAHalt` → `SetExtHalt` on both cores); a pure A↔B
+                // transfer halts neither (see `drain_dma`).
                 let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
                 if dma_cost != 0 {
                     scheduler
@@ -1079,6 +1105,10 @@ impl Saturn {
                         .cpu
                         .pipeline
                         .cycles += dma_cost;
+                    let s = scheduler.entity_mut(*slave_id).sh2_mut();
+                    if !s.is_halted() {
+                        s.cpu.pipeline.cycles += dma_cost;
+                    }
                 }
             }
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
@@ -1089,11 +1119,17 @@ impl Saturn {
             } {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
-                // A slave-triggered DMA stalls the slave for the same reason.
+                // A slave-triggered C-bus DMA halts both CPUs the same way.
                 let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
                 if dma_cost != 0 {
                     scheduler
                         .entity_mut(*slave_id)
+                        .sh2_mut()
+                        .cpu
+                        .pipeline
+                        .cycles += dma_cost;
+                    scheduler
+                        .entity_mut(*master_id)
                         .sh2_mut()
                         .cpu
                         .pipeline

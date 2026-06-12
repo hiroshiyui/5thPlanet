@@ -378,10 +378,17 @@ fn bsc_shared_timestamp_makes_a_cpu_wait_for_the_siblings_access() {
 fn bsc_dma_accesses_are_cost_only_and_dont_disturb_cpu_bus_state() {
     let mut bus = fresh();
     bus.cycle = 1000;
-    // SH-2 DMAC / SCU-DMA timeline costs (Mednafen `SH2DMAHax`).
+    // SH-2 DMAC / SCU-DMA timeline costs (Mednafen `dma_time_thing`): a
+    // C-bus SDRAM read is 6 per 32-bit word, a C-bus write is free
+    // (`DMA_Write` WriteBus==2 charges nothing), B-bus VDP1/VDP2 cost 1 per
+    // 16-bit access and the SCSP 13.
     assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Dma).1, 6);
-    assert_eq!(bus.write32(HIGH_WRAM_BASE, 0, AccessKind::Dma), 3);
+    assert_eq!(bus.write32(HIGH_WRAM_BASE, 0, AccessKind::Dma), 0);
     assert_eq!(bus.read32(LOW_WRAM_BASE, AccessKind::Dma).1, 14);
+    assert_eq!(bus.write16(0x05C0_0000, 0, AccessKind::Dma), 1); // VDP1
+    assert_eq!(bus.write16(0x05E0_0000, 0, AccessKind::Dma), 1); // VDP2
+    assert_eq!(bus.write16(SCSP_RAM_BASE, 0, AccessKind::Dma), 13); // SCSP
+    assert_eq!(bus.read32(0x05C0_0000, AccessKind::Dma).1, 2); // two 16-bit halves
     // A CPU access right after pays only its own cost — the DMA charges
     // never touched the shared bus state.
     assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 7);

@@ -192,8 +192,8 @@ fn bbus_cost(addr: u32) -> (u64, u64, u64) {
 
 /// CS1/CS2 A-bus access cost (per-16-bit-transaction, from Mednafen
 /// `scu.inc ABusRW_DB`; the cartridge window's from the live ASR0
-/// strobe/wait fields). The DMA path also uses the legacy flat B-bus totals
-/// here — the SH-2 path goes through [`bbus_cost`] instead.
+/// strobe/wait fields). B-bus accesses never reach here — the SH-2 path
+/// goes through [`bbus_cost`] and the DMA path has its own arm.
 #[inline]
 fn cs12_cost(addr: u32, width: u32, write: bool, asr0: u32) -> u64 {
     match addr {
@@ -210,31 +210,6 @@ fn cs12_cost(addr: u32, width: u32, write: bool, asr0: u32) -> u64 {
         0x0500_0000..=0x057F_FFFF => 0,
         // A-bus CS2: the CD-block. +8 per 16-bit transaction.
         0x0580_0000..=0x058F_FFFF => 8 * halves(width),
-        // B-bus SCSP: a read is always two 16-bit accesses at +24 each (= +48,
-        // any width); a write ≈ +17 write-finish (see the M11 SFX wedge).
-        0x05A0_0000..=0x05BF_FFFF => {
-            if write {
-                17
-            } else {
-                48
-            }
-        }
-        // B-bus VDP1: read +14, write +2 immediate + 9 deferred ≈ 11.
-        0x05C0_0000..=0x05D7_FFFF => {
-            if write {
-                11
-            } else {
-                14
-            }
-        }
-        // B-bus VDP2: read +20, write +2 immediate + 3 deferred ≈ 5.
-        0x05E0_0000..=0x05FB_FFFF => {
-            if write {
-                5
-            } else {
-                20
-            }
-        }
         _ => 0,
     }
 }
@@ -466,14 +441,21 @@ impl SaturnBus {
         // cost; it is 0 outside the VDP1 window.
         let draw = u64::from(self.vdp1_draw_stall(addr, write));
         if kind == AccessKind::Dma {
+            // DMA-timeline costs (Mednafen scu.inc `dma_time_thing`): the SCU
+            // paces itself much cheaper than the SH-2 path — B-bus VDP1/VDP2
+            // cost 1 per 16-bit access and the SCSP 13 (read or write); a
+            // C-bus SDRAM read costs 6 per 32-bit word and a C-bus write is
+            // free (`DMA_Write` WriteBus==2 charges nothing).
             let c = match addr {
                 0x0600_0000..=0x07FF_FFFF => {
                     if write {
-                        3
+                        0
                     } else {
                         6
                     }
                 }
+                0x05A0_0000..=0x05BF_FFFF => 13 * halves(width),
+                0x05C0_0000..=0x05FB_FFFF => halves(width),
                 a if a < 0x0200_0000 => cs0_half_cost(a) * halves(width),
                 a => cs12_cost(a, width, write, self.scu.asr0),
             };
