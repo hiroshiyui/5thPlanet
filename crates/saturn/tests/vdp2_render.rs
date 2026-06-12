@@ -729,6 +729,9 @@ fn rotation_coefficient_lines_halve_in_double_density_interlace() {
     }
 
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    // Per-field compositing (P5): each frame renders one field; run two
+    // consecutive frames so the weave covers both display-line parities.
+    sat.run_frame(&mut out);
     sat.run_frame(&mut out);
     let px = |x: usize, y: usize| (y * 320 + x) * 4;
     let red = [0xFFu8, 0, 0, 0xFF];

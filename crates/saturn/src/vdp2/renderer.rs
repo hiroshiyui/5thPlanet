@@ -94,6 +94,13 @@ pub const FRAMEBUFFER_BYTES: usize = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
 /// Render one frame of NTSC low-res into `out`, compositing the enabled NBG
 /// layers and the VDP1 sprite layer (`sprite_fb`, `None` when there's no VDP1
 /// frame buffer to read). Panics if `out`'s length isn't [`FRAMEBUFFER_BYTES`].
+///
+/// **Double-density interlace writes only the current field's rows** (TVSTAT
+/// ODD → display rows 0, 2, …; even → 1, 3, …), exactly as the hardware scans
+/// one field per vertical period. A caller that wants the full woven picture
+/// must persist `out` across frames so consecutive fields accumulate (all
+/// in-tree callers do; the frontend's `render_pipe` worker keeps a dedicated
+/// weave canvas because its transport buffers ping-pong).
 /// Frame-constant state hoisted out of the per-dot samplers. Inside
 /// [`render_frame`] the VDP registers and VRAM are frozen (it is a pure read
 /// of a snapshot), so anything derived only from them is loop-invariant —
@@ -428,6 +435,19 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
         return (w, h);
     }
 
+    // Per-field compositing (roadmap P5): in double-density interlace the
+    // hardware scans only ONE field per vertical period, so composite only the
+    // current field's rows and leave the other field's rows untouched — the
+    // caller weaves the full picture by persisting `out` across frames
+    // (Mednafen `VDP2REND_DrawLine`: `out_line = (n << 1) | InterlaceField`
+    // with `SurfInterlaceField = !Odd`). Halves the compositing cost in
+    // exactly the expensive hi-res interlaced case (VF2 fights at 640×448).
+    let field = if vdp2.regs.double_density_interlace() {
+        Some(!vdp2.regs.odd_field() as usize)
+    } else {
+        None
+    };
+
     let ctx = FrameCtx::new(vdp2);
     // Scanline-band parallel composite: every dot is a pure function of the
     // frozen VDP state, and the bands write disjoint rows — output is
@@ -452,7 +472,11 @@ pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]
             let ctx = &ctx;
             sc.spawn(move || {
                 for (dy, row) in band.chunks_exact_mut(w * 4).enumerate() {
-                    render_line(vdp2, ctx, sprite_fb, i * band_rows + dy, w, row);
+                    let y = i * band_rows + dy;
+                    if field.is_some_and(|f| y & 1 != f) {
+                        continue; // the other field's row — not scanned this frame
+                    }
+                    render_line(vdp2, ctx, sprite_fb, y, w, row);
                 }
             });
         }
@@ -917,7 +941,7 @@ fn rot_param_window_b(vdp2: &Vdp2, ctx: &FrameCtx, x: u32, y: u32) -> bool {
 /// two display lines — without the halving the lower half of the screen
 /// wraps back to the top of the buffer.
 fn sprite_fb_word(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> u16 {
-    let y = if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 { y >> 1 } else { y };
+    let y = if vdp2.regs.double_density_interlace() { y >> 1 } else { y };
     let word = fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32);
     if fb.hires8() {
         let byte = if vdp2.regs.screen_dims().0 >= 640 {
@@ -1023,7 +1047,7 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
     // sprite-framebuffer y>>1). Feeding the raw display line advanced the
     // coefficient table at twice the hardware rate: VF2's fight floor began
     // at display 31% instead of ~61% with a doubly-steep perspective.
-    if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 {
+    if vdp2.regs.double_density_interlace() {
         my >>= 1;
     }
     // Window tests stay in display-dot units (hi-res window X coordinates
@@ -2065,6 +2089,36 @@ mod tests {
         assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF], "code + SPCAOS<<8");
     }
 
+    /// Per-field compositing (roadmap P5): in double-density interlace one
+    /// `render_frame` call writes only the current field's rows — TVSTAT ODD
+    /// scans display rows 0, 2, …; even scans 1, 3, … (Mednafen
+    /// `SurfInterlaceField = !Odd`) — leaving the other field's rows for the
+    /// caller's weave, exactly as the hardware produces one field per
+    /// vertical period.
+    #[test]
+    fn double_density_composites_only_the_current_field() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x80C0); // DISP | LSMD=11 (DD), 320 wide → 448 lines
+        let mut buf = fresh_buf();
+        v.regs.write16(0x004, 0x0002); // TVSTAT ODD field
+        render_frame(&v, None, &mut buf);
+        for y in [0usize, 2, 446] {
+            assert_eq!(
+                pixel(&buf, 5, y),
+                [0, 0, 0, 0xFF],
+                "ODD field scans display row {y}"
+            );
+        }
+        for y in [1usize, 3, 447] {
+            assert_eq!(pixel(&buf, 5, y), [0xCD; 4], "row {y} belongs to the other field");
+        }
+        v.regs.write16(0x004, 0x0000); // even field
+        render_frame(&v, None, &mut buf);
+        for y in [1usize, 3, 447] {
+            assert_eq!(pixel(&buf, 5, y), [0, 0, 0, 0xFF], "even field completes the weave");
+        }
+    }
+
     /// In double-density interlace the display has twice the lines of the
     /// 256-line VDP1 framebuffer, so each fb line spans two display lines —
     /// without the halving the lower half wraps back to the buffer top (was
@@ -2077,6 +2131,10 @@ mod tests {
         v.cram.write16(0x12 * 2, 0x001F); // code 0x12 = red
         let fb = sprite_fb_with(10, 100, 0x0012);
         let mut buf = fresh_buf();
+        // Per-field compositing (P5): one render covers one field; weave
+        // both fields so the y-mapping assertions can sample either parity.
+        render_frame(&v, Some(&fb), &mut buf);
+        v.regs.write16(0x004, 0x0002); // TVSTAT ODD → the other field
         render_frame(&v, Some(&fb), &mut buf);
         // 704-dot: display x 20/21 ← fb x 10; DD: display y 200/201 ← fb 100.
         assert_eq!(pixel_at_width(&buf, 704, 20, 200), [0xFF, 0, 0, 0xFF]);

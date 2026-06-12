@@ -139,12 +139,24 @@ impl Vdp2Regs {
             1 => 240,
             _ => 256,
         };
-        let height = if (self.tvmd() >> 6) & 0b11 == 3 {
+        let height = if self.double_density_interlace() {
             base_h * 2 // double-density interlace
         } else {
             base_h
         };
         (width, height)
+    }
+    /// Double-density interlace — TVMD LSMD (bits 7..6) == 3. The display has
+    /// twice the lines of the progressive modes, scanned as two alternating
+    /// fields of which the hardware produces exactly one per vertical period.
+    pub fn double_density_interlace(&self) -> bool {
+        (self.tvmd() >> 6) & 0b11 == 3
+    }
+    /// TVSTAT ODD-field bit (bit 1) — live raster state maintained by
+    /// `Saturn::update_video_timing`, toggling each frame. In double-density
+    /// interlace it selects which field the current frame scans.
+    pub fn odd_field(&self) -> bool {
+        self.read16(0x004) & 0x0002 != 0
     }
     pub fn ramctl(&self) -> u16 {
         self.read16(0x00E)

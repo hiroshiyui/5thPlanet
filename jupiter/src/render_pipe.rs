@@ -62,9 +62,31 @@ impl RenderPipe {
         let worker = std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
+                // Weave canvas: in double-density interlace `render_frame`
+                // composites only the current field's rows (roadmap P5) and
+                // relies on the output buffer persisting across frames. The
+                // pipe's two transport buffers ping-pong — each sees every
+                // *other* frame, i.e. always the same field — so the worker
+                // composites into this single persistent canvas and copies
+                // the woven result out.
+                let mut canvas = vec![0u8; buf_bytes];
+                let mut canvas_dims = (0usize, 0usize);
                 while let Ok(mut job) = job_rx.recv() {
                     let dims =
-                        saturn::vdp2::render_frame(&job.vdp2, Some(&job.sprite_fb), &mut job.out);
+                        saturn::vdp2::render_frame(&job.vdp2, Some(&job.sprite_fb), &mut canvas);
+                    if dims != canvas_dims {
+                        // Resolution switch: rows a field render skipped still
+                        // hold the previous mode's pixels at the wrong stride.
+                        // Clear to opaque black and composite once more (this
+                        // double render happens only on a mode change).
+                        for px in canvas[..dims.0 * dims.1 * 4].chunks_exact_mut(4) {
+                            px.copy_from_slice(&[0, 0, 0, 0xFF]);
+                        }
+                        saturn::vdp2::render_frame(&job.vdp2, Some(&job.sprite_fb), &mut canvas);
+                        canvas_dims = dims;
+                    }
+                    let n = dims.0 * dims.1 * 4;
+                    job.out[..n].copy_from_slice(&canvas[..n]);
                     if done_tx.send(Done { out: job.out, dims }).is_err() {
                         break; // main thread gone
                     }
@@ -186,6 +208,38 @@ mod tests {
     fn wait_without_submit_is_none() {
         let mut pipe = RenderPipe::new(FRAMEBUFFER_BYTES);
         assert!(pipe.wait().is_none());
+    }
+
+    /// Per-field DD-interlace compositing (roadmap P5) relies on the output
+    /// buffer persisting across frames, but the pipe's transport buffers
+    /// ping-pong — each carries every *other* frame, i.e. always the same
+    /// field. The worker's weave canvas bridges them: after two fields, a
+    /// returned frame contains BOTH fields even though its transport buffer
+    /// never carried the first one.
+    #[test]
+    fn dd_interlace_weave_survives_the_ping_pong_buffers() {
+        let mut pipe = RenderPipe::new(FRAMEBUFFER_BYTES);
+        let mut sat = booted();
+        sat.bus.vdp2.regs.write16(0x000, 0x80C0); // DISP | LSMD=11 (DD) → 320×448
+        sat.bus.vdp2.regs.write16(0x004, 0x0002); // TVSTAT ODD: rows 0,2,… scan first
+        assert!(pipe.submit(&sat));
+        let (frame1, dims) = pipe.wait().expect("frame 1");
+        assert_eq!(dims, (320, 448));
+        let alpha = |b: &[u8], y: usize| b[(y * 320 + 5) * 4 + 3];
+        assert_eq!(alpha(&frame1, 0), 0xFF, "ODD-field row rendered");
+        // Hand the pipe a DIFFERENT transport buffer (sentinel-tagged) for
+        // frame 2, the way main.rs's display/spare swap does.
+        pipe.recycle(vec![0x55u8; FRAMEBUFFER_BYTES]);
+        sat.bus.vdp2.regs.write16(0x004, 0x0000); // even field
+        assert!(pipe.submit(&sat));
+        let (frame2, _) = pipe.wait().expect("frame 2");
+        assert_eq!(alpha(&frame2, 1), 0xFF, "even-field row rendered");
+        assert_eq!(alpha(&frame2, 0), 0xFF, "ODD row persisted via the weave canvas");
+        assert_ne!(
+            frame2[5 * 4],
+            0x55,
+            "row 0 pixels came from the canvas, not the fresh transport buffer"
+        );
     }
 
     #[test]
