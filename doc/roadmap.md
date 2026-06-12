@@ -1,930 +1,310 @@
 # 5thPlanet Roadmap
 
 Accuracy-first SEGA Saturn emulator in Rust. Milestones are scoped tightly so
-the foundation is solid before the next chip is added.
+the foundation is solid before the next chip is added. This file is a status
+tracker; blow-by-blow investigation history lives in the git log,
+`doc/bootstrapping.md`, and the commit messages referenced below.
 
-The full design rationale lives in `/home/yhh/.claude/plans/temporal-strolling-hollerith.md`.
+Current test count: **1058 workspace-wide, 0 failures**, ~85% line coverage
+(`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
-Current test count: **1058 workspace-wide, 0 failures**, at **~85% line
-coverage** (`cargo llvm-cov`, excluding the interactive SDL2 frontend and the
-FFI `physdisc` crate).
+## Component status
 
-## Overview — component status
-
-Per-chip / per-subsystem implementation progress. ✅ complete · 🟡 partial
-(usable core, refinements pending) · 🔶 stub · ⬜ not started.
+✅ complete · 🟡 partial (usable core, refinements pending) · 🔶 stub · ⬜ not started.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, exceptions; on-chip INTC/DIVU + live FRT (counts + interrupts), working DMAC (transfers + interrupt), behavioral WDT (SCI/UBC remain storage stubs; BSC wait-state timing a refinement) |
-| Saturn bus + memory map | ✅ | Typed regions, wait states, open-bus default |
-| Event-driven scheduler | ✅ | Deterministic; SH-2 ×2 + CD-block entities |
-| SMPC | ✅ | Slave hold/release, staged INTBACK + digital pad, NMIREQ, SNDON/SNDOFF, live RTC (SETTIME + host-seeded), SETSMEM, configurable region; clock-change/SYSRES still no-op |
-| SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct + indirect, D*AD strides, hardware start factors: VBlank/sprite-end/sound), interrupt aggregation → master INTC; cycle-stealing bus timing a refinement |
+| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, exceptions, on-chip INTC/DIVU/FRT/DMAC/WDT (SCI/UBC storage stubs) |
+| Saturn bus + memory map | ✅ | Typed regions, per-access BSC bus-timing model (M12 #8), open-bus default |
+| Event-driven scheduler | ✅ | Deterministic; master-leads-slave SH-2 interleave + CD-block entity |
+| SMPC | ✅ | Slave hold/release, staged INTBACK + pad/mouse, NMIREQ, SNDON/OFF, live RTC, region; clock-change/SYSRES no-op |
+| SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct/indirect/strides/start factors, cycle-stealing), interrupt aggregation, Timer 0/1 |
 | SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
-| VDP2 | ✅ | NBG0–3 (full pattern names, 8×8/16×16 cells, H/V flip, 2×2-page planes, 8bpp banks) + RBG0/1 rotation (4×4-page planes, line-coefficient, screen-over) + VDP1 sprite layer, priority composited; colour calc + W0/W1 windows (rect + per-line) + sprite shadow; per-line scroll/zoom + vertical cell scroll; CRAM modes 0/1/2; hi-res output (320/352/640/704 from TVMD). Sprite window unmodelled (as in the reference) |
-| VDP1 | ✅ | Plotter (all primitives + colour modes), framebuffer erase, draw-end IRQ, VDP2 sprite-layer feed, gouraud shading, double-buffer swap (FBCR), cycle-accurate draw-end |
-| MC68EC000 (sound CPU) | ✅ | Full ISA incl. MOVEP + memory shift/rotate, exception/interrupt model (`m68k` crate); remaining: address/bus-error frames, precise long-op timing |
-| SCSP | ✅ | Hosted+scheduled 68k, timers + interrupts, 32-slot PCM engine, ADSR + TL, mixer/DAC (DISDL/DIPAN), 128-step effect DSP, 44.1 kHz output. (Refinements: effect-return pan, MIDI, master volume) |
-| CD-block | 🟡 | HLE engine complete (M7 phases 1–5): disc image (ISO / CUE-BIN / CCD-IMG) + TOC/session, 200-block buffer with 24 filters/partitions, 75 Hz read pump + 32-bit data transfer (SCU-DMA port), ISO9660 filesystem, authentication/region. **M10** adds CDDA→SCSP playback and live physical-disc reads (via the `SectorSource` trait + the `physdisc`/libcdio crate). **M11** adds the SCU external interrupt (vector 0x50, level 7) and a faithful port of Mednafen's `cdb.cpp` **`Drive_Run` drive-phase model** (`d0640a5`): a `DrivePhase` machine (Idle/Startup/SeekStart/Seek/Play/Pause) with the BUSY→SEEK→PLAY status sequence, a one-sector read-ahead pipeline, per-sector `CSCT`, buffer-full backpressure, and the `PauseCounter`-delayed PLAY→PAUSE end so the end IRQ (`PEND` for Play / `EFLS` for Read File) fires with the status already PAUSE — replacing the old immediate `PLAY→PAUSE` pump so the host-visible status sequence and HIRQ edge timeline match the reference, not just the final values. The **recognition spin-up** (`Startup`, `e2884e7`) extends this: a disc present at power-on/insert reports `STATUS_BUSY` for ~1 s before settling to PAUSE (Mednafen `DRIVEPHASE_STARTUP`, `1*44100*256` CD clocks), with a host `Init` guarded not to cancel it mid-spin-up — so the BIOS plays its disc-present **boot animation** (verified vs MAME with an audio CD inserted) instead of jumping straight to the static logo. Remaining: MPEG card, move/copy sector ops. SH-1 LLE is infeasible (undumped firmware + analog servo) — HLE is the model, as in every Saturn emulator |
-| Cartridge slot | ✅ | Extension DRAM (1 MB / 4 MB, two banks), battery backup-RAM (odd-byte packing), and game ROM carts, mapped at `0x0200_0000..0x04FF_FFFF` with the probed cart-ID byte at `0x04FF_FFFF`; `--cart=` frontend flag. (CDDA→SCSP, MPEG card, move/copy ops still deferred within M7) |
-| SDL2 frontend | ✅ | Window + framebuffer, 44.1 kHz audio queue, keyboard (rebindable) + hot-plug game controller → digital pad, F5/F9 save-state hotkeys, persisted config |
-| Save states | ✅ | Full deterministic snapshot/restore (`Saturn::save_state`/`load_state`, bincode + versioned header). External media (BIOS / disc / ROM cart) referenced not embedded, validated by FNV-1a fingerprint. M8 |
-| Backup RAM (battery) | ✅ | Internal 32 KiB backup RAM with hardware odd-byte packing + "BackUpRam Format" default; persisted to a host `.bup` file by the frontend. M8 |
-| On-screen menu (OSD) | ✅ | Hand-rolled, software-composited in-window menu (ADR-0008): Esc opens it; save/load slots, reset, eject/insert disc, quit, **Settings → Graphics (window scale 1×–4× + fullscreen) / Controller (press-to-bind keyboard rebind) / Region (Japan/NA/EU/Asia) / Cartridge (None/Ext-RAM/Backup) / BIOS (power-cycle into a sibling image)**, all persisted to a config file (`$XDG_CONFIG_HOME/5thplanet/jupiter.toml`). M9 |
+| VDP2 | ✅ | NBG0–3 + RBG0/1 + sprite layer compositor: priority, colour calc (+special/extended), windows, shadow, mosaic, colour offset, line/back screens, per-line scroll/zoom, VCP fetch gating, CRAM modes, hi-res (320–704), live raster regs |
+| VDP1 | ✅ | Full plotter (all primitives/colour modes, gouraud), erase, double-buffer (FBCR), TVM 8bpp + DIE interlace, cycle-accurate draw-end IRQ. TVM=3 (8bpp+rotate) deferred |
+| MC68EC000 (sound CPU) | ✅ | Full ISA + exception/interrupt model, exact MUL/DIV timing, address/bus/trace exceptions |
+| SCSP | ✅ | 32-slot PCM+FM engine, ADSR, LFO, mixer/DAC, MVOL, slot monitor (0x408), 128-step effect DSP, CD-DA via EXTS, 44.1 kHz output |
+| CD-block | 🟡 | HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
+| Cartridge slot | ✅ | Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
+| SDL2 frontend | ✅ | Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
+| Save states | ✅ | `save_state`/`load_state` (bincode + versioned header, currently v6); media referenced not embedded, fingerprint-validated |
+| Backup RAM (battery) | ✅ | Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
+| On-screen menu (OSD) | ✅ | Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
-**Milestone status:** M1–M3 ✅ · M4 (BIOS splash) ✅ — SEGA splash renders
-· M5 (chip-coverage: VDP1 / MC68EC000 / VDP2) ✅ — all three complete,
-plus a post-M6 fidelity pass that made the SH-2 on-chip peripherals (FRT/WDT/
-DMAC), SCU DMA (start factors / indirect / strides), and SMPC (live RTC / region)
-behaviorally faithful · M6 (SCSP audio) ✅ · **M7 (CD-block HLE + cartridge
-slot) ✅** — all five CD-block HLE phases (disc/TOC, buffer/filter/partition,
-read pump + data transfer, ISO9660 FS, authentication) and the **cartridge
-slot** (Extension DRAM / backup / ROM carts + cart-ID) are done. See the
-Milestone 7 section. (Deferred within M7: CDDA→SCSP, MPEG card, move/copy
-sector ops.) · **M8 (save states + battery-backed backup RAM) ✅** — full
-deterministic snapshot/restore (`save_state`/`load_state`, bincode + versioned
-header, media referenced not embedded) and a hardware-faithful, host-persisted
-internal backup RAM. See the Milestone 8 section. · **M9 (frontend OSD) ✅
-complete 2026-06-11** — the in-window menu (Esc): save/load slots, reset,
-eject/insert disc, quit, and the **Settings submenus** — Graphics (scale 1×–4×
-+ fullscreen), **Controller (press-to-bind keyboard rebind)**, Region,
-Cartridge, and **BIOS (power-cycle into a sibling 512-KiB image, save files
-re-keyed)** — all persisted to a **config file**
-(`$XDG_CONFIG_HOME/5thplanet/jupiter.toml`; CLI flag > config > autodetect).
-Basic hot-plug **SDL2 GameController support** (fixed Xbox-style mapping +
-OSD navigation) is in; per-button gamepad rebind + analog devices ride with
-M13 E2. · **M10 (live physical disc + CDDA→SCSP) ✅** — the `SectorSource`
-trait, CD-audio BGM mixed into the SCSP, and live optical-drive reads via the
-feature-gated `physdisc`/libcdio crate (ADR-0009; verified on a real drive with
-Virtua Fighter 2). See the Milestone 10 section. · **M11 (boot a game to
-gameplay) ✅ complete 2026-06-10, tag `vf2-good-emulation`** — **Virtua
-Fighter 2 is fully playable at a steady 60 fps** (title → menus → character
-select → 3D fights to the K.O. screen, with correct graphics, CD-DA BGM
-through the SCSP EXTS inputs, in-fight SFX at the hardware mix balance, and
-smooth pacing — all user-verified); ***Doukyuusei ~if~* is also fully playable**
-(GFX, SFX, and voices all working — user-verified 2026-06-11). See the
-Milestone 11 section. Follow-on performance push (`1e1e115`): the VF2 fight (704×448 DD 3D) went 13.8 → 34.7 fps full-path via the renderer `FrameCtx` frame-invariant hoist + the scanline-band parallel composite (bit-identical, golden unchanged); with the frontend render worker the displayed ceiling is ≈63 fps = NTSC real-time. `bench_vf2_fight` is the permanent fight benchmark.
+**Milestones:** M1–M11 ✅ · M12 (cycle accuracy) 🚧 · M13 (fidelity backlog) 📋.
+Two commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
+`vf2-good-emulation`) and *Doukyuusei ~if~*.
 
-## Milestone 1 — Cycle-accurate SH-2 (SH7604) core ✅ complete
+## Milestone 1 — Cycle-accurate SH-2 core ✅
 
-Standalone `sh2` library crate validated by unit tests and ROM regressions.
+Standalone `sh2` crate: full ISA (~142 ops), delay slots, exceptions, 5-stage
+pipeline cycle model (load-use, multiply latency, branch costs), 4 KiB 4-way
+cache, on-chip peripherals (INTC/DMAC/DIVU/FRT/WDT behavioral; BSC/SCI/UBC
+storage stubs). ROM regression harness with committed golden hashes.
 
-- Full SH-2 ISA (~142 ops): decoder, interpreter, delay slots, exceptions.
-- 5-stage pipeline cycle model (load-use stalls, multiply latency, branch costs).
-- 4 KiB 4-way cache + on-chip peripherals (INTC, DMAC, DIVU, FRT, WDT behavioral;
-  BSC/SCI/UBC register-storage stubs). FRT/WDT activation + working DMAC transfers
-  landed in the post-M6 fidelity pass.
-- Exception/interrupt dispatch (reset, illegal, slot-illegal, address error, NMI, TRAPA, external).
-- ROM regression harness with committed golden state hashes.
+## Milestone 2 — Saturn bus, dual SH-2, scheduler ✅
 
-`cargo test -p sh2` → 131 tests. (The proposed SingleStepTests corpus was
-dropped — no public SH-2 corpus exists; per-opcode unit tests + ROM hashes
-cover the same ground.)
+`SaturnBus` typed regions + memory-map dispatch (open bus when unmapped), the
+cache wired into live fetch/data paths, second (slave) SH-2, deterministic
+event-driven `Scheduler` + `SchedEntity`, `Saturn` aggregate.
 
-## Milestone 2 — Saturn bus, dual SH-2, event-driven scheduler ✅ complete
+## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2 ✅
 
-Pairs the M1 SH-2 with a Saturn-shaped memory map, a second (slave) SH-2, and
-a deterministic event-driven scheduler, with the M1 cache wired into the live
-fetch/data paths.
+SMPC slave hold/release; SCU registers + 3 DMA channels + interrupt aggregator;
+`scu_dsp` full VLIW DSP crate wired into the SCU host; VDP2 register bank +
+VRAM/CRAM + minimal NBG0 renderer; SDL2 frontend shell; BIOS-boot golden test.
 
-- `sh2::Cache` line-data storage + write-through; cached vs cache-through dispatch.
-- `SaturnBus` typed region structs + memory-map dispatch (open bus when unmapped).
-- `Scheduler` + `SchedEntity` trait; `Saturn` aggregate + dual-SH-2 integration.
+## Milestone 4 — BIOS splash on screen ✅ (2026-05-28)
 
-`cargo test --workspace` → 156 tests.
+The real BIOS boots to the animated SEGA splash, pixel-matching MAME (golden
+`0x2C379F92CE1B63F7` at frame 200; later re-baselined by C7 to
+`0x0B1BA6E5180766F7`). Key fixes found by re-syncing PC diff vs MAME/Yabause:
 
-## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2 ✅ scaffolding complete
+- The boot blocker was a **missing VBlank-OUT interrupt** (SCU vector `0x41`) —
+  its callback advances the BIOS frame counter the boot park polls.
+- SCU register map was off by `0x10` from offset `0x90` up (IMS/IST/timers),
+  spuriously masking the SMPC interrupt (`d51cfca`).
+- `sh2`: route CCR (`0xFFFFFE92`) to the cache; `LDC …,SR` is not slot-illegal.
+- SMPC command codes + INTBACK timing/layout; VDP2 live raster timing
+  (`VCNT`/`TVSTAT`, cycle-exact VBlank edges); SCU fixed external vectors
+  (`0x40 + source`).
+- Splash render fixes: VDP1 automatic draw (PTM=0b10), VDP2 8bpp char
+  addressing (`char × 0x20`), CRAM address offset (CRAOFA/B), transparent-pen-
+  as-solid (`7842133`/`bafa590`/`ca97b38`/`122db98`).
 
-Stood up the system bridge (SCU + DMA + interrupt aggregator), the slave-release
-path (SMPC), the display generator (VDP2 minimal — one NBG layer), the SCU-DSP,
-and the SDL2 frontend shell.
+Values tuned to a reference rather than a datasheet are tagged `REVIEW(magic)`
+(`grep -rn "REVIEW(magic)" crates`); revisit a tag only if a divergence
+implicates it.
 
-- SMPC registers + `SETSL`/`SETSM` slave hold-release.
-- SCU registers + 3 DMA channels (synchronous) + interrupt aggregator into the master INTC.
-- `scu_dsp` crate — full VLIW DSP core (ALU + X/Y/D1 buses + multiplier, MVI/JMP/LPS/BTM,
-  END/ENDI, DMA), wired into the SCU host (PPAF/PPD/PDA/PDD ports), run + DMA driven by the
-  Saturn aggregate, raising `Source::DspEnd`. **Fully implemented and integrated.**
-- VDP2 register bank + VRAM (512 KiB) + CRAM (4 KiB) + minimal NBG0 renderer (bitmap +
-  4-cell tile, 8/16/32 bpp via CRAM).
-- SDL2 frontend — window, run loop, framebuffer texture upload (default-on feature).
-- BIOS-boot regression test gated on a committed golden hash.
+## Milestone 5 — Chip build-out: VDP1, MC68EC000, VDP2 ✅
 
-`cargo test --workspace` → 240 tests. **The "SEGA logo on screen" goal is not yet
-met** — see M4.
+- **VDP1 plotter** — one textured-quad rasteriser backs polygons/sprites/lines;
+  all CMDPMOD colour modes, clipping, gouraud, erase, double-buffering (FBCR),
+  cycle-accurate draw-end + SCU sprite-draw-end interrupt.
+- **MC68EC000** — new `m68k` crate (`no_std`, structured like `sh2`): all EA
+  modes, full user-mode ISA, exception/interrupt model. SCSP host wiring: 512 KiB
+  sound RAM + hosted 68k paced at 11.2896 MHz, released by SMPC SNDON.
+- **VDP2 build-out** — NBG0–3 priority compositing, sprite layer (SPCTL type
+  decode + PRISA..D), RBG0/1 rotation (parameter table, coefficients,
+  screen-over), full pattern-name decode (1/2-word, 16×16 cells, flips, plane
+  sizes), colour calc + W0/W1 windows + sprite shadow, CRAM modes, per-line
+  scroll/zoom/windows, vertical cell scroll.
 
-## Milestone 4 — BIOS splash on screen ✅ done
+## Milestone 6 — SCSP audio ✅
 
-Goal: boot a real BIOS to the SEGA logo, confirmed visually. **Achieved
-(2026-05-28):** the BIOS boots to the animated SEGA splash (blue ringed-planet
-on green, "TM & © 1995 SEGA. All rights reserved."), the framebuffer settles to
-a stable image by frame ~285, and the `bios_boot` golden was committed
-(`0xF862E76BE919D7A6` at 300 frames). The blocker turned out to be a **single
-missing interrupt**, found via a re-syncing PC diff against the verified MAME
-reference (see below) — not the "cycle-phase" question we'd parked on.
-*(Post-M4, five more fixes completed the renderer so the splash pixel-matches MAME's
-bright brushed-metal logo; the golden was retargeted to frame 200 and is now
-`0x2C379F92CE1B63F7` — see "Splash now renders fully" below.)*
+Timers A/B/C + the 68k/main-CPU interrupt model (SCIEB/SCIPD/SCILV, MCIPD →
+SCU); 32-slot PCM engine (OCT/FNS phase, loop modes, interpolation); ADSR + TL
+envelope; DISDL/DIPAN mixer to 44.1 kHz stereo; SDL2 audio output; 128-step
+effect DSP (MAC, delay line, PACK/UNPACK); SMPC digital pad from the keyboard.
 
-| # | Task | Status |
-|---|------|--------|
-| 1 | SMPC `INTBACK` — full response (status + staged peripheral protocol, NMIREQ, RESENAB/RESDISA) | ✅ done |
-| 2 | CD-block presence stub + host-interface command protocol | ✅ done |
-| 3 | VDP1 register + VRAM + framebuffer stub (no rendering — became M5 task #1) | ✅ done |
-| 4 | VDP2 register-decode fidelity — renderer reads real registers, not constants | ✅ done |
-| 5 | Iterate-to-splash — trace BIOS, fix the next blocker | ✅ done (missing VBlank-OUT interrupt) |
-| 6 | Commit splash golden + visual confirmation | ✅ done (`0xF862E76BE919D7A6`) |
+## Milestone 7 — CD-block (HLE) + cartridge slot ✅
 
-### BIOS-boot debug — outcome
+**Approach: HLE** — the SH-1's CD firmware is undumped and half its job is an
+analog servo, so there is nothing to LLE against; we model the host command
+interface + buffer engine + filesystem (as MAME/Yabause/Mednafen do), against
+MAME `saturn_cd_hle.cpp`.
 
-A headless **Yabause** build (then **MAME** v0.287, both kept locally under
-`yabref/` / `mameref/`, never committed) were patched to log the master SH-2 PC
-stream and diffed against ours instruction-by-instruction (`mameref/resync_diff.py`,
-poll-loop-tolerant). This proved the **SH-2 core / cache / SMPC / SCU / bus
-correct** (bit-exact for millions of instructions) and pinned each boot blocker
-to an exact instruction. Real bugs fixed from it:
+| # | Phase | Status |
+|---|-------|--------|
+| 1 | Disc image + TOC (`disc.rs`: ISO/CUE-BIN/CCD → FAD-addressed `Disc`, 102-entry TOC) | ✅ |
+| 2 | Buffer/filter/partition core (200 blocks, 24 filters, commands `0x40`–`0x54`) | ✅ |
+| 3 | Sector read pump + data transfer (FIFO port + SCU-DMA at `0x2581_8000`) | ✅ |
+| 4 | ISO9660 filesystem (Change Dir / file info / Read File, `0x70`–`0x75`) | ✅ |
+| 5 | Authentication + region (`0xE0`/`0xE1`, "SEGA SEGASATURN" header) | ✅ |
+| 6 | Cartridge slot (`cartridge.rs`: DRAM/backup/ROM carts + cart-ID) | ✅ |
 
-- `sh2` — route `CCR` (`0xFFFFFE92`) to the cache (BIOS couldn't enable the I-cache).
-- `sh2` — `LDC Rm,SR` / `LDC.L @Rm+,SR` are **not** slot-illegal (only PC-rewriting ops are).
-- `saturn` — correct SMPC command codes (INTBACK=0x10, NMIREQ=0x18, …); INTBACK OREG
-  layout, execution-time, and SF-settle-**on-read** at the exact completion cycle.
-- `saturn` — VDP2 raster timing (`VCNT`/`TVSTAT`) live from the global cycle; correct
-  NTSC frame length (`479_151`) + cycle-exact VBlank-IN edge.
-- `saturn` — SCU presents **fixed external interrupt vectors** (`0x40 + source`), not
-  the SH-2 auto-vector; back SCSP sound RAM (512 KiB) so init's write-verify completes.
-- `saturn` — CD-block host-interface command protocol, MAME-aligned HIRQ/report
-  behaviour, sub-frame periodic-report timing, and the staged INTBACK peripheral protocol.
+Deferred within M7: CDDA→SCSP and live discs (→ done in M10); MPEG card and
+move/copy sector ops (still open, block nothing).
 
-**Why it's parked:** the residual divergence is a VBlank interrupt landing one
-instruction off, from accumulated **cycle-phase** drift vs the references — not a
-per-instruction cost we got wrong. Our SH-2 cycle model is **spec-correct**: `BF`/`BT`
-= 3/1 per the SH7604 manual (same as MAME); deterministic hot loops match MAME's
-iteration counts **exactly**; only *variable* poll loops differ, and their count
-depends on *when* a polled flag flips (phase), not on cycle cost. Matching MAME's
-exact poll counts would over-fit to MAME's timing approximations and make us *less*
-faithful to the spec. So we stop PC-diffing here; closing the splash is a matter of
-finding any genuine *spec* deviation (peripheral/interrupt behaviour vs the hardware
-manuals), for which the reference builds + `resync_diff.py` remain available.
+## Milestone 8 — Save states + battery backup RAM ✅
 
-**`REVIEW(magic)` audit.** Values tuned to a reference emulator rather than a
-datasheet are tagged inline; `grep -rn "REVIEW(magic)" crates` enumerates them
-(INTBACK SF-busy timings, `CYCLES_PER_FRAME`, the HBLANK approximation, placeholder
-RTC bytes, `OREG10=0x34`, CD Get-HW-Info literals). None gate boot; revisit a tag
-only if a divergence implicates it. Spec-grounded values are deliberately not tagged.
+serde derives across the cores (feature-gated) and `saturn`;
+`save_state`/`load_state` over bincode with a magic + version header; external
+media `#[serde(skip)]`'d, re-grafted on load, fingerprint-validated; a
+snapshot-then-equal-runs determinism test. `memory::BackupRam` (32 KiB,
+hardware odd-byte packing, "BackUpRam Format" default) persisted to
+`<bios>.bup`; F5/F9 frontend hotkeys. Deferred: state migration across version
+bumps, rewind/run-ahead, compression.
 
-### Splash blocker — refined diagnosis (2026-05-27)
+## Milestone 9 — Frontend OSD ✅ (2026-06-11)
 
-Revisiting the park with the loop-collapsed PC diff + live-state probes
-(`crates/saturn/tests/trace_boot.rs`, all `#[ignore]`) sharpens the picture and
-**revises the "cycle-phase drift" theory above** — the residual is more likely a
-**data-path divergence**, not interrupt phase:
+Hand-rolled, software-composited in-window menu (ADR-0008), sdl2-free +
+core-free so it's unit-tested without a window. Esc opens it: save/load slots
+(10), Reset, Eject/Insert disc, Quit, plus Settings — **Graphics** (scale
+1×–4×, fullscreen), **Controller** (press-to-bind keyboard rebind),
+**Region**, **Cartridge**, **BIOS** (power-cycle into a sibling 512-KiB image,
+save files re-keyed). All persisted to a flat TOML-subset config at
+`$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (CLI flag > config > autodetect).
+Basic hot-plug SDL2 GameController support (fixed Xbox-style mapping, OSD
+navigation); per-button gamepad rebind + analog devices ride with M13 E2.
+Related fix: no disc now reports `NODISC` (0x07), matching MAME.
 
-- **Boot reaches a stable WRAM park at `0x060108BE`** (a `MOV.W @R3,R3 / CMP/EQ /
-  BT` loop) waiting for **`[0x060408A4]`** (16-bit) to change. Disassembled live.
-- The watched word **never changes across 600 frames (~10 s emulated)** — far past
-  any splash timing — so this is a **genuine stall, not phase jitter / slowness**.
-- VDP2 **display is still off** (`TVMD.DISP=0`), so it's strictly **pre-splash**.
-- **Interrupts are live and correct**: `imask=0`; the VBlank-IN vector (`0x40`,
-  `VBR=0x06000000` → trampoline `0x06000840` → common dispatcher `0x060008F4`)
-  **fires every frame**, pushes regs, `JSR @R6` through the per-vector callback
-  table, and `RTE`s cleanly. Verified the handler entry is hit ~2×/frame.
-- **But every SCU-vector callback is still the BIOS default do-nothing stub**
-  (`0x0600083C` = `RTS; nop`). Nothing advances `0x060408A4`, so the park spins
-  forever and display is never enabled.
-- **Control flow matches MAME** across the entire traceable window (loop-collapsed
-  skeletons agree for all ~721 K basic blocks we cover; raw PC streams agree
-  bit-exact for ~9.3 M instructions before the first poll-count shift). Since the
-  PC paths agree but the installed callback differs, the divergence is a **value
-  the BIOS writes into the callback table (or the source feeding it) — invisible to
-  PC tracing**, not a control-flow/branch bug.
+## Milestone 10 — Live physical disc + CDDA→SCSP ✅
 
-**Follow-up (2026-05-27, same session):**
+- **`SectorSource` trait** decouples the CD-block from the in-memory `Disc`;
+  `CdBlock.disc` is `Option<Box<dyn SectorSource>>` (drops `Clone`).
+- **CDDA→SCSP** — audio sectors decode to a CD-DA FIFO consumed as the SCSP
+  **EXTS inputs** (see M11), pulled through a ~0.5 s pre-roll jitter buffer
+  (`take_cd_audio_buffered`, `87b85e9`) that absorbs the burst-vs-steady
+  mismatch. Debug hooks `dbg_play_cdda`/`dbg_play_first_audio_track` (jupiter
+  F8) play CD-DA without a BIOS Play.
+- **`physdisc` crate** — feature-gated libcdio `SectorSource` (the sole unsafe
+  crate, ADR-0009); verified booting VF2 from a real drive on `/dev/sr0`.
 
-- **Install is *not* reached.** The real callback table base is `0x06000900`
-  (captured live from the dispatcher, not PC-rel arithmetic); the VBlank-IN slot
-  `0x06000A00` holds the stub `0x0600083C` and **never changes over 900 frames
-  (~15 s)** — no interrupt callback of any vector is ever installed. So this is
-  not a store-*value* bug; the BIOS is blocked *before* the install code.
-- **Region is not the gate.** The only BIOS present is the **EUR (PAL)** image,
-  but booting it with the matching PAL area code (`0x0C`) instead of the default
-  North-America `0x04` gives a **byte-identical stuck trajectory** — same park,
-  same frame-by-frame PCs. The splash path is region-independent, as expected.
-- **`0x060408A4` is a VBlank frame-counter.** The park is the standard "wait
-  until the counter advances past a saved value" idiom; the counter is bumped by
-  the (never-installed) VBlank-IN callback. We arrive at this wait loop *without*
-  the BIOS having installed that callback.
+## Milestone 11 — Boot a game to gameplay ✅ (2026-06-10, tag `vf2-good-emulation`)
 
-**RESOLVED (2026-05-28) — the bug was a missing VBlank-OUT interrupt.** A
-re-syncing PC diff (`mameref/resync_diff.py`) against a longer, verified MAME
-trace matched our control flow for **31.5 M instructions** then diverged exactly
-at the park: MAME exits (`0x060108C4`), we loop. Counting trampoline hits across
-the traces showed why — **SCU vector `0x41` (VBlank-OUT) fired 98× in MAME and
-0× in ours**; its installed callback (`0x060102AA`, runs `0x06013144`) is what
-advances the `0x060408A4` frame counter. `update_video_timing` raised VBlank-IN
-on the active→VBLANK edge but only triggered SCU **DMA** factor 1 (not the
-**interrupt**) on the VBLANK→active edge. One line — `scu.raise(Source::VBlankOut)`
-at that edge (`system.rs`) — ticks the counter, the park exits, the BIOS enables
-VDP2 display (`TVMD.DISP` 0→1) and renders the splash. The earlier "install never
-reached" probe was misleading: it watched vector `0x40`'s slot (legitimately a
-stub); the counter is driven by vector `0x41`.
+**Virtua Fighter 2 is fully playable at a steady 60 fps** (title → menus →
+character select with CD-DA BGM → 3D fights to the K.O. screen, correct
+graphics/audio balance/pacing, user-verified). ***Doukyuusei ~if~* is also
+fully playable** (GFX, SFX, voices — user-verified 2026-06-11, native 640×224
+hi-res). Pursued purely on the **real-BIOS LLE path**, trace-diffed against
+Mednafen (itself LLE — the only mode where a master-SH-2 PC-trace diff is
+valid). An opt-in HLE direct boot (ADR-0010/0011) was tried and **removed**.
 
-*Historical (pre-fix) analysis follows; kept for context.* The genuine bug was a
-control-flow path that skips the (`0x41`) callback — because the `0x41` interrupt
-never fired.
+Fix chain (each with regressions; details in the commits):
 
-**MAME reference verified to boot fully (2026-05-27).** `mameref/saturn` boots the
-*byte-identical* BIOS (USA/EUR/JP `mpr-17933.bin`, SHA1 `faa8ea18…`) past the SEGA
-splash to the **"Set Language" setup menu** (snapshot via a Lua `video:snapshot()`
-autoboot script + `-seconds_to_run`; screen black at 5 s, menu by 25 s). So the
-splash blocker is squarely on **our** side. The earlier worry that the reference
-might not reach the splash was wrong — the existing `/tmp/mame_pc.log` (ends in a
-BIOS loop at `0x0003200`) was just the **2 s** default of `pctrace.sh`, too short.
+- **Boot**: data-transfer state machine + Seek/Init handling; `DCHG` cleared by
+  the host W1C, never re-raised at Init (the recognition-loop root); region
+  autodetect; the `cmd_log` command-level CD trace-diff methodology.
+- **Post-boot**: SH7604 BCR1 master/slave bit (`1f584d6`); `run_frame` = one
+  `run_for(CYCLES_PER_FRAME)` (`0b78733`); Mednafen scheduler alignment —
+  master-leads-slave interleave (`b583cc4`) + per-instruction SCU interrupt
+  sampling (`70f4049`); per-sector CD periodic during PLAY (`cacffca`);
+  Mednafen `Drive_Run` drive-phase port (`d0640a5`) + recognition spin-up
+  (~1 s BUSY, `e2884e7` — the BIOS boot animation plays).
+- **VF2 intro → title**: stop-then-Play seek origin from the physical pickup
+  (`fb52d0c`); the periodic report must not clobber a half-composed command +
+  Get Subcode 0x20 + the BUSY seek-settle (`c1b4dc9`); VDP1 TVM 8bpp + DIE
+  interlace + VDP2 8-bit sprite decode (`0dd3ddd`, savestate v4); sprite
+  SPCAOS CRAM offset (`5a192c0`); hi-res window-X scaling (`caec91f`).
+- **VF2 audio**: CD Play track/index form (`9d46803`); CD-DA paced at 1×
+  (`b08d100`); MSB-first (cdrdao) rip detection warning (`072fea2`); SH-2→SCSP
+  B-bus wait-states (`7dfbfab` — a 0-wait SCSP let VF2's sound-submit timeout
+  latch a permanent "sound wedged" flag, muting all SFX); CD-DA through the
+  SCSP **EXTS** inputs at the game-programmed mix (`7ac3837`); KYONEX re-keys
+  only a Release-phase EG (`e963b19`).
+- **SH-2 core**: PC-relative fetches are slot-*legal* (branch family only is
+  slot-illegal), with slot base = branch target + 2 when taken (`1d49088`).
+- **Doukyuusei**: FRT `FTCSR` write-0-to-clear (`073805d` — the inter-CPU FTI
+  handshake root); VDP2 hi-res rendering (`c0f2344`); SCU-DSP DMA cache-through
+  mask (`ea20509`) + DSP effect-send scaling/MIXS wrap (`845f611`) + the SCSP
+  slot CA monitor `0x408` (the boot-jingle loop root) for the boot jingle;
+  SCU indirect-DMA table-pointer alias fold (`bfd6240`) + VDP1 fb hi-res
+  horizontal doubling (`4b93204`) for the in-game menu.
+- **Performance** (follow-on, bit-identical): renderer `FrameCtx` hoists +
+  scanline-band parallel composite (`1e1e115`), emu-thread decoupling, fight
+  hot-path cuts (`03e842a`), audio-pacing mirror credit (`021dab5`) — VF2
+  fights 13.8 → 34.7 fps full-path, displayed ceiling ≈63 fps = real-time.
 
-**Concrete next step:** regenerate a longer reference trace (`./pctrace.sh 25`, or
-a windowed window-of-interest to keep it from ballooning past ~19 M PCs/s), then run
-a *re-syncing* (LCS / poll-loop-tolerant) diff — not the line-by-line one — to find
-the first point our control flow leaves MAME's. Secondary lead worth checking: our
-staged-INTBACK **peripheral** response reports a phantom port-1 pad (`OREG0=0xF1,
-OREG1=0x02`) where M4's plan was "no controller" — verify that doesn't send the BIOS
-down a divergent peripheral path.
+General accuracy fixes spun out (independent of any boot path): scheduler
+cycle-resync on un-halt; inter-CPU FRT input-capture (FTI) regions; SCU IST
+cleared on the acknowledge cycle; event-edge-clamped scheduler batching; CD
+status `is_cdrom` bit; CD-block SCU external interrupt (vector 0x50, level 7,
+`57a1066`); the **`sdbg`** interactive debugger (`crates/debugger` — see
+project conventions).
 
-### Post-splash menu transition — root cause fixed (2026-05-28)
+## Milestone 12 — Whole-system cycle accuracy 🚧
 
-The boot parked in a per-frame callback dispatcher (~`0x06028DD4`) waiting for the byte
-`[0x060100AB]` to become `1`. That flag is set by the SCU **SMPC interrupt (vector
-`0x47`, SCU source 7)**, which was **masked and never delivered** — but the mask was
-bogus. **Our SCU register map was off by `0x10` from offset `0x90` up:** IMS was decoded
-at `0xB0` (hardware IMS is `0xA0`), IST at `0xB4` (`0xA4`), and the timers at
-`0xA0/0xA4/0xA8` instead of `0x90/0x94/0x98`, with a bogus `dsp_ctrl` window eating
-`0x90..0x9C`. So the BIOS's *real* interrupt mask (SMPC unmasked) — written to `0xA0` —
-was stored in `t0c` and ignored, while the BIOS's A-bus `ASR0` write to `0xB0`
-(`0x1FF01FF0`, bit 7 set) landed in our `ims` field and **spuriously masked SMPC**. The
-periodic peripheral poll then died after ~11 frames and the flag never advanced.
+Close residual whole-system timing gaps vs the LLE reference (Mednafen) so
+timing-gated behaviour matches even when code/data are byte-identical.
 
-**Fix** (`crates/saturn/src/scu.rs`, commit `d51cfca`): corrected the map to the SCU
-User's Manual / MAME `saturn_scu.cpp` `regs_map` — `0x90` T0C, `0x94` T1S, `0x98` T1MD,
-`0xA0` IMS, `0xA4` IST, `0xA8` AIACK, `0xB0/B4` ASR0/1, `0xB8` AREF, `0xC4` RSEL, `0xC8`
-VER. All 142 lib + integration tests pass; `bios_boot` golden unchanged (divergence is
-post-frame-300). The boot now advances past the park (master PC → `0x0604xxxx`, `BGON`
-`0` → `0x1011`, steady BIOS main loop by frame ~1000).
-
-*(The earlier "vec `0x47` not masked, `IMS=0`" note was stale — measured before the
-M5/M6 work; the post-fix `IMS=0x1FF01FF0` reading is exactly the misrouted `ASR0` value.
-Diagnosis: an env-gated `SMPC_LOG` trace in `system.rs::drain_smpc` showed the periodic
-poll stop with `IMS=0x1FF01FF0`; cross-checking that offset against MAME's `regs_map`
-exposed the `0x10` shift.)*
-
-### Splash now renders fully — pixel-matches MAME (2026-05-28)
-
-With the boot unblocked, four further fixes took the splash from a frozen dark blob to
-the genuine bright brushed-metal "SEGA SATURN" logo, byte-verified against MAME at the
-`BGON=0x080C` phase (identical CRAM / VRAM char data / registers → identical pixels):
-
-- **VDP1 automatic-draw, `7842133`** — the splash uses `PTMR` PTM=`0b10` (re-render the
-  command list every frame), not a one-shot draw on the register write. We only redrew
-  on the write, so the single populated frame buffer ping-ponged under the per-frame
-  swap and the logo strobed at 30 Hz. Now `frame_change` re-renders in auto-draw mode.
-- **VDP2 8bpp char addressing, `bafa590`** — character numbers are in `0x20`-byte units;
-  an 8bpp cell is `0x40` bytes (two units), so the byte base is `char × 0x20`. We used
-  `char × 64` and read the wrong VRAM region, so NBG2/NBG3 (the metal layers) drew
-  garbage.
-- **VDP2 colour-RAM address offset, `ca97b38`** — CRAOFA/CRAOFB (`NxCAOS << 8`) select a
-  CRAM bank per layer; NBG3's silver palette is at CRAM `0x300+`. We ignored the offset
-  and read the dark bank 0, rendering the logo dark maroon.
-- **VDP2 transparent-pen-as-solid, `122db98`** — BGON `NxTPON`/`R0TPON` draw palette code
-  0 as the opaque colour `CRAM[offset]` rather than transparent. NBG3 sets it; we always
-  treated code 0 as transparent, leaving black speckle in the metal.
-
-`bios_boot` golden retargeted to frame 200 (the stable splash plateau) and tracked the
-renders: `0xED48761869D728FD` → `0x871FD74D6C91AF08` → `0x2D966904356AFCC3` →
-`0x2C379F92CE1B63F7` (final). Boot speed: the debug build runs ~5–6 fps; `--release`
-runs ~74 fps (use it to see the splash quickly).
-
-**Open follow-up:** the post-splash **CD-player "Drive empty" screen** (the `BGON=0x1011`
-phase — NBG0 bitmap + RBG0 rotation) benefits from the same VDP2 fixes but hasn't been
-re-verified against MAME's snapshot; check it when M7 brings a disc in. A minor ~2×
-*emulated-time* slowness in BIOS init (our cycle model charges a touch high) is also
-noted for a later look.
-
-## Milestone 5 — Chip-coverage build-out (VDP1 → MC68EC000 → VDP2) ✅ complete
-
-Turn the remaining presence-stubs into real chips, in the order set by the user —
-**VDP1, then MC68EC000, then VDP2**. Each is a self-contained, independently
-testable unit. MAME (`/mameref`) is an encoding/behaviour reference only; the
-hardware manuals stay authoritative.
+> **BGM resolved 2026-06-06** — the BIOS CD-player BGM silence was **not** a
+> timing gap but an `m68k` decode bug (`32662f7`): `ADDA.L`/`SUBA.L Dn,An`
+> mis-decoded as ADDX/SUBX (the guard must exclude opmode `0b11`), collapsing
+> the sound driver's note-ring to 2 entries. Found by a cross-emulator
+> note-ring diff; regression `m68k/tests/ring_offset_repro.rs`. The timing
+> items below stand on their own merits.
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | **VDP1 plotter** — list walker, all primitives + colour modes, render into the framebuffer | ✅ done |
-| 2 | VDP1 finish — erase ✅, SCU sprite-draw-end interrupt ✅, VDP2 sprite-layer compositing ✅, gouraud shading ✅, double-buffer swap (FBCR) ✅, cycle-accurate draw-end ✅ | ✅ done |
-| 3 | **MC68EC000** — `m68k` CPU crate ✅ (ISA + exceptions) + SCSP host wiring ✅ (sound RAM/registers, hosted+scheduled 68k, SNDON/SNDOFF). Audio engine = M6 | ✅ done |
-| 4 | **VDP2 build-out** — NBG0–3 priority compositing ✅, VDP1 sprite layer ✅, RBG0/1 rotation ✅, background fidelity (full PN formats + 16×16 cells + flip + 2×2-page planes + 8bpp banks) ✅, colour calc + W0/W1 windows + sprite shadow ✅, CRAM modes 0/1/2 ✅, per-line scroll ✅, per-line windows ✅, vertical cell scroll ✅, rotation 4×4-page planes + line-coefficient + screen-over ✅, line-zoom ✅ (sprite window unmodelled, as in the reference) | ✅ done |
-
-### Task #1 — VDP1 plotter (`cargo test -p saturn --test vdp1` → 22 tests)
-
-`crates/saturn/src/vdp1/{command,plotter}.rs` turn the address-space stub into a
-real plotter. `Command` decodes a 32-byte command-table entry; `Plotter` walks the
-list (END / jump / skip / call+return) and rasterises into the 512×256 RGB555 frame
-buffer:
-
-- One textured-quad rasteriser (forward-differenced edge walk, 16.16 fixed point)
-  backs polygons, distorted/scaled sprites, lines and polylines; normal sprites use
-  a direct blit loop. Local coordinates (0xA) + system/user clipping (0x9/0x8).
-- All six CMDPMOD colour modes, the no-transparency poly writer, SPD/MESH/end-code,
-  and the replace/shadow/half-luminance/half-transparent calc modes.
-- A `PTMR` write erases the EWLR..EWRR region (to EWDR), runs the list, latches
-  `EDSR.CEF`/`COPR`, and flags the SCU sprite-draw-end interrupt (drained by the
-  aggregate).
-- **Gouraud shading** (CMDPMOD bit 2): the four CMDGRDA vertex colours are
-  interpolated per-edge across the quad rasteriser (bilinear over normal sprites)
-  and offset each RGB555 channel by `correction - 16`.
-- **Double buffering**: the plotter targets a draw buffer; VDP2 composites the
-  display buffer; `FBCR` swaps them at the VBlank edge (automatic 1-cycle mode
-  or a manual one-shot change).
-- **Cycle-accurate draw-end**: a `PTMR` plot models a draw duration (per-command
-  + per-dot), so `EDSR.CEF` reads busy and the SCU sprite-draw-end interrupt
-  fires only after the duration — settled by the bus on VDP1 access and by the
-  run loop between batches. This closes task #2.
-
-### Task #3 — MC68EC000 (`cargo test -p m68k` → 68 tests)
-
-A new `m68k` crate, structured like `sh2` (`no_std` + alloc, big-endian,
-host-owned bus returning `(value, stall)`). The CPU is now essentially
-complete for user-mode code plus the interrupt model SCSP needs:
-
-- **Registers** — D0-D7 / A0-A7 with USP↔SSP banking on the S bit, PC, named SR.
-- **Effective addresses** — all twelve modes (incl. brief-format index + PC-relative).
-- **Instructions** — MOVE/MOVEA/MOVEQ; the ADD/SUB/AND/OR/EOR/CMP families with
-  immediate/quick/address/extend (ADDX/SUBX) forms; MULU/MULS, DIVU/DIVS;
-  ABCD/SBCD/NBCD; NEG/NEGX/NOT/CLR/TST/TAS; bit ops (BTST/BCHG/BCLR/BSET, static
-  + dynamic); EXT/SWAP/EXG; shifts/rotates; MOVEM, LINK/UNLK; BRA/BSR/Bcc/DBcc/Scc,
-  RTS, JMP/JSR; MOVE to/from CCR/SR — all with correct NZVCX flags.
-- **Exceptions** — TRAP/TRAPV/CHK, zero-divide, illegal + line-A/F, privilege
-  violation, STOP/RESET/RTE/RTR, and external-interrupt dispatch (autovector,
-  `SR.imask`-gated, level-7 NMI). `raise_interrupt()` is the host's entry point.
-
-Cycle model counts the 68000's 4-clock bus cycle per word; per-instruction timing
-tables are a later refinement.
-
-**SCSP host wiring landed** (`crates/saturn/src/scsp/`): the SCSP owns the 512 KiB
-sound RAM, the control/slot/DSP register bank, and the hosted 68k. The 68k's
-`M68kView` maps sound RAM at 0 and the registers at 0x100000; the SH-2 sees them
-at 0x05A0_0000 / 0x05B0_0000 (shared RAM). `Scsp::run` paces the 68k at the
-11.2896 MHz SCSP clock from the Saturn run loop; SMPC `SNDON`/`SNDOFF` release /
-re-hold it. End-to-end: SH-2 stages a program into sound RAM → SNDON → the
-scheduler runs the 68k from it (9 tests).
-
-**Remaining for the chip:** address/bus-error stack frames (rare) and precise
-long-operation timing tables. (MOVEP and the memory shift/rotate forms landed
-in the post-M6 fidelity pass.) As the **M6 audio milestone**: the SCSP slot/FM engine, the SCSP
-DSP, the mixer/DAC, and the timer/sound interrupt sources feeding
-`Scsp::raise_interrupt`.
-
-### Task #4 — VDP2 multi-layer compositing (`cargo test -p saturn --lib vdp2` → 63 tests)
-
-The NBG0-only renderer became a per-pixel priority compositor over NBG0–3.
-Generalized per-layer register accessors drive it; two register-map bugs found
-against MAME were fixed (MPOFN at 0x03C / 2-bit fields — 0x03E is the rotation
-MPOFR — and PLSZ at 0x03A). Compositing picks the highest PRINA/PRINB priority
-with a non-transparent dot (ties → lower-numbered layer; priority 0 hides a
-layer; else the CRAM[0] backdrop). Colour formats: 4bpp/8bpp paletted (tile +
-bitmap) and 16bpp RGB555 direct (bitmap); bitmap now uses the hardware width and
-characters address as `char_number × cell_bytes`.
-
-The **VDP1 sprite layer** is now composited too: `render_frame` reads the VDP1
-frame buffer and `sample_sprite` decodes each word per the SPCTL sprite-type
-tables (colour mask + priority shift/mask) into a colour (CRAM palette code, or
-RGB555 direct when the MSB is set and SPCLMD is on) and a priority from
-PRISA..PRISD; the sprite layer wins priority ties against the NBGs. A real VDP1
-plot shows through at its sprite priority.
-
-**Rotation (RBG0/RBG1)** is in too: `rotation.rs` reads the rotation-parameter
-table (set A/B) and evaluates the affine screen→plane transform; `sample_rbg`
-maps each dot and samples the rotation plane (bitmap or single-page tile). RBG0
-(param A, priority PRIR) and RBG1 (param B, N0PRIN) join the race in the default
-order sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
-
-**Background fidelity** (done): `sample_tile` now decodes the full pattern-name
-set — 1-word (CNSM 12-bit char vs 10-bit char + H/V flip, SPCN/SPLT supplement)
-and 2-word (15-bit char + 7-bit palette + flip) — supports 8×8 and 16×16
-characters (four 8×8 cells addressed consecutively, per-character H/V flip), and
-composes plane sizes 1×1 / 2×1 / 2×2 pages across planes A–D via MPABNn/MPCDNn +
-MPOFN with plane-base alignment. 8bpp tiles select a CRAM colour bank from the PN
-palette field. New regs accessors (PNCN one-word/CNSM/SPCN/SPLT, per-plane page).
-
-**Colour calc + windows + shadow** (done): the compositor keeps the top two
-opaque dots by priority; when the front layer enables colour calc (CCCTL) it
-blends with the dot below — ratio/alpha mode (alpha = `(31-CCRT)/31`, from
-CCRNA/CCRNB/CCRR) or additive (CCMD). Sprites blend via CCRSA..D selected per
-sprite type, gated by SPCCEN + the SPCCCS/SPCCN priority condition. W0/W1
-windows: each layer's WCTL byte enables W0/W1 with inside/outside area bits and
-AND/OR combine logic; windowed-out dots are suppressed (rectangles from
-WPSX/WPSY/WPEX/WPEY, X at half-dot resolution). An MSB-only sprite word on a
-shadow-capable sprite type halves the layer beneath.
-
-**CRAM modes + line scroll/windows** (done): palette lookups honour RAMCTL.CRMD
-— RGB555 (modes 0/1) or true RGB888 (modes 2/3). NBG0/NBG1 apply per-line scroll
-from the SCRCTL/LSTAn table (integer H/V, LSS interval), and W0/W1 can take their
-horizontal extent per scanline from the LWTAn line-window table (vertical bounds
-still from WPSY/WPEY).
-
-**Rotation completeness** (done): RBG tiles compose the full 4×4-page plane
-grid (A..P) with the shared pattern-name decode; the per-line coefficient
-table (KTCTL) overrides kx/ky for perspective and flags transparent lines; and
-the screen-over modes (RAOVR/RBOVR) repeat or clip the field.
-
-**Remaining:** dual-parameter window selection, the sprite window plane,
-per-line zoom, and the minor rotation refinements (coefficient Xp mode, CRAM
-coefficient tables, the screen-over pattern).
-
-## Milestone 6 — SCSP audio ✅ complete
-
-The MC68EC000 is complete and hosted (M5 task #3); M6 turned the SCSP into a
-sound source. The full chain runs end to end: a sound program on the 68k keys
-slots → PCM + ADSR envelope + TL → mixer (DISDL/DIPAN) → optional effect DSP →
-44.1 kHz stereo → SDL2; SMPC reports a keyboard-mapped digital pad. (Remaining
-refinements: precise effect-return panning, MIDI, master-volume scaling.)
-
-| # | Task | Status |
-|---|------|--------|
-| 1 | SCSP timers (A/B/C) + interrupt model (68k IRQ via SCIEB/SCIPD/SCILV, main-CPU sound IRQ via MCIPD/MCIEB → SCU) | ✅ done |
-| 2 | Slot engine — 32 PCM slots: phase/pitch (OCT/FNS), loop control, 8/16-bit, interpolation, key-on/off | ✅ done |
-| 3 | Envelope generator (ADSR) + total level (TL) attenuation per slot | ✅ done |
-| 4 | Mixer / DAC — sum slots to L/R via DISDL/DIPAN; produce a 44.1 kHz stream | ✅ done |
-| 5 | SDL2 audio output — feed the sample stream to the frontend | ✅ done |
-| 6 | SCSP DSP — 128-step effect microprogram (reverb etc.) | ✅ done |
-| 7 | SMPC peripheral data → SDL2 keyboard input (digital pad) | ✅ done |
-
-### Task #1 — timers + interrupts (`cargo test -p saturn --lib scsp` → 8 tests)
-
-`ScspCtrl` reacts to control-register writes: three timers tick at the
-44.1 kHz sample clock ÷ 2^prescale and pend `SCIPD` bits on overflow; the
-asserted 68k IRQ level is derived from `SCIPD & SCIEB` encoded through
-`SCILV0..2`, presented level-triggered on `cpu.pending_irq` each instruction
-boundary, and acknowledged via `SCIRE`. Timer A also pends the main-CPU sound
-interrupt (`MCIPD`/`MCIEB`), forwarded by `Saturn::drain_scsp` to the SCU
-`SoundRequest` source. The hosted 68k is now a real interrupt-driven engine.
-
-### Task #2 — slot (PCM) engine
-
-The 32-slot PCM engine plays waveforms from the shared sound RAM. Each slot
-has a phase accumulator stepped by an OCT/FNS-derived increment; `slot_sample`
-fetches 8-bit (×256) or 16-bit PCM at SA + phase with linear interpolation,
-applies the loop mode (no-loop / normal / reverse / ping-pong), and advances.
-A `KYONEX` write keys slots on/off by their `KYONB` bit. The envelope (ADSR,
-task #3) and the mixer/DAC (task #4) consume these pre-envelope samples.
-
-### Task #3 — envelope generator (ADSR + TL)
-
-Each slot has an ADSR envelope: attack → decay1 → decay2/sustain → release,
-with rates cached at key-on and scaled by OCT/KRS/FNS through the SCSP time
-tables, a decay-level boundary, and EGHOLD. `eg_advance` runs the state machine
-one sample and returns the linear EG × TL multiplier (attack ramps directly,
-later phases via a log→linear table; TL is the SCSP per-bit dB attenuation
-ladder). Key-off enters the release phase. The mixer (task #4) multiplies
-`slot_sample` by `eg_advance` and pans the result to L/R.
-
-### Tasks #4–7 — mixer, output, DSP, input
-
-- **#4 Mixer/DAC:** per sample, each slot's enveloped voice is panned by
-  DIPAN and scaled by the direct-sound level DISDL (precomputed gain tables),
-  summed across 32 slots, and clamped to a 16-bit stereo pair (`next_sample`).
-- **#5 Audio output:** `Scsp::run` buffers the 44.1 kHz stream;
-  `Saturn::take_audio` hands it to the SDL2 frontend, which queues it each frame.
-- **#6 Effect DSP** (`scsp/dsp.rs`): the 128-step microprogram engine
-  (24×13-bit MAC, TEMP/MEMS/COEF, sound-RAM delay line with float PACK/UNPACK).
-  Slot effect-sends (ISEL/IMXL) feed its input mix; EFREG folds back into L/R.
-- **#7 Input:** the INTBACK peripheral phase reports a standard digital pad
-  (`smpc::pad`), driven by the frontend's keyboard mapping.
-
-## Milestone 7 — CD-block (HLE) + cartridge slot ✅ done
-
-The CD-block is the last core subsystem and the prerequisite for booting
-commercial games — the disc-recognition + filesystem + authentication surface
-the BIOS drives. (The actual boot-to-gameplay, loading a game's 1st-read program
-via the real BIOS, is **M11**.) **Approach: HLE** (the established model in every Saturn emulator —
-MAME, Yabause, Mednafen). The SH-1's CD-ROM firmware is undumped (on-die mask
-ROM) and half its job is an analog servo with no digital ground truth, so
-there is nothing to low-level-emulate *against*. We instead model the host
-command interface + the buffer/filter/partition engine + the CD-ROM
-filesystem, reading sectors from a disc image — which is exactly the surface
-the BIOS and games interact with, and fully observable. (This is the one chip
-where "never approximate" is satisfied by HLE rather than LLE; the earlier
-"SH-1 firmware" framing is superseded.) Modelled against MAME's
-`saturn_cd_hle.cpp`.
-
-The current `cd_block.rs` already has the host-register shape (HIRQ/CR1–4,
-`cmd_pending==0xF` dispatch, periodic report, the no-disc command subset).
-M7 grows it into the full engine, in independently-testable phases:
-
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **Disc image + TOC** ✅ done | `disc.rs`: raw ISO + CUE/BIN + CloneCD CCD/IMG parsers → a FAD-addressed `Disc` (FAD = LBA + 150), `read_sector` (2352→2048 user payload), and the 102-entry Saturn `toc()` (matches MAME `cd_readTOC`). CD-block holds `Option<Disc>`; `Saturn::insert_disc` + the frontend `<BIOS> [game]` arg load `.iso`/`.cue`/`.ccd`. Get Status/standard reports carry real geometry; Get TOC streams the 408-byte TOC through the data FIFO; Get Session returns the lead-out FAD. Tests: 7 disc-parser + 4 cd-block + 1 gated real-disc (the `roms/` boot disc). |
-| 2 | **Buffer/filter/partition core** ✅ done | 200 blocks, 24 filters (FAD-range / file-id / channel / submode / coding-info), partitions. Reset Selector / Set Filter\* / Get Buffer\* (`0x40`–`0x54`). Pure-logic tests. |
-| 3 | **Sector pump + data transfer** ✅ done | 75/150 Hz read pump (extends `CdBlockEntity`) disc→filter→partition; Get/Get-and-Delete Sector Data (`0x60`–`0x63`) streaming the data port + the SCU-DMA path. **Address-map fix:** the data-transfer port is at `0x2581_8000` (the SCU DMA already special-cases `0x0581_8000`) — outside the current `0x0589_xxxx` window, so the bus needs that region. |
-| 4 | **CD-ROM filesystem** ✅ done | ISO9660 directory parse (PVD at FAD 166, `direntryT` records). Change Dir / Get File Scope / Get File Info / Read File (`0x70`–`0x75`). |
-| 5 | **Authentication + region** ✅ done | disc-validity / region report (`0xE0`/`0xE1`) + the "SEGA SEGASATURN" header check, so the BIOS accepts the disc and reads its IP.BIN. (Actually *booting* a game — loading the 1st-read program and reaching its game code — is **M11**, done via the real BIOS; M7 delivers the CD-block surface that boot drives.) |
-| 6 | **Cartridge slot** ✅ done | `cartridge.rs`: Extension DRAM (1 MB / 4 MB, two mirrored banks), battery backup-RAM (Saturn odd-byte packing + "BackUpRam Format" tag), and game ROM carts, at `0x0200_0000..0x04FF_FFFF` with the cart-ID byte at `0x04FF_FFFF` (empty slot floats high to `0xFF`). `Saturn::insert_cartridge` + frontend `--cart=ram1m|ram4m|bram[4|8|16|32]|rom:<path>`. 5 tests. |
-
-**Deferred within M7 → done in M10:** CDDA audio playback into the SCSP, and
-(beyond M7's image-only model) live physical-disc reads. **Still remaining:** the
-MPEG card (`0x90`+), Move/Copy sector ops, and realistic seek timing — none
-block game boot. (The BIOS splash park at `0x060108BA` is a VDP2-only path and
-may be independent of the disc; treated as a possible side-benefit, not the M7
-goal.)
-
-Also in M7 (task #6, ✅ done): the **cartridge slot** — Extension DRAM carts
-(1 MB at `0x0240_0000`; 4 MB as two banks at `0x0240_0000` / `0x0260_0000`),
-the battery backup-RAM cart, and game ROM carts (`0x0200_0000`), selected per
-game with the probed cart-ID byte at `0x04FF_FFFF`. The 4 MB Extension DRAM
-cart is what Street Fighter Zero 3 and The King of Fighters '97 require.
-
-## Milestone 8 — Save states + battery-backed backup RAM ✅
-
-Snapshot/restore the whole machine, and persist the console's battery.
-
-| # | Task | Notes |
-|---|------|-------|
-| 1 | **serde derives (cores)** ✅ done | Feature-gated `Serialize`/`Deserialize` on the sh2 / m68k / scu_dsp state types (off by default; the cores stay dependency-free). Big arrays via serde-big-array; the scu_dsp `[[u32;64];4]` data RAM via a no_std flat-tuple codec. |
-| 2 | **serde derives (saturn) + save-state API** ✅ done | Derives across the bus, every peripheral, the scheduler, and `Saturn`. `savestate.rs`: `save_state`/`load_state` over bincode with a magic + version header; external media (BIOS / disc image / ROM-cart bytes) `#[serde(skip)]`'d and re-grafted on load, guarded by FNV-1a fingerprints. 8 tests incl. a snapshot-then-equal-runs determinism check. |
-| 3 | **Battery-backed backup RAM** ✅ done | `memory::BackupRam` (32 KiB) with hardware odd-byte packing (matches MAME `backupram_r/w` + the M7 cart) + "BackUpRam Format" default; `Saturn::internal_backup`/`load_internal_backup`. BIOS-boot golden unchanged. |
-| 4 | **Frontend** ✅ done | F5 quicksave / F9 quickload to `<bios>.state`; internal backup RAM loaded from / written to `<bios>.bup` (battery) on both builds. |
-
-**Deferred (queued):** save-state migration across `VERSION` bumps (v1 rejects
-mismatches), rewind/run-ahead, compressed states, and multiple slots / a
-save-state UI.
-
-## Milestone 9 — Frontend OSD (in-window menu) ✅ complete (2026-06-11)
-
-A hand-rolled, ZSNES/fwNES-style on-screen menu in the SDL2 frontend
-(see ADR-0008). Pure-frontend; the core stays UI-agnostic.
-
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **OSD framework + core actions** ✅ done | `jupiter/src/osd/` — `font.rs` (embedded CC0 8×8 font + RGBA `fill_rect`/`draw_text`/`dim` primitives) and `mod.rs` (menu state machine). Software-composited into the 320×224 framebuffer; **Esc** opens it; arrows/Enter navigate. Actions: save/load state to 10 slots (`<bios>.<n>.state`), Reset, Eject/Insert disc, Quit; transient toasts. The module is `sdl2`-free + core-free (`&mut [u8]` buffer + a `Nav` enum), so it's unit-tested without a window. Core add: `Saturn::eject_disc`. **Tests:** 12 OSD (font draw + nav state machine, run even with `--no-default-features`) + 1 cd-block (insert→eject NODISC round-trip). |
-| 2 | **Graphics settings + persisted config** ✅ done | A **Settings → Graphics** submenu: **window scale 1×–4×** (cycles; `canvas.window_mut().set_size`, base 320×224 × N) and **fullscreen toggle** (`FullscreenType::Desktop`). Driven by core-free `OsdAction::SetScale`/`ToggleFullscreen` + `OsdCtx.scale`/`fullscreen`. **Persisted config file** (`jupiter/src/config.rs`, 2026-06-11): a dependency-free flat `key = value` TOML-subset at `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` holding scale, fullscreen, region, cartridge, and the pad keymap — loaded at startup (CLI flag > config > autodetect; region: `SAT_REGION` > config > BIOS-filename), written back on every Settings change. Headless builds honour it too (it shapes cart/region in `main`). |
-| 3 | **Controller settings** ✅ done (2026-06-11): keyboard rebind + basic gamepad | **Settings → Controller**: lists the 13 pad buttons with their bound host keys (`OsdCtx.pad_keys` — the OSD stays `sdl2`-free, names are strings); selecting a row enters a **modal press-to-bind capture** (`OsdAction::StartRebind` → `UiMsg::ArmRebind` arms the SDL thread, which owns the keyboard; Esc cancels; `EmuIn::BindResult` reports back). Bindings apply immediately and persist to the config file; **Reset Defaults** restores the stock layout. **Basic SDL2 GameController support** (same day): hot-plug open/close on the device events, per-frame button merge into the port-1 pad bits with a **fixed mapping** on SDL's normalized Xbox-style layout (A/B/C = X/A/B, X/Y/Z = Y/LB/RB, L/R = thresholded analog triggers, D-pad or left stick = D-pad, Sega's own Xbox-Saturn-port convention), and **controller navigation of the OSD** (D-pad/A/B, Start toggles; suppressed while a rebind capture is armed). Per-button *gamepad* rebinding + the analog devices ride with M13 E2 (the SDL GameController axes are exactly E2's host layer). |
-| 4 | **Region + cartridge + BIOS management** ✅ done (2026-06-11) | **Settings → Region** (Japan / North America / Europe-PAL / Asia-NTSC — `set_region` + reset, re-applying the cart; the active region is marked) and **Settings → Cartridge** (None / Ext RAM 1M / Ext RAM 4M / Backup RAM — `insert_cartridge` + reset; active marked); both persist to the config file. **Settings → BIOS** (2026-06-11): `scan_bios_images` lists every 512-KiB `.bin` beside the launched image (active marked); selecting one is a **power cycle** mirroring the launch path (persist the outgoing battery → fresh `Saturn::new` → re-apply region/mouse-ports/RTC/disc/cart) and **re-keys the save files** (`.bup`/`.state`) to the new image — the emu thread returns its final save base so the exit battery persist follows a mid-session swap. |
-
-**Related fix landed alongside Phase 1:** with no disc the CD-block now reports
-status `NODISC` (`0x07`) instead of `PAUSE`, matching MAME's no-image reset.
-
-## Milestone 10 — Live physical disc + CDDA→SCSP audio ✅
-
-The two CD capabilities deferred from M7: playing CD-audio BGM, and reading an
-original disc from a host drive (see ADR-0009). The security ring is a non-issue
-— our authentication is HLE/header-only.
-
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **`SectorSource` trait** ✅ done | `disc::SectorSource` (+ `TrackInfo`) decouples the CD-block from the in-memory `Disc`: reads fill a caller buffer, so a live drive can back the source and reads are on-demand. `CdBlock.disc` is now `Option<Box<dyn SectorSource>>`; `insert_disc` is generic; save-state media identity uses `fingerprint()`. `SaturnBus`/`CdBlock` drop `Clone`. Pure refactor — suite green, golden unchanged. |
-| 2 | **CDDA→SCSP** ✅ done | Audio tracks decode to a CD-DA FIFO in the read pump (2352-byte sector → 588 stereo frames); the SCSP consumes it as its **EXTS digital inputs** (M11 `7ac3837`: slots 16/17 EFSDL/EFPAN = the game-controlled CD volume + DSP EXTS input reads; the original M10 form was a full-level `take_audio` sum). Games with CD-audio BGM (e.g. Romance of the Three Kingdoms V) now play their music. 2 tests. **Smooth-streaming fix (`87b85e9`):** the read pump fills the FIFO in sector bursts on the scheduler's batch cadence while the host pulls smoothly per frame, so `take_audio` drains via `take_cd_audio_buffered` — a ~0.5 s pre-roll jitter buffer (re-primed only on a dry FIFO; cap raised to ~5 s) that eliminates the burst-vs-steady underrun (the old 1 s cap dropped burst-decoded sectors → stutter). Verified bit-identical to the disc (minus pregap) with zero underrun. **Live playback hooks:** `dbg_play_cdda`/`dbg_play_first_audio_track` drive CD-DA via the real Play machinery without a BIOS Play command; jupiter's **F8** plays a disc's first audio track live. 2 manual probes (`cdda_plays_real_disc_track2_audio`, `emulator_plays_cdda_track`). |
-| 3 | **Physical drive (`physdisc` + libcdio)** ✅ done | New feature-gated `crates/physdisc`: `PhysicalDisc` impls `SectorSource` via libcdio (TOC + raw sectors + CD-DA), cross-platform. Default = stub (no libcdio); the frontend's `physical-disc` feature + a `cdrom:<device>` disc spec enable it. The crate is the sole ADR-0007 unsafe exception (ADR-0009). Data sectors read through the kernel's cooked block device (no `CAP_SYS_RAWIO`); libcdio handles the TOC + CD-DA. **Verified on a real drive** (Virtua Fighter 2 on `/dev/sr0`): TOC, data, CD-DA, and the emulator boots from the disc — as a normal `cdrom`-group user. |
-
-## Milestone 11 — Boot a game to gameplay ✅ **complete (2026-06-10): Virtua Fighter 2 is playable**
-
-A discovery milestone (like M4): get a commercial game (*Virtua Fighter 2*, JP
-`GS-9079`) past the BIOS CD player. **Achieved end-to-end**: title → menus →
-character select (CD-DA BGM) → full 3D gameplay to the K.O. screen,
-user-verified in the live frontend. (***Doukyuusei ~if~* is also fully
-playable** — GFX, SFX, and voices all working, user-verified 2026-06-11.) Follow-ons since closed: **performance** (60 fps via the
-renderer hoists + scanline-band composite + emu-thread decoupling + the fight-loop
-hot-path cuts `03e842a` + the audio-pacing mirror credit `021dab5`), the
-fight-floor rotation geometry (`5ee3ecb`/`ac712a8`), and the **audio endgame** —
-in-fight SFX (`7dfbfab`, SCSP B-bus wait-states), BGM/SFX balance (`7ac3837`,
-CD-DA through the SCSP EXTS inputs), and announcer-ghost key-ons (`e963b19`,
-Release-only KYONEX re-key) — see the Phase 4 row. Checkpoint tag:
-**`vf2-good-emulation`**. Pursued purely on the **real-BIOS LLE path**,
-trace-diffed against Mednafen (itself LLE — the only mode in which a master-SH-2
-PC-trace-diff is valid). An opt-in HLE direct boot was tried and **removed** —
-see "Removed: the HLE-boot detour" below.
-
-**Status: a commercial game now boots to a correctly-rendered title screen.**
-*Doukyuusei ~if~* (NEC InterChannel) boots the real BIOS, loads its 1st-read,
-runs game code on both SH-2s, and reaches its **title screen** (「同級生」 "PRESS
-START"), displayed at its native **640×224 hi-res**. The chain: the boot
-breakthrough (Phase 3, the `DCHG` fix) → both VF2 and Doukyuusei load their
-1st-read → Doukyuusei's intro **slave crash** turned out to be a **SH7604 FRT
-`FTCSR` write-0-to-clear bug** (Phase 5): the inter-CPU FRT input-capture (FTI)
-handshake clears `ICF` by writing 0 to it, which ours (wrongly W1C) ignored, so
-`ICF` stuck set, the slave's wait-loop never waited, and it called a master-built
-function-pointer table mid-rebuild (null) → fatal halt. With `ICF` clearing
-correctly the slave waits properly and the game advances to its title; **VDP2
-hi-res rendering** (320/352/640/704) then displays it without the overflow ours'
-fixed 320-wide framebuffer caused.
-
-**VF2 (the original M11 target) remains on a separate wall:** its intro demo-
-script job engine loops on a **polled CD-state divergence**. This round exhausted
-the CD-HIRQ axis for VF2 — the HIRQ *value* matches Mednafen, DCHG matches, and
-the newly-added CD-block SCU interrupt is *masked* by VF2 (it polls) — so the
-remaining divergence is other polled CD state (the CR1–4 status report / partition
-block-count) or residual scheduler timing. The interactive debugger
-(`crates/debugger`/`sdbg`), extended again this round, drives both investigations.
-
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **CD-block boot fixes** ✅ done | Trace-diff vs MAME found the disc was rejected before booting. Fixes: the data-transfer state machine (persistent TRANS bit + `xfer_done` count; End Data Transfer reports the real word count instead of "nothing"), `play_data` matching drive state with `PERI` masked, the disc-change one-shot + cold-boot DCHG, and the previously-unhandled `Seek (0x11)` + Init drive-state reset. VF2 now authenticates, passes the region check, reads IP.BIN, and shows the SEGA license screen. |
-| 2 | **Frontend region + boot-debug toolkit** ✅ done | Region auto-detect (`SAT_REGION` / BIOS filename) so a JP disc boots on the JP BIOS; a full disc image (`cdrdao` CUE/BIN, all 34 tracks) as the deterministic target; headless hooks `CD_TRACE` / `SAT_PCTRACE` / `SAT_DISASM` / `SAT_BP` / `SAT_FBP` / `SAT_INLOOP` (full-speed PC trace + breakpoint capture; `SAT_SHELL_BASE` tunes the give-up detection) / `SAT_BIOSTRACE` / `SAT_WWATCH` / `SAT_IRQ_DUMP` / `SAT_INTC_TRACE` / `SAT_MEMDUMP` / `SAT_DUMP`. |
-| 3 | **LLE trace-diff vs Mednafen** ✅ done — VF2 + Doukyuusei ~if~ boot to game code | Both run the **same BIOS CD-boot loader**; auth, region, and the IP.BIN read all pass. Our loader rejected the disc and re-recognized (`GetToc`/`Init` → CD player) where Mednafen reads the 1st-read (`ChangeDir`→`GetFileScope`→`ReadFile` → game). **Root: the CD-block re-raised `DCHG` (Disc Changed, HIRQ `0x20`) on the first `Init` after recognition** — the internal `disk_changed` latch was cleared only *inside* the Init handler, so that Init reported a fresh disc swap and the BIOS looped recognition forever. **Fix: clear `disk_changed` when the host write-1-to-clear-acknowledges `DCHG`** (matching Mednafen, which clears it once during recognition and never re-raises it at Init). **The method that cracked it:** the BIOS code is identical on both LLE sides, so the root had to be a differing CD-block response → a **command-level CD trace-diff** (detailed `cmd_log`: caller PC + CR1–4 in→out + HIRQ in→out, poll bursts collapsed) showed the streams match exactly through the 19th command (2nd `GetSession`), then the *only* state difference was the HIRQ — ours' Init left `DCHG` set (`0FC4→0FE5`) where Mednafen left it clear (`0F84`). With the fix, ours' command stream matches Mednafen and the master reaches VF2's load address `0x06004000` and executes game code (frame 653); Doukyuusei ~if~ likewise reaches `ReadFile`. `bios_boot` golden unchanged, full saturn suite green. (Earlier notes — state-diff beats the unreliable PC-diff; the CR1 `is_cdrom` fix — stand but weren't the decider; the *general recipe* is: find the first differing **input**, not the first differing behavior.) |
-| 4 | **Post-boot run + blocker localization** 🚧 localized to the intro job engine | After Phase 3 the game runs but stalls mid asset-load (display off). Fixes: **BCR1 bit-15 master/slave** (`1f584d6`) — an `SSHON`-released slave takes the BIOS slave path instead of re-initialising work RAM over the running game (it was clobbering the loaded code → master fault); **`run_frame` = one `run_for(CYCLES_PER_FRAME)`** (`0b78733`) — the old active/VBLANK split re-anchored `run_for`'s batch grid and diverged the master's execution from the headless path. A **Mednafen dev-build** (`--enable-dev-build`, `-ss.dbg_mask cdb`) **CD trace-diff** then proved the CD command/response stream is **byte-identical to Mednafen** through the divergence and the data transfer is correct by construction; the game's next-file decision diverges on **timing** (stall point oscillates FAD 2596 ↔ 7772 with each timing change). **Mednafen scheduler alignment Phase 2** landed — **2A** master-leads-slave interleave (`b583cc4`), **2B** per-instruction SCU interrupt sampling (`70f4049`) — correct accuracy gains, `bios_boot` golden unchanged, but not sufficient alone. An evidence-driven cadence alignment followed (`cacffca`): the CD periodic/`SCDQ` report now fires **per-sector during PLAY** (matching Mednafen's `17712`-clock reload — was a flat ~60 Hz), found via the dev-build trace-diff — it advanced VF2's load further (stall moved 2596 → 7772). A later **file-load comparison** (full ordered Play streams, both sides) showed the next-file divergence is **not** timing-sensitive selection: ours loads the **same** intro files as Mednafen (`SOUNDS`/`SNDDAT`/`SLAU`) then **loops** instead of advancing. The loop is VF2's **intro demo-script job engine** (a linked list of timed jobs on the master at `0x06047xxx`; processor `0x06047718`, producer `0x06047544`, list driver `0x06047B2C`) where a job never reaches its terminal state nibble (`7`/`0xA`). **CD, sound (SCSP 68k), and the slave SH-2 are all ruled out:** the 68k runs its driver fine and cycles with SNDON/SNDOFF, and the slave's spin on a sound-RAM signal (`0x05A03C2A`) is a downstream symptom — the master *clears* that signal but, looping, never *sets* it to release the slave. **Tooling: `sdbg`** (`crates/debugger`) — breakpoints incl. register-guarded + stack backtrace, single-step, SH-2 **and** SCSP-68k disasm (`d68`) + 68k PC-trace (`t68`), read/write watchpoints (`SAT_RWATCH`/`bw`), memory search, CD-command / windowed-PC-trace breaks (`cb`/`t`), and SCSP/68k state probes (`scsp`). **Drive-phase port + trace-diff (`d0640a5`):** to exhaust the CD-timeline hypothesis, the CD read pump was rewritten as a faithful port of Mednafen's `cdb.cpp` `Drive_Run` (the BUSY→SEEK→PLAY status sequence, read-ahead pipeline, `PauseCounter`-delayed end IRQ, buffer-full backpressure) so the whole timeline — not just final values — matches the reference. A fresh `SS_PCTRACE` trace-diff against the new timeline then showed **the port did not change VF2's divergence**: ours' intro-loader **job state nibble never reaches terminal `0xA`** (job processor `0x06047752 CMP/EQ #10`: Mednafen reaches the terminal path `0x06047758` 14792×, ours 0×), and the GFS server never reaches its completion handler (`0x0604D2F2+`). The stuck job is "load **SLAU** (FAD 7772)" (persistent struct `0x060B1960`: nibble `[+4]` oscillates 1↔3, FAD `[+0xC]`=7772) — the file ours loops on; Mednafen completes it and advances to the next batch (→ MOVIE 8560). So with the CD-block timeline now faithful **and** byte-identical, the blocker is **definitively a deep game-logic state-machine condition in VF2's intro demo-script engine, not CD-block fidelity** — the nibble's advance, gated through a nested chain (job-list `0x06047B2C` → processor `0x06047718` ↔ producer `0x06047544` → GFS dispatch `0x0604D056`, work-byte `0x060FFCB4`) down to a CD-HIRQ read, never fires. **Update (`fb52d0c`): one concrete deadlock under this engine is now cleared — a stop-then-Play seek**. `CdBlock::seek_start` seeded its seek-distance origin from `cd_curfad`, but a stopped drive parks `cd_curfad` at the `0xFFFF_FFFF` display sentinel while the physical pickup stays at `drive_sector`; a stop-then-Play computed `delta = abs_diff(0xFFFFFFFF)` → a multi-day seek that deadlocked the drive at FAD 0x085D (2141). Seeding `prev` from `drive_sector` (+ refreshing the reported `track`/`index`) advances VF2 past 0x085D into late game code (job FAD reaches 8632) without falling back to the BIOS; Doukyuusei ~if~ stays stable. Regression: `cd_block::tests::play_after_seek_stop_uses_physical_pickup_as_seek_origin` + manual `vf2_trajectory` guard. **The bogus-command derail is FIXED (`c1b4dc9`) — VF2's intro now runs with the display ON.** The malformed command was actually **`0x24`** (not `0x21`), from `0x0604182A` ≈ frame 695, and the diagnosis went two levels deep. *First hypothesis (wrong but productive):* `0x24 = 0x20|STAT_SEEK` looked like a status-byte leak into VF2's command builder, and the status timing **was** divergent — Mednafen reports **BUSY** through the `256000`-clock `SeekStart2` settle (`SEEK_START1/2/3` all `STATUS_BUSY`) before `SEEK`, while ours folded the settle into the SEEK-reported seek time. That fidelity gap is fixed (new `DrivePhase::SeekSettle`, appended last for savestate-index stability) — but the `0x24` survived it, with the full report `2400,4101,0100` visible in CR1–3. *Actual root:* **`0x24 = STAT_SEEK|STAT_PERI` — our own periodic report's CR1.** The unsolicited periodic **clobbered CR1–4 between VF2's CR1 write (`0x2000`, GetSubcodeQ) and its CR4 write**, so the dispatch consumed the report's status byte as the command (`0x21` = `PAUSE|PERI` was the same race in a paused drive state). Hardware keeps host command words and block results in **separate register files** (Mednafen `CTR.CD[]` vs `Results[]`; MAME gates its periodic on `cmd_pending`); our shared CR1–4 now guards both periodic emitters on `cr_written == 0`. Also implemented the previously-missing **Get Subcode (0x20)** (Mednafen `COMMAND_GET_SUBCODE`: Q = 10 bytes staged for FIFO with CR2=5 words + DTREQ + DRDY; R–W = 24×`0xFF`; type≥2 rejected) — VF2 polls the Q channel during its 1-sector probe-plays and the default arm had answered with no data. **Result:** no non-standard CD command in 1500 frames; **VDP2 display enabled with the intro rendering** (frame 1200: 289k/315k non-black at 704×448, slave executing game code; was permanently dark). `bios_boot` golden unchanged; Doukyuusei ~if~ unaffected. Regressions: `periodic_report_does_not_clobber_a_half_composed_command`, `get_subcode_q_stages_the_head_position_for_fifo_read`, `seek_holds_busy_through_the_seekstart2_settle_before_reporting_seek`. **Open task (VF2):** the intro job still parks at FAD 8632 (`0x060B7xxx` poll loop) — determine whether that's the attract-loop steady state or the old nibble `3→0xA` wall; re-trace vs Mednafen from the now-aligned baseline. **VF2 BOOTS TO ITS TITLE** — the FAD-8632 "park" was in fact the title/attract steady state. The remaining render bug — the blinking "PRESS START BUTTON" + menu text invisible (logo/copyright fine) — was the deferred **C6 VDP1 TVM** feature, now implemented (`0dd3ddd`): VF2's title runs the VDP1 fb in **TVM 8 bits/pixel** (TVMR=1, 1024×256 bytes, sprite type 0xC) with **FBCR DIE/DIL double-interlace plotting** (fields at `y>>1`), in a 704×448 double-density display. Faithful Mednafen port: byte-per-dot plot (no gouraud/CC in 8bpp; MSBON read-modifies the containing word), `Framebuffer::hires8` latched at plot and carried through the swap, VDP2 sprite layer extracts the dot byte (`0xFF00|byte`, parity in hi-res / high byte in normal res; types 8–F mask to one byte), and **DD-interlace samples fb line `y>>1`** (text otherwise wrapped over the logo + screen bottom). Savestate VERSION 3→4 (new fb field). Title + blinking PRESS START + 3D character attract intros (LAU CHAN…) all render; `bios_boot` golden unchanged; Doukyuusei unaffected. Regressions: vdp1 `tvm_8bpp_polygon_writes_one_byte_per_dot` / `die_double_interlace_plots_the_selected_field_at_half_y`, renderer `tvm_8bpp_sprite_layer_reads_one_byte_per_dot` / `double_density_interlace_samples_the_sprite_fb_at_half_y`. Still deferred: 8bpp+rotate fb layout (TVM=3). A follow-up colour fix (`5a192c0`): the sprite layer ignored the **CRAOFB.SPCAOS colour-RAM address offset** — VF2's text palettes live at CRAM `0x300+` (SPCAOS=3), so PRESS START rendered outline-only black; sprite codes now look up `CRAM[(SPCAOS·0x100 + code) & 0x7FF]` (Mednafen `CRAMAddrOffs_Sprite`), and the text matches the reference (red PRESS, gradient START BUTTON). Regression: `sprite_palette_applies_the_spcaos_cram_offset`. The mode-select menu's missing "ARCADE MODE" text (`caec91f`) was a *fourth* render gap on the same screen: **VDP2 window X coordinates are hi-res dot units** — raw in 640/704 modes, halved only in normal modes (Mednafen `if(!(HRes&0x2)) xs>>=1`); ours halved unconditionally, shrinking the menu-text window (NBG1 gated inside-W0) to its left half — only the leading "A" passed. Localized via layer isolation (text = NBG1, not sprites) + the new **`SAT_VDP1LOG`** plot-time command dump + an exact-state repro from VRAM/CRAM/regs dumps. Regression: `window_x_is_raw_in_hires_modes_halved_in_normal`. User-verified: title + menus + character select all render. The **missing character-select BGM** (`9d46803`) was the **CD Play track/index addressing form**: VF2 issues `Play(track 14 idx 1 → idx 99, mode 0x0F)` — a CD-DA track on infinite repeat — and our seek "approximated the track form to the disc start", looping *data* sectors at FAD 150 instead of the music. Implemented per Mednafen: SeekStart1's track-form resolve (track start FAD from the TOC), CheckEndMet's track-number bounds, head-following track geometry in the report, the mixed-form Play reject (cdb.cpp:2830), and play-mode bit 7 (no-pickup-change re-arm). BGM now streams through the CDDA→SCSP path. Regressions: `play_track_index_form_seeks_to_the_track_and_loops_its_audio`, `play_with_mixed_fad_and_track_forms_is_rejected`. The BGM then played as a **buzz** (`b08d100`): the PLAY tick paced every sector at the 2× data speed, but the per-sector period is **type-dependent** (Mednafen cdb.cpp:2306 `(44100*256)/((subq&0x40)?150:75)`) — CD-DA streams at 1×; the 2× over-production overflowed the CD-DA FIFO's cap and dropped chunks. Pace by the read-ahead's sector type (audio → `sector_cyc(1)`). Regression: `audio_sectors_stream_at_single_speed_even_at_2x_data_speed`. The residual buzz was **the disc image, not the emulator**: the rip's audio tracks were **MSB-first** (a cdrdao dump — the surviving `vf2_full.toc` proved it — paired with a hand-made `.cue`; Mednafen's `.cue` path assumes LSB-first too and would buzz equally). Proven by waveform analysis (BE decode smooth at every audio track, LE full-scale noise; our `take_audio` capture matched the LE profile). Fixed by regenerating the image with the audio region byte-swapped (`vf2_full_lsb.*`) — **user-confirmed: character-select BGM plays perfectly**. Also landed (`072fea2`): a **load-time warning** when an image's audio tracks look byte-swapped (`Disc::audio_looks_msb_first`, an LE-vs-BE sample-jump heuristic, silence-neutral) so this image class self-identifies. Regression: `detects_msb_first_audio_tracks`. **Character confirm then crashed to a black screen** (`1d49088`, an **SH-2 core bug**): `is_illegal_in_slot` wrongly included the PC-relative fetches (`MOV.W/L @(disp,PC)`, `MOVA`) — the SH-2 slot-illegal set is the *branch family only* (manual §6; Mednafen `OP_SLOT_ILLEGAL`). VF2's character loader runs `BF/S` with `MOV.L @(disp,PC)` in the slot (`0x060277E0`); the false vector-6 sent the game into the BIOS fatal halt (`SR.IMASK=0xF` self-loop at `0x06000952`). Found from the user's stall savestate (post-mortem: master parked in the halt, 152 undrained partition sectors) → deterministic repro from boot with scripted input → `last_fault` watch caught vector 6 → the fault-site bytes showed valid code (`8F14` BF/S + `D20C` slot). Also fixed the slot PC base: a *taken* branch's slot fetches relative to **branch destination + 2** (manual MOVA note; Mednafen `UCDelayBranch`), not slot+4 (`Cpu::pcrel_base`). VF2 now survives confirm into gameplay code (3600 frames, no fault). Regressions: 3 new slot-PC-relative tests in `sh2/tests/exceptions.rs`. **★★★ VF2 IS PLAYABLE (user-verified 2026-06-10):** title → mode menu → character select (CD-DA BGM) → full 3D fights to the K.O./round-win screens. The perf campaign then took in-fight displayed rate ~30 → locked 60 (renderer ctx hoists `1e1e115`/`09a8163`, scanline-band composite, emu-thread decoupling `7f38007`+`d4dec59`). The last render artifact — the fight floor cut off short of the horizon — was the **per-dot rotation coefficient mode** (`5ee3ecb`): VF2 RDBS-grants bank A1 for coefficient reads and walks `DKAx` per dot; ours read one coefficient per line. Faithful Mednafen port: `(KTAOF<<26)+KAst+DKAst·line+DKAx·dot` accumulator, CRKTE CRAM-resident tables, ungranted-bank reads-as-0, coefficient mode 3 (Xp override). The geometry then needed two more pieces (`ac712a8`): **in double-density interlace the rotation accumulators advance per field line** (display y>>1 — the coefficient table itself proved it: first solid entry at line 137 of a 224-line field = the ~61% horizon Mednafen shows; feeding display lines made the perspective twice as steep and painted over the road/mountains), plus **RPMD modes 2/3** (coefficient-MSB and rotation-parameter-window per-dot A/B selection — VF2 runs RPMD=3). Fight frame now matches the Mednafen reference composition. **The last fight gap — in-fight SFX (hit sounds, announcer/winner voices) silent while CD-DA BGM played — was an SH-2 bus-timing hole (`7dfbfab`)**: `waits_for` charged 0 for the SCSP region, but Mednafen (`scu.inc` `SCU_FromSH2_BusRW_DB`) charges every SH-2 *read* of B-bus as two 16-bit accesses at +24 each (= +48, any width; writes +17). VF2's master-side sound submit spin-waits the 68k driver's request mailbox (sound RAM `0x3C20`) for up to 0x10000 cache-through reads; at 0 waits that timeout window shrank from ~120 ms to ~21 ms — shorter than the 68k driver's wake-from-sleep re-init (it parks with all IRQs masked whenever its voice count hits 0, and fills 64 KiB of sound RAM on wake) — so the first request submitted during a wake timed out and the game latched a permanent "sound driver wedged" flag (`0x060E0017`), silently dropping every later SFX request. With the B-bus waits charged, the wedge never latches and fight SFX key on (scripted-fight probe: five distinct hit/voice samples vs none). `bios_boot` golden unchanged. Regression: `bus_routing::scsp_region_charges_bbus_wait_states`. The SFX then surfaced two more SCSP fidelity gaps, closing the audio axis: **(1) BGM drowned the SFX (`7ac3837`)** — CD-DA was summed into the output at full scale outside the chip; on hardware it enters as the **EXTS digital inputs**, where slots 16/17's EFSDL/EFPAN are the game-controlled CD volume and the effect DSP can read EXTS (IRA `0x30`/`0x31`) and return the mix through other slots' EFSDL. VF2 sets slots 16/17 EFSDL=0 and routes fight BGM through its DSP ~10–20× quieter than our sum (proven with a mednaref `SS_EXTSLOG` hook + a user-played Mednafen fight). Fix: per-batch EXTS feed (`Saturn::run_for` → `Scsp::cd_need`/`feed_cd` through the CD pre-roll buffer), `mix` latches one CD frame per sample into `dsp.exts`, and the per-slot effect-return now mixes for **every** slot, keyed or not (the old active-only gate silenced DSP returns routed through un-keyed slots — VF2's BGM exactly). Regression: `scsp::tests::cd_exts_mixes_via_slot16_17_efsdl`. **(2) Every punch replayed the "Go" announcer (`e963b19`)** — `key_on_execute` re-keyed any *inactive* slot with stale KYONB=1, but hardware keys on only an EG in **Release** (`(EnvPhase==RELEASE)==KeyBit`); a sample-ended slot keeps its EG phase (only the fetch stops), so each SFX note-on's global KYONEX strobe resurrected the dead announcer slot. Regression: `scsp::tests::sample_ended_slot_is_not_rekeyed_by_a_stray_strobe`. **User-verified balanced and correct; checkpoint `vf2-good-emulation`.** |
-| 5 | **Doukyuusei ~if~ boots to its title screen** ✅ | A *different* commercial game reached its title via two fixes. (a) **SH7604 FRT `FTCSR` write-0-to-clear** (`073805d`): Doukyuusei renders its Inter Channel logo then its slave SH-2 crashed — a null `JSR @R2` (`R2 = [0x0602739C]`). Diagnosed (new `sdbg` register-guarded *slave* breakpoint + bus-level **memory probe**, `3e4c270`) as the slave reading a master-built function-pointer table *mid-rebuild* (transiently 0), because its inter-CPU FTI `ICF` never cleared: ours treated `FTCSR` as W1C, but the SH7604 clears its status flags by writing 0 after reading 1, so the slave's `ICF`-clear (write 0) was ignored and its wait-loop spun through. Fixed → the slave waits, reads a valid pointer, the game advances logo → title. (b) **VDP2 hi-res rendering** (`c0f2344`): Doukyuusei runs at **640×224** (TVMD HRESO=2) but ours hardcoded 320 → overflow. `Vdp2Regs::screen_dims()` decodes TVMD (320/352/640/704 × 224/240/256[×2]); `render_frame` renders the active w×h (returns the dims); the frontend re-creates its SDL texture on resolution change. `bios_boot` golden unchanged (hashes only the active region). Also landed (a real missing feature, though VF2 masks it): the **CD-block SCU external interrupt** (vector 0x50, level 7; `57a1066`) + the HIRQ-edge `hirqlog` trace (`94dfdd4`). |
-| 6 | **Doukyuusei ~if~ boot-animation jingle — RESOLVED (plays the full evolving melody)** ✅ | The SEGA Saturn boot-animation jingle (Mednafen plays it loud, t≈1.5–9 s) was dead silent in ours — a **separate root** from the in-game BGM (`m68k` `ADDA.L` decode bug, M12). Root: a **cache-through address bug in the SCU-DSP DMA** (`exec_dsp_dma`, `system.rs`; `ea20509`). The jingle is loaded by a multi-stage chain — WRAM → (SCU DMA) → VDP1 VRAM staging → **(SCU-DSP microprogram DMA)** → sound RAM `0x5_0000` → slot0 → SCSP DSP reverb → out. The SCU-DSP's `WA0`/`RA0` carry full SCU-bus addresses **including the SH-2 cache-through bit** (`0x25A5_0000` = `0x05A5_0000 \| 0x2000_0000`); `exec_dsp_dma` passed `wa0<<2`/`ra0<<2` straight to `read32`/`write32`, but `SaturnBus` only maps the physical `0x05xx_xxxx` regions, so `0x25xx_xxxx` matched nothing → reads returned open bus (0), writes were dropped → the DSP copied **zeros** into sound RAM and the keyed voice played silence. Fix: mask `& 0x07FF_FFFF` before the bus access (matching the sibling `scu_transfer`). Now sound comes out at the right time/duration (first sound ~frame 117, sustained ~1.5–9 s). **The decisive trace for the silence root:** mednaref `-soundrecord` WAV → `SS_KEYON` (slot0/`SA=0x50000`/`DSPlvl=7`) → the master's fill-poll PC `0x06013248` polls SCU `0x05FE0080` bit 16 = SCU-DSP **PPAF EXF** → `DBG_DSPDMA` showed the DSP reading `0x25C20000`=0 while direct `0x05C20000` had data → the missing mask. **Then noise, now FIXED (`845f611`):** the jingle came out as self-oscillating static — the slot→DSP effect-send was `voice << IMXL` but the SCSP scales it `(int16)sample << 4 >> (7−IMXL)` (=×2^(IMXL−3), Mednafen `scsp.inc:1776`), so ours over-drove the DSP input **8×** and `set_sample` didn't wrap MIXS at 20 bits (`& 0xFFFFF`) → the reverb feedback saturated. Fix: scale like the SCSP + wrap MIXS; zero-crossing 0.30→0.10 (noise→tonal). A general SCSP accuracy fix (regression `dsp::tests::mixs_accumulates_modulo_20_bits`). **STILL OPEN — the jingle LOOPS its first ~4 notes** instead of the full evolving melody, **traced to a master-side streaming-state divergence (VF2-class), not an audio-engine bug.** Mednafen's jingle evolves over 1.5–9 s (1-s blocks uncorrelated, crescendo to ~14000), so sound RAM `0x5_0000` is a continuously-**streamed** ring buffer (0x8000 words ≈1.3 s). A mednaref `SS_DSPKICK` hook (on the PPAF/EXF write, logging the master PC) proves Mednafen kicks the SCU-DSP **154×** (1 initial @`0x06013044` + **153 from the streaming loop @`0x0601318A`**) while ours kicks it **1×** and never reaches `0x0601318A`. Ours *does* call the streaming function (entry `0x06013140`, frame 78) but with its chunk-index arg **r4 = −2 (0xFFFFFFFE), stuck** — the function streams only when `r4 ≠ [r13]` (current vs last chunk), so after the initial fill it always sees "no new chunk" and returns. ⇒ the **chunk index never advances** (a master state-machine/streaming-counter divergence, state struct at `0x060348xx`); likely tied to the unimplemented SCSP slot **CA monitor `0x408`** and/or the boot-animation-too-fast timing (#5/#6). Next: find the real caller of `0x06013140` and what computes r4. `bios_boot` golden unchanged; regression `scu_dsp_dma_to_cache_through_address_lands_at_the_physical_region`. **★★★ RESOLVED (2026-06-07) — the loop root was the unimplemented SCSP slot CA monitor (register `0x408`).** The streaming chain is: slot0 plays the ring buffer (`SA=0x50000`, `lpctl=1`, loop `0..0x7FFF`); the **68k sound driver reads register `0x408`** (CA/SGC/EG of the MSLC-selected slot, MSLC=0=slot0) to track playback progress and writes a **progress byte to sound RAM `0x7A0`**; the master's vblank streamer (`0x06013124`) reads `0x7A0` (=`r4`), and at `0x0601314C` sets the gate `[0x0606FFB2]=1` once `r4≥1`, then streams the next chunk whenever `r4 ≠ [0x0606FFB0]` (last-streamed index). Ours' `0x408` read returned the **static backing byte** (`raw[0x408]`), never the live CA, so the 68k never advanced `0x7A0` → `r4` stayed 0 → gate never opened → 0 stream-copies → the buffer was filled once and looped. (The earlier "r4 = −2 stuck" note was a stale measurement; freshly, `r4` and the gate are simply 0.) **Fix:** implement the slot monitor — `ScspCtrl::read8` special-cases reg `0x408` to return the computed `((CurrentAddr>>12)<<7) | (EnvPhase<<5) | (EnvLevel>>5)` for the MSLC slot (`slot_monitor()`, matching Mednafen `scsp.inc` `SlotMonitorData`; ours' `eg.volume` is the inverse of Mednafen's `EnvLevel`, so `EnvLevel = 0x3FF − volume`). Now `0x7A0` advances `0→1→…→7→0…` in lock-step with the slot CA nibble, the gate opens, ~121 chunks stream over the jingle (Mednafen 153), slot0 finally releases (`eg=REL`) so the jingle **ends** instead of looping, and the amplitude **crescendos** (300-frame sums 342M→822M) — the full evolving melody (user-confirmed by ear). `bios_boot` golden unchanged; regression `scsp::tests::slot_monitor_reports_the_selected_slots_live_current_address`. **Decisive trace:** broke the master at `0x06013140` with the Doukyuusei disc, read the literal pool → `r4` source = sound RAM `0x25A007A0`; `SAT_WWATCH`/`wwatch68` showed nobody advances `0x7A0`; a frame-by-frame slot scan (draining audio each frame — the SCSP mixer freezes when its output buffer isn't drained) showed slot0's CA nibble cycling correctly while `0x408` stayed static. |
-| 7 | **Doukyuusei ~if~ in-game menu renders correctly** ✅ | The record-select menu showed wrong/missing graphics (memory `doukyuusei-menu-bg-investigation-progress`); the long "script-VM skips the bg-load preamble / master-side block-count divergence" thread was a downstream **symptom**, not the root. Two small fixes fixed it: (a) **SCU indirect-DMA table-pointer fold** (`bfd6240`) — the descriptor walker read the table base from `req.dst` verbatim, but games program it through an SH-2 cache-through alias (`0x2600_xxxx` for HWRAM `0x0600_xxxx`); `SaturnBus` is region-matched so the alias read open-bus 0, every descriptor looked empty, and the ch2 indirect DMAs that load VDP2 VRAM (the menu bg) moved nothing. Fold the base `& 0x07FF_FFFF` like the per-triplet src/dst and `scu_transfer` already do (VDP2 nonzero words 92,024 → 194,424). (b) **VDP1 framebuffer hi-res doubling** (`4b93204`) — in VDP2 640/704-dot modes each VDP1 dot spans two display dots; the compositor sampled the VDP1 fb at the display-x directly, so the 320-wide menu sprites landed in the left half. Add `sprite_framebuffer_x` (`>>1` when width ≥ 640) on the two fb-sample sites (`sample_sprite`, `sprite_window_pixel`). 320-dot modes (incl. the `bios_boot` golden region) unaffected. Regressions: `tests/scu.rs::dma_indirect_table_accepts_sh2_cache_through_alias`, renderer `hires_mode_doubles_vdp1_dots_horizontally`. Distinct from VF2's still-open intro-loop (Phase 4). |
-
-### Spun out of M11 — kept general accuracy fixes
-
-Real hardware-fidelity fixes that came out of the boot investigation and stand on
-their own (independent of any boot path):
-
-- **Scheduler cycle-resync on un-halt** — `Saturn::release_slave` (SMPC `SSHON`)
-  bumps the slave's frozen `pipeline.cycles` up to the global clock before
-  un-halting, so the scheduler can't "time-travel" through millions of stale
-  catch-up cycles. Regression: `dual_sh2::releasing_slave_resyncs_its_cycle_no_time_travel`.
-- **Inter-CPU FRT input-capture (FTI)** — a 16-bit write to
-  `0x0100_0000..0x017F_FFFF` pulses the slave's `FTCSR.ICF`, `0x0180_..` the
-  master's (`sh2 Frt::input_capture` + bus FTI regions + `Saturn::drain_input_capture`).
-  Regression: `dual_sh2::word_write_to_fti_region_pulses_target_frt_input_capture`.
-- **SCU clears IST on the SH-2 acknowledge cycle** — `take_pending_interrupt`
-  clears the acknowledged source's IST bit (matching hardware/Mednafen, which W1C
-  IST only a couple of times a run) instead of leaving it stale-set.
-- **Event-edge-clamped scheduler batching** (Mednafen-alignment Phase 1) —
-  `Saturn::run_for` now clamps each scheduler batch to the next *scheduled event
-  edge* (VBlank-IN, VBlank-OUT, or a pending INTBACK completion) via a shared
-  `batch_size`/`cycles_to_next_event`, instead of fixed ≤256-cycle batches. This
-  mirrors Mednafen's `next_event_ts` model so interrupt assertion and the raster
-  registers settle at the cycle-exact point the reference produces them — keeping
-  the LLE↔Mednafen master-PC diff aligned (verified: the streams now correspond
-  PC-for-PC from boot). HBlank and SCU-DMA are deliberately excluded as clamp
-  edges. Also reconciled the INTBACK SF-busy time to Mednafen's 4 MHz SMPC-clock
-  model (`intback_busy_us`; a status INTBACK ≈ 261 µs, was ~16 µs). The scheduler
-  determinism contract is untouched.
-- **CD status report `is_cdrom` bit** — the CD-block status report's CR1 low byte
-  is now `(is_cdrom << 7) | (repcnt & 0x7F)` (matching Mednafen `cdb.cpp`), where
-  bit 7 marks the current head position as a CD-ROM (data) track; it was a
-  mismodeled `(options << 4) | repcnt` that left bit 7 clear. (A genuine fidelity
-  fix; not the VF2 boot decider — see M11 Phase 3.)
-- **Master-leads-slave CPU interleave** (Mednafen-alignment Phase 2A) —
-  `Saturn::step_cpus` steps the master one instruction then runs the slave until
-  it catches up to the master's timestamp (Mednafen `ss.cpp`: `CPU[0].Step` +
-  `RunSlaveUntil`), replacing the scheduler's most-behind-first rule for the
-  SH-2 pair (which could let the slave lead the master). `run_for` and
-  `run_for_traced` both route through it; the generic `Scheduler::run_for` is
-  kept for the CD timer + the determinism unit test. Golden unchanged;
-  determinism + savestate round-trip green.
-- **Per-instruction SCU interrupt sampling** (Phase 2B) — the SCU IRL is sampled
-  before every master instruction (`step_cpus` / `debug_step_master`) instead of
-  once per scheduler batch, so an interrupt is delivered at the exact instruction
-  `SR.imask` drops below its level (matching Mednafen's per-instruction IRL
-  sampling) rather than up to a batch late. `drain_scu_intc` retired.
-- **SH7604 FRT `FTCSR` write-0-to-clear** (`073805d`) — the free-running timer's
-  status flags (ICF/OCFA/OCFB/OVF) clear by writing 0 after reading 1 (the
-  Hitachi semantic; consistent with our WDT `TCSR`), not W1C as ours had it. Was
-  load-bearing for the inter-CPU FTI handshake (a core polling `FTCSR.ICF` clears
-  it by writing 0; under W1C `ICF` stuck set and its wait-loop never waited) — it
-  fixed Doukyuusei's intro slave crash (M11 Phase 5). Two FRT tests corrected.
-- **CD-block SCU external interrupt** (`57a1066`) — the CD-block now drives SCU
-  external interrupt 0 (IST bit 16, **vector 0x50, level 7**), asserted as a
-  level `(HIRQ & HIRQ_Mask) != 0`, masked by IMS **bit 15** (the SCU sign-extends
-  the 16-bit mask), and re-armed via the AIACK write (Mednafen `RecalcIRQOut` /
-  `ABusIRQCheck`). ours had no CD interrupt at all. Unit-tested; golden unchanged.
-- **VDP2 hi-res rendering** (`c0f2344`) — the renderer reads the active resolution
-  from TVMD (`Vdp2Regs::screen_dims`: 320/352/640/704 × 224/240/256[×2]) and
-  renders that width×height (returning the dims) instead of a fixed 320×224; the
-  SDL frontend re-creates its texture on a mode change. Fixed the 640-wide
-  Doukyuusei title-screen overflow (M11 Phase 5); `bios_boot` golden unchanged.
-- **`sdbg` interactive debugger** (`crates/debugger`) — a headless gdb-style REPL
-  over the core: breakpoints (incl. register-guarded, with a stack backtrace on
-  hit), single-step, SH-2 + **SCSP-68k** disassembly (`d68`) and 68k PC-trace
-  (`t68`), read/write watchpoints (`SAT_RWATCH`/`bw`), memory search, CD-block
-  state + command history + a `cb` CD-command breakpoint, SCSP/68k state probes
-  (`scsp`), and save-state rewind. Built to drive the boot/CD/sound/timing
-  investigation without rebuild cycles. It bundles a small MC68000 disassembler.
-
-### Removed: the HLE-boot detour (ADR-0010/0011 Superseded)
-
-An opt-in HLE direct boot (`--hle-boot`: load the 1st-read + jump) plus an HLE
-BIOS SYS-call library (`bios_hle`, `cold_hle_boot`) got VF2's own code running on
-both SH-2s but never rendered, and — being a different program from the real-BIOS
-boot — broke the PC-trace-diff methodology. Since the reference oracle (Mednafen)
-is LLE, the path was **removed** to keep the codebase clean and the diff valid.
-The general fixes above were salvaged from it.
-
-## Milestone 12 — Whole-system cycle accuracy (cycle-exact timing vs Mednafen) 🚧
-
-The project's accuracy-first axis demands **cycle-exact timing**, not just correct
-final values. M11 and the SCSP **BGM trace-down** independently hit the same wall:
-timing-dependent behaviour diverges from the LLE reference (Mednafen) even when the
-game/driver **code and data are byte-identical**. This milestone closes the residual
-whole-system timing gaps so timing-gated behaviour matches the reference.
-
-> **★★★ BGM RESOLVED 2026-06-06 — the BIOS BGM plays. The root was NOT a timing
-> gap at all but a `m68k` decode bug (`32662f7`).** `ADDA.L`/`SUBA.L Dn,An` (opmode
-> `0b111`) with a register-direct source was mis-decoded as `ADDX`/`SUBX` — the ADDX
-> guard `op & 0x0130 == 0x0100` failed to exclude opmode `0b11`. So `adda.l d7,a2`
-> never accumulated the address, collapsing the BIOS sound driver's SCSP note-ring
-> enqueue offset: a 9-entry ring became 2 entries, so note-on records overwrote each
-> other before the drain (`0x2162`) read them and the BGM voices never keyed (dead
-> silent on the audio-CD panel and in games). Found by a **cross-emulator note-ring
-> slot diff vs Mednafen** (ours wrote 2 ring slots, Mednafen 9) → an `m68k` unit-test
-> repro (`crates/m68k/tests/ring_offset_repro.rs`). After the fix the audio-CD panel
-> keys **12 voices (was 1)**, avg \|amplitude\| 0→111. **This supersedes the seq-tick-
-> phase / WRAM-bus-timing / 68k-control-flow-fork hypotheses below** (tasks #5/#6/#8/
-> A7) — those were all downstream symptoms or red herrings of the silent BGM. The
-> master-SH-2 per-access bus-timing gap (task #8) is a *real* cycle-accuracy item on
-> its own merits but was confirmed **decoupled from the BGM** (closing the phase left
-> it silent; the decode bug was the cause). `bios_boot` golden unchanged (SH-2 path
-> untouched).
-
-Two concrete, quantified failing cases drive it:
-
-- **SCSP BGM trigger phase.** On the audio-CD BIOS CD-player, ours processes **4414
-  seq-ticks (Timer-B interrupts) before the BGM vs Mednafen's 4497 — 83 fewer
-  (~1.8 %)**. Since `83 mod 8 = 3`, the sound driver's two per-voice dividers
-  (`[a4+3]` @`0x484C`, `[a4+4]` @`0x48AE`) land 3 phases off, so its note-processing
-  branches skip → a thin chord then a stall → **silence**. The SCSP synthesis, the
-  68k→SCSP path, the sequence data, and the clocks are all proven correct (and the
-  SCSP timer model was fixed to match Mednafen — task #1), so the gap is *when* the
-  BGM is triggered: ours reaches the trigger ~1.8 % early. Full trace-down in
-  `doc/bootstrapping.md §B.7`. **★ ACTUAL root (2026-06-06): the `m68k` `ADDA.L`/
-  `SUBA.L` decode bug (`32662f7`, see the banner above) — the BGM was silent because
-  the note-ring collapsed to 2 entries, NOT because of trigger phase.** The phase
-  lead and the 68k IRQ-entry under-cost (`3347369`) were real, separately-fixed cycle
-  bugs, but the seq-tick "early trigger" was a symptom of the silent driver, not the
-  cause. The per-access SH-2 bus-timing model (task #8) stays a worthwhile accuracy
-  item but does not gate the BGM.
-- **VF2 intro demo-script engine** (M11 Phase 4). The intro stall is timing-gated —
-  the stall point oscillates (FAD 2596 ↔ 7772) with each timing change, and the CD
-  command/response stream is byte-identical to Mednafen; the job nibble's `3 → 0xA`
-  advance bottoms out on timing.
-
-**Goal / acceptance:** the BGM plays (the seq-tick count / divider phase matches
-Mednafen and the BGM voices key); VF2's intro job engine advances past its
-timing-gated stall; *Doukyuusei ~if~* stays stable; and the master-SH-2 PC-trace
-stays aligned with Mednafen over a multi-second run. `bios_boot` golden unchanged
-throughout, validated with the seq-tick / divider-phase metric and the
-master-trace-diff harness.
-
-| # | Phase | Notes |
-|---|-------|-------|
-| 1 | **SCSP timer + clock-model cycle-accuracy + measurement harness** ✅ done | The SCSP timers were auto-reload counters overflowing one clock late (at `0x100`); rewrote them as Mednafen's **free-running 8-bit** model — load `TIMx` into the counter on a register *write* only, interrupt when the counter reaches `0xFF`, then wrap `0xFF→0x00` and free-run (period 256), with the `2^Control` prescale **phase-locked to a global sample counter** (`d7f5444`, two unit tests; `bios_boot` golden unchanged). Verified the clock constants match the reference (SH-2 `28636360`, sample `44100`, 68k `11289600`; Mednafen NTSC master `1746818182`/61 = the same SH-2 clock). Built the **measurement harness** that quantifies the divergence: the `ITRACE`/mednaref `SS_ITRACE` frozen value-ring + a **seq-tick counter** (`0829eea`/`9847b89`/`68b49e8`), plus `ENQLOG`, `SS_SEQDUMP`, `SS_WWATCH`, the 68k footprint. |
-| 2 | **Disambiguate the 83-tick gap: trigger-time vs seq-tick-rate** ✅ done | Measured the **Timer-B period** (samples/seq-tick) — a zero-point-independent rate — in both emulators: snapshot the SCSP sample counter at the first seq-tick and at the BGM trigger for `(s_trig − s_first)/(seq_ticks−1)` (ours), and the last 16 seq-tick 68k timestamps for `delta/256` (mednaref `SS_ITRACE`); commit `0d3455f`. **The periods are IDENTICAL: ours 88.0005, Mednafen 88.0 (22528/256).** So ours' SCSP-timer + 68k execution rate are cycle-correct and **no Timer-B interrupts are dropped** (a clean, equal period ⇒ every overflow → one seq-tick). **The 83-tick gap is therefore purely TRIGGER-TIME**: ours reaches the BGM trigger at sample **388694** vs Mednafen's ~**395736** (4497×88) — **~7000 samples / ~0.16 s / ~10 frames earlier**. ⇒ **rules OUT tasks #3 and #4 as the BGM root** (the rate is already correct) and points squarely at task #5 (master-side trigger timing). |
-| 3 | **68k ↔ SCSP scheduling granularity + IRQ delivery** ⏸ not the BGM root | ours steps the 68k and the SCSP/timers in **scheduler-quantum batches** (`Scsp::run`); Mednafen interleaves them **per output sample** (`RunSCSP` scheduled at sample edges, the 68k run to the next sample edge). Aligning ours' interleaving would be a general accuracy gain, but **task #2 ruled it out as the BGM cause** — ours' Timer-B period already matches the reference (88.0) with no dropped interrupts, so the seq-tick *rate* is correct. Deferred unless a future case needs cycle-exact intra-batch interrupt delivery. |
-| 4 | **68k instruction cycle-count audit** ⏸ not the BGM root | the sound 68k's effective execution rate sets how many Timer-B interrupts it services per unit time, so a systematic per-instruction cycle error would shift the seq-tick count — but **task #2 showed the seq-tick rate already matches** (period 88.0 both), so 68k cycle-count error is **not** the BGM root. A general `m68k`-crate accuracy pass (long ops MUL/DIV/MOVEM, memory shifts/rotates, address/bus-error frames) remains worthwhile on its own merits, just not on this milestone's critical path. |
-| 5 | **Master-side trigger timing — root found: missing VDP1-VRAM draw-slowdown** 🚧 investigation ✅, fix pending | **Localized via the `MASTERHIST` probe** (master-PC histogram + ordered tail, freeze disabled; commit `5286c76`): just before the BGM the master busy-spins in a backward byte-copy loop `0x06029EBA-0x06029EC2` (R0=`0x060A0020` WRAM → R13=`0x05C214A0` VDP1 VRAM via cache-through) — it is **drawing the boot animation / CD-player panel into VDP1 VRAM, compute-bound (not VBlank-paced)**, so the draw wall-time gates the BGM. **Root: ours charges 0 wait-states for VDP1-VRAM SH-2 accesses** (`bus.rs` `STUB_WAITS`; only BIOS/backup/WRAM have waits), while Mednafen models a **VDP1 draw-slowdown** (`vdp1.cpp` `Write_CheckDrawSlowdown`: ~22-25 cycles per SH-2 write to VDP1 VRAM while `DrawingActive`, 41-44 per read, capped by the inter-access gap; `HORRIBLEHACK_VDP1RWDRAWSLOWDOWN`). So ours' drawing is far faster → animation finishes ~10 frames early → BGM ~83 seq-ticks early. **Fix (task #6):** model the SH-2↔VDP1-VRAM contention — needs a VDP1 draw-timing window (`DrawingActive`) + the per-access slowdown. **Subsumes the VF2 intro-timing divergence** (M11 Phase 4), the same class of bug. **(Update from #6: the per-access slowdown landed but is a no-op until the draw-DURATION model is fixed — see #6.)** |
-| 6 | **VDP1-VRAM SH-2 draw-slowdown — primitive done, gated on the draw-DURATION model** 🚧 | Ported Mednafen's `Write_/Read_CheckDrawSlowdown` (commit `9934411`): `Vdp1::draw_slowdown` charges SH-2 VDP1-VRAM/FB accesses 25/22/41/44 cy capped by the inter-access gap while `is_drawing()`, wired into all 6 `SaturnBus` return sites. Golden-safe (`bios_boot` unchanged, 537 tests green) and it fires correctly during the CD-player UI. **BUT instrumentation (`dbg_slowdown`/`dbg_plots`, both `#[serde(skip)]`) proves it is currently a NO-OP for the BGM**: over the 530-frame audio-CD boot the master makes **407,354** VDP1 accesses, **0 while drawing**. Cause: our modelled draw is **~100× too short** — 326 `begin_plot` calls, **avg 2000 cy / max 4992 cy** each, vs a ~479,151-cy frame, so `is_drawing()` covers ~0.4 % of a frame and never overlaps the master's ~768 VDP1 writes/frame (spread across the whole frame). **So the real lever is the VDP1 draw-DURATION model**: our `begin_plot` duration (`commands×16 + dots×1`) counts only ~1800 processed dots/frame; Mednafen's `DoDrawing` charges per-command setup + a per-pixel **resume loop** (`resume_table`) so `DrawingActive` spans the real rasterization (much of a frame for a logo morph). **Open question before investing:** is Mednafen's boot-animation draw actually large (needs a mednaref `CycleCounter`/`DrawingActive`-span probe to confirm)? **Refuted en route:** the CD-startup lever — `STARTUP_CYC ×2` moved the trigger the *wrong* way (4414→1653) and killed the throwaway key-on, so the recognition-BUSY window is **not** a clean animation-length knob. |
-| 8 | **BGM root resolved end-to-end → the master SH-2 per-access bus-timing model** 🚧 fix scoped | **The 2026-06-05/06 deep dive (see `doc/bootstrapping.md §B.7`) closed the chain and *supersedes* the tasks #5–6 VDP1-draw-slowdown hypothesis** (the draw-slowdown landed but was confirmed a no-op — the master's busy-loop wasn't the gate). Proven, in order: **(a) the BGM data is valid** — the instrument sample (`0x10740`) + the note sequence (`0x18200`, 13-pitch looping melody) both synthesize to clean audio through a forced key-on (`bios_bgm_sample_audible` / `bios_bgm_sequence_audible` probes); synth + output are already proven (sine 0.2 %, CDDA live). **(b) The 68k driver had a real cycle bug** — `service_interrupt` omitted the interrupt-acknowledge + exception-entry overhead (Mednafen `Exception(INT)` `+6 +4` + `BusIntAck +10` = **20 cy/IRQ**); **fixed `3347369`** (cost-lockstep drift −5426/214k → −450/45k). Found by a **68k cost-per-instruction lockstep** (new `SS_M68K_PCSTREAM` mednaref hook + `tools/pc_lockstep.py` histogram). **(c) But the residual phase lead is master-SH-2-driven** — the cross-emulator **SCOPE** (`tools/scope_diff.py`, Timer-B timebase) shows the 68k sequence engine identical tick-for-tick, while the master-written `cmd500`/`req504` and the 68k's `voice7034` run ~43→343 ticks **early** (ours reaches its BGM command at tick 407/4060 vs Mednafen 450/4403). **(d) The master cost-lockstep does NOT transfer** (its full-BIOS PC stream diverges in ~6 instrs — "master PC-diff unreliable"; tooling built: `Saturn::enable_master_pcstream` + `SS_MASTER_PCSTREAM`, `d1eac67`). **ROOT: ours under-charges the SH-2's external-bus accesses.** Mednafen gates both SH-2s through one shared **`SH7095_mem_timestamp`** with region-weighted waits + CPU↔CPU contention; ours has a per-instruction loop with flat waits. Gap (`bus.rs waits_for` vs Mednafen): **high-WRAM read `1`→`+7` / write `+2`** (sh7095.inc:2282/2206, the dominant lever — the master runs from WRAM), **low-WRAM `3`→`+7`** (ss.cpp:195), BIOS `10`→`+8`, backup `6`→`+8`; **A-bus CS2 (CD-block) `0`→`+8` LANDED `6d4d667`** (golden-safe, but moved the BGM phase zero — CD polls are too rare); B-bus VDP waits already done (#6). **THE FIX (the deferred M13 "per-access SH-2 cycle model"):** correct the WRAM read/write waits → re-measure the SCOPE (cmd500 → 4403) → **re-baseline the `bios_boot` golden** (boot timing shifts — a deliberate accuracy re-baseline) → then the SDRAM page timing (`BSC.last_mem_time`) + SCU B-bus/A-bus arbitration (`scu.inc ABusRW_DB`) + optionally the shared-timestamp contention. **Interacts with the I-cache** (cached fetches = 0 stall, so the +7 applies on cache misses + data reads). Large, golden-churning, system-wide — a dedicated effort. **★★ CORRECTION (2026-06-06, tested): the WRAM waits ARE the phase lever (confirmed empirically — `+7` WRAM moved `voice7034` 407→475 toward Mednafen's 450, `bios_boot` golden unmoved), BUT closing the phase does NOT make the BGM play (still `slot_starts=1`, silent). So the master phase lead is a *real cycle-accuracy gap worth fixing on its own merits*, but it is NOT the BGM root.** The BGM silence is the **68k FOREGROUND control-flow fork** (the earlier #2 finding, now re-confirmed as the actual cause): ours' 68k sets the voice flag (`0x1AC0` → `voice7034=0x80`) then **clears it (`0x1C02`, the note-off path `0x1BF0: btst#7 a status byte → bclr → clear voice`) without ever keying** — it never reaches `0x1B3E`/`0x2E78`. Mednafen takes the *key* path. The gate is a 68k status byte (`a3+d7+1` bit7) SET in ours / clear in Mednafen, and it is NOT a timing artifact (correcting the phase didn't change which path the 68k takes). **TRUE NEXT STEP for the BGM: find who sets that status byte and why ours' value differs** (a 68k-driver state/logic divergence) — NOT the bus-timing model. The WRAM bus-timing rework is split off as its own accuracy task (needs the full cache/SDRAM-page/SCU model + game-boot validation; the flat `+7` overshoots and risks M11). Validation metric for the phase: the SCOPE tick deltas → 0; for the BGM: `slot_starts>1` / audible. **★ LANDED (2026-06-11, `57cbfe5`+`006187a`): the per-access BSC bus-timing model.** A faithful port of Mednafen's `BSC_BusRead/Write` + `BusRW_DB_CS0`: **CS0 as a 16-bit bus** (per-transaction low-WRAM +7 / BIOS +8 / backup +8 / SMPC 0 / FTI +8 / unknown +4 — 32-bit pays twice), **CS3 SDRAM** (read +7, write +2 + a 2-cycle array-busy window), the **SH-2 write buffer** (a lone store is CPU-free; only write-after-write stalls), **cache-line fills as one SDRAM burst** (`AccessKind::LineFill` — beats 2–4 free on CS3, full price on CS0/B-bus), **bus turnaround +1**, the **A-bus cart cost from live ASR0** + CD CS2 per-16-bit, and a **shared bus timestamp** giving the CPU↔CPU arbitration Mednafen gets from `SH7095_mem_timestamp` (per-instruction granularity; the deferred per-access core rework was NOT needed — the bus-side state machine + incremental `BusTiming::pay` charge does it). DMA stays cost-only on its own timeline (CS3 6/3). Savestate v6. **Results:** `bios_boot` golden **unchanged** (no re-baseline needed — the splash plateau absorbs the shift); BGM-phase metric moved **+25 seq-ticks toward the oracle** (4179 → **4204** vs Mednafen's 4497, re-measured same-day on both emulators with the audio-CD ITRACE) — the right direction *without* the flat-+7 overshoot; **VF2 trajectory healthy** (late game code f1021, attract steady state, 0 stalls) and **Doukyuusei boots to title with BGM** (avg amplitude 1209 over 2400 frames). The residual ~293-tick first-tick/phase gap is dominated by a non-bus axis (recognition/INTBACK-class timing — the `REVIEW(magic)` values) — the next investigation, separate from the now-faithful bus model. Remaining bus refinements: exact B-bus deferred-write serialization, SCU A/B-bus arbitration. |
-| 9 | **Validate against the targets** | BGM plays (seq-tick count / divider phase matches, voices key); VF2's intro advances past the timing-gated stall; *Doukyuusei ~if~* stable; master-PC-trace aligned over a multi-second run; `bios_boot` golden + full suite green throughout. |
-
-## Milestone 13 — Hardware completeness & fidelity-gap backlog 📋
-
-The output of a **full architecture audit** (2026-06-04, fanned out per chip). The
-emulator is **"boot-complete" but not "hardware-complete"**: it reaches game code
-on the real-BIOS LLE path, but a number of hardware features and timing behaviours
-are stubbed, approximated, or absent. **None of these block the current targets**
-(BIOS boot, VF2, *Doukyuusei ~if~* — both games fully playable) — which is *why* they're still open —
-but together they are the path to **broad game compatibility + full cycle-accuracy**.
-
-This is a **prioritized backlog**, not a single-goal sprint: tasks are pulled in
-when a specific game or accuracy need surfaces, golden-safe throughout. The
-whole-system **timing** items (Tier A) extend M12 and partly overlap it (cross-ref
-noted). Ordered by relevance to the accuracy-first axis. The cache-fidelity audit
-that produced this list also closed one gap in passing — the SH-2 associative purge
-(`46d3f24`); the cache itself is now verified write-through + invalidation-complete.
-
-**Tier A — Whole-system timing** (the cycle-accuracy frontier; extends M12)
-
-> **Status (2026-06-04) — Tier A push closed.** Landed: **A2** (SCSP per-sample
-> interleave), **A3** (SCU-DMA cycle-stealing), **A5** (real HBLANK dot count);
-> **A6** confirmed adequate; **A1** advanced (VDP1 draw-end + SCU Timer-0 + inter-CPU
-> FTI converted to exact events, DMA execution refactored onto the bus); **A4**
-> base VDP-VRAM access waits added and its *contention* framing **dropped** (the
-> Mednafen oracle has no VRAM-contention model). All verified golden-/rate-/
-> Doukyuusei-stable (the golden never needed a re-baseline). **Two foundational
-> remainders, deliberately not rushed** — both need a core change, not an
-> increment: A1's write-triggered SMPC/SCSP-interrupt side effects (need the
-> queue-and-drain borrow lifted, like the DMA foundation, then drop the 256-cy
-> poll cap), and A4's CPU↔CPU bus arbitration (needs **per-access** SH-2 cycle
-> timestamping; today's per-step model already step-approximates it via
-> master-leads-slave). The per-access SH-2 cycle model is the shared prerequisite
-> and warrants its own milestone. **Update (2026-06-04b):** the BGM/M12 lever was
-> *believed* to be a VDP1 **command-list divergence** (A6), but a frame-aligned
-> per-frame command-count diff vs Mednafen **refuted** that — the VDP1 lists match
-> byte-for-byte (113/115 phase transitions identical; constant ~14-frame offset,
-> ours slightly *behind*). The BGM-trigger lead is **decoupled from the (matching)
-> VDP1 timeline** and lives in the 68k seq-engine / polled-CD-state trigger (A6 row
-> + `doc/bootstrapping.md §B.7`). So Tier A is confirmed orthogonal to the BGM, and
-> the VDP1 axis is now **closed**, not pending.
-
-| # | Gap | Notes |
-|---|-----|-------|
-| A1 | **Continuous event timeline (kill batch-drain jitter)** 🚧 incremental, 3 conversions done | Peripherals settle *between* batches at ≤256-cy granularity, not their exact cycle. Being converted **one peripheral at a time** from batch-drain to exact event, golden + BGM-rate verified at each step: **#1 VDP1 sprite-draw-end** (`347a341` — `draw_end_cycle` fed into `cycles_to_next_event`); **#2 SCU Timer-0 line compare** (`336029a` — batch lands at scanline T0C); **#3 inter-CPU FTI** (`b0e3356` — applied per-instruction in `step_cpus`, so the sibling sees the wake on its next instruction, not a batch late; Doukyuusei boot-trajectory-identical). **Remaining:** the write-triggered SMPC-command-start + SCU-DMA side effects (harder — they touch the aggregate, so they need the queue-and-drain borrow lifted, not just a flag), HBlank edges (status-only, low value), then raising/removing the `SMPC_POLL_QUANTUM` cap once everything is event-scheduled. The completions that already matter (VBlank, INTBACK, now draw-end/Timer-0/FTI) are exact. |
-| A2 | **SCSP per-sample interleave** ✅ done (`d539341`) | `Scsp::run` now produces one sample (timer tick + mixer) every 256 68k cycles *interleaved with* the 68k stepping (Mednafen's per-sample-edge model), instead of lumping all samples then all 68k. Totals identical → verified Timer-B rate unchanged (period 88.0005, seq-ticks 4414, trigger 388694 all byte-identical); only the 68k *phase* vs the sample/timer clock is corrected. Golden-safe (framebuffer is SCSP-independent). |
-| A3 | **SCU-DMA cycle-stealing** ✅ done (`80551c2` + `7d997b1`) | DMA is no longer free: `drain_dma`/`scu_transfer` accumulate the per-access bus wait-states the transfer incurs (our `waits_for` model — same cost the CPU pays), and `step_cpus` runs the DMA the instant its trigger instruction queues it and **stalls that CPU for the cost** (slave runs while the master is DMA-blocked; keeps the master-leads interleave exact). **Golden UNCHANGED** (no re-baseline needed), 16 SCU + 546 tests green, Doukyuusei trajectory-identical, BGM rate 88.0005. The audio-CD BGM tick moved 4414→4388 (correct: small DMAs now wait the real transfer time, not a full 256-cy batch). **Caveat:** the cost *distribution* inherits our bus model's roughness (VDP VRAM is STUB_WAITS=0), so the per-bus split sharpens when **A4** (real VRAM timing) lands — but "DMA takes ~bus time" ≫ "free". |
-| A4 | **Bus contention / VDP timing** 🚧 re-scoped; base VDP waits done (`864ce3b`) | **Key finding:** Mednafen (the LLE oracle) has **no display-dependent VRAM *contention* model** — VDP2 VRAM is a direct/fast region; the only slowdown is the per-game VDP1 draw hack (already ported). So the audit's "VDP2-VRAM contention" would *diverge* from the oracle → **dropped**. The real divergence was the missing **base** VDP access cost: done — `waits_for` now charges the SH-2 the Mednafen B-bus values (VDP1 read 14/write ≈11, VDP2 read 20/write ≈5), golden-safe. **Remaining:** (a) the exact *deferred write-finish* serialization (current write cost overcharges isolated writes); (b) the broader B-bus base (+2 write) for SCSP/SCU/CD writes; (c) **CPU↔CPU bus arbitration** — Mednafen shares one `SH7095_mem_timestamp` that **each CPU syncs to on *every* memory access** (`sh7095.inc` BSC_BusRW + the MemRead/Write macro: `timestamp = SH7095_mem_timestamp`). That is fundamentally a **per-access cycle model**; ours tracks cycles **per instruction step**, so a faithful port needs per-access timestamping in the SH-2 core (a foundational rework). **And it's largely redundant:** our master-leads-slave loop already bounds the slave to the master's timestamp each step, so the cross-CPU bus serialization is *approximated* at step granularity — the per-access version is a low-marginal-value refinement that risks the verified VF2/Doukyuusei work. So this is **deliberately deferred** to a dedicated per-access-timing effort, not rushed. **→ RESOLVED by M12 task #8 (2026-06-11):** the shared-timestamp arbitration landed as a **bus-side state machine** (`SaturnBus::timing` + incremental `BusTiming::pay`) — no SH-2-core rework was needed; see the M12 row for the full model. Still open here: (a) exact deferred-write-finish serialization for the B-bus, (b) SCU A/B-bus arbitration. |
-| A5 | **Real HBlank dot-count** ✅ done (`7207810`) | TVSTAT.HBLANK now asserts at the real per-mode dot boundary (Mednafen `HTimings`): 320-family active 320 of 427 dots (HBLANK last ~25 %), 352-family 352 of 455 (~22.6 %), HRESO LSB picks the family — replacing the invented "last 20 %". Pure `hblank_active` helper + unit test; golden-safe. (The draw-end/FTI batch-boundary jitter is part of the A1 event-timeline work.) |
-| A6 | **VDP1 command-list divergence — REFUTED, lists MATCH** ✅ closed (frame-aligned `VDP1LOG` diff) | A frame-aligned per-frame VDP1 command-count diff — ours (`Vdp1::dbg_take_frame` + the `VDP1LOG`/`VDP1_OUT` probe) vs a new mednaref `SS_VDP1DRAW f=/cmds=` per-draw hook (audio-CD, JAP BIOS) — proves **ours and Mednafen draw the byte-for-byte same command-list sequence**. The animation ramp matches value-for-value (743→744→739→726→…→162→…→692), the `665×14` run matches, and the **11-cmd steady panel is f373–579 (Mednafen) vs f375–591 (ours)**: **113/115 phase transitions identical** (the 2 diffs are single-frame ramp transients). The earlier "ours **≤11** vs Mednafen **~371** pre-trigger" was a **measurement artifact** — it compared ours' *steady panel* (11) against Mednafen's *animation ramp* (~371) at **different absolute frames**. Ours actually reaches the 742-cmd logo at **f125** (not "~f529 post-trigger"); the prior #5/#6 "ours builds the big list ~470 frames late / stays un-throttled" premise is **withdrawn**. The only real difference is a **constant ~14-frame offset, ours slightly *behind*** (set at recognition→animation; no per-frame drift). **⇒ the BGM-trigger lead is NOT a VDP1 phenomenon.** Ours' 68k seq-trigger fires at frame ~498 (seq-tick 4166), ~110 frames into the *matched* 11-cmd panel — far before the panel→226 transition (~f613) where Mednafen's BGM key-on lands (~f591). The lever is the **68k seq-engine / polled-CD-state trigger** (see `doc/bootstrapping.md §B.7`), decoupled from the (matching) VDP1 timeline. The draw-DURATION coefficient (A6's old framing) was already adequate; this closes the command-list question. |
-| A7 | **Sound-68k timing (BGM cycle-lockstep)** ✅ 2 fixes landed; BGM root re-localized | A config-driven cross-emulator **signal "oscilloscope"** (`Scsp::enable_scope`/`take_scope` + the `bios_audio_probe` `SCOPE_*` env + a matching mednaref `sound.cpp` `scope_tick` + `tools/scope_diff.py`; `c7efb89`/`92aad72`) plus a cycle-exact 68k lockstep found + fixed two real sound-68k timing bugs vs Mednafen: **(1) SCSP sound-RAM access wait-state** (`729bfc3` — `SCSP_ACCESS_WAIT` +2 cy/access; the 68k ran ~1.5× too fast per instruction, matched Mednafen `SoundCPU_BusRead` cycle-exact), **(2) SCSP↔68k interleave budget-overshoot carry** (`d755708` — `budget_carry`; the 68k discarded each tiny event-clamped batch's whole-instruction overshoot → ran ~270 cost-cy/sample not 256; per-seq-tick interval 23808→**22512** = Mednafen's 22528). Both oracle-validated + golden-/savestate-safe. **Neither moved the BGM** — the activation is a seq-tick *count*, which per-cycle timing doesn't change. ⇒ the BGM-trigger lead is the **68k sequence-advance**: ours reaches the panel-BGM channel `0x9900` activation in **331 fewer Timer-B ticks** on byte-identical data (the channel setup `acc=0x1E300/step=0x199` is identical). The chip acting too soon = the **sound 68k**, via its sequence-advance logic (not raw speed, now corrected; master/CD ruled out). **Next:** scope the seq work area (≈`0x6000–0x7FFF`) per tick to find the earliest divergent address (start-early vs advance-too-fast). See `doc/bootstrapping.md §B.7` (2026-06-04e). |
-
-**Tier B — SCSP audio features** (adjacent to the BGM goal)
-
-| # | Gap | Notes |
-|---|-----|-------|
-| B1 | **SCSP LFO** ✅ done (`b1085eb`) | Pitch (vibrato) + amplitude (tremolo) LFO — saw/square/triangle/noise waveforms, PLFOS/ALFOS depth, LFOF rate, LFORE reset, shared 17-bit noise LFSR (32×/sample). Ported Mednafen `RunLFO`/`GetPLFO`/`GetALFO`: PLFO joins the phase increment inside the octave shift, ALFO joins the EG dB index. No-LFO path byte-identical (golden + 28 prior SCSP tests unchanged); new `lfo_modulates_pitch_and_amplitude` test. |
-| B2 | **SCSP FM / slot-to-slot modulation** ✅ done | The phase-modulation FM is implemented (`fm_modalizer` + the 64-entry `SoundStack` with a 4-slot `ss_delayer` feedback latency, applied in `slot_sample`): reg 7 `MDL`/`MDXSL`/`MDYSL` select two stack entries off the global slot counter, summed + scaled by MDL, shifting the carrier's read position — the SCSP's slot-to-slot FM (Mednafen `scsp.inc`). This *is* how the BIOS CD-player BGM synthesises its voices, so it's validated by the user-confirmed boot jingle. Tests: `fm_modulation_changes_the_carrier_output`, `fm_modulation_reads_8bit_pcm`. |
-| B3 | **SCSP misc** ✅ done (DAC18B/MEM4MB noted) | **Slot/EG readback** (0x408: CA + SGC envelope-phase + EG level via `slot_monitor`) done with the boot-jingle fix. **MVOL** (master volume) now scales the final DAC mix — `mv = 0x2<<(MVOL>>1)`, −25 % if even, 0 if MVOL=0, unity at 0xF (Mednafen) — **validated jingle-safe**: the BIOS raises MVOL 0→0xF by the time the jingle plays (~7 s), so the user-confirmed jingle is unchanged. **MIDI** (0x404): no device attached, so the read reports Flags = INPUT_EMPTY \| OUTPUT_EMPTY (0x09) — a game polls "nothing to read, ready to send" instead of garbage; MOBUF writes are discarded. **DAC18B** (no-op on our 16-bit DAC) and **MEM4MB** (the Saturn wires 512 KiB sound RAM regardless) are stored, not applied — a faithful no-op. Tests: `master_volume_scales_the_final_dac_mix`, `midi_status_reports_empty_with_no_device`. |
-
-**Tier C — VDP2 / VDP1 rendering features** (visible as the game library widens)
-
-| # | Gap | Notes |
-|---|-----|-------|
-| C1 | **VDP2 mosaic** ✅ done (`8419717`) | MZCTL (0x022) pixel-grouping: `Vdp2Regs::mosaic_coord` snaps a layer's colour-sample coordinate to its block origin (MZSZH+1 × MZSZV+1), applied to NBG0–3 (bits 0–3) + RBG0 (bit 4). Dormant when MZCTL=0 → golden + render tests unchanged. (Sprite mosaic still TODO.) |
-| C2 | **VDP2 shadow on NBG/RBG** ✅ done | The sprite MSB-shadow is now gated by the **SDCTL** (0x0E2) per-screen shadow-receive enable (`Vdp2Regs::shadow_enabled`): a shadow darkens a screen only when its bit is set — NBG0–3 (bits 0–3), RBG0 (4), or the back screen (5), via the `Dot.layer` tag — matching Mednafen's `(SDCTL >> n) & 1` → `PIX_SHADEN`, replacing the former unconditional halving. Golden-safe (the splash casts no MSB-shadow). Tests: `shadow_enable_bits_decode_per_screen`. |
-| C3 | **VDP2 line-color screen + back-screen register** ✅ done | The backdrop is now the real **back screen**: `Vdp2Regs::back_screen` decodes BKTAU/BKTAL → a VRAM word address, and `back_color` reads RGB555 from VRAM per scanline (BKCLMD per-line-colour mode advances one word/line → gradients), replacing the hardcoded `CRAM[0]`. The **line-colour screen** (`line_colour_screen`/`line_colour_enable` = LCTA/LNCLEN) reads a per-line CRAM index and inserts it as the colour-calc partner of LNCLEN-selected layers (a simplified model vs Mednafen's per-pixel multi-screen pipeline; dormant unless LNCLEN set). A `Layer` tag added to `Dot` (also serving C2/C4). **Golden-safe** (the splash fills the active region; line-colour dormant). Tests: `vdp2_render.rs` back-screen single/per-line + line-colour (3). |
-| C4 | **VDP2 special priority + special color-calc** ✅ done (2026-06-08) | Full per-dot application wired — a faithful port of Mednafen's `MakeSFCodeLUT` + `MakeNBGRBGPix`. The samplers now return a `Sample` carrying the dot's `(rgb, palette code, spr, scc, is_rgb, cram-MSB)`; `resolve_special` derives the per-dot priority and colour-calc descriptor for NBG0–3 + RBG0/1 across all four SFPRMD priority modes (0 = register, 1 = per-character SPR bit, 2 = SPR then SFCODE-masked, 3 = LSB forced 0) and four SFCCMD modes (0 = whole layer, 1 = per-dot SCC, 2 = SCC then SFCODE-masked, 3 = CRAM-MSB / always for RGB). Per-dot SPR/SCC bits source from 2-word PN (bits 13/12), 1-word PN supplement (PNCN/PNCR bits 9/8), or bitmap BMSPR/BMSCC (BMPNA/BMPNB); the SFCODE LUT tests bit `(code>>1)&7`. **Golden-safe** (special modes default 0 → `resolve_special` collapses to the prior register priority + whole-layer cc; the splash is unmoved). Validated by unit tests against the oracle algorithm — no game yet exercises it. Tests: `special_color_calc_mode2_gates_blending_by_sfcode`, `special_priority_mode2_raises_lsb_by_sfcode`, `special_function_registers_decode`. Third VDP2 gap from `doc/emulation-capabilities-evaluation.md`. |
-| C5 | **VDP2 windows + rotation edge cases** 🚧 sprite window + CRAM mode 3 + RPMD 0/1 done; per-dot rotation edges deferred | **Sprite window** done: `window_allows` folds W0/W1/sprite (WCTL SWA/SWE) through the LOG bit, with `sprite_fb` threaded into the per-layer test; the flag is bit 15 of the VDP1 framebuffer pixel when SPCTL.SPWINEN is set (Mednafen `SpriteWinEn`). **CRAM mode 3** confirmed already correct (modes 2 \| 3 → RGB888, matching the oracle). **Rotation-parameter mode RPMD 0/1** done (2026-06-08): RBG0 selects rotation parameter set A or B whole-layer (`Vdp2Regs::rotation_param_mode`, 0x0B0; forced to A when RBG1 is active, per Mednafen `EffRPMD`). `sample_rbg` now takes the parameter set (geometry/coefficient/plane) and the RBG layer (CRAM offset / transparent pen) as distinct indices. Golden-safe (RPMD defaults 0 → param A, the prior behaviour; the splash uses no RBG). Test: `rpmd_selects_rotation_parameter_set_for_rbg0`. Still open (deferred — need per-dot-x coefficient sampling or a game to validate): **RPMD modes 2/3** (per-dot coeff-MSB / rotation-parameter window), **dual-parameter window** selection, the RBG coefficient **mode-3 (Xp)** override (ambiguous fixed-point unit), and rotation screen-over **mode 1** (the over-pattern). |
-| C6 | **VDP1 framebuffer TVM modes** | Rotated / 8bpp framebuffer layouts; only the default RGB555 512×256 (TVM mode 0) is modeled. `vdp1/framebuffer.rs`. |
-| C8 | **VDP2 NBG0/1 reduction + fractional scroll** ✅ done (2026-06-08) | `sample_nbg` now walks the source coordinate as 16.16 fixed point: whole-layer **ZMXN/ZMYN** reduction/zoom (`Vdp2Regs::nbg_coord_inc`, the 3.8 register shifted to .16) + the NBG0/1 **8-bit scroll fraction** (`nbg_scroll_frac`, SCXDN/SCYDN), composed with the existing per-line scroll/zoom and vertical cell scroll (per-line zoom replaces the whole-layer X increment for its line; a 0 zoom register reads as 1:1). NBG2/3 stay integer scroll / 1:1 → the maths collapses to the old `scroll + coord`, so **golden-safe** (the splash uses NBG2/3). Mirrors Mednafen's `CurXCoordInc`/`CurXScrollIF`. Tests: `nbg0_horizontal_reduction_halves_the_layer`, `nbg0_fractional_scroll_shifts_the_sampled_source_pixel`. Closes the second VDP2 gap from `doc/emulation-capabilities-evaluation.md`. |
-| C7 | **VDP2 colour offset** ✅ done (2026-06-08) | CLOFEN/CLOFSL + COAR/COAG/COAB (set A) / COBR/COBG/COBB (set B): `Vdp2Regs::{color_offset_enable,color_offset_select,color_offset}` decode the per-screen enable/select and the signed 9-bit per-channel offset; `renderer::apply_color_offset` adds it to the final dot (clamped 0..=255) after colour calc, before sprite-shadow halving — keyed on the front screen (back screen = bit 6 when nothing is on top), matching Mednafen `MixIt`. **Not golden-safe — a deliberate accuracy re-baseline:** the BIOS splash itself sets `CLOFEN=0x08` (NBG3) + set B `(−64,−64,−64)` to darken the brushed-metal logo, which we previously ignored; the `bios_splash` golden moved `0x2C379F92CE1B63F7` → `0x0B1BA6E5180766F7`. Tests: `vdp2_render.rs` colour-offset apply + disabled (2). The first VDP2 gap from `doc/emulation-capabilities-evaluation.md` (the Mednafen-vs-ours comparison) to land. **In-game validated + trace-confirmed (2026-06-08):** Doukyuusei ~if~'s **Inter Channel** trademark screen now **fades in and out** like Mednafen — before C7 the colour-offset writes were dropped, so the logo popped at full brightness instantly. A register trace over the boot pins the exact mechanism: the game ramps **COBR/COBG/COBB (offset set B)** with `CLOFEN`/`CLOFSL` selecting NBG0/2/3 + sprite — fade-in ≈ frames 362–385 (COB −61 → +249), fade-out from ≈ 385 (COB +249 → …). `CCCTL=0x0042` (NBG1 + sprite colour calc) is *constant* across the fade, so the colour-calc work composites the logo but is **not** the fade driver — the fade is unambiguously C7's colour offset. First recently-shipped Tier C feature confirmed by a commercial game's visible behaviour. |
-| C10 | **VDP2 VRAM cycle-pattern fetch gating** 🟡 fetch-gating done (2026-06-08); reduction-limit excluded | The VRAM **cycle-pattern** table (CYCA0..CYCB1, 0x010..0x01E) gates which NBG may fetch name-table / character data from each VRAM bank. `Vdp2Regs::nbg_vcp_fetch_masks(n)` decodes the table + VRAM partition mode (`vram_partition_mode`/`vcp_esb`, RAMCTL bits 9:8) + RDBS into per-bank NT/CG permission masks (a port of Mednafen `nt_ok`/`cg_ok`, `vdp2_render.cpp:270-311`); `sample_tile` reads a fetch from a non-granted bank as a transparent **dummy tile** — the hardware's VRAM-bandwidth gate. **Validated by the `bios_boot` golden, which is unchanged:** the BIOS splash programs a real VCP table (VRAM_Mode 3; captured from a boot) that grants its tile NBG2/NBG3 fetches exactly the banks their data lives in, so honouring the table reproduces the splash pixel-for-pixel — turning an "unvalidatable" feature into one validated against hardware-programmed data. **The reduction-limit half is deliberately excluded** — Mednafen couldn't generalize it and carries a hardcoded per-game VCP whitelist (`vdp2_render.cpp:1714-1726`); porting that imports per-game oracle hacks (see `mednafen-oracle-hacks`), against the project's accuracy-first / no-special-casing stance. Bitmap-CG gating + the rotation (RDBS) fetch path also deferred. Tests: `vram_cycle_pattern_gates_a_tile_layers_character_fetch`, `nbg_vcp_fetch_masks_decode_the_bios_splash_cycle_pattern`, `nbg_vcp_unsplit_bank_shares_the_upper_subbank_pattern`. Sixth (last) VDP2 gap from `doc/emulation-capabilities-evaluation.md`. |
-| C9 | **VDP2 extended colour calc (3-layer)** 🟡 non-line EXCC done (2026-06-08); line/gradient deferred | The compositor now keeps the top **three** opaque dots (`insert_dot` cascades to a `third`), and under **extended colour calculation** (CCCTL **EXCEN**, bit 10, in low-res) the front layer's colour-calc partner becomes the rounding-down **average of the 2nd and 3rd layers** instead of just the 2nd — a faithful port of Mednafen's non-line `MIXIT_SPECIAL_EXCC_CRAM0`/`CRAM12` (`vdp2_render.cpp:2537-2550`) + the `:3136` mode selection. Gated on the 2nd layer's own CCCTL CC bit (`Layer::cc_ctl_bit`); in RGB888 CRAM mode the average is taken only when the 3rd layer is RGB direct colour (the back screen counts as RGB). `Dot` gained an `is_rgb` flag; the averaging uses the carry-safe byte-wise mean. **Golden-safe** (EXCEN defaults 0 → the prior top-two blend; gradient mode takes precedence when set). Deferred: the **line-colour** EXCC variants (`EXCC_LINE_CRAM0/12`) and the **gradient** special blend (`MIXIT_SPECIAL_GRAD`). Tests: `extended_color_calc_blends_front_over_second_third_average`, `extended_color_calc_active_gates_on_excen_lowres_and_gradient`. Fourth VDP2 gap from `doc/emulation-capabilities-evaluation.md`. |
-
-**Tier D — CPU & SCU peripherals** ✅ complete (2026-06-07)
-
-> All five Tier-D items done. **D1** SH-2 DIVU 39-cy divide latency (read-stall
-> scoreboard); **D2** SH-2 on-chip DMAC transfer engine (was already wired —
-> hardened to Mednafen `DMA_DoTransfer`: DMAOR fault gating, address-mode 3,
-> 16-byte block, misalign→AE); **D3** address-generation interlock (already
-> subsumed by load-use; locked in + documented); **D4** MC68EC000 exact MUL/DIV
-> cycle tables + the address/bus/trace exceptions with the group-0 frame; **D5**
-> SCU Timer 1 + HBlank-IN + DMA-illegal, with Pad/refresh-registers matched to
-> the oracle's no-op. All golden-/savestate-safe. The DIVU and 68k MUL/DIV
-> timing move us *toward* the LLE oracle (re-validate the 68k BGM SCOPE phase).
-
-| # | Gap | Notes |
-|---|-----|-------|
-| D1 | **SH-2 DIVU timing + overflow IRQ** ✅ done | The overflow interrupt is wired (`f00c866`): `refresh_interrupts` arms `Source::DivuOvf` level-triggered on DVCR.OVF & OVFIE (mirroring VCRDIV into the INTC vector slot), at the IPRA priority. **Divide latency now modelled** (M13 D1): a triggering DVDNT/DVDNTL write arms `Pipeline::schedule_divide` (≈39 cy for a 32/32 divide, ≈6 on overflow — `Divu::pending_latency`), and a read of *any* DIVU register before the divider retires stalls the CPU via `Pipeline::stall_for_divide`, returned through the on-chip read's wait-state count (Mednafen `divide_finish_timestamp`; `sh7095.inc DIVU_S32_S32`). The result is computed eagerly — only the timing is deferred — and adding the stall moves us *toward* the LLE oracle. **Golden-safe** (the boot splash hash is unchanged). Tests: `divu_timing.rs` (3) + `divu` unit tests. |
-| D2 | **SH-2 on-chip DMAC transfers** ✅ done | The transfer engine (`Cpu::run_dma`/`run_dma_channel` in `interpreter.rs`) runs after each instruction step, modelled on Mednafen `DMA_DoTransfer`: master run condition `DMAOR & 0x07 == 0x01` (DME set, NMIF/AE clear, re-checked per channel) + `CHCR & 0x03 == 0x01` (DE set, TE clear); auto-request only (AR ungated — no DREQ source on the Saturn SH-2, matching the oracle); all four TS sizes incl. the 16-byte block (per-longword DAR advance), SM/DM modes 0–3 (mode 3 → decrement per the `ainc` table), TCR=0 → 16M max, misaligned address → AE fault + abort, TE latch + channel interrupt on completion. Golden-safe (the BIOS uses SCU DMA). Tests: `crates/sh2/tests/dmac.rs` (10). |
-| D3 | **SH-2 address-generation interlock** ✅ done (already modelled) | A load feeding the next instruction's address base/index/post-modified base stalls 1 cycle — and it already does: the load-use scoreboard (`load_dest_pending` + `Op::reads_reg`) reports address-base operands as register reads, so the address-gen interlock is unified with load-use exactly as Mednafen unifies them (every register read runs `WB_EX_CHECK`; `sh7095_ops.inc`). Locked in with `address_gen_interlock.rs` (6 tests across @Rn / @(d,Rn) / @(R0,Rn) / store-base / post-inc + a no-stall control). A full per-register absolute-readiness scoreboard (`WB_until = MA_until+1`) is the same deferred per-access timing foundation as A4 and yields no observable change at per-instruction granularity, so it stays out of scope. |
-| D4 | **MC68EC000 timing + exceptions** ✅ done | **Exact MUL/DIV cycle tables** ported verbatim from Mednafen `m68k.cpp`: MULU `34 + 2·popcount(src)`, MULS `34 + 2·transitions`, and the bit-serial DIVU/DIVS restoring-division algorithm with its taken-path/overflow/sign-fixup penalties (and the matching overflow N/Z/V flags). **Exception model completed**: address error (vec 3, on a word/long access to an odd address — recorded by the access via `Cpu::fault`, taken at the instruction boundary), bus error (vec 2 — modelled with the frame, no trigger on the mirrored Saturn sound bus), and trace (vec 9, after an instruction run with `SR.T` set), all with the 68000 long **group-0 stack frame** (the 3 access-info words stacked as zeros, matching the oracle). Golden-/savestate-safe; the MUL/DIV timing moves the 68k *toward* the LLE oracle (re-validate the BGM SCOPE phase). Tests: `exceptions_timing.rs` (9) + the updated `andi_to_sr` trace interaction. (Shift `2+2n` was already modelled.) |
-| D5 | **SCU timers + unraised interrupts** ✅ done | Timer 0 line-compare (`694eb89`) plus, now ported from Mednafen `SCU_SetHBVB`: **Timer 1** (sub-line H-position down-counter — reload from T1S at HBLANK start, fire at the T1S dot per line or only on the Timer-0 line in mode 1; the within-line position is at `update_video_timing` granularity pending M12's dot-exact raster, but the line/mode/enable are exact), the **HBlank-IN** interrupt (raised on the HBLANK rising edge), and **DMA-illegal** (`scu_dma_bus`/`scu_dma_illegal` from Mednafen `AddressToBus`+`StartDMATransfer`: a **same-mapped-bus** SCU DMA raises `Source::DmaIllegal` and does not transfer — the unmapped-endpoint arm is deliberately *not* enforced, since our bus model treats Low Work RAM as ordinary RAM and skipping a legal transfer would corrupt data). All gated/dormant on the boot path → golden-safe. **Matched to the oracle, deliberately:** the **Pad** interrupt is never raised (Mednafen never asserts `SCU_INT_PAD` — no Saturn source drives it; the SMPC drives `Source::Smpc`), and the **A/B-bus refresh registers** (ASR0/1, AREF, RSEL) are *stored, not applied* — Mednafen does the same (they don't feed its timing model; applying them would diverge the trace), with only the hardware write masks now modelled. Tests: `scu.rs` Timer 1 / HBlank-IN (3) + `scu_dma_*` classification (2) + the masked register round-trip. |
-
-**Tier E — Input devices** (only one digital pad on port 1 today)
-
-| # | Gap | Notes |
-|---|-----|-------|
-| E1 | **Multitap + port-2 scanning** | No 4/6-player multitap and no port-2 peripheral chain; INTBACK returns "no device" for port 2. `smpc.rs` / INTBACK peripheral phase. |
-| E2 | **Analog peripherals** | 3D Control Pad, Mission Stick, racing controller — no analog peripheral IDs or data formats. |
-| E3 | **Specialty peripherals** 🚧 mouse ✅ | **Shuttle Mouse done (`638cda7`/`80b7120`)**: SMPC `PortDevice` per-port selection (None/Pad/Mouse), INTBACK block ID `0xE3` + 3 data bytes ((flags<<4)\|buttons, X, Y; ±256/255 clamp + overflow flags, Y+ = up, accumulators reset per report — Mednafen `input/mouse.cpp`/`smpc.cpp:1421`), `Saturn::set_port_devices`/`feed_mouse`, jupiter `--mouse[=1\|2]` with relative-pointer capture (F10 toggles capture, `26eb845`; Esc/OSD also releases; Return = mouse Start). Savestate v5. For *Doukyuusei ~if~* (mouse-supported per Sega Retro). 3 tests (`smpc.rs`). Remaining: light gun (needs raster crosshair position), keyboard. |
-
-**Tier F — Already-deferred** (cross-referenced)
-
-| # | Gap | Notes |
-|---|-----|-------|
-| F1 | **MPEG card** ⏸ | Deferred from M7 — see *Later milestones* below. |
-| F2 | **CD move/copy sector ops** ⏸ | Deferred from M7. |
-| F3 | **Cache address/data arrays** | The direct-access spaces `0x60000000` (address array) and `0xC0000000` (data array) fall through to open bus; rarely used outside cache-as-RAM mode. `sh2/interpreter.rs` `classify`. |
-
-## Performance optimization (future, opt-in "fast mode")
-
-**Accuracy stays the default and the trace-diff baseline.** These are an *opt-in*
-performance track for once the core is feature-complete — never replacing the
-cycle-faithful default, never a JIT/dynarec. They're cataloged from how the
-reference oracle **Mednafen achieves full speed while remaining LLE** (it runs
-real BIOS + game code; it is *not* a HLE/approximation — it's just engineered
-for speed and makes a few principled omissions); this is the menu of levers to
-close the speed gap without abandoning fidelity.
-
-**Landed so far — the accuracy-neutral levers (P2 + P4), all bit-identical (the
-`bios_boot` golden is unchanged):** a profiling pass (P4) measured Doukyuusei at
-640×224 hi-res — its heaviest "Press Start" stage — at ~55% of real-time
-(~33 fps), then closed most of the gap. **(1)** INTC O(1) highest-pending cache
-(`addfe06`), **(2)** per-instruction interrupt re-arm early-out when source regs
-are unchanged (`69b6fdf`, the biggest single win), **(3)** a pre-decoded
-instruction LUT (`bc7c3c1`), **(4)** eliminating the per-hit cache line copy in
-`mem_read*` — the `bench_cache` probe showed a 99.9 % hit rate, so `cache_fill`'s
-cost was the hit-path whole-line copy, not the rare miss-fill; `Cache::probe`
-returns the line *location* and the caller extracts in place (`6b0f907`). Plus a
-frontend lever outside the table: a **render-pipeline worker thread**
-(`757f164`) overlaps the VDP2 composite onto a 2nd core (the multi-core answer to
-"1 core at 100%"; `render_frame` is a pure read, so the displayed frame just
-trails by 1, pixels identical). Net: compute-only 640-hi-res went ~33 → ~67 fps
-(now above real-time at that stage). Profilers added: `bench_fps`,
-`bench_stages`, `bench_cache`, `presstart_pchist` (in `trace_boot.rs`,
-`#[ignore]`d). The remaining interpreter cost is `step` dispatch + the rare
-cache-miss fill (only 0.1 % of accesses — the probe proved it's not worth it).
-
-| # | Lever | What Mednafen does | What ours does today | Risk / caveat |
-|---|-------|--------------------|----------------------|---------------|
-| P1 | **Coarser cross-chip sync** | Runs each CPU in batches against a shared `SH7095_mem_timestamp` + an **event scheduler**; only re-syncs the siblings at the next scheduled *event* edge. | **Per-instruction** master-leads-slave interleave + per-instruction SCU sampling — re-syncs every instruction. | The single biggest cost. A "fast mode" could widen the sync quantum; must keep the per-instruction path for the accuracy default + trace-diff. |
-| P2 | **Optimized interpreter dispatch** | Template-specialized SH-2 core, tight computed dispatch, **fastmap** page table for memory access. | 🟢 *partly landed* — pre-decoded instruction LUT, INTC O(1) pending cache, interrupt-re-arm early-out, and the cache hit-path copy elimination (all bit-identical; see "Landed so far" above). Still a clear-over-micro-optimized core otherwise. | Pure constant-factor win, accuracy-neutral. Remaining: `step` dispatch + a fastmap-style page table for the bus `match` (the bus dispatch reorder was tried and gave zero gain — the SH-2 cache absorbs nearly all HWRAM accesses). |
-| P3 | **Skip invisible models in fast mode** | Default **"CPU Cache Emulation Mode: Data only"** (skips full I-cache emulation); **no VDP2 VRAM-contention** model at all. | Models the I-cache + per-region wait-states + (M13) VDP-VRAM base access waits faithfully. | Accuracy-affecting → fast-mode only. NB: Mednafen's *lack* of VRAM contention is why we must **not** add it on the accuracy path (it would diverge the trace — see M13 notes). |
-| P4 | **Build & profile** | Native, mature, `-O2`, no test harness. | 🟢 *profiled* — a `perf` + save-state-snapshot pass located the real hot spots (INTC scan, interrupt re-arm, decode, cache hit-path), all since optimized; `bench_*` profilers live in `trace_boot.rs`. Still unprofiled for PGO/LTO. | Free wins remaining: PGO/LTO and a release-mode frontend default. |
-
-Sequencing note: **P2 + P4 are accuracy-neutral and can land anytime**; **P1 + P3
-change observable timing and must be gated behind an explicit opt-in** so the
-default build stays trace-faithful to Mednafen.
+| 1 | SCSP timer free-running 8-bit model + clock verification + measurement harness (ITRACE/seq-tick counter) | ✅ (`d7f5444`) |
+| 2 | Disambiguate the 83-seq-tick gap: the Timer-B *period* matches Mednafen exactly (88.0) — the gap is pure trigger-time, ruling out rate-class causes | ✅ (`0d3455f`) |
+| 3 | 68k↔SCSP per-sample interleave granularity | ⏸ not the BGM root (→ landed as M13 A2) |
+| 4 | 68k instruction cycle audit | ⏸ not the BGM root (→ landed as M13 D4) |
+| 5–6 | VDP1 draw-slowdown hypothesis: `Write_/Read_CheckDrawSlowdown` ported (`9934411`) but proven a no-op for the BGM (our modelled draw duration is ~100× too short to overlap) | ✅ investigated, superseded by #8 |
+| 8 | **Per-access BSC bus-timing model** — faithful Mednafen `BSC_BusRead/Write` port, done bus-side (`57cbfe5`+`006187a`, savestate v6): CS0 16-bit per-transaction costs, CS3 SDRAM + write buffer + line-fill burst + turnaround, A-bus from live ASR0, B-bus flat totals, shared bus timestamp (CPU↔CPU arbitration). Golden unchanged; BGM phase 4179→4204 vs oracle 4497; VF2/Doukyuusei stable. Residual ~293-tick gap = recognition/INTBACK-class timing (the `REVIEW(magic)` values), not the bus. Remaining refinements: exact B-bus deferred-write serialization, SCU A/B-bus arbitration | ✅ landed (2026-06-11) |
+| 9 | Validate: BGM phase matches, *Doukyuusei* stable, master PC-trace aligned over a multi-second run, golden + suite green | 🚧 residual phase gap open |
+
+The full BGM/phase trace-down (probes, lockstep tools, refuted hypotheses) is
+in `doc/bootstrapping.md §B.7`.
+
+## Milestone 13 — Hardware completeness & fidelity backlog 📋
+
+Output of a full per-chip architecture audit (2026-06-04). The emulator is
+"boot-complete" but not "hardware-complete": none of these block the current
+targets (both games fully playable), but together they are the path to broad
+compatibility + full cycle-accuracy. A **prioritized backlog** — tasks are
+pulled when a game or accuracy need surfaces, golden-safe throughout.
+
+**Tier A — whole-system timing** (extends M12; push closed 2026-06-04)
+
+| # | Gap | Status |
+|---|-----|--------|
+| A1 | Continuous event timeline (kill batch-drain jitter) | 🚧 VDP1 draw-end, SCU Timer-0, FTI converted to exact events; remaining: write-triggered SMPC/SCSP side effects (needs the queue-and-drain borrow lifted), HBlank edges, then lift `SMPC_POLL_QUANTUM` |
+| A2 | SCSP per-sample interleave with the 68k | ✅ (`d539341`) |
+| A3 | SCU-DMA cycle-stealing (CPU stalls for the real transfer cost) | ✅ (`80551c2`+`7d997b1`) |
+| A4 | Bus contention / VDP timing | ✅ base B-bus waits (`864ce3b`); VRAM *contention* deliberately dropped (the oracle has none); shared-timestamp CPU↔CPU arbitration resolved by M12 #8. Remaining: B-bus deferred-write serialization, SCU A/B-bus arbitration |
+| A5 | Real HBlank dot-count (per-mode `HTimings`) | ✅ (`7207810`) |
+| A6 | VDP1 command-list divergence | ✅ closed — refuted: frame-aligned diff proves the lists match byte-for-byte; the BGM lead is not a VDP1 phenomenon |
+| A7 | Sound-68k timing | ✅ 2 fixes (`729bfc3` sound-RAM access wait, `d755708` interleave budget carry), oracle-validated; built the cross-emulator signal "oscilloscope" (`tools/scope_diff.py`) |
+
+**Tier B — SCSP audio features** ✅ all done: B1 LFO (`b1085eb`), B2 slot-to-slot
+FM (validated by the boot jingle), B3 misc (slot monitor 0x408, MVOL, MIDI
+empty-status, DAC18B/MEM4MB faithful no-ops).
+
+**Tier C — VDP2/VDP1 rendering features**
+
+| # | Gap | Status |
+|---|-----|--------|
+| C1 | VDP2 mosaic (MZCTL) | ✅ (`8419717`; sprite mosaic TODO) |
+| C2 | Shadow gated by SDCTL per-screen enable | ✅ |
+| C3 | Line-colour screen + back-screen register | ✅ (simplified line-colour model) |
+| C4 | Special priority + special colour-calc (SFPRMD/SFCCMD, all modes) | ✅ (2026-06-08) |
+| C5 | Windows + rotation edge cases | 🟡 sprite window, CRAM mode 3, RPMD 0–3, per-dot coefficients (DKAx walk, RDBS bank grants, CRKTE CRAM tables, mode-3 Xp) all done (`5ee3ecb`+`ac712a8`, VF2's floor; in DD interlace the rotation accumulators advance per *field* line). Deferred: dual-parameter window selection, screen-over mode 1 |
+| C6 | VDP1 framebuffer TVM modes | 🟡 8bpp + DIE interlace done (`0dd3ddd`); TVM=3 (8bpp+rotate layout) deferred |
+| C7 | Colour offset (CLOFEN/COA*/COB*) | ✅ (deliberate golden re-baseline → `0x0B1BA6E5180766F7`; validated by Doukyuusei's logo fade) |
+| C8 | NBG0/1 reduction (ZMXN/ZMYN) + fractional scroll | ✅ |
+| C9 | Extended colour calc (3-layer) | 🟡 non-line EXCC done; line-colour variants + gradient blend deferred |
+| C10 | VRAM cycle-pattern fetch gating | 🟡 fetch gating done (validated by the unchanged splash golden); reduction-limit deliberately excluded (Mednafen uses a per-game whitelist — an oracle hack); bitmap-CG + rotation fetch path deferred |
+
+**Tier D — CPU & SCU peripherals** ✅ complete (2026-06-07): D1 SH-2 DIVU 39-cy
+latency + overflow IRQ; D2 on-chip DMAC transfer engine (Mednafen
+`DMA_DoTransfer` semantics); D3 address-generation interlock (unified with
+load-use, locked in by tests); D4 68k exact MUL/DIV cycle tables +
+address/bus/trace exceptions with the group-0 frame; D5 SCU Timer 1 +
+HBlank-IN + DMA-illegal (Pad interrupt and refresh registers deliberately
+matched to the oracle's no-op).
+
+**Tier E — input devices**
+
+| # | Gap | Status |
+|---|-----|--------|
+| E1 | Multitap + port-2 scanning | ⬜ |
+| E2 | Analog peripherals (3D pad, Mission Stick, racing) + per-button gamepad rebind | ⬜ |
+| E3 | Specialty peripherals | 🟡 Shuttle Mouse done (`638cda7`/`80b7120`, savestate v5, `--mouse[=1|2]`); light gun + keyboard remaining |
+
+**Tier F — already-deferred:** F1 MPEG card ⏸ · F2 CD move/copy sector ops ⏸ ·
+F3 SH-2 cache address/data array spaces (open bus today; rare outside
+cache-as-RAM).
+
+## Performance (opt-in "fast mode" — future)
+
+Accuracy stays the default and the trace-diff baseline; never a JIT/dynarec.
+Levers catalogued from how Mednafen stays LLE at full speed:
+
+| # | Lever | Status / risk |
+|---|-------|---------------|
+| P1 | Coarser cross-chip sync (event-edge quantum instead of per-instruction) | ⬜ accuracy-affecting — opt-in only |
+| P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
+| P3 | Skip invisible models (I-cache, wait-states) | ⬜ accuracy-affecting — opt-in only |
+| P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
+
+Plus the accuracy-neutral frontend lever already landed: the render-pipeline
+worker thread (`757f164`) overlaps VDP2 compositing onto a second core
+(displayed frame trails by 1, pixels bit-identical).
 
 ## Later milestones (queued)
 
-- **MPEG card** + CD move/copy sector ops (deferred from M7).
-- **Explicitly never** — JIT / dynarec (accuracy over performance is the project's design axis).
+- MPEG card + CD move/copy sector ops (deferred from M7).
+- **Explicitly never** — JIT / dynarec (accuracy over performance is the
+  project's design axis).
