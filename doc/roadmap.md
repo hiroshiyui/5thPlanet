@@ -298,10 +298,19 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 | P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
 | P3 | Skip invisible models (I-cache, wait-states) | ⬜ accuracy-affecting — opt-in only |
 | P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
+| P5 | Per-field rendering in interlaced modes | ⬜ **highest-impact open lever, and MORE faithful, not less**: Mednafen composites only the current field (~224 lines into alternating surface rows — `vdp2_render.cpp` `VDP2REND_StartFrame`/`DrawLine`, `out_line = (out_line << 1) \| InterlaceField`) where we re-render the full DD height (448/480) every frame — 2× our compositing cost in exactly the expensive hi-res case (VF2 fights). Real hardware scans one field per 1/60 s. Needs a frontend weave/deinterlace step |
+| P6 | Line-granular render overlap | ⬜ Mednafen hides VDP2 compositing behind emulation *within* a frame: a per-scanline work queue + dedicated render thread (`vdp2_render.cpp` `WWQ`/`RThreadEntry`, "MDFN VDP2 Render"), hard sync only at frame end. Our `render_pipe` overlaps at frame granularity (trails by 1); line granularity would also remove the 1-frame display latency. Register writes must be queued in line order |
+| P7 | Native-width line output | ⬜ Mednafen emits each line at its native width (`espec->LineWidths`; 320-wide lines stay 320, the GPU scaler upscales; `ss.h_blend` doubling is an opt-in cosmetic) where we plot/composite at full decoded width. Smaller win; interacts with the VDP1 fb-dot horizontal doubling in 640/704 modes |
 
 Plus the accuracy-neutral frontend lever already landed: the render-pipeline
 worker thread (`757f164`) overlaps VDP2 compositing onto a second core
 (displayed frame trails by 1, pixels bit-identical).
+
+(P5–P7 are the 2026-06-12 answer to "how does Mednafen's video output stay
+steadier than ours": not a filter — field-only interlace rendering, a per-line
+render thread, and native-width output. Its frontend `video.frameskip` /
+`espec.skip` exists but barely matters for SS — the VDP2 thread composites
+regardless; only extras like the light-gun cursor are skipped.)
 
 ## Later milestones (queued)
 
