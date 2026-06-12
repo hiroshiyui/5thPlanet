@@ -294,23 +294,19 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 
 | # | Lever | Status / risk |
 |---|-------|---------------|
-| P1 | Coarser cross-chip sync (event-edge quantum instead of per-instruction) | ⬜ accuracy-affecting — opt-in only |
 | P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
-| P3 | Skip invisible models (I-cache, wait-states) | ⬜ accuracy-affecting — opt-in only |
 | P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
-| P5 | Per-field rendering in interlaced modes | ⏸ **implemented 2026-06-12 (`4284c1c`), reverted same day by user choice** — the raw weave presentation was rejected in play-testing: field-offset ghosting ("anti-images") on motion and a heavy frame-skipped feel on a progressive 60 Hz display (a CRT masks this; a naive weave does not). The render numbers were real (VF2 fight render −45%, full-path 38.1 → 48.2 fps) and the approach is more hardware-faithful (one field per 1/60 s; parity `!TVSTAT.ODD` = Mednafen `SurfInterlaceField = !Odd`), so the revert commit is a faithful re-land base — but it must ship WITH a frontend deinterlacer (bob or blend, not bare weave) as the default presentation. Mednafen pairs its field rendering with the frontend deinterlacer setting for the same reason |
-| P6 | Line-granular render overlap | ⬜ Mednafen hides VDP2 compositing behind emulation *within* a frame: a per-scanline work queue + dedicated render thread (`vdp2_render.cpp` `WWQ`/`RThreadEntry`, "MDFN VDP2 Render"), hard sync only at frame end. Our `render_pipe` overlaps at frame granularity (trails by 1); line granularity would also remove the 1-frame display latency. Register writes must be queued in line order |
-| P7 | Native-width line output | ⬜ Mednafen emits each line at its native width (`espec->LineWidths`; 320-wide lines stay 320, the GPU scaler upscales; `ss.h_blend` doubling is an opt-in cosmetic) where we plot/composite at full decoded width. Smaller win; interacts with the VDP1 fb-dot horizontal doubling in 640/704 modes |
+
+(Other levers were catalogued and dropped 2026-06-12 — accuracy-affecting
+sync/model shortcuts, and the Mednafen-style video-output levers, of which
+per-field interlace rendering (P5) was implemented and reverted by user
+choice: the bare weave showed ghosting in play-testing; see `4284c1c`/
+`fe70809` and the git history of this section. Current performance is
+sufficient without them.)
 
 Plus the accuracy-neutral frontend lever already landed: the render-pipeline
 worker thread (`757f164`) overlaps VDP2 compositing onto a second core
 (displayed frame trails by 1, pixels bit-identical).
-
-(P5–P7 are the 2026-06-12 answer to "how does Mednafen's video output stay
-steadier than ours": not a filter — field-only interlace rendering, a per-line
-render thread, and native-width output. Its frontend `video.frameskip` /
-`espec.skip` exists but barely matters for SS — the VDP2 thread composites
-regardless; only extras like the light-gun cursor are skipped.)
 
 ## Later milestones (queued)
 
