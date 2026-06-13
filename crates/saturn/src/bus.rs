@@ -265,9 +265,27 @@ pub struct SaturnBus {
     pub watch: Option<(u32, Option<u32>)>,
     #[serde(skip)]
     pub watch_hit: Option<(u32, u32, u32)>,
+    /// Raster-jitter probe (M13 A1 evidence-first): when `raster_probe_on`, a
+    /// read of VCNT/TVSTAT stashes `(reg_offset, stored_value)` here for the
+    /// aggregate (`step_cpus`) to compare against the cycle-exact value — the
+    /// "bus flags, aggregate drains" pattern, like `slave_input_capture`. Gated
+    /// by the flag so a normal run pays only one predictable branch per read.
+    /// `#[serde(skip)]` — observer-only, never part of a save state.
+    #[serde(skip)]
+    pub raster_probe_on: bool,
+    /// `(reg_offset, stored_value, reading_pc, read_cycle)` of the last
+    /// VCNT/TVSTAT read while the probe is on.
+    #[serde(skip)]
+    pub last_raster_read: Option<(u32, u16, u32, u64)>,
 }
 
 impl SaturnBus {
+    /// Pop the last-noted raster-register read `(reg_offset, stored_value)` (M13
+    /// A1 jitter probe). The aggregate drains this after each instruction.
+    pub fn take_raster_read(&mut self) -> Option<(u32, u16, u32, u64)> {
+        self.last_raster_read.take()
+    }
+
     /// Extra SH-2 stall for an access to VDP1 VRAM/FB while the plotter is
     /// drawing — the SH-2↔VDP1 VRAM bus contention (M12 #6). 0 elsewhere. Added
     /// on top of [`waits_for`] so graphics-drawing code can't outrun the
@@ -317,6 +335,8 @@ impl SaturnBus {
             master_input_capture: false,
             watch: None,
             watch_hit: None,
+            raster_probe_on: false,
+            last_raster_read: None,
         }
     }
 
@@ -594,6 +614,13 @@ impl Bus for SaturnBus {
             _ => 0,
         };
         read_watch(addr, 2, v as u32, k, self.cycle, self.step_pc);
+        // Raster-jitter probe: note a VCNT (0x05F8_000A) / TVSTAT (0x05F8_0004)
+        // read so the aggregate can compare the stored value to the cycle-exact
+        // one. Canonical addresses only (games read those); off by default.
+        if self.raster_probe_on && (addr == 0x05F8_0004 || addr == 0x05F8_000A) {
+            self.last_raster_read =
+                Some((addr - crate::vdp2::REGS_BASE, v, self.step_pc, self.cycle));
+        }
         (v, self.charge(addr, 2, false, k))
     }
 

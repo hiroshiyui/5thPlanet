@@ -4049,6 +4049,133 @@ fn disc_read_content_check() {
     }
 }
 
+/// M13 A1 evidence-first probe: does batch-drain jitter ever make a raster
+/// register (VCNT/TVSTAT) read return a value that differs from the cycle-exact
+/// one? For each VCNT/TVSTAT read the core records the stored (batch-grained)
+/// value vs `raster_state` at the read cycle; this test tallies stale reads
+/// across BIOS boot + (if assets present) a VF2 fight and the Doukyuusei menu.
+/// A near-zero stale count is the evidence that the HBlank-clamp / lift-
+/// `SMPC_POLL_QUANTUM` work can stay deferred. Run with --release.
+///
+///   cargo test --release -p saturn --test trace_boot raster_jitter_probe \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "manual: raster batch-drain jitter probe (run with --release)"]
+fn raster_jitter_probe() {
+    use core::cmp::Reverse;
+    use std::collections::HashMap;
+    const CYC: u64 = 479_151;
+    let root = workspace_root();
+    let bios_path = root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin");
+    let Ok(bios) = std::fs::read(&bios_path) else {
+        println!("no BIOS at {}; skipped", bios_path.display());
+        return;
+    };
+
+    // Tally one phase's log: total reads, stale (stored != exact) split by
+    // register, VCNT max scanline delta, TVSTAT differing-bit union, top PCs.
+    let report = |label: &str, log: &[(u32, u64, u32, u16, u16)]| {
+        let total = log.len();
+        let vcnt = log.iter().filter(|r| r.2 == 0x00A).count();
+        let tvstat = log.iter().filter(|r| r.2 == 0x004).count();
+        let stale: Vec<_> = log.iter().filter(|r| r.3 != r.4).collect();
+        let vcnt_stale = log.iter().filter(|r| r.2 == 0x00A && r.3 != r.4).count();
+        let tvstat_stale = log.iter().filter(|r| r.2 == 0x004 && r.3 != r.4).count();
+        let max_vcnt_delta = log
+            .iter()
+            .filter(|r| r.2 == 0x00A)
+            .map(|r| (r.3 as i32 - r.4 as i32).abs())
+            .max()
+            .unwrap_or(0);
+        let bit_diff = log
+            .iter()
+            .filter(|r| r.2 == 0x004)
+            .fold(0u16, |acc, r| acc | (r.3 ^ r.4));
+        let mut by_pc: HashMap<u32, u64> = HashMap::new();
+        for r in &stale {
+            *by_pc.entry(r.0).or_default() += 1;
+        }
+        let mut top: Vec<(u32, u64)> = by_pc.into_iter().collect();
+        top.sort_by_key(|&(_, n)| Reverse(n));
+        println!("--- raster-jitter [{label}] ---");
+        println!("  reads: {total} (VCNT {vcnt}, TVSTAT {tvstat})");
+        println!(
+            "  STALE (stored != exact): {} — VCNT {vcnt_stale}, TVSTAT {tvstat_stale}",
+            stale.len()
+        );
+        println!("  VCNT max |Δscanline|: {max_vcnt_delta}");
+        println!("  TVSTAT differing bits (union): {bit_diff:#06X} (HBLANK=0x4 ODD=0x2 VBLANK=0x8)");
+        for (pc, n) in top.iter().take(5) {
+            println!("    stale-read PC {pc:08X}: {n}");
+        }
+    };
+
+    // Phase 1 — BIOS boot to the splash (no disc needed).
+    {
+        let mut sat = Saturn::new(bios.clone());
+        sat.reset();
+        sat.set_region(saturn::smpc::region::JAPAN);
+        sat.set_rtc_unix(1_700_000_000);
+        sat.enable_raster_jitter();
+        let frames: u32 = std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+        for _ in 0..frames {
+            sat.run_for(CYC);
+            let _ = sat.take_audio();
+        }
+        report("BIOS boot", &sat.take_raster_jitter());
+    }
+
+    // Phase 2 — VF2 fight (needs the cue + the cached fight snapshot).
+    let vf2_snap = root.join("tmp/vf2_fight_f2700.sav");
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms/vf2_full_lsb.cue"))
+        && vf2_snap.exists()
+        && let Ok(disc) =
+            saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    {
+        let mut sat = Saturn::new(bios.clone());
+        sat.reset();
+        sat.set_region(saturn::smpc::region::JAPAN);
+        sat.set_rtc_unix(1_700_000_000);
+        sat.insert_disc(disc);
+        if sat.load_state(&std::fs::read(&vf2_snap).unwrap()).is_ok() {
+            sat.enable_raster_jitter(); // after load_state (it clears probe state)
+            let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+            for _ in 0..300 {
+                sat.run_frame(&mut fb);
+                let _ = sat.take_audio();
+            }
+            report("VF2 fight", &sat.take_raster_jitter());
+        }
+    } else {
+        println!("--- raster-jitter [VF2 fight] skipped (no cue / snapshot) ---");
+    }
+
+    // Phase 3 — Doukyuusei menu (needs the cue + the cached menu snapshot).
+    let dk_snap = std::path::PathBuf::from("/tmp/dk_menu_f2000.sav");
+    if let Ok(cue) = std::fs::read_to_string(root.join("roms/Doukyuusei - if (Japan) (1M, 2M).cue"))
+        && dk_snap.exists()
+        && let Ok(disc) =
+            saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    {
+        let mut sat = Saturn::new(bios.clone());
+        sat.reset();
+        sat.set_region(saturn::smpc::region::JAPAN);
+        sat.set_rtc_unix(1_700_000_000);
+        sat.insert_disc(disc);
+        if sat.load_state(&std::fs::read(&dk_snap).unwrap()).is_ok() {
+            sat.enable_raster_jitter();
+            let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+            for _ in 0..300 {
+                sat.run_frame(&mut fb);
+                let _ = sat.take_audio();
+            }
+            report("Doukyuusei menu", &sat.take_raster_jitter());
+        }
+    } else {
+        println!("--- raster-jitter [Doukyuusei menu] skipped (no cue / snapshot) ---");
+    }
+}
+
 /// VF2 fight-scene benchmark (the 704×448 double-density 3D load — the
 /// heaviest render mode). Scripts input to the fight (Start at title, A at
 /// menu, A to confirm Akira), snapshots at FIGHT_AT (cached under tmp/), then

@@ -343,7 +343,21 @@ pub struct Saturn {
     /// Capped so a hot trigger can't grow unbounded. `#[serde(skip)]`.
     #[serde(skip)]
     pctrace: Option<PcTrace>,
+    /// Debug-only (M13 A1 evidence): per-read raster-jitter log. When enabled,
+    /// each VCNT/TVSTAT read records `(pc, cycle, reg_offset, stored, exact)` —
+    /// the *stored* (batch-grained) value the guest saw vs the cycle-exact value
+    /// [`raster_state`] gives at that cycle — to measure whether batch-drain
+    /// latency is ever observable. Capped; `#[serde(skip)]`. See
+    /// [`Saturn::enable_raster_jitter`].
+    #[serde(skip)]
+    raster_jitter: Option<RasterJitter>,
 }
+
+/// `records[(pc, cycle, reg_offset, stored_value, exact_value)]` — see
+/// [`Saturn::enable_raster_jitter`]. For VCNT `reg_offset == 0x00A` the values
+/// are scanline numbers; for TVSTAT `0x004` they are the raster bits
+/// (VBLANK|HBLANK|ODD) of the stored register vs the exact state.
+type RasterJitter = Vec<(u32, u64, u32, u16, u16)>;
 
 /// `(target_low24_pc, reg_index, records[(reg_value, cycle)])` — see [`Saturn::enable_seqlog`].
 type SeqLog = (u32, usize, Vec<(u32, u64)>);
@@ -376,6 +390,7 @@ impl Saturn {
             master_pcstream: None,
             seqlog: None,
             pctrace: None,
+            raster_jitter: None,
         }
     }
 
@@ -517,6 +532,21 @@ impl Saturn {
     /// with [`Self::take_master_pcstream`].
     pub fn enable_master_pcstream(&mut self) {
         self.master_pcstream.get_or_insert_with(Vec::new);
+    }
+
+    /// Debug-only (M13 A1): arm the raster-jitter probe — record, per VCNT/TVSTAT
+    /// read, the stored (batch-grained) value vs the cycle-exact one. Also flips
+    /// the bus-side note flag. Drain with [`Self::take_raster_jitter`].
+    pub fn enable_raster_jitter(&mut self) {
+        self.raster_jitter.get_or_insert_with(Vec::new);
+        self.bus.raster_probe_on = true;
+    }
+
+    /// Debug-only: drain the raster-jitter log and disarm the probe.
+    pub fn take_raster_jitter(&mut self) -> RasterJitter {
+        self.bus.raster_probe_on = false;
+        self.bus.last_raster_read = None;
+        self.raster_jitter.take().unwrap_or_default()
     }
 
     /// Debug-only: drain the master PC+cycle stream `(pc, accumulated_cycle)`.
@@ -772,33 +802,47 @@ impl Saturn {
     /// stub leaves it unable to sync (it spins after INTBACK). Called
     /// between scheduler batches, so the registers track the raster to
     /// ~`SMPC_POLL_QUANTUM` granularity.
-    fn update_video_timing(&mut self) {
-        let now = self.now();
+    /// The cycle-exact raster register state at global cycle `now` for the given
+    /// horizontal resolution: `(vcnt, tvstat_raster_bits)`, where the bits are
+    /// VBLANK (0x0008) | HBLANK (0x0004) | ODD (0x0002). The raster registers are
+    /// derivable from the global cycle alone, so this is a pure function — the
+    /// single source of truth for both `update_video_timing` (which merges the
+    /// bits into the stored TVSTAT each batch) and the raster-jitter probe (which
+    /// compares a register read's *stored* value against this *exact* one to
+    /// measure batch-drain staleness). See [`hblank_active`] and `VBLANK_IN_CYCLE`.
+    fn raster_state(now: u64, h_res: u8) -> (u16, u16) {
         let frame = now / CYCLES_PER_FRAME;
         let frame_cycle = now % CYCLES_PER_FRAME;
         let line = (frame_cycle / CYCLES_PER_LINE).min(LINES_PER_FRAME - 1);
         let line_cycle = frame_cycle % CYCLES_PER_LINE;
+        let mut bits = 0u16;
+        // Precise frame-derived edge (matches the `run_for` clamp + the reference)
+        // rather than the rounded per-line `line >= 224`.
+        if frame_cycle >= Self::VBLANK_IN_CYCLE {
+            bits |= 0x0008; // VBLANK
+        }
+        if hblank_active(line_cycle, h_res, CYCLES_PER_LINE) {
+            bits |= 0x0004; // HBLANK
+        }
+        if frame & 1 == 1 {
+            bits |= 0x0002; // ODD field
+        }
+        (line as u16, bits)
+    }
 
+    fn update_video_timing(&mut self) {
+        let now = self.now();
         let prev = self.bus.vdp2.regs.read16(0x004);
         // Previous scanline (the VCNT register before we overwrite it below) —
         // the edge reference for the SCU Timer-0 line compare.
         let prev_line = self.bus.vdp2.regs.read16(0x00A);
-        // Use the precise frame-derived edge (matches the `run_for` clamp and
-        // the reference) rather than the rounded per-line `line >= 224`.
-        let vblank = frame_cycle >= Self::VBLANK_IN_CYCLE;
-        let mut tvstat = prev & !0x000E; // clear VBLANK | HBLANK | ODD
-        if vblank {
-            tvstat |= 0x0008; // VBLANK
-        }
         let h_res = self.bus.vdp2.regs.h_resolution();
-        let hblank = hblank_active(line_cycle, h_res, CYCLES_PER_LINE);
-        if hblank {
-            tvstat |= 0x0004; // HBLANK
-        }
-        if frame & 1 == 1 {
-            tvstat |= 0x0002; // ODD field
-        }
-        self.bus.vdp2.regs.write16(0x00A, line as u16); // VCNT
+        // Cycle-exact raster state (shared with the jitter probe via raster_state).
+        let (line, raster_bits) = Self::raster_state(now, h_res);
+        let vblank = raster_bits & 0x0008 != 0;
+        let hblank = raster_bits & 0x0004 != 0;
+        let tvstat = (prev & !0x000E) | raster_bits; // replace VBLANK|HBLANK|ODD
+        self.bus.vdp2.regs.write16(0x00A, line); // VCNT
         self.bus.vdp2.regs.write16(0x004, tvstat);
 
         // Raise VBlank-IN once, on the transition into the VBLANK region.
@@ -839,7 +883,7 @@ impl Saturn {
         // TENB, so the BIOS boot path is unaffected. (*SCU User's Manual*,
         // T0C/T1MD.)
         let t0c = (self.bus.scu.t0c & 0x3FF) as u16;
-        let timer0_met = line as u16 == t0c;
+        let timer0_met = line == t0c;
         if self.bus.scu.timers_enabled() && timer0_met && prev_line != t0c {
             self.bus.scu.raise(crate::scu::Source::Timer0);
         }
@@ -897,11 +941,13 @@ impl Saturn {
     /// Included edges: VBlank-IN, VBlank-OUT, and a pending INTBACK completion
     /// (`smpc.intback_complete_at`). **Deliberately excluded** — do NOT add
     /// without the noted prerequisites:
-    /// - **HBlank**: `TVSTAT.HBLANK` here is an invented "last 20% of the
-    ///   scanline" approximation (see `update_video_timing`), not the real
-    ///   H-blank dot count — clamping to it would lock in a *precise* divergence
-    ///   from the reference and add ~526 stops/frame for no diff benefit. Add
-    ///   only once the dot count is corrected and a divergence points at HBLANK.
+    /// - **HBlank**: `TVSTAT.HBLANK` is the real per-mode dot-count boundary
+    ///   (`hblank_active`, M13 A5), but it is deliberately **not** a clamp edge:
+    ///   clamping to it would add ~420–526 stops/frame, and the `raster_jitter_probe`
+    ///   (M13 A1) measured **zero** stale HBLANK/VCNT reads across BIOS boot, a VF2
+    ///   fight, and the Doukyuusei menu — the batched value is never observed stale
+    ///   (VBLANK, the bit games actually poll, is already an exact clamp edge below).
+    ///   Add a clamp only if a future game's oracle diff points at HBLANK.
     /// - **SCU DMA**: synchronous/instant in our model (`drain_dma` finishes
     ///   the whole transfer at the boundary) — there is no future completion
     ///   timestamp to clamp to. Making it a timed event is a later model change.
@@ -988,8 +1034,31 @@ impl Saturn {
             master_pcstream,
             seqlog,
             pctrace,
+            raster_jitter,
             ..
         } = self;
+        // M13 A1 evidence: drain a noted VCNT/TVSTAT read and log the stored
+        // (batch-grained) value vs the cycle-exact `raster_state` at the read
+        // cycle. Off-path is a single None check (probe disabled).
+        macro_rules! record_raster {
+            () => {
+                if let Some(rj) = raster_jitter.as_mut()
+                    && let Some((reg, stored, pc, cyc)) = bus.take_raster_read()
+                    && rj.len() < 65_536
+                {
+                    let h_res = bus.vdp2.regs.h_resolution();
+                    let (vcnt, bits) = Saturn::raster_state(cyc, h_res);
+                    // VCNT (0x00A): compare scanlines. TVSTAT (0x004): compare only
+                    // the batch-drainable bits HBLANK|ODD (0x0006). VBLANK (0x0008)
+                    // is excluded: it is already a cycle-exact clamp edge AND the
+                    // bus ORs it live for the display-off case, so any VBLANK
+                    // mismatch is that correct correction, not batch-drain jitter.
+                    let (s, e) =
+                        if reg == 0x00A { (stored, vcnt) } else { (stored & 0x0006, bits & 0x0006) };
+                    rj.push((pc, cyc, reg, s, e));
+                }
+            };
+        }
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
         // instruction flagged on the bus — pulse the *sibling's* FRT now so it
         // sees the input-capture on its next instruction, not up to a batch
@@ -1092,6 +1161,7 @@ impl Saturn {
                 }
                 scheduler.entity_mut(*master_id).step(bus);
                 apply_fti!(); // master may have pulsed the slave's (or its own) FTI
+                record_raster!(); // log any raster read the master just did
                 // If the master's instruction triggered an SCU DMA, run it now.
                 // A C-bus-endpoint transfer halts BOTH SH-2s for its paced
                 // duration — the SCU owns the CPU bus (Mednafen
@@ -1119,6 +1189,7 @@ impl Saturn {
             } {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
+                record_raster!(); // log any raster read the slave just did
                 // A slave-triggered C-bus DMA halts both CPUs the same way.
                 let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
                 if dma_cost != 0 {
@@ -1729,8 +1800,8 @@ impl Saturn {
 #[cfg(test)]
 mod tests {
     use super::{
-        CYCLES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count, hblank_active, intback_busy_us,
-        scu_dma_bus, scu_dma_illegal, us_to_cycles,
+        CYCLES_PER_FRAME, CYCLES_PER_LINE, LINES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count,
+        hblank_active, intback_busy_us, scu_dma_bus, scu_dma_illegal, us_to_cycles,
     };
 
     #[test]
@@ -1826,5 +1897,34 @@ mod tests {
         assert!(hblank_active(352, 1, 455), "HBLANK at the 352-mode edge");
         // 704 hi-res shares the 352 family (HRESO=3, LSB 1).
         assert!(hblank_active(352, 3, 455));
+    }
+
+    #[test]
+    fn raster_state_matches_the_inline_derivation_at_edges() {
+        // raster_state is the shared cycle→(VCNT, raster-bits) helper used by
+        // both update_video_timing and the jitter probe. Pin it to an
+        // independent inline derivation at representative cycles + the edges.
+        let check = |now: u64, h_res: u8| {
+            let frame = now / CYCLES_PER_FRAME;
+            let fc = now % CYCLES_PER_FRAME;
+            let line = (fc / CYCLES_PER_LINE).min(LINES_PER_FRAME - 1) as u16;
+            let mut bits = 0u16;
+            if fc >= Saturn::VBLANK_IN_CYCLE {
+                bits |= 0x0008; // VBLANK
+            }
+            if hblank_active(fc % CYCLES_PER_LINE, h_res, CYCLES_PER_LINE) {
+                bits |= 0x0004; // HBLANK
+            }
+            if frame & 1 == 1 {
+                bits |= 0x0002; // ODD
+            }
+            assert_eq!(Saturn::raster_state(now, h_res), (line, bits), "now={now} h_res={h_res}");
+        };
+        check(0, 0); // frame 0, line 0, active display
+        check(Saturn::VBLANK_IN_CYCLE - 1, 0); // last active cycle
+        check(Saturn::VBLANK_IN_CYCLE, 0); // exact VBLANK-IN edge
+        check(CYCLES_PER_FRAME, 0); // frame 1 → ODD set
+        check(CYCLES_PER_FRAME + CYCLES_PER_LINE * 100 + 400, 1); // mid-line, 352-family
+        check(CYCLES_PER_FRAME * 2 - 1, 3); // last cycle of an even frame, 704
     }
 }
