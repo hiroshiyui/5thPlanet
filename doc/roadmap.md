@@ -5,7 +5,7 @@ the foundation is solid before the next chip is added. This file is a status
 tracker; blow-by-blow investigation history lives in the git log,
 `doc/bootstrapping.md`, and the commit messages referenced below.
 
-Current test count: **1058 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1086 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
 ## Component status
@@ -27,7 +27,7 @@ Current test count: **1058 workspace-wide, 0 failures**, ~85% line coverage
 | CD-block | 🟡 | HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
 | Cartridge slot | ✅ | Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
 | SDL2 frontend | ✅ | Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
-| Save states | ✅ | `save_state`/`load_state` (bincode + versioned header, currently v6); media referenced not embedded, fingerprint-validated |
+| Save states | ✅ | `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
 | Backup RAM (battery) | ✅ | Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
 | On-screen menu (OSD) | ✅ | Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
@@ -307,6 +307,18 @@ sufficient without them.)
 Plus the accuracy-neutral frontend lever already landed: the render-pipeline
 worker thread (`757f164`) overlaps VDP2 compositing onto a second core
 (displayed frame trails by 1, pixels bit-identical).
+
+Save/load latency (accuracy-neutral, `df02192`): the disc fingerprint — the
+FNV-1a media identity the save-state header checks — is now computed once at
+`Disc` construction and cached in a field, not re-hashed over the whole image on
+every `save_state`/`load_state`. That re-hash was a ~1.5–1.7 s stall per
+quicksave **and** per quickload on a 600–700 MB image; the cost now falls once at
+disc-insert (an already-slow load), so quicksaves are instant. Same hash value —
+bit-identical, golden + savestate round-trip unchanged. (Measured-and-rejected at
+the same time: a per-frame CRAM→RGB888 LUT in the compositor — bit-identical and
+it did cut `color_rgb888` self-time 2.3→0.1%, but the end-to-end fps gain was
+within noise since render is the band-parallel edge and both heavy scenes already
+clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
 
 ## Later milestones (queued)
 
