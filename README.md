@@ -25,7 +25,7 @@ foundation stays solid.
 | M9        | Frontend OSD (in-window menu)                               | ✅ complete  |
 | M10       | Live physical disc + CD audio                               | ✅ complete  |
 | M11       | Boot a commercial game to gameplay                          | ✅ complete  |
-| M12       | Whole-system cycle accuracy vs the reference emulator        | 🚧 active    |
+| M12       | Whole-system cycle accuracy vs the reference emulator        | ✅ complete  |
 | M13       | Hardware completeness & fidelity-gap backlog                 | 📋 in progress |
 
 **What works today:** a real Saturn BIOS boots to its splash screen, and
