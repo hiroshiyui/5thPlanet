@@ -240,7 +240,7 @@ pulled when a game or accuracy need surfaces, golden-safe throughout.
 
 | # | Gap | Status |
 |---|-----|--------|
-| A1 | Continuous event timeline (kill batch-drain jitter) | 🚧 VDP1 draw-end, SCU Timer-0, FTI converted to exact events; remaining: write-triggered SMPC/SCSP side effects (needs the queue-and-drain borrow lifted), HBlank edges, then lift `SMPC_POLL_QUANTUM` |
+| A1 | Continuous event timeline (kill batch-drain jitter) | 🚧 VDP1 draw-end, SCU Timer-0, FTI, and **write-triggered SMPC commands** converted to exact events (`b65cd18` — a queued command breaks the batch via `smpc.has_pending()`, so `drain_smpc` dispatches within one instruction of the COMREG write; SCSP's own writes were already immediate); remaining: HBlank clamp edge, then lift `SMPC_POLL_QUANTUM` |
 | A2 | SCSP per-sample interleave with the 68k | ✅ (`d539341`) |
 | A3 | SCU-DMA cycle-stealing (CPU stalls for the real transfer cost) | ✅ (`80551c2`+`7d997b1`) |
 | A4 | Bus contention / VDP timing | ✅ base B-bus waits (`864ce3b`); VRAM *contention* deliberately dropped (the oracle has none); shared-timestamp CPU↔CPU arbitration resolved by M12 #8. Remaining items closed by M12 #8 residuals (2026-06-12): B-bus deferred-write serialization + SCU A/B-bus DMA arbitration |
