@@ -1136,6 +1136,18 @@ impl Saturn {
                         .cycles += dma_cost;
                 }
             }
+            // M13 A1: a queued SMPC command becomes an immediate event edge.
+            // Break the batch so the boundary `drain_smpc` dispatches the
+            // command's side effect (slave release, SNDON, the INTBACK arm)
+            // within one instruction of the COMREG write rather than up to a
+            // `SMPC_POLL_QUANTUM` batch late. The master has already retired
+            // ≥1 instruction this iteration, so progress is guaranteed; and
+            // `drain_smpc` consumes `pending` before the next batch, so this
+            // cannot re-trigger. The dispatch stays at the aggregate to keep
+            // the bus/scheduler borrows disjoint (queue-and-drain, ADR-0005).
+            if bus.smpc.has_pending() {
+                break;
+            }
         }
         // Trailing CD-block ticks up to the batch target.
         while scheduler.entity(*cd_id).next_deadline() <= target {
