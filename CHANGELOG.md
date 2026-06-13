@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-14
+
+A small, behaviour-preserving release: a save/load latency optimization plus
+documentation sync. No emulation behaviour changes — the boot golden hash and
+the save-state format (v9) are unchanged, so existing save states still load.
+
+### Changed
+
+- **Disc fingerprint is cached at construction** instead of re-hashed on every
+  `save_state`/`load_state`. The save-state media-identity check ran a full
+  FNV-1a over the entire disc image (a ~1.5–1.7 s stall per quicksave *and* per
+  quickload on a 600–700 MB game image); the hash is now computed once when the
+  disc is inserted and stored in a field, so quicksaves and quickloads are
+  effectively instant. The hash value is unchanged — bit-identical media
+  identity, boot golden and save-state round-trip unaffected.
+
 ## [0.3.0] - 2026-06-12
 
 **Milestone 12 (whole-system cycle accuracy) is complete.** The three
