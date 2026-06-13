@@ -138,6 +138,13 @@ pub struct Disc {
     tracks: Vec<Track>,
     /// FAD of the lead-out (one past the last user sector) = total LBA + 150.
     lead_out_fad: u32,
+    /// The disc's stable identity (FNV-1a over `image`) for save-state media
+    /// validation, computed **once** at construction. The hash dominated
+    /// `save_state`/`load_state` when recomputed per call — a ~1.7 s stall on a
+    /// 700 MB image, paid on every quicksave/load — so it is cached here and the
+    /// [`SectorSource::fingerprint`] impl just returns it (mirrors the
+    /// `physdisc` live drive, which likewise precomputes its TOC fingerprint).
+    fingerprint: u64,
 }
 
 impl Disc {
@@ -145,6 +152,18 @@ impl Disc {
     /// save-state media validation (the image itself is never serialized).
     pub fn image(&self) -> &[u8] {
         &self.image
+    }
+
+    /// FNV-1a over the image bytes — the disc's stable identity. Computed once
+    /// at construction (see the `fingerprint` field) so the per-call media
+    /// check is O(1) rather than re-hashing the whole image.
+    fn image_fingerprint(image: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in image {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
     }
 
     /// A raw ISO: a single Mode-1 data track of 2048-byte sectors at FAD 150.
@@ -160,6 +179,7 @@ impl Disc {
             sector_size: SECTOR_USER,
         };
         Disc {
+            fingerprint: Self::image_fingerprint(&image),
             image,
             tracks: vec![track],
             lead_out_fad: FAD_OFFSET + sectors,
@@ -349,6 +369,7 @@ impl Disc {
         let last = out.last().unwrap();
         let lead_out_fad = last.start_fad + last.length;
         let disc = Disc {
+            fingerprint: Self::image_fingerprint(&image),
             image,
             tracks: out,
             lead_out_fad,
@@ -545,14 +566,9 @@ impl SectorSource for Disc {
         Disc::subheader(self, fad)
     }
     fn fingerprint(&self) -> u64 {
-        // FNV-1a over the image bytes (same identity the M8 save-state media
-        // check used before the trait existed).
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in &self.image {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
-        }
-        h
+        // Precomputed at construction (see the `fingerprint` field) — O(1), not
+        // a re-hash of the whole image on every save_state/load_state.
+        self.fingerprint
     }
 }
 
@@ -641,6 +657,31 @@ mod tests {
         assert_eq!(d.tracks()[0].start_fad, 150);
         assert_eq!(d.tracks()[0].length, 4);
         assert_eq!(d.lead_out_fad(), 154);
+    }
+
+    #[test]
+    fn fingerprint_is_cached_but_bit_identical_to_a_fresh_hash() {
+        // The cached field must equal a from-scratch FNV-1a over the image, so
+        // moving the hash to construction is purely a memoization — the
+        // save-state media identity is byte-for-byte unchanged.
+        let mut img = vec![0u8; SECTOR_USER * 4];
+        for (i, b) in img.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        let d = Disc::from_iso(img.clone());
+        let fresh = {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in &img {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            h
+        };
+        assert_eq!(d.fingerprint(), fresh, "cached fingerprint must match the raw FNV-1a");
+        // Identity: equal images → equal fingerprint; a one-byte change differs.
+        assert_eq!(Disc::from_iso(img.clone()).fingerprint(), d.fingerprint());
+        img[SECTOR_USER * 2] ^= 0xFF;
+        assert_ne!(Disc::from_iso(img).fingerprint(), d.fingerprint());
     }
 
     #[test]
