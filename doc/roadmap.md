@@ -294,15 +294,24 @@ block the current targets; each is golden-safe and pulled when a game needs it.
 The deliberate, *do-not-regress* divergences from MAME/Yabause those audits
 recorded now live in [`bootstrapping.md`](bootstrapping.md) §C.1.
 
+**Triage (2026-06-14 re-verified at HEAD):** all rows still hold. **G2 and G3
+are the two most likely to actually surface** (both audio, both plausibly hit by
+a real sound driver) — check them first if a future game has a sound bug. The
+proactive items are G1's two halves: **`.m3u` is cheap** (playlist parser +
+the existing eject/insert path) and unlocks the multi-disc games; **CHD is the
+bigger usability win but its own scoped task** (a feature-gated reader crate,
+mirroring `physdisc`, not hand-rolled codecs). G2/G6 carry real regression risk
+(the current behaviour is load-bearing) — fix only with a repro.
+
 | # | Gap | Subsystem | Note |
 |---|-----|-----------|------|
-| G1 | CHD disc images + multi-disc `.m3u` playlist swapping | disc / frontend | Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only |
-| G2 | `SNDON` does a full 68k reset, not an un-halt | SCSP | a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1519`) |
-| G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | SCSP | a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
-| G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | SCSP | `decode_sci` (`scsp/mod.rs:~579`) |
-| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `CEF`-clear-on-swap; `BEF` status flag | VDP1 | erase-on-displayed + the status-only flags MAME models |
-| G6 | VDP2 VBlank-OUT/VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | VDP2 raster | marginal, golden-risk (`system.rs:~718,~691`) |
-| G7 | SCU Timer0 is line-compare only (no free-running counter); indirect-mode DMA write-back address; DMA-illegal predicate is same-bus/unmapped vs MAME's BIOS-source key | SCU | verify the DMA-illegal predicate against a game that DMAs from BIOS |
+| G1 | CHD disc images + multi-disc `.m3u` playlist swapping | disc / frontend | Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only. Split effort: `.m3u` low, CHD high (compressed hunk container — prefer a feature-gated crate) |
+| G2 | `SNDON` does a full 68k reset, not an un-halt | SCSP | a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
+| G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | SCSP | only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
+| G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | SCSP | `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
+| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `BEF` status flag always 0; `CEF`-clear-on-swap nuance | VDP1 | **`CEF` itself is done** (latched on draw-end, cleared at list-start); the residue is erase-on-displayed + `BEF` + MAME's extra clear-on-swap. All edge cases |
+| G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | VDP2 raster | **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
+| G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | SCU | **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
 
 ## Performance (opt-in "fast mode" — future)
 
