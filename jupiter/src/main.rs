@@ -265,6 +265,19 @@ fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
     }
 }
 
+/// Game-frames to compute before the next render submit, given the current
+/// audio reserve `depth` (source-rate queued bytes). Renders every game-frame
+/// in normal play (1); only once the reserve has drained below `catchup_floor`
+/// does it permit a `max`-frame "run N, show 1" catch-up, so a transient
+/// compute spike can recover the reserve before an under-run *without*
+/// chronically collapsing frames when there's headroom. The old unconditional
+/// cap chased the full audio target and so dropped ~1/3 of rendered frames on
+/// VF2 even at 6 ms/frame — cutting distinct fps and adding input latency
+/// (`tmp/vf2_perflog`). `max` is the catch-up ceiling (`SAT_MAX_BURST`, ≥1).
+fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
+    if depth < catchup_floor { max.max(1) } else { 1 }
+}
+
 #[cfg(feature = "sdl2-frontend")]
 fn run(
     bios: Vec<u8>,
@@ -463,7 +476,20 @@ fn run(
         .max(10);
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
     let mut audio_started = false;
-    let max_frames_per_burst = 2u32;
+    // Catch-up ceiling: the *most* game-frames `burst_cap` will collapse into
+    // one render when the audio reserve has drained low. Normal play renders
+    // every frame regardless (see `burst_cap`); this only bounds recovery from a
+    // sub-real-time spike. Default 2 ("run 2, show 1" at worst); `SAT_MAX_BURST=1`
+    // disables catch-up entirely (pure 1-frame-per-render).
+    let max_frames_per_burst: u32 = std::env::var("SAT_MAX_BURST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2);
+    // Reserve below which catch-up is allowed: a third of the target (~40 ms at
+    // the default 120 ms). Normal play hovers near the target (VF2 median
+    // ~77 ms), so collapsing only kicks in on a genuine dip toward an under-run.
+    let catchup_floor = audio_target_bytes / 3;
 
     let perflog = std::env::var_os("SAT_PERFLOG").is_some();
 
@@ -651,11 +677,14 @@ fn run(
                 saturn.set_pad1(held);
                 // Audio-paced burst: run frames until the (mirrored) SDL queue
                 // depth plus what this burst just produced reaches the target.
-                // The cap keeps a sub-real-time stretch from turning into a big
-                // visual lurch (run 2, show 1 at worst).
+                // `burst_cap` renders every game-frame in normal play and only
+                // collapses (run N, show 1) when the reserve has drained low —
+                // chasing the full target unconditionally dropped ~1/3 of VF2's
+                // frames and added input latency.
                 let mut depth = emu_mirror.load(Ordering::Relaxed);
+                let cap = burst_cap(depth, catchup_floor, max_frames_per_burst);
                 let mut burst = 0u32;
-                while depth < audio_target_bytes && burst < max_frames_per_burst {
+                while depth < audio_target_bytes && burst < cap {
                     let t = std::time::Instant::now();
                     saturn.advance_frame();
                     pl_advance += t.elapsed();
@@ -1861,4 +1890,34 @@ fn run(
         eprintln!();
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::burst_cap;
+
+    // Healthy reserve (well above the floor) → render every frame, never
+    // collapse — the VF2-steady-60 case (~77 ms vs a ~40 ms floor).
+    #[test]
+    fn renders_every_frame_with_reserve() {
+        assert_eq!(burst_cap(80_000, 7_056, 2), 1);
+        assert_eq!(burst_cap(7_056, 7_056, 2), 1); // exactly at the floor: not below
+    }
+
+    // Reserve drained below the floor → allow up to `max` to recover before an
+    // under-run.
+    #[test]
+    fn allows_catchup_when_drained() {
+        assert_eq!(burst_cap(5_000, 7_056, 2), 2);
+        assert_eq!(burst_cap(0, 7_056, 3), 3);
+    }
+
+    // `SAT_MAX_BURST=1` disables catch-up: 1 frame per render even when drained.
+    #[test]
+    fn max_one_disables_catchup() {
+        assert_eq!(burst_cap(0, 7_056, 1), 1);
+        assert_eq!(burst_cap(80_000, 7_056, 1), 1);
+        // A degenerate max of 0 still computes at least one frame.
+        assert_eq!(burst_cap(0, 7_056, 0), 1);
+    }
 }
