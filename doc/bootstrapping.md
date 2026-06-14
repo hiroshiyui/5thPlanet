@@ -5,9 +5,9 @@ instruction — brings the machine up from reset to the SEGA splash, and how it
 then recognises a disc, authenticates it, and loads a game. This is the
 process/sequence reference; for the chip→module map see
 [`system-architecture.md`](system-architecture.md), for vocabulary see
-[`glossary.md`](glossary.md), for task status see [`roadmap.md`](roadmap.md),
-and for the point-in-time cross-reference audit against Mednafen see
-[`mednafen-divergence-review.md`](mednafen-divergence-review.md).
+[`glossary.md`](glossary.md), and for task status see [`roadmap.md`](roadmap.md).
+The deliberate divergences from the secondary references (MAME / Yabause) — the
+residue of the now-retired cross-reference audits — are consolidated in [§C.1](#deliberate-divergences-from-mame--yabause--do-not-regress).
 
 **Guiding principle (ADR-0002):** every real chip is emulated cycle-by-cycle;
 the BIOS is *run for real*, not high-level-emulated. The only HLE component is
@@ -293,6 +293,44 @@ only — no emulator code is included or derived.
 > matched to MAME; the *game boot* must match Mednafen. Several M11 fixes are
 > exactly this re-alignment — keep both the `bios_boot` golden (MAME-shaped, no
 > disc) and the Mednafen disc-present path green.
+
+#### Deliberate divergences from MAME / Yabause — do not regress
+
+The system layer was built walking several references (Yabause → MAME → Mednafen),
+each with different conventions. The points below are places where ours
+**deliberately** follows Mednafen / real hardware where MAME (the secondary
+reference) differs — so a future "align to MAME" impulse must not silently break
+the Mednafen game-boot path. Each is documented with its per-item rationale in
+`CLAUDE.md`; this is the consolidated guard-list (it absorbs the retired
+2026-06-08 MAME/Mednafen cross-reference audits).
+
+- **CD reset/Init HIRQ** = full `0x0BE1` on disc-present reset (not MAME's
+  `CMOK|ESEL|EHST`) — see [§B.2](#b2-the-reset-hirq-the-load-bearing-detail).
+- **HIRQ reads are sticky/W1C** — reads never clear `DCHG`/`CSCT`/`BFUL` (MAME
+  read-clears them); the host's `DCHG` W1C **also clears the internal
+  `disk_changed` latch**, so a later `Init` doesn't re-raise `DCHG` (the actual
+  M11 boot root).
+- **Get HW Info** reports **no MPEG** (`CR2=0x0002`); MAME's MPEG-present byte
+  triggers the BIOS auth probe that loops recognition.
+- **`DrivePhase::Startup`** holds `STATUS_BUSY` ~1 s then settles PAUSE; **empty
+  drive reports `NODISC` (0x07), not PAUSE** — both match Mednafen/hardware.
+- **Dual-SH-2 = master-leads-slave per instruction** (not MAME's global scheduler
+  + MINIT/SINIT quantum boost); preserves timing-sensitive inter-CPU WRAM handoffs.
+- **SCU interrupt is a level sampled per master instruction** (internal `0x40+`,
+  external CD `0x50`, IMASK reset `0xBFFF`, bit-15 sign-extend, AIACK/`cd_prohibit`).
+- **`SSHON` cold-resets the slave** (VBR=0, reset vector) + sets its BCR1
+  master/slave bit; an LLE slave must cold-boot, not resume stale state.
+- **INTBACK** uses Mednafen's 4 MHz SF-phasing (~261 µs status-only via
+  `intback_complete_at`) and status SR `(SR&~0xA0)|0x0F|NPE`; MAME clears SF ~4×
+  too fast and derails the BIOS poll.
+- **Cart + internal backup-RAM use odd-byte packing** (one packing for
+  backup-manager compatibility); MAME packs the cart linearly.
+
+Where ours is simply **more faithful** than MAME (no action needed, don't
+"simplify" toward MAME): the SCSP envelope/FM/timer/monitor/wait-state model, the
+VDP1 event-clamped draw-end, the SCU Timer1 down-counter, and the system-level
+CDDA mix. The remaining *gaps* (where MAME does more) are tracked as roadmap
+[M13 Tier G](roadmap.md#milestone-13--hardware-completeness--fidelity-backlog-).
 
 ### C.2 Our instrumentation (all env-gated, off by default)
 

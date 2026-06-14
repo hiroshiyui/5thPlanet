@@ -287,6 +287,23 @@ matched to the oracle's no-op).
 F3 SH-2 cache address/data array spaces (open bus today; rare outside
 cache-as-RAM).
 
+**Tier G — residual reference-audit items.** Consolidated from the point-in-time
+MAME + Mednafen cross-reference audits (2026-06-08, since retired — their
+boot-critical findings all landed; these are the small open remainders). None
+block the current targets; each is golden-safe and pulled when a game needs it.
+The deliberate, *do-not-regress* divergences from MAME/Yabause those audits
+recorded now live in [`bootstrapping.md`](bootstrapping.md) §C.1.
+
+| # | Gap | Subsystem | Note |
+|---|-----|-----------|------|
+| G1 | CHD disc images + multi-disc `.m3u` playlist swapping | disc / frontend | Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only |
+| G2 | `SNDON` does a full 68k reset, not an un-halt | SCSP | a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1519`) |
+| G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | SCSP | a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
+| G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | SCSP | `decode_sci` (`scsp/mod.rs:~579`) |
+| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `CEF`-clear-on-swap; `BEF` status flag | VDP1 | erase-on-displayed + the status-only flags MAME models |
+| G6 | VDP2 VBlank-OUT/VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | VDP2 raster | marginal, golden-risk (`system.rs:~718,~691`) |
+| G7 | SCU Timer0 is line-compare only (no free-running counter); indirect-mode DMA write-back address; DMA-illegal predicate is same-bus/unmapped vs MAME's BIOS-source key | SCU | verify the DMA-illegal predicate against a game that DMAs from BIOS |
+
 ## Performance (opt-in "fast mode" — future)
 
 Accuracy stays the default and the trace-diff baseline; never a JIT/dynarec.
