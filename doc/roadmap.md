@@ -348,6 +348,17 @@ it did cut `color_rgb888` self-time 2.3→0.1%, but the end-to-end fps gain was
 within noise since render is the band-parallel edge and both heavy scenes already
 clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
 
+## Enhancements
+
+Non-accuracy, presentation / quality-of-life polish for the frontend —
+explicitly **optional** and below the M13 fidelity backlog in priority.
+Frontend-only (`jupiter`), feature-gated, and never touching the core or its
+golden hashes (these run on the framebuffer the core has already produced).
+
+| # | Enhancement | Status |
+|---|-------------|--------|
+| EN1 | RetroArch-style GLSL / `.slang` multi-pass shader presets (CRT / scanline / NTSC, shader chains, parameter UI) | ⬜ Large. Prerequisite: replace the SDL2 2D-`Canvas` present path (`main.rs` — `into_canvas` / `create_texture_streaming` / `canvas.copy`) with an SDL2 **OpenGL context** + a fullscreen-quad fragment-shader pass — the 2D renderer can't run GLSL. The OSD should become a crisp pass *on top* of the shaded game so the menu isn't CRT-distorted. A single built-in CRT/scanline toggle in the OSD Graphics menu is the lighter on-ramp sharing the same GL-context groundwork |
+
 ## Later milestones (queued)
 
 - MPEG card + CD move/copy sector ops (deferred from M7).
