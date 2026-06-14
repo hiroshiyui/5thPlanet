@@ -543,7 +543,16 @@ fn run(
         .iter()
         .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().into_owned())
         .collect();
-    let sess = Session {
+    // The disc browser opens in the launched disc's directory (when it's an
+    // image path), else the working directory.
+    let browse_dir = launched_spec
+        .as_deref()
+        .filter(|s| !s.starts_with("cdrom:"))
+        .and_then(|s| std::path::Path::new(s).parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let mut sess = Session {
         save_base: save_base.clone(),
         launched_spec,
         ui,
@@ -552,7 +561,10 @@ fn run(
         bios_names,
         bios_active,
         mouse_port,
+        browse_dir,
+        browse_entries: Vec::new(),
     };
+    sess.refresh_browse();
 
     std::thread::scope(|scope| {
         let emu_mirror = Arc::clone(&audio_mirror);
@@ -599,6 +611,18 @@ fn run(
                     pad_keys: sess.cfg.keys.clone(),
                     bios_names: sess.bios_names.clone(),
                     bios_active: sess.bios_active,
+                    // The browser listing can be large; it's only read while the
+                    // menu is open, so skip cloning it on the gameplay hot path.
+                    browse_entries: if osd.is_open() {
+                        sess.browse_entries.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    browse_dir: if osd.is_open() {
+                        sess.browse_dir.to_string_lossy().into_owned()
+                    } else {
+                        String::new()
+                    },
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
@@ -1170,7 +1194,15 @@ struct Session {
     bios_active: usize,
     /// Which port carries the Shuttle Mouse (re-applied across a power cycle).
     mouse_port: Option<u8>,
+    /// The disc browser's current directory and its (cached) listing — rebuilt
+    /// only as the user navigates, not every frame.
+    browse_dir: std::path::PathBuf,
+    browse_entries: Vec<osd::BrowseEntry>,
 }
+
+/// Disc-image extensions the browser offers (lower-cased compare).
+#[cfg(feature = "sdl2-frontend")]
+const DISC_EXTS: [&str; 3] = ["cue", "iso", "ccd"];
 
 #[cfg(feature = "sdl2-frontend")]
 impl Session {
@@ -1179,6 +1211,48 @@ impl Session {
     }
     fn state_path(&self) -> std::path::PathBuf {
         self.save_base.with_extension("state")
+    }
+
+    /// Rebuild `browse_entries` from `browse_dir`: `..` first (when not at the
+    /// filesystem root), then sub-directories, then disc-image files — each
+    /// group sorted case-insensitively. All `fs` errors degrade to an empty
+    /// listing (the browser just shows "(no disc images)").
+    fn refresh_browse(&mut self) {
+        let mut dirs: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        if let Ok(rd) = fs::read_dir(&self.browse_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue; // skip dotfiles / dotdirs
+                }
+                match e.file_type() {
+                    Ok(ft) if ft.is_dir() => dirs.push(name),
+                    Ok(_) => {
+                        let ext = std::path::Path::new(&name)
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if DISC_EXTS.contains(&ext.as_str()) {
+                            files.push(name);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let key = |s: &String| s.to_ascii_lowercase();
+        dirs.sort_by_key(key);
+        files.sort_by_key(key);
+
+        let mut entries = Vec::with_capacity(dirs.len() + files.len() + 1);
+        if self.browse_dir.parent().is_some() {
+            entries.push(osd::BrowseEntry { name: "..".into(), is_dir: true });
+        }
+        entries.extend(dirs.into_iter().map(|name| osd::BrowseEntry { name, is_dir: true }));
+        entries.extend(files.into_iter().map(|name| osd::BrowseEntry { name, is_dir: false }));
+        self.browse_entries = entries;
     }
 }
 
@@ -1294,6 +1368,43 @@ fn dispatch_osd(
             },
             None => osd.set_toast("No disc to insert", 120),
         },
+        OsdAction::BrowseEnter(i) => {
+            // Descend into / ascend out of a directory, then rebuild the listing.
+            if let Some(e) = sess.browse_entries.get(i).cloned() {
+                if e.name == ".." {
+                    if let Some(parent) = sess.browse_dir.parent() {
+                        sess.browse_dir = parent.to_path_buf();
+                    }
+                } else {
+                    sess.browse_dir.push(&e.name);
+                }
+                sess.refresh_browse();
+            }
+        }
+        OsdAction::LoadDisc(i) => {
+            // Resolve the chosen image, insert it, and power-cycle so the BIOS
+            // boots the new game (region + cart re-applied across the reset,
+            // mirroring SetRegion). The loaded disc becomes the session disc, so
+            // a later Reset / Insert Disc references it.
+            match sess.browse_entries.get(i) {
+                Some(e) if !e.is_dir => {
+                    let path = sess.browse_dir.join(&e.name);
+                    let spec = path.to_string_lossy().into_owned();
+                    match insert_from_spec(saturn, &spec) {
+                        Ok(()) => {
+                            saturn.reset();
+                            saturn.set_region(osd_region_to_code(sess.ui.region));
+                            saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
+                            sess.launched_spec = Some(spec);
+                            osd.set_toast(format!("Loaded {}", e.name), 150);
+                            osd.close();
+                        }
+                        Err(err) => osd.set_toast(format!("Load failed: {err}"), 180),
+                    }
+                }
+                _ => osd.set_toast("No such disc", 120),
+            }
+        }
         OsdAction::SetScale(s) => {
             sess.ui.scale = s;
             // Window pixels = base 320×224 × scale; applied on the SDL main

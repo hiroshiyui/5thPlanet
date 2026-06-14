@@ -55,6 +55,21 @@ pub enum OsdCart {
     BackupRam,
 }
 
+/// One row in the disc-image browser ([`Screen::DiscBrowser`]). The frontend
+/// builds the list from the current directory (`..` first when not at the
+/// filesystem root, then sub-directories, then disc-image files); the OSD only
+/// displays it and reports the chosen index, so all `fs` I/O stays frontend-side
+/// and the menu remains unit-testable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowseEntry {
+    /// File or directory name (not the full path — the frontend rebuilds that
+    /// from its current browse directory).
+    pub name: String,
+    /// `true` for a directory (selecting it descends/ascends); `false` for a
+    /// loadable disc image (selecting it loads + boots it).
+    pub is_dir: bool,
+}
+
 /// An effect the frontend must carry out. The OSD itself never touches the
 /// emulator; it just says what the user chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +97,14 @@ pub enum OsdAction {
     ResetBinds,
     /// Power-cycle into another BIOS image (an [`OsdCtx::bios_names`] index).
     SetBios(u8),
+    /// Descend into / ascend out of a directory in the disc browser (an
+    /// [`OsdCtx::browse_entries`] index whose `is_dir` is `true`). The frontend
+    /// updates its browse directory and rebuilds `browse_entries`; the browser
+    /// screen stays open (the OSD resets the selection to the top).
+    BrowseEnter(usize),
+    /// Load + boot the disc image at an [`OsdCtx::browse_entries`] index (a file
+    /// entry). The frontend inserts the disc, resets the machine, and closes.
+    LoadDisc(usize),
 }
 
 /// Dynamic context the frontend supplies each draw so labels reflect live
@@ -107,6 +130,11 @@ pub struct OsdCtx {
     pub bios_names: Vec<String>,
     /// Index of the currently-running BIOS in [`OsdCtx::bios_names`].
     pub bios_active: usize,
+    /// Contents of the disc browser's current directory (`..`, sub-dirs, then
+    /// disc images) — the frontend rebuilds this as the user navigates.
+    pub browse_entries: Vec<BrowseEntry>,
+    /// The browser's current directory path, shown as the screen title.
+    pub browse_dir: String,
 }
 
 /// Which screen is on top of the stack.
@@ -124,6 +152,8 @@ enum Screen {
     Region,
     Cartridge,
     Bios,
+    /// Filesystem browser for picking a disc image to load.
+    DiscBrowser,
 }
 
 /// One menu item: its label is computed from [`OsdCtx`] at draw time.
@@ -137,6 +167,10 @@ struct Item {
 enum Select {
     Push(Screen),
     Emit(OsdAction),
+    /// Emit an action but keep the current screen, resetting the selection to
+    /// the top — used by the disc browser when descending into a directory so
+    /// the rebuilt listing starts at row 0.
+    Browse(OsdAction),
     /// Close the menu (emits `Resume`).
     Close,
 }
@@ -245,6 +279,7 @@ impl Osd {
                 } else {
                     mk("Insert Disc", Select::Emit(OsdAction::ReinsertDisc))
                 },
+                mk("Load Disc...", Select::Push(Screen::DiscBrowser)),
                 mk("Settings", Select::Push(Screen::Settings)),
                 mk("Quit", Select::Emit(OsdAction::Quit)),
             ],
@@ -346,6 +381,31 @@ impl Osd {
                 v.push(mk("Back", Select::Close));
                 v
             }
+            Screen::DiscBrowser => {
+                // One row per entry: directories descend (kept open, selection
+                // reset to the top via `Select::Browse`), files load + boot.
+                // Names are truncated to the panel width; dirs get a trailing
+                // '/'. The action index is the `browse_entries` index, so the
+                // entries must come first and "Back" last.
+                let mut v = Vec::with_capacity(ctx.browse_entries.len() + 1);
+                for (i, e) in ctx.browse_entries.iter().enumerate() {
+                    if e.is_dir {
+                        let short: String = e.name.chars().take(19).collect();
+                        v.push(mk(
+                            &format!("{short}/"),
+                            Select::Browse(OsdAction::BrowseEnter(i)),
+                        ));
+                    } else {
+                        let short: String = e.name.chars().take(20).collect();
+                        v.push(mk(&short, Select::Emit(OsdAction::LoadDisc(i))));
+                    }
+                }
+                if ctx.browse_entries.is_empty() {
+                    v.push(mk("(no disc images)", Select::Close));
+                }
+                v.push(mk("Back", Select::Close));
+                v
+            }
         }
     }
 
@@ -360,6 +420,7 @@ impl Osd {
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
             Screen::Bios => "BIOS",
+            Screen::DiscBrowser => "Load Disc",
         }
     }
 
@@ -411,6 +472,13 @@ impl Osd {
                         self.back()
                     }
                     Select::Emit(action) => Some(action),
+                    Select::Browse(action) => {
+                        // Stay on this screen but reset the cursor: the frontend
+                        // is about to rebuild `browse_entries` for the new
+                        // directory, so the old index would point at a stale row.
+                        *self.sel_mut() = 0;
+                        Some(action)
+                    }
                 }
             }
         }
@@ -455,19 +523,41 @@ impl Osd {
         let items = self.items(screen, ctx);
         let sel = self.sel().min(items.len().saturating_sub(1));
 
-        // Panel geometry: centred, sized to the content.
-        let rows = items.len();
+        // Scrolling viewport: a screen with more rows than `MAX_VISIBLE_ROWS`
+        // (the disc browser over a large directory) shows a window around the
+        // selection. Every built-in screen has <= `MAX_VISIBLE_ROWS` rows, so
+        // their layout is unchanged.
+        const MAX_VISIBLE_ROWS: usize = 15;
+        let total = items.len();
+        let (first, shown) = if total <= MAX_VISIBLE_ROWS {
+            (0, total)
+        } else {
+            let first = sel
+                .saturating_sub(MAX_VISIBLE_ROWS / 2)
+                .min(total - MAX_VISIBLE_ROWS);
+            (first, MAX_VISIBLE_ROWS)
+        };
+
+        // Panel geometry: centred, sized to the visible rows.
         let pw = 180usize;
-        let ph = 28 + rows * 12 + 8;
+        let ph = 28 + shown * 12 + 8;
         let px = c.w.saturating_sub(pw) / 2;
         let py = c.h.saturating_sub(ph) / 2;
 
         c.fill_rect(px, py, pw, ph, PANEL_BG);
         c.rect_outline(px, py, pw, ph, PANEL_BORDER);
 
-        let title = Self::title(screen);
+        // The disc browser titles itself with its current directory (tail-
+        // truncated so the *current* folder stays visible); others use a caption.
+        let browser_title;
+        let title: &str = if screen == Screen::DiscBrowser {
+            browser_title = dir_tail(&ctx.browse_dir, 20);
+            &browser_title
+        } else {
+            Self::title(screen)
+        };
         c.draw_text(
-            px + (pw - Canvas::text_width(title)) / 2,
+            px + (pw.saturating_sub(Canvas::text_width(title))) / 2,
             py + 8,
             title,
             TITLE,
@@ -475,15 +565,16 @@ impl Osd {
         c.fill_rect(px + 6, py + 22, pw - 12, 1, PANEL_BORDER);
 
         let row0 = py + 28;
-        for (i, it) in items.iter().enumerate() {
-            let ry = row0 + i * 12;
+        for vis in 0..shown {
+            let i = first + vis;
+            let ry = row0 + vis * 12;
             let color = if i == sel {
                 c.fill_rect(px + 4, ry - 2, pw - 8, 11, HILITE_BAR);
                 ITEM_SEL
             } else {
                 ITEM
             };
-            c.draw_text(px + 12, ry, &it.label, color);
+            c.draw_text(px + 12, ry, &items[i].label, color);
         }
 
         self.draw_toast(c);
@@ -497,6 +588,20 @@ impl Osd {
             c.fill_rect(tx, ty, tw, 12, TOAST_BG);
             c.draw_text(tx + 4, ty + 2, msg, TOAST_FG);
         }
+    }
+}
+
+/// The trailing `max` characters of a path string, prefixed with ".." when
+/// clipped — keeps the *current* folder visible in the disc-browser title
+/// rather than the (usually long, usually shared) leading path.
+fn dir_tail(path: &str, max: usize) -> String {
+    let n = path.chars().count();
+    if n <= max {
+        path.to_string()
+    } else {
+        let keep = max.saturating_sub(2);
+        let tail: String = path.chars().skip(n - keep).collect();
+        format!("..{tail}")
     }
 }
 
@@ -515,7 +620,16 @@ mod tests {
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
             bios_active: 0,
+            browse_entries: Vec::new(),
+            browse_dir: "/games".into(),
         }
+    }
+
+    fn dir(name: &str) -> BrowseEntry {
+        BrowseEntry { name: name.into(), is_dir: true }
+    }
+    fn file(name: &str) -> BrowseEntry {
+        BrowseEntry { name: name.into(), is_dir: false }
     }
 
     /// Navigate from the main screen to a named item by repeated Down, then
@@ -784,5 +898,108 @@ mod tests {
         assert!(osd.is_open());
         // Back from Main closes/resumes.
         assert_eq!(osd.handle(Nav::Back, &c), Some(OsdAction::Resume));
+    }
+
+    /// Open the disc browser from Main, with a given directory listing.
+    fn open_browser(osd: &mut Osd, c: &OsdCtx) {
+        assert_eq!(select_main(osd, c, "Load Disc..."), None); // pushes browser
+    }
+
+    #[test]
+    fn load_disc_item_lists_entries_dirs_get_a_slash() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.browse_entries = vec![dir(".."), dir("saturn"), file("vf2.cue"), file("game.iso")];
+        open_browser(&mut osd, &c);
+        let items = osd.items(osd.screen(), &c);
+        // Dirs carry a trailing '/', files don't; "Back" is last.
+        assert_eq!(items[0].label, "../");
+        assert_eq!(items[1].label, "saturn/");
+        assert_eq!(items[2].label, "vf2.cue");
+        assert_eq!(items[3].label, "game.iso");
+        assert_eq!(items.last().unwrap().label, "Back");
+    }
+
+    #[test]
+    fn browser_directory_emits_enter_and_resets_selection() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.browse_entries = vec![dir(".."), dir("saturn"), file("vf2.cue")];
+        open_browser(&mut osd, &c);
+        osd.handle(Nav::Down, &c); // sel = 1 ("saturn/")
+        // Selecting a directory emits BrowseEnter(idx), stays open, resets cursor.
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::BrowseEnter(1)));
+        assert_eq!(osd.sel(), 0, "selection resets for the rebuilt listing");
+        assert!(osd.is_open());
+    }
+
+    #[test]
+    fn browser_file_emits_load_disc() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.browse_entries = vec![dir(".."), file("vf2.cue"), file("game.iso")];
+        open_browser(&mut osd, &c);
+        osd.handle(Nav::Down, &c); // sel = 1
+        osd.handle(Nav::Down, &c); // sel = 2 ("game.iso")
+        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::LoadDisc(2)));
+    }
+
+    #[test]
+    fn browser_empty_offers_placeholder_then_back() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // browse_entries empty
+        open_browser(&mut osd, &c);
+        let items = osd.items(osd.screen(), &c);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "(no disc images)");
+        // Selecting the placeholder just pops back to Main.
+        assert_eq!(osd.handle(Nav::Select, &c), None);
+        assert!(osd.is_open());
+    }
+
+    #[test]
+    fn browser_back_pops_to_main() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.browse_entries = vec![file("vf2.cue")];
+        open_browser(&mut osd, &c);
+        // "Back" is the last row.
+        assert_eq!(select_main(&mut osd, &c, "Back"), None);
+        assert!(osd.is_open());
+        // Now back at Main: the next Back resumes.
+        assert_eq!(osd.handle(Nav::Back, &c), Some(OsdAction::Resume));
+    }
+
+    #[test]
+    fn browser_long_directory_scrolls_without_panic() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.browse_entries = (0..40).map(|i| file(&format!("disc{i:02}.cue"))).collect();
+        open_browser(&mut osd, &c);
+        // Walk well past the viewport; the windowed draw must stay in bounds.
+        for _ in 0..30 {
+            osd.handle(Nav::Down, &c);
+        }
+        assert_eq!(osd.sel(), 30);
+        let (w, h) = (320usize, 240usize);
+        let mut buf = vec![0u8; w * h * 4];
+        osd.render_overlay(&mut buf, w, h, &c); // must not panic / overflow
+        assert!(buf.iter().any(|&b| b != 0), "scrolled browser paints pixels");
+    }
+
+    #[test]
+    fn dir_tail_keeps_the_current_folder() {
+        assert_eq!(dir_tail("/games", 20), "/games");
+        let long = "/home/user/roms/saturn/jp";
+        let t = dir_tail(long, 20);
+        assert_eq!(t.chars().count(), 20);
+        assert!(t.starts_with(".."));
+        assert!(t.ends_with("saturn/jp"));
     }
 }
