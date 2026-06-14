@@ -12,24 +12,24 @@ Current test count: **1086 workspace-wide, 0 failures**, ~85% line coverage
 
 ✅ complete · 🟡 partial (usable core, refinements pending) · 🔶 stub · ⬜ not started.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| SH-2 (SH7604) ×2 core | ✅ | Full ISA, 5-stage cycle model, cache, exceptions, on-chip INTC/DIVU/FRT/DMAC/WDT (SCI/UBC storage stubs) |
-| Saturn bus + memory map | ✅ | Typed regions, per-access BSC bus-timing model (M12 #8), open-bus default |
-| Event-driven scheduler | ✅ | Deterministic; master-leads-slave SH-2 interleave + CD-block entity |
-| SMPC | ✅ | Slave hold/release, staged INTBACK + pad/mouse, NMIREQ, SNDON/OFF, live RTC, region; clock-change/SYSRES no-op |
-| SCU (+ DMA + INTC) | ✅ | 3 DMA channels (direct/indirect/strides/start factors, cycle-stealing), interrupt aggregation, Timer 0/1 |
-| SCU-DSP | ✅ | Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
-| VDP2 | ✅ | NBG0–3 + RBG0/1 + sprite layer compositor: priority, colour calc (+special/extended), windows, shadow, mosaic, colour offset, line/back screens, per-line scroll/zoom, VCP fetch gating, CRAM modes, hi-res (320–704), live raster regs |
-| VDP1 | ✅ | Full plotter (all primitives/colour modes, gouraud), erase, double-buffer (FBCR), TVM 8bpp + DIE interlace, cycle-accurate draw-end IRQ. TVM=3 (8bpp+rotate) deferred |
-| MC68EC000 (sound CPU) | ✅ | Full ISA + exception/interrupt model, exact MUL/DIV timing, address/bus/trace exceptions |
-| SCSP | ✅ | 32-slot PCM+FM engine, ADSR, LFO, mixer/DAC, MVOL, slot monitor (0x408), 128-step effect DSP, CD-DA via EXTS, 44.1 kHz output |
-| CD-block | 🟡 | HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
-| Cartridge slot | ✅ | Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
-| SDL2 frontend | ✅ | Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
-| Save states | ✅ | `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
-| Backup RAM (battery) | ✅ | Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
-| On-screen menu (OSD) | ✅ | Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
+| Component | Status |
+|-----------|--------|
+| SH-2 (SH7604) ×2 core | ✅ Full ISA, 5-stage cycle model, cache, exceptions, on-chip INTC/DIVU/FRT/DMAC/WDT (SCI/UBC storage stubs) |
+| Saturn bus + memory map | ✅ Typed regions, per-access BSC bus-timing model (M12 #8), open-bus default |
+| Event-driven scheduler | ✅ Deterministic; master-leads-slave SH-2 interleave + CD-block entity |
+| SMPC | ✅ Slave hold/release, staged INTBACK + pad/mouse, NMIREQ, SNDON/OFF, live RTC, region; clock-change/SYSRES no-op |
+| SCU (+ DMA + INTC) | ✅ 3 DMA channels (direct/indirect/strides/start factors, cycle-stealing), interrupt aggregation, Timer 0/1 |
+| SCU-DSP | ✅ Full VLIW core (ALU/MUL/buses/jumps/DMA/END), host-wired |
+| VDP2 | ✅ NBG0–3 + RBG0/1 + sprite layer compositor: priority, colour calc (+special/extended), windows, shadow, mosaic, colour offset, line/back screens, per-line scroll/zoom, VCP fetch gating, CRAM modes, hi-res (320–704), live raster regs |
+| VDP1 | ✅ Full plotter (all primitives/colour modes, gouraud), erase, double-buffer (FBCR), TVM 8bpp + DIE interlace, cycle-accurate draw-end IRQ. TVM=3 (8bpp+rotate) deferred |
+| MC68EC000 (sound CPU) | ✅ Full ISA + exception/interrupt model, exact MUL/DIV timing, address/bus/trace exceptions |
+| SCSP | ✅ 32-slot PCM+FM engine, ADSR, LFO, mixer/DAC, MVOL, slot monitor (0x408), 128-step effect DSP, CD-DA via EXTS, 44.1 kHz output |
+| CD-block | 🟡 HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
+| Cartridge slot | ✅ Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
+| SDL2 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
+| Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
+| Backup RAM (battery) | ✅ Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
+| On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
 **Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
 Two commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
@@ -303,26 +303,23 @@ bigger usability win but its own scoped task** (a feature-gated reader crate,
 mirroring `physdisc`, not hand-rolled codecs). G2/G6 carry real regression risk
 (the current behaviour is load-bearing) — fix only with a repro.
 
-Status key: 🟡 partial (core path done, edge residue) · ⬜ not started. None are
-✅ — each is a known remainder pulled on demand.
-
-| # | Gap | Subsystem | Status | Note |
-|---|-----|-----------|--------|------|
-| G1 | CHD disc images + multi-disc `.m3u` playlist swapping | disc / frontend | ⬜ | Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only. Split effort: `.m3u` low, CHD high (compressed hunk container — prefer a feature-gated crate) |
-| G2 | `SNDON` does a full 68k reset, not an un-halt | SCSP | ⬜ | a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
-| G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | SCSP | ⬜ | only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
-| G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | SCSP | ⬜ | `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
-| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `BEF` status flag always 0; `CEF`-clear-on-swap nuance | VDP1 | 🟡 | **`CEF` itself is done** (latched on draw-end, cleared at list-start); the residue is erase-on-displayed + `BEF` + MAME's extra clear-on-swap. All edge cases |
-| G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | VDP2 raster | 🟡 | **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
-| G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | SCU | 🟡 | **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
+| # | Gap | Status |
+|---|-----|--------|
+| G1 | CHD disc images + multi-disc `.m3u` playlist swapping (disc/frontend) | ⬜ Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only. Split effort: `.m3u` low, CHD high (compressed hunk container — prefer a feature-gated crate) |
+| G2 | SCSP `SNDON` does a full 68k reset, not an un-halt | ⬜ a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
+| G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | ⬜ only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
+| G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | ⬜ `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
+| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `BEF` status flag always 0; `CEF`-clear-on-swap nuance | 🟡 **`CEF` itself is done** (latched on draw-end, cleared at list-start); the residue is erase-on-displayed + `BEF` + MAME's extra clear-on-swap. All edge cases |
+| G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | 🟡 **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
+| G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | 🟡 **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
 
 ## Performance (opt-in "fast mode" — future)
 
 Accuracy stays the default and the trace-diff baseline; never a JIT/dynarec.
 Levers catalogued from how Mednafen stays LLE at full speed:
 
-| # | Lever | Status / risk |
-|---|-------|---------------|
+| # | Lever | Status |
+|---|-------|--------|
 | P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
 | P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
 
