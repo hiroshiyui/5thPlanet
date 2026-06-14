@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-14
+
+Adds the OSD disc-image browser and fixes VF2 input lag, plus an M13 A1
+timing-accuracy refinement and a documentation overhaul. Backwards-compatible:
+the save-state format (v9) and the `bios_boot` golden hash are both unchanged,
+so existing save states still load.
+
+### Added
+
+- **Disc-image browser in the OSD.** Esc → **Load Disc…** opens a filesystem
+  browser: navigate directories and pick a `.cue` / `.iso` / `.ccd`; selecting
+  an image loads it and power-cycles to boot the game. The menu stays core-free
+  and `fs`-free (the frontend supplies the directory listing); a scrolling
+  viewport handles large directories.
+- **Raster batch-drain jitter probe** (M13 A1, dev instrumentation) — an
+  observer-only check confirming VCNT/TVSTAT reads are never stale, the evidence
+  that the HBlank clamp edge can stay deferred.
+
+### Changed
+
+- **SMPC command dispatch is now an exact mid-batch event** (M13 A1). A queued
+  command breaks the scheduler batch so it dispatches within one instruction of
+  the COMREG write, matching the LLE reference. Golden-safe — a timing-fidelity
+  improvement, not a behaviour regression.
+- **Documentation overhaul.** Normalised all roadmap tables to one format;
+  consolidated Tier G (residual reference-audit items) with status markers;
+  retired the point-in-time MAME/Mednafen cross-reference audits, folding their
+  durable residue into `bootstrapping.md` §C.1 and roadmap Tier G; added an
+  **Enhancements** section (EN1: GLSL shader presets); and synced the disc
+  browser into the feature docs.
+
+### Fixed
+
+- **Input lag / "not steady 60 fps" in VF2.** The emu-thread frame pacer was
+  chronically collapsing ~1/3 of rendered frames ("run 2, show 1") because it
+  chased an audio-reserve target it structurally couldn't reach. It now renders
+  **every** game-frame in normal play, collapsing only when the audio reserve
+  has genuinely drained toward an under-run — smoother motion and lower input
+  latency. The `SAT_MAX_BURST` env var becomes the catch-up ceiling (default 2;
+  `=1` disables catch-up).
+
 ## [0.3.1] - 2026-06-14
 
 A small, behaviour-preserving release: a save/load latency optimization plus
