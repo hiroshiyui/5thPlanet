@@ -456,7 +456,7 @@ font; **Esc** opens it. The module is deliberately `sdl2`-free and core-free
 (it draws into a `&mut [u8]` buffer and consumes a `Nav` enum), so it's
 unit-tested without a window; `main.rs` bridges SDL keys → `Nav`/pad and
 runs the resulting actions (save/load [save state] slots, reset, eject/insert
-disc, quit).
+disc, load a disc image via a filesystem browser, quit).
 
 **On-chip peripherals** — SH7604 builds INTC, DMAC, DIVU, FRT, BSC,
 WDT, SCI, UBC right into the CPU package. Mapped at

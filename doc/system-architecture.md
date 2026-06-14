@@ -244,8 +244,8 @@ implemented-vs-total figures the percentage is based on, where countable.
 instruction families + **13** ALU ops · MC68EC000 full 68000 set
 (inline-decoded) · CD-block **33 of ~50** host commands · SMPC **16** commands ·
 VDP1 **9** command types (full set) · VDP2 **101** named registers, 6 layers ·
-**527** tests workspace-wide (sh2 153, m68k 68, scu_dsp 21, saturn 273,
-frontend 12).
+**555** tests workspace-wide (sh2 153, m68k 68, scu_dsp 21, saturn 273,
+frontend 40).
 
 | Component | Code | Progress | Count | Done / remaining |
 |---|---|---|---|---|
@@ -262,7 +262,7 @@ frontend 12).
 | Live optical drive | `crates/physdisc/` | ~80% | 1 backend (libcdio) | M10: libcdio `SectorSource` (TOC + raw sectors + CD-DA), feature-gated. Linux-verified; other OSes untested. |
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
 | Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
-| Frontend (SDL2 + OSD) | `jupiter/` | ~55% | OSD phase 1/4+ | M9: window, audio, input, headless mode; OSD phase 1 (save/load, reset, eject, quit). Graphics / controller-rebind / region-BIOS / cartridge submenus + config file remain. (12 tests) |
+| Frontend (SDL2 + OSD) | `jupiter/` | ~80% | OSD complete | M9: window, audio, input, headless mode; full OSD — save/load slots, reset, disc eject/insert + a **Load Disc… image browser** (navigate + pick + boot), and Settings (Graphics / Controller keyboard-rebind / Region / Cartridge / BIOS) with persisted config. Per-button gamepad rebind + analog devices deferred to M13 E2. (40 tests) |
 | LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The boot blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Post-boot, VF2 runs on both SH-2s and streams its CD asset load (after the BCR1 master/slave + `run_frame`-no-split fixes), then stalls mid-load: a dev-build CD trace-diff proved the CD layer byte-identical to Mednafen, so the remaining blocker is scheduler/interrupt-timing accuracy (Mednafen-alignment Phase 2 landed — master-leads interleave + per-instruction SCU sampling — Phase 3 remains). |
 
 ---

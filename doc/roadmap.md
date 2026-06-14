@@ -29,7 +29,7 @@ Current test count: **1086 workspace-wide, 0 failures**, ~85% line coverage
 | SDL2 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
 | Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
 | Backup RAM (battery) | ✅ Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
-| On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
+| On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert + image browser, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
 **Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
 Two commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
@@ -130,7 +130,9 @@ bumps, rewind/run-ahead, compression.
 
 Hand-rolled, software-composited in-window menu (ADR-0008), sdl2-free +
 core-free so it's unit-tested without a window. Esc opens it: save/load slots
-(10), Reset, Eject/Insert disc, Quit, plus Settings — **Graphics** (scale
+(10), Reset, Eject/Insert disc, a **Load Disc…** filesystem image browser
+(navigate dirs, pick a `.cue`/`.iso`/`.ccd`, load + boot — frontend owns the
+`fs`, the menu stays pure), Quit, plus Settings — **Graphics** (scale
 1×–4×, fullscreen), **Controller** (press-to-bind keyboard rebind),
 **Region**, **Cartridge**, **BIOS** (power-cycle into a sibling 512-KiB image,
 save files re-keyed). All persisted to a flat TOML-subset config at
