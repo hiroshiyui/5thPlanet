@@ -60,9 +60,13 @@ crates/physdisc/   — M10: live optical-drive `SectorSource` via libcdio,
                      feature-gated (`libcdio`); the sole `unsafe`/FFI crate
                      (ADR-0009). Default build is a stub.
 crates/debugger/   — interactive headless Saturn debugger (bin `sdbg`): a
-                     gdb-style REPL over `saturn::Saturn`. Master + slave
-                     breakpoints, both register-guarded (`b`/`bs <addr> <ri>
-                     <v>`); a bp **memory probe** (`probe <addr>` captures raw
+                     gdb-style REPL over `saturn::Saturn`. **Multiple** master +
+                     slave breakpoints, each register-guarded (`b <addr> [ri v]`
+                     adds, `b` lists, `bd <id>` deletes; both `c` and `fc` honour
+                     the list, the hit says which fired); a **symbol table**
+                     (`sym`/`syms <file>`/`--syms=`) resolving names anywhere an
+                     address is expected and annotating output `name+0xNN`; a bp
+                     **memory probe** (`probe <addr>` captures raw
                      WRAM read through the bus, no CPU cache, at the bp cycle —
                      the cache-vs-torn-write test); single-step; SH-2 + SCSP-68k
                      disasm (`d68`) + 68k PC-trace (`t68`); read/write
