@@ -828,6 +828,10 @@ impl Dbg {
             reference.len()
         );
 
+        // Snapshot the pre-trace state so the divergence can be re-run to a
+        // breakpoint for exact register state (the frame-batched trace pass runs
+        // past it). Cheap — external media is referenced, not embedded.
+        let snap = self.sat.save_state();
         let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
         let mut cursor = 0usize; // index into `reference` matched so far
         let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
@@ -851,6 +855,7 @@ impl Dbg {
                 }
                 if pc != reference[cursor] {
                     self.report_divergence(&reference, cursor, pc, add, f);
+                    self.pin_divergence(&snap, pc.wrapping_sub(add), f + 2);
                     return;
                 }
                 cursor += 1;
@@ -885,7 +890,36 @@ impl Dbg {
         }
         println!("  ours executed @ {exec:08X}:");
         self.dump_disasm(exec, 4);
-        println!("  inspect regs there:  (re)load a snapshot, `b {exec:08X}`, then `fc`");
+    }
+
+    /// After a divergence, rewind to the pre-trace snapshot and re-run to a
+    /// breakpoint at the divergent PC, so its full register state + call-chain
+    /// are captured (the frame-batched trace pass runs past it). The machine is
+    /// left parked there for `r`/`m`/`d` inspection.
+    ///
+    /// This lands on the **first execution** of the divergent PC. For a
+    /// control-flow fork (ours branches somewhere the matched prefix never went)
+    /// that *is* the divergence; for a divergence inside a loop that matched
+    /// several iterations first, it lands on the loop's first pass — re-run with
+    /// a register-guarded breakpoint (`b {pc} <ri> <v>`) to pin the right one.
+    fn pin_divergence(&mut self, snap: &[u8], exec: u32, max_frames: u64) {
+        if self.sat.load_state(snap).is_err() {
+            println!("  (could not rewind to capture registers at the divergence)");
+            return;
+        }
+        self.sat.bus.cd_block.cmd_log_on = true;
+        self.sat.set_master_bps(vec![(exec, None)]);
+        self.sat.set_master_bp_probe(self.bp_probe);
+        for f in 0..max_frames {
+            self.sat.run_for(CYCLES_PER_FRAME);
+            if let Some(h) = self.sat.take_master_bp_hit() {
+                println!("\n  registers at the divergence (rewound + re-run to {exec:08X}):");
+                self.report_bp_hit("  divergence", f, &h, true);
+                println!("  machine parked here — inspect with `r` / `m` / `d`.");
+                return;
+            }
+        }
+        println!("  (re-run did not reach {exec:08X} within {max_frames} frames)");
     }
 
     /// Full-system run until the CD-block first logs a host command matching
