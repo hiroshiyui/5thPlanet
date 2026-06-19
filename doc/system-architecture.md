@@ -120,7 +120,21 @@ source of truth; this table mirrors them:
 
 Each region struct owns its bytes with big-endian `read*/write*` at *region-local*
 offsets and folds out-of-range offsets modulo its size (so a smaller image
-mirrors transparently). Wait states are SH7604 BSC defaults (`waits_for`).
+mirrors transparently).
+
+**Bus timing (M12)** is no longer a flat per-region default — it is a faithful
+Mednafen `BSC_BusRead/Write` port (`BusTiming` in `bus.rs`, serialized since
+savestate v6). A **shared bus timestamp** both CPUs sync to makes CPU↔CPU
+arbitration emerge (Mednafen's `SH7095_mem_timestamp`); **CS0 is a 16-bit bus**
+with per-transaction costs (a 32-bit access pays twice); **CS3 high WRAM is
+32-bit SDRAM** (read +7, write +2 with an array-busy window; a cache-line fill is
+one free burst); the **SH-2 write buffer** lets a lone store return 0 stall;
+**bus turnaround** costs +1. The **B-bus** uses an exact deferred-write model — a
+write hands off in +2 cycles and posts its device-side completion (SCSP +17/+13,
+VDP1 +9/+1, VDP2 +3/+1 per 16-bit half), which only the *next* B-bus access waits
+out; a B-bus read is always two 16-bit halves (VDP1 +28, VDP2 +40, **SCSP +48**).
+SCU-DMA arbitration follows Mednafen's `dma_time_thing` costs, and a
+C-bus-endpoint SCU DMA halts **both** SH-2s for its paced duration.
 
 ---
 
@@ -155,10 +169,15 @@ the surface the frontend holds.
   a between-batch drain — they're sampled per master instruction in `step_cpus`
   (Phase 2B; the former `drain_scu_intc` was removed).
 
-The **SMPC** (`smpc.rs`) is the low-speed controller: reset/clock, the RTC, pad
-input via `INTBACK`, and slave/sound on-off (`SSHON`/`SSHOFF`, `SNDON`). The
-**SCU** (`scu.rs`) holds the 3 DMA channels, the interrupt mask/status (IMS/IST),
-and the timers, and aggregates interrupts toward the master.
+The **SMPC** (`smpc.rs`) is the low-speed controller: reset/clock, the RTC,
+peripheral input via `INTBACK`, and slave/sound on-off (`SSHON`/`SSHOFF`,
+`SNDON`). Controller ports are selectable (`PortDevice::{None,Pad,Mouse}`): the
+digital pad (ID `0x02`) or the **Shuttle Mouse** (ID `0xE3`, three data bytes;
+`Saturn::feed_mouse`, jupiter `--mouse`). The **SCU** (`scu.rs`) holds the 3 DMA
+channels, the interrupt mask/status (IMS/IST), and the timers, and aggregates
+interrupts toward the master — including the **CD-block external interrupt**
+(`Source::Cd`, IST bit 16, vector `0x50`, level 7), a level driven by
+`Scu::set_cd_int` from `CdBlock::irq_active()` and masked by IMS bit 15 (§7).
 
 ---
 
@@ -168,13 +187,28 @@ and the timers, and aggregates interrupts toward the master.
 double-buffered framebuffer; VDP2 (`vdp2/renderer.rs`) composites NBG0–3 and
 RBG0/1 (rotation in `vdp2/rotation.rs`) by priority, plus the VDP1 sprite layer,
 with colour calculation, windows, and per-line scroll/zoom. `Saturn::run_frame`
-calls `vdp2::render_frame(&vdp2, Some(vdp1.display_fb()), out)` to produce the
-final RGBA8888 320×224 frame.
+calls `vdp2::render_frame(...)`, which renders at the **active resolution decoded
+from TVMD** (320/352/640/704 wide × 224/240/256 tall, ×2 for double-density
+interlace) and returns those dims; the output buffer is sized for the maximum
+(`MAX_FRAME_WIDTH 704 × MAX_FRAME_HEIGHT 512`, RGBA8888). VDP1 always plots at its
+native horizontal resolution, so in the 640/704-dot modes each VDP1 framebuffer
+dot occupies two display dots.
 
 **Audio:** the SCSP (`scsp/mod.rs`) is a 32-slot FM/PCM engine + the SCSP-DSP
 (`scsp/dsp.rs`) + the hosted MC68EC000 in sound RAM. `Saturn::take_audio` drains
-the mixed 44.1 kHz stereo each frame and **sums in CD-DA** decoded by the
-CD-block (CDDA→SCSP, M10) at the aggregate.
+the mixed 44.1 kHz stereo each frame. **CD-DA enters as the SCSP's EXTS digital
+inputs** (M11 — *not* an aggregate-level sum): each batch `Saturn::run_for` feeds
+the SCSP exactly the CD samples it will consume (`cd_need`/`feed_cd`), and the
+SCSP mixes them at the game-programmed levels (slots 16/17's effect-return is the
+CD volume; the effect DSP can read EXTS as inputs IRA `0x30`/`0x31`). The earlier
+full-level aggregate sum played BGM 10–20× over the game's mix and drowned SFX.
+
+**Frontend pipeline (`jupiter/`):** the SDL2 frontend overlaps work across two
+cores — `main.rs` advances the machine (`Saturn::advance_frame`) while a
+`render_pipe` worker composites the *previous* frame (the displayed frame trails
+by one; pixels are bit-identical). **Audio is the pacer, not vsync**: the device
+stays paused until the 44.1 kHz queue first holds `SAT_AUDIO_MS` (default 120 ms)
+of reserve, then `main.rs` bursts emulated frames to keep that reserve filled.
 
 ---
 
@@ -197,19 +231,26 @@ polls `FTCSR.ICF`). See [`glossary.md`](glossary.md) "FTI inter-CPU signalling".
 32-bit SCU-DMA data port, the ISO9660 filesystem, and disc authentication —
 reading sectors through a `disc::SectorSource` (an in-memory image, or a live
 optical drive via the feature-gated `crates/physdisc/` libcdio crate, ADR-0009,
-the project's only `unsafe`).
+the project's only `unsafe`). It drives the **SCU external interrupt 0**
+(`Source::Cd`, vector `0x50`, level 7) as a level — `irq_active()` =
+`(HIRQ & HIRQ_Mask) != 0`, sampled per master instruction (M11, §4) — and models
+the disc-recognition spin-up (`DrivePhase::Startup`: ~1 s `STATUS_BUSY` before
+settling to PAUSE).
 
-**Boot — LLE only:** run the real BIOS ROM; it initialises the hardware and
-either boots a disc or drops to its CD player. This is the path the `bios_boot`
-golden test pins, and the one M11 (boot a game) is being driven down via a
-trace-diff against Mednafen. (An opt-in HLE direct boot + HLE BIOS SYS-call
-library was tried and removed — ADR-0010/0011 Superseded — because the reference
-oracle is itself LLE, so a valid PC-trace-diff needs LLE↔LLE.)
+**Boot — LLE only:** run the real BIOS ROM; it authenticates the disc,
+region-checks, reads IP.BIN, loads the 1st-read program, and jumps to it (or
+drops to its CD player). This is the path the `bios_boot` golden test pins.
+**M11 (boot a game) is complete** (tag `vf2-good-emulation`): Virtua Fighter 2 is
+fully playable at a steady 60 fps (looping CD-DA BGM, balanced SFX, full 3D
+fights) and Doukyuusei ~if~ is fully playable at native 640×224 hi-res (GFX, SFX,
+and voices). (An opt-in HLE direct boot + HLE BIOS SYS-call library was tried and
+removed — ADR-0010/0011 Superseded — because the reference oracle is itself LLE,
+so a valid PC-trace-diff needs LLE↔LLE.)
 
-**Save states** (`savestate.rs`, M8): a `bincode` snapshot of the whole machine;
-external media (BIOS/disc/ROM-cart bytes) is referenced not embedded, re-grafted
-on load and validated by an FNV-1a fingerprint. **Backup RAM** persists to a
-host file.
+**Save states** (`savestate.rs`, M8; format v9): a `bincode` snapshot of the
+whole machine; external media (BIOS/disc/ROM-cart bytes) is referenced not
+embedded, re-grafted on load and validated by an FNV-1a fingerprint. **Backup
+RAM** persists to a host file.
 
 ---
 
@@ -242,28 +283,28 @@ implemented-vs-total figures the percentage is based on, where countable.
 
 **By the numbers:** SH-2 **143/143** instruction encodings · SCU-DSP **7**
 instruction families + **13** ALU ops · MC68EC000 full 68000 set
-(inline-decoded) · CD-block **33 of ~50** host commands · SMPC **16** commands ·
-VDP1 **9** command types (full set) · VDP2 **101** named registers, 6 layers ·
-**555** tests workspace-wide (sh2 153, m68k 68, scu_dsp 21, saturn 273,
-frontend 40).
+(inline-decoded) · CD-block **33 of ~50** host commands · SMPC **16** commands
+(digital pad + Shuttle Mouse) · VDP1 **9** command types (full set) · VDP2
+**101** named registers, 6 layers · **1099** tests workspace-wide (sh2 210,
+m68k 167, scu_dsp 66, saturn 597, frontend 40, plus doc-tests).
 
 | Component | Code | Progress | Count | Done / remaining |
 |---|---|---|---|---|
 | SH-2 core (master + slave) | `crates/sh2/` | ~95% | 143/143 encodings; 5/8 on-chip live | M1: full ISA decoded + executed (exhaustive `match`), 5-stage pipeline interlocks, write-through cache, exceptions. On-chip INTC/DMAC/DIVU/FRT/WDT functional; **BSC/SCI/UBC are register stubs**. Deep cycle-timing edges refine as games surface them. (153 tests) |
 | MC68EC000 (SCSP CPU) | `crates/m68k/` | ~85% | full 68000 set | M5: 68000 decoded inline (no flat table — addressing modes make one awkward); runs hosted SCSP sound code. Rare ops / edge-case flags may remain. (68 tests) |
 | SCU-DSP | `crates/scu_dsp/` | ~90% | 7 families + 13 ALU ops | M3: standalone core, full ISA + DSP-DMA. (21 tests) |
-| SCSP (FM/PCM engine + SCSP-DSP) | `crates/saturn/src/scsp/` | ~80% | 32 slots | M6: 32-slot FM/PCM engine, SCSP-DSP, hosted 68k, CDDA mix-in. SCSP CD-input level/pan fidelity and some envelope/effect corners are refinements. |
+| SCSP (FM/PCM engine + SCSP-DSP) | `crates/saturn/src/scsp/` | ~85% | 32 slots | M6/M11: 32-slot FM/PCM engine, SCSP-DSP, hosted 68k, **CD-DA via the EXTS digital inputs** (game-programmed mix, not an aggregate sum). Some envelope/effect corners refine as games surface them. |
 | VDP1 (sprite/polygon) | `crates/saturn/src/vdp1/` | ~85% | 9/9 command types | M5: full command-list plotter — normal/scaled/distorted sprites, polygon, polyline, line, user-clip, system-clip, local-coordinate; gouraud + colour-calc. Some rare colour modes/edges. |
 | VDP2 (background/compositor) | `crates/saturn/src/vdp2/` | ~85% | 6 layers; 101 registers | M5: NBG0–3 + RBG0/1, rotation, priority, colour calc, windows, per-line scroll/zoom. Mosaic / some special modes refine as needed. |
-| SCU (DMA / INTC / timers) | `crates/saturn/src/scu.rs` | ~85% | 3 DMA channels | M3: 3 DMA channels, interrupt aggregation, timers. Synchronous block DMA — cycle-stealing timing is a later refinement. |
-| SMPC | `crates/saturn/src/smpc.rs` | ~85% | 16 commands | M3–M4: register bank, `INTBACK` + digital pad, RTC, slave/sound on-off, region. Clock-change / `SYSRES` are no-ops. |
-| Bus + scheduler + memory | `bus.rs` `scheduler.rs` `memory.rs` | ~95% | — | M2: region dispatch, deterministic deadline scheduler, typed RAM/ROM/backup regions. |
-| CD-block (HLE) | `crates/saturn/src/cd_block.rs` | ~85% | 33 of ~50 commands | M7+M10: host interface, block/filter/partition engine, read pump, data transfer, ISO9660 FS, auth, CDDA. **MPEG card + move/copy sector ops deferred.** |
+| SCU (DMA / INTC / timers) | `crates/saturn/src/scu.rs` | ~90% | 3 DMA channels | M3/M11/M12: 3 DMA channels, interrupt aggregation (incl. the CD external IRQ, vec `0x50`), timers. M12 added Mednafen-faithful DMA-bus arbitration (both-CPU halt for C-bus DMAs). Block transfer is still synchronous on its own timeline. |
+| SMPC | `crates/saturn/src/smpc.rs` | ~85% | 16 commands | M3–M4/M13: register bank, `INTBACK` + digital pad **and Shuttle Mouse**, RTC, slave/sound on-off, region. Clock-change / `SYSRES` are no-ops. |
+| Bus + scheduler + memory | `bus.rs` `scheduler.rs` `memory.rs` | ~95% | — | M2/M12: region dispatch, deterministic deadline scheduler, typed RAM/ROM/backup regions, and the per-access **BSC bus-timing model** (`BusTiming` — 16-bit CS0 / 32-bit CS3 SDRAM, write buffer, B-bus deferred writes, shared-timestamp CPU arbitration). |
+| CD-block (HLE) | `crates/saturn/src/cd_block.rs` | ~85% | 33 of ~50 commands | M7+M10+M11: host interface, block/filter/partition engine, read pump, data transfer, ISO9660 FS, auth, CD-DA (→SCSP EXTS), the SCU external interrupt (vec `0x50`), and disc-recognition spin-up. **MPEG card + move/copy sector ops deferred.** |
 | Live optical drive | `crates/physdisc/` | ~80% | 1 backend (libcdio) | M10: libcdio `SectorSource` (TOC + raw sectors + CD-DA), feature-gated. Linux-verified; other OSes untested. |
 | Cartridge slot | `crates/saturn/src/cartridge.rs` | ~90% | 4 cart types | M7: Extension DRAM (1/4 MB), battery RAM, ROM cart, cart-ID byte. |
-| Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | — | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
-| Frontend (SDL2 + OSD) | `jupiter/` | ~80% | OSD complete | M9: window, audio, input, headless mode; full OSD — save/load slots, reset, disc eject/insert + a **Load Disc… image browser** (navigate + pick + boot), and Settings (Graphics / Controller keyboard-rebind / Region / Cartridge / BIOS) with persisted config. Per-button gamepad rebind + analog devices deferred to M13 E2. (40 tests) |
-| LLE BIOS boot / game boot | (uses real BIOS) | ~80% | splash + game code | M4: boots to the SEGA splash, pixel-matching the reference. **M11:** VF2 and Doukyuusei ~if~ boot a *game* via the real BIOS loader — authenticate, region-check, read IP.BIN, load the 1st-read program, and reach game code (VF2 at `0x06004000`). The boot blocker was the CD-block re-raising `DCHG` (Disc Changed) at `Init`; fixed by clearing `disk_changed` on the host's `DCHG` write-1-to-clear (trace-diffed vs Mednafen). Post-boot, VF2 runs on both SH-2s and streams its CD asset load (after the BCR1 master/slave + `run_frame`-no-split fixes), then stalls mid-load: a dev-build CD trace-diff proved the CD layer byte-identical to Mednafen, so the remaining blocker is scheduler/interrupt-timing accuracy (Mednafen-alignment Phase 2 landed — master-leads interleave + per-instruction SCU sampling — Phase 3 remains). |
+| Save states + backup RAM | `savestate.rs` `memory.rs` | ~90% | format v9 | M8: whole-machine bincode snapshot (media referenced), host-persisted battery. No cross-version migration. |
+| Frontend (SDL2 + OSD) | `jupiter/` | ~80% | OSD complete | M9: window, audio, input (keyboard pad, gamepad, **Shuttle Mouse**), headless mode; a **render-pipeline worker** (compositing overlaps emulation on a 2nd core) with **audio as the frame pacer**; full OSD — save/load slots, reset, disc eject/insert + a **Load Disc… image browser** (navigate + pick + boot), and Settings (Graphics / Controller keyboard-rebind / Region / Cartridge / BIOS) with persisted config. Per-button gamepad rebind + analog devices deferred to M13 E2. (40 tests) |
+| LLE BIOS boot / game boot | (uses real BIOS) | ~90% | splash + 2 playable games | M4: boots to the SEGA splash, pixel-matching the reference. **M11 complete (tag `vf2-good-emulation`):** Virtua Fighter 2 and Doukyuusei ~if~ both boot via the real BIOS loader (authenticate, region-check, read IP.BIN, load the 1st-read program) and are **fully playable** — VF2 at a steady 60 fps with looping CD-DA BGM and balanced SFX, Doukyuusei at native 640×224 hi-res with voices. The original boot blocker (the CD-block re-raising `DCHG` at `Init`, fixed by clearing `disk_changed` on the host's write-1-to-clear) and the audio/scheduling endgame (B-bus wait-states, CD-DA via EXTS, master-leads-slave interleave + per-instruction SCU sampling) are resolved; remaining work is per-game cycle-accuracy polish (M12/M13). |
 
 ---
 
