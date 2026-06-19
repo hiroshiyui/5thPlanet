@@ -363,6 +363,31 @@ golden hashes (these run on the framebuffer the core has already produced).
 
 ## Later milestones (queued)
 
+- **Precompiled binary packages (download-and-run distribution).** Ship
+  self-contained `5thplanet` (the `jupiter` frontend, renamed via `[[bin]]`)
+  binaries on GitHub Releases so users don't need a Rust toolchain.
+  - **Crux — SDL2 linking:** currently dynamic (`sdl2 = "0.37"`), so a bare
+    binary needs the host's `libSDL2`. Add a `bundled-sdl2` feature
+    (`sdl2 = ["bundled","static-link"]`) so *release* artifacts statically link
+    SDL2 (self-contained, no system SDL2) while local dev keeps the fast dynamic
+    build. Cost: a C toolchain/CMake in the build env, +~2–4 MB.
+  - **Automation:** no CI exists yet → use **cargo-dist (`dist`)**: one
+    `[workspace.metadata.dist]` block generates a GitHub Actions workflow that
+    builds the per-platform matrix on the `v*` tag push (which the
+    `release-engineering` flow already creates), making archives + SHA256 +
+    installers and uploading to the Release.
+  - **Platforms:** Phase 1 = Linux x86_64 + Windows x86_64 (free runners; mark
+    Windows **experimental/untested** per "Linux-verified, others untested").
+    Phase 2 = macOS x86_64/arm64 (needs a tester) + optional musl fully-static
+    Linux.
+  - **Legal (non-negotiable):** (1) the **BIOS is never shipped** — release notes
+    must state the user supplies their own legally-obtained dump (the `bios/`
+    policy); (2) keep **`physical-disc`/libcdio OFF** in every distributed binary
+    — libcdio is GPL and the project is MIT, so default-feature builds stay
+    MIT-clean (a release build must not enable it).
+  - Archive contents: the `5thplanet` binary (optionally `sdbg`), README,
+    LICENSE (MIT) + bundled SDL2 zlib licence, the BIOS-not-included note,
+    SHA256SUMS.
 - MPEG card + CD move/copy sector ops (deferred from M7).
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the
   project's design axis).
