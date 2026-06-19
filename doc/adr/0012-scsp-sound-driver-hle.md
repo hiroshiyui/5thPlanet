@@ -37,7 +37,7 @@ cheap, high-confidence axes (cycle timing) are exhausted.
 
 The project is **accuracy-first** (ADR-0002). The user has chosen to consider
 deviating for this *optional* audio goal (the boot-BGM investigation, now
-resolved — see [`../bootstrapping.md` §B.7](../bootstrapping.md#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06)),
+resolved — see [`../system-architecture.md` §9, B.7](../system-architecture.md#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06)),
 via this design study.
 
 **Directly relevant precedent — HLE was tried here and removed.** ADR-0010

@@ -3,7 +3,8 @@
 Accuracy-first SEGA Saturn emulator in Rust. Milestones are scoped tightly so
 the foundation is solid before the next chip is added. This file is a status
 tracker; blow-by-blow investigation history lives in the git log,
-`doc/bootstrapping.md`, and the commit messages referenced below.
+`doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
+referenced below.
 
 Current test count: **1086 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
@@ -228,7 +229,7 @@ timing-gated behaviour matches even when code/data are byte-identical.
 | 9 | Validate: BGM phase matches, *Doukyuusei* stable, master PC-trace aligned over a multi-second run, golden + suite green | ✅ (2026-06-12) BGM-phase seq-ticks **+182 → −47 vs the oracle** (4450 vs a same-day re-measured 4497, ~1%): the DMA cost model (#8b) was the dominant term. The residual decomposes into (a) a **discrete ~14-frame recognition-handshake offset** (boot-anim start f125 vs oracle f111; recognition/INTBACK `REVIEW(magic)`-class — ours' Startup also skips the oracle's post-spin-up `StartSeek(0x800096)`) and (b) a **diffuse component dominated by a 68k-gated mailbox poll loop** (master PC `0x06032D02`, store-then-poll-until-cleared) — poll-loop *phase*, i.e. oracle-approximation territory per the M4 stop rule. Both documented as follow-up threads, not per-instruction cost errors. `bios_boot` golden unchanged through all of M12; Timer-B period locked (88.0009); VF2 trajectory (late_game f999, 0 stalls) + Doukyuusei title BGM (avg \|amplitude\| 1203) healthy |
 
 The full BGM/phase trace-down (probes, lockstep tools, refuted hypotheses) is
-in `doc/bootstrapping.md §B.7`.
+in `doc/system-architecture.md` §9, Part B.7.
 
 ## Milestone 13 — Hardware completeness & fidelity backlog 📋
 
@@ -294,7 +295,8 @@ MAME + Mednafen cross-reference audits (2026-06-08, since retired — their
 boot-critical findings all landed; these are the small open remainders). None
 block the current targets; each is golden-safe and pulled when a game needs it.
 The deliberate, *do-not-regress* divergences from MAME/Yabause those audits
-recorded now live in [`bootstrapping.md`](bootstrapping.md) §C.1.
+recorded now live in [`system-architecture.md`](system-architecture.md) §9,
+Part C.1.
 
 **Triage (2026-06-14 re-verified at HEAD):** all rows still hold. **G2 and G3
 are the two most likely to actually surface** (both audio, both plausibly hit by
