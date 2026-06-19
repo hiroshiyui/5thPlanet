@@ -364,8 +364,8 @@ golden hashes (these run on the framebuffer the core has already produced).
 ## Later milestones (queued)
 
 - **Precompiled binary packages (download-and-run distribution).** Ship
-  self-contained `5thplanet` (the `jupiter` frontend, renamed via `[[bin]]`)
-  binaries on GitHub Releases so users don't need a Rust toolchain.
+  self-contained `jupiter` frontend binaries on GitHub Releases so users don't
+  need a Rust toolchain.
   - **Crux — SDL2 linking:** currently dynamic (`sdl2 = "0.37"`), so a bare
     binary needs the host's `libSDL2`. Add a `bundled-sdl2` feature
     (`sdl2 = ["bundled","static-link"]`) so *release* artifacts statically link
@@ -385,7 +385,7 @@ golden hashes (these run on the framebuffer the core has already produced).
     policy); (2) keep **`physical-disc`/libcdio OFF** in every distributed binary
     — libcdio is GPL and the project is MIT, so default-feature builds stay
     MIT-clean (a release build must not enable it).
-  - Archive contents: the `5thplanet` binary (optionally `sdbg`), README,
+  - Archive contents: the `jupiter` binary (optionally `sdbg`), README,
     LICENSE (MIT) + bundled SDL2 zlib licence, the BIOS-not-included note,
     SHA256SUMS.
 - MPEG card + CD move/copy sector ops (deferred from M7).
