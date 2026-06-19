@@ -175,6 +175,10 @@ enum Select {
     Close,
 }
 
+/// The in-window OSD menu state (ADR-0008): whether it's open, the
+/// screen/selection stack, a transient toast line, and any pending key-capture.
+/// A pure, sdl2-free, core-free state machine — driven by navigation input and
+/// rendered into an RGBA buffer, so it unit-tests without a window.
 pub struct Osd {
     open: bool,
     /// Screen stack with the selection index for each level.
@@ -194,6 +198,7 @@ impl Default for Osd {
 }
 
 impl Osd {
+    /// A closed OSD positioned at the main menu.
     pub fn new() -> Self {
         Self {
             open: false,
@@ -214,6 +219,7 @@ impl Osd {
         self.capturing = None;
     }
 
+    /// Whether the menu is currently showing (and intercepting input).
     pub fn is_open(&self) -> bool {
         self.open
     }
