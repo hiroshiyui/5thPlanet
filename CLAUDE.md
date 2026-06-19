@@ -73,9 +73,12 @@ crates/debugger/   — interactive headless Saturn debugger (bin `sdbg`): a
                      watchpoints (`SAT_RWATCH`/`bw`); HIRQ-edge trace (`hirqlog`);
                      **reference master-PC trace-diff** (`tdiff <ref> [frames]` —
                      full-system `run_for_traced` run vs a Mednafen `SS_PCTRACE`
-                     dump, stops at the first divergent PC + context; the
-                     LLE↔Mednafen methodology hosted in the REPL; `TDIFF_ADD`/
-                     `PCTRACE_LO`/`PCTRACE_HI` knobs); memory search; CD-block +
+                     dump, stops at the first divergent PC + context, then
+                     rewinds (pre-trace snapshot) + re-runs to a breakpoint there
+                     to capture registers + call-chain, parking the machine at
+                     the divergence; the LLE↔Mednafen methodology hosted in the
+                     REPL; `TDIFF_ADD`/`PCTRACE_LO`/`PCTRACE_HI` knobs); memory
+                     search; CD-block +
                      SCSP/68k state; command history; save-state rewind. Depends
                      only on `saturn` + `sh2`; an
                      observer/driver that adds no core behaviour (it bundles a
