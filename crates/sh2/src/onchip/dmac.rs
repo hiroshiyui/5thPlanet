@@ -23,6 +23,7 @@
 //! instruction step (M13 D1 — modelled on Mednafen `DMA_DoTransfer`).
 //! Cycle-stealing / burst bus arbitration is a later timing refinement.
 
+/// One DMAC channel's registers (SAR/DAR/TCR/CHCR).
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Channel {
@@ -32,6 +33,8 @@ pub struct Channel {
     pub chcr: u32,
 }
 
+/// The SH7604 on-chip DMA controller: two [`Channel`]s. See the module header
+/// for the per-channel register map.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dmac {

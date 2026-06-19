@@ -42,6 +42,9 @@ pub enum Source {
     External(u8),
 }
 
+/// The SH7604 interrupt controller: the on-chip priority registers plus a
+/// pending bitmap the CPU samples at each instruction boundary (see the module
+/// header). [`Intc::raise`] flags a source; [`Intc::acknowledge`] clears it.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Intc {
@@ -84,6 +87,9 @@ impl Intc {
         Self::default()
     }
 
+    /// Flag interrupt `src` as pending; it fires once its priority exceeds
+    /// SR.imask. External lines use auto-vector `64 + level` unless a device
+    /// supplied its own vector.
     pub fn raise(&mut self, src: Source) {
         if let Source::External(level) = src {
             // Auto-vector mode: vector = 64 + level (SH7604 default for IRL
@@ -147,6 +153,7 @@ impl Intc {
         self.recompute_best();
     }
 
+    /// Clear `src` from the pending set once the CPU has vectored to it.
     pub fn acknowledge(&mut self, src: Source) {
         self.pending &= !(1 << src.ord());
         self.recompute_best();

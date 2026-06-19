@@ -24,6 +24,8 @@
 /// CKS[2:0] → prescaler period in CPU clocks (φ/2 … φ/8192).
 const CKS_PERIODS: [u32; 8] = [2, 64, 128, 256, 512, 1024, 4096, 8192];
 
+/// The SH7604 watchdog timer (WDT): an 8-bit up-counter usable as an interval
+/// timer (ITI on overflow) or a true watchdog. See the module header.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Wdt {

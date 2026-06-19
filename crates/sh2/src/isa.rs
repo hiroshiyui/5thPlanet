@@ -13,6 +13,11 @@
 /// Register index (0..15). Held as `u8` for compact storage in [`Op`].
 pub type Reg = u8;
 
+/// One decoded SH-2 instruction — a single variant per distinct encoding, with
+/// operand fields (`rn`/`rm`/`imm`/`disp`) pre-extracted so the interpreter
+/// never re-parses the raw word. The classifier methods
+/// (`reads_reg`/`load_dest`/`is_illegal_in_slot`/…) drive the pipeline
+/// scoreboard; extend them in lockstep when adding an encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Op {
     // ---- Data transfer ----

@@ -10,6 +10,8 @@
 
 use crate::isa::{Op, disp4, disp12, imm8, m_field, n_field, uimm8};
 
+/// Decode one 16-bit instruction word into its [`Op`]. Pure function; the
+/// dispatch follows the SH-2 manual's encoding tables (see the module header).
 pub fn decode(w: u16) -> Op {
     match (w >> 12) & 0xF {
         0x0 => decode_0(w),

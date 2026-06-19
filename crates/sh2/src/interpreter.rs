@@ -134,6 +134,8 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    /// A fresh CPU in the SH7604 cold-reset state (registers at their power-on
+    /// values; the first `step` fetches PC/SP from the vector table).
     pub fn new() -> Self {
         Self {
             regs: Registers::new_at_reset(),

@@ -26,6 +26,9 @@
 //! whether to stall the incoming instruction) and updates it post-dispatch
 //! (to record what the just-issued instruction left pending).
 
+/// The pipeline-interlock scoreboard: the running cycle count plus the cycles
+/// at which the multiply (MAC) and divide (DIVU) results become readable, so
+/// [`crate::interpreter::Cpu::step`] can stall a dependent instruction.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pipeline {

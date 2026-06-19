@@ -41,6 +41,9 @@ use wdt::Wdt;
 /// First on-chip-mapped address.
 pub const ONCHIP_BASE: u32 = 0xFFFF_FE00;
 
+/// Aggregate of every SH7604 on-chip peripheral, owned by the CPU and consulted
+/// first for any access into the on-chip range (`FFFF FE00..`). Routes the
+/// access to the right peripheral by address; see the module header.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OnChip {

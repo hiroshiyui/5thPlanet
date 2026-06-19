@@ -35,6 +35,8 @@ const DIVIDE_LATENCY: u32 = 39;
 /// quotient that doesn't fit) — Mednafen settles these in ~6 cycles.
 const OVERFLOW_LATENCY: u32 = 6;
 
+/// The SH7604 hardware divider (DIVU) — see the module header for the register
+/// map. A `DVDNT`/`DVDNTL` write launches the 32/32 (or 64/32) division.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Divu {

@@ -18,6 +18,9 @@
 //! (OCFA/OCFB in FTCSR). Overflow flag OVF set on FRC wrap. Edge capture
 //! and external clock sources are out of scope.
 
+/// The SH7604 free-running timer (FRT): a 16-bit up-counter with output-compare
+/// and input-capture. Its input-capture pin (FTI) is the Saturn's inter-CPU
+/// wake; see the module header for the register map.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Frt {

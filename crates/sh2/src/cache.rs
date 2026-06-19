@@ -57,6 +57,9 @@ impl Default for Line {
     }
 }
 
+/// The SH7604 mixed instruction/data cache: 4 KiB, 4-way set-associative,
+/// 16-byte lines, write-through with **no write-allocate** (a write miss never
+/// installs a line). CCR controls it; `purge`/`assoc_purge` drop lines.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cache {
@@ -183,6 +186,7 @@ impl Cache {
         self.ccr & 0x08 != 0
     }
 
+    /// Full cache flush (CCR.CP): invalidate every line.
     pub fn purge(&mut self) {
         for set in &mut self.sets {
             for line in set {
@@ -319,6 +323,8 @@ impl Cache {
             self.sets[set_idx][way].data[(addr & 0xF) as usize] = val;
         }
     }
+    /// Write 16 bits through to a cached line *if present* (write-through, no
+    /// write-allocate — a miss does nothing). Big-endian within the line.
     pub fn write_through_u16(&mut self, addr: u32, val: u16) {
         if let Some((set_idx, way)) = self.locate(addr) {
             let off = (addr & 0xF) as usize;
@@ -327,6 +333,8 @@ impl Cache {
             self.sets[set_idx][way].data[off + 1] = b[1];
         }
     }
+    /// Write 32 bits through to a cached line if present (see
+    /// [`Cache::write_through_u16`]).
     pub fn write_through_u32(&mut self, addr: u32, val: u32) {
         if let Some((set_idx, way)) = self.locate(addr) {
             let off = (addr & 0xF) as usize;
@@ -373,11 +381,15 @@ impl Cache {
 pub fn extract_u8(line: &[u8; LINE_BYTES], addr: u32) -> u8 {
     line[(addr & 0xF) as usize]
 }
+/// Read a big-endian 16-bit value from a fetched cache `line` at `addr`'s
+/// in-line offset.
 #[inline]
 pub fn extract_u16(line: &[u8; LINE_BYTES], addr: u32) -> u16 {
     let o = (addr & 0xF) as usize;
     u16::from_be_bytes([line[o], line[o + 1]])
 }
+/// Read a big-endian 32-bit value from a fetched cache `line` at `addr`'s
+/// in-line offset.
 #[inline]
 pub fn extract_u32(line: &[u8; LINE_BYTES], addr: u32) -> u32 {
     let o = (addr & 0xF) as usize;

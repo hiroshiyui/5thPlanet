@@ -80,11 +80,15 @@ impl Sr {
         ((self.0 & Self::I_MASK) >> 4) as u8
     }
     #[inline]
+    /// Set the 4-bit interrupt mask (SR bits 4..7) to `lvl`.
     pub fn set_imask(&mut self, lvl: u8) {
         self.0 = (self.0 & !Self::I_MASK) | (((lvl as u32) & 0xF) << 4);
     }
 }
 
+/// The SH-2 programmer's register file: R0..R15 (R15 = SP), the control/system
+/// registers (PC, PR, SR, GBR, VBR), and the multiply-accumulate pair
+/// (MACH/MACL).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
