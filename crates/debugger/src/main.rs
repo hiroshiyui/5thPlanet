@@ -37,14 +37,16 @@ const CYCLES_PER_FRAME: u64 = 479_151;
 struct Dbg {
     sat: Saturn,
     fb: Vec<u8>,
-    master_bp: Option<u32>,
-    /// Optional register guard on `master_bp`: `(reg-index, value)` — the bp
-    /// fires only when `R[idx] == val`. Set via `b <addr> <regidx> <val>`.
-    master_bp_cond: Option<(usize, u32)>,
-    slave_bp: Option<u32>,
-    /// Optional register guard on `slave_bp`: `(reg-index, value)` — fires only
-    /// when slave `R[idx] == val`. Set via `bs <addr> <regidx> <val>`.
-    slave_bp_cond: Option<(usize, u32)>,
+    /// Master breakpoints, each `(pc, optional (reg-index, value) guard)` — the
+    /// guard fires only when `R[idx] == val`. Several may be set (`b <addr>`
+    /// adds, `bd <id>` deletes); both `c` and `fc` honour the whole list.
+    mbps: Vec<(u32, Option<(usize, u32)>)>,
+    /// Slave breakpoints (same shape); honoured by `fc`.
+    sbps: Vec<(u32, Option<(usize, u32)>)>,
+    /// Symbol table `(name, addr)`: resolves names where an address is expected
+    /// (`b main`, `m loader_state`) and annotates output (`name+0xNN`). Loaded
+    /// via `syms <file>` / `--syms=<file>` or defined with `sym <name> <addr>`.
+    syms: Vec<(String, u32)>,
     /// Optional memory probe address captured (read through the bus = raw WRAM,
     /// no CPU cache) on any breakpoint hit. Set via `probe <addr>`. Compares
     /// what a CPU loaded (via its cache) against true memory at the bp cycle.
@@ -188,6 +190,139 @@ fn cd_name(cmd: u8) -> &'static str {
 }
 
 impl Dbg {
+    // ---- Symbols ---------------------------------------------------------
+
+    /// Resolve an address token: a defined symbol name, else a hex literal.
+    fn resolve(&self, tok: &str) -> Option<u32> {
+        self.syms
+            .iter()
+            .find(|(n, _)| n == tok)
+            .map(|(_, a)| *a)
+            .or_else(|| parse_num(tok))
+    }
+
+    /// The nearest symbol at or below `addr` (within 0x1000), as `name` or
+    /// `name+0xNN` — for annotating disassembly, breakpoint hits, and the call
+    /// chain. `None` when no symbol covers it.
+    fn label(&self, addr: u32) -> Option<String> {
+        self.syms
+            .iter()
+            .filter(|(_, a)| *a <= addr && addr - *a < 0x1000)
+            .max_by_key(|(_, a)| *a)
+            .map(|(n, a)| {
+                if *a == addr {
+                    n.clone()
+                } else {
+                    format!("{n}+0x{:X}", addr - a)
+                }
+            })
+    }
+
+    /// `08X` address with a trailing `  <label>` when a symbol covers it.
+    fn fmt_addr(&self, addr: u32) -> String {
+        match self.label(addr) {
+            Some(l) => format!("{addr:08X} <{l}>"),
+            None => format!("{addr:08X}"),
+        }
+    }
+
+    /// Load `name addr` (or `addr name`) pairs from a file — one per line, `#`
+    /// comments and blank lines skipped. A later definition of a name replaces
+    /// an earlier one.
+    fn load_syms(&mut self, path: &str) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("read {path} failed: {e}");
+                return;
+            }
+        };
+        let mut n = 0;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(a), Some(b)) = (it.next(), it.next()) else {
+                continue;
+            };
+            // Accept either column order; the hex token is the address.
+            let (name, addr) = match (parse_num(a), parse_num(b)) {
+                (None, Some(x)) => (a, x), // name addr
+                (Some(x), _) => (b, x),    // addr name
+                (None, None) => continue,
+            };
+            self.define_sym(name, addr);
+            n += 1;
+        }
+        println!("loaded {n} symbols from {path}; {} total", self.syms.len());
+    }
+
+    /// Define (or redefine) a symbol.
+    fn define_sym(&mut self, name: &str, addr: u32) {
+        self.syms.retain(|(n, _)| n != name);
+        self.syms.push((name.to_string(), addr));
+    }
+
+    // ---- Breakpoint management ------------------------------------------
+
+    /// List all breakpoints (master, slave, 68k) with a global id (the index
+    /// `bd <id>` deletes).
+    fn list_bps(&self) {
+        if self.mbps.is_empty() && self.sbps.is_empty() && self.bp68.is_none() {
+            println!("no breakpoints (`b <addr>` to add)");
+            return;
+        }
+        let cond = |g: &Option<(usize, u32)>| match g {
+            Some((i, v)) => format!("  if R{i}=={v:08X}"),
+            None => String::new(),
+        };
+        let mut id = 0;
+        for (pc, g) in &self.mbps {
+            println!("  {id:>2}  [M]   {}{}", self.fmt_addr(*pc), cond(g));
+            id += 1;
+        }
+        for (pc, g) in &self.sbps {
+            println!("  {id:>2}  [S]   {}{}", self.fmt_addr(*pc), cond(g));
+            id += 1;
+        }
+        if let Some((pc, g)) = &self.bp68 {
+            let g = g
+                .map(|(r, v)| {
+                    let n = if r < 8 { format!("D{r}") } else { format!("A{}", r - 8) };
+                    format!("  if {n}=={v:08X}")
+                })
+                .unwrap_or_default();
+            println!("  {id:>2}  [68k] {pc:06X}{g}");
+        }
+    }
+
+    /// Delete a breakpoint by global id (the index shown by `list_bps`).
+    fn delete_bp(&mut self, id: usize) {
+        let (m, s) = (self.mbps.len(), self.sbps.len());
+        if id < m {
+            let (pc, _) = self.mbps.remove(id);
+            println!("deleted master bp {pc:08X}");
+        } else if id < m + s {
+            let (pc, _) = self.sbps.remove(id - m);
+            println!("deleted slave bp {pc:08X}");
+        } else if id == m + s && self.bp68.is_some() {
+            let (pc, _) = self.bp68.take().unwrap();
+            println!("deleted 68k bp {pc:06X}");
+        } else {
+            println!("no breakpoint #{id}");
+        }
+    }
+
+    /// Parse the optional `<regidx> <val>` guard following a breakpoint address.
+    fn parse_guard(idx: Option<&str>, val: Option<&str>) -> Option<(usize, u32)> {
+        match (idx.and_then(parse_dec), val.and_then(parse_num)) {
+            (Some(i), Some(v)) if i < 16 => Some((i as usize, v)),
+            _ => None,
+        }
+    }
+
     fn read_mem(&mut self, addr: u32, size: u8) -> u32 {
         match size {
             1 => self.sat.bus.read8(addr, AccessKind::Data).0 as u32,
@@ -421,7 +556,12 @@ impl Dbg {
             let w = self.read_mem(pc, 2) as u16;
             let op = decode(w);
             let marker = if pc == cur { "=>" } else { "  " };
-            println!("{marker} {pc:08X}: {w:04X}  {}", disasm(op));
+            // A symbol that lands exactly on this PC labels the line.
+            let lbl = match self.label(pc) {
+                Some(l) if l.find('+').is_none() => format!("  <{l}>"),
+                _ => String::new(),
+            };
+            println!("{marker} {pc:08X}: {w:04X}  {}{lbl}", disasm(op));
         }
     }
 
@@ -522,9 +662,15 @@ impl Dbg {
             .map(|&(a, sz)| self.read_mem(a, sz))
             .collect();
         for i in 0..max {
-            let pc = self.sat.master().regs.pc;
-            if i > 0 && Some(pc) == self.master_bp {
-                println!("breakpoint @ {pc:08X} (after {i} insns)");
+            let m = &self.sat.master().regs;
+            let (pc, regs) = (m.pc, m.r);
+            if i > 0
+                && self
+                    .mbps
+                    .iter()
+                    .any(|(bp, g)| *bp == pc && g.is_none_or(|(idx, v)| regs[idx] == v))
+            {
+                println!("breakpoint @ {} (after {i} insns)", self.fmt_addr(pc));
                 self.dump_regs();
                 return;
             }
@@ -551,20 +697,12 @@ impl Dbg {
     }
 
     /// Full-system continue: run whole frames (slave + peripherals advance) up
-    /// to `max_frames`, stopping when the armed master breakpoint snapshots.
+    /// to `max_frames`, stopping when an armed breakpoint (master, slave, or
+    /// 68k) snapshots. Honours the whole master/slave breakpoint *lists*; the
+    /// hit's PC says which one fired.
     fn frame_cont(&mut self, max_frames: u64) {
-        if let Some(pc) = self.master_bp {
-            match self.master_bp_cond {
-                Some((idx, val)) => self.sat.set_master_bp_cond(pc, idx, val),
-                None => self.sat.set_master_bp(pc),
-            }
-        }
-        if let Some(pc) = self.slave_bp {
-            match self.slave_bp_cond {
-                Some((idx, val)) => self.sat.set_slave_bp_cond(pc, idx, val),
-                None => self.sat.set_slave_bp(pc),
-            }
-        }
+        self.sat.set_master_bps(self.mbps.clone());
+        self.sat.set_slave_bps(self.sbps.clone());
         // Arm the memory probe on whichever CPU breakpoint fires.
         self.sat.set_master_bp_probe(self.bp_probe);
         self.sat.set_slave_bp_probe(self.bp_probe);
@@ -585,75 +723,60 @@ impl Dbg {
                 println!("  sr: imask={} super={}", h.sr_imask, h.sr_super);
                 return;
             }
-            if let Some((r, pr, gbr, code, probe)) = self.sat.take_master_bp_hit() {
-                println!(
-                    "master breakpoint hit at frame {f}: pc={:08X}",
-                    self.master_bp.unwrap_or(0)
-                );
-                if let Some(a) = self.bp_probe {
-                    println!("  probe [{a:08X}] = {probe:08X} (raw WRAM via bus)");
-                }
-                println!(
-                    "  r0-7:  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
-                );
-                println!(
-                    "  r8-15: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                    r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
-                );
-                println!(
-                    "  pr={pr:08X} gbr={gbr:08X} code={:04X?}",
-                    &code[..code.len().min(8)]
-                );
-                // Heuristic call-chain: scan the stack (R15..+0x100) for words
-                // that look like return addresses into game/BIOS code — the
-                // saved PRs of the enclosing calls. No frame pointers on SH-2,
-                // so this is best-effort but reliably surfaces the callers.
-                let sp = r[15];
-                let mut chain: Vec<(u32, u32)> = Vec::new();
-                for off in (0..0x100u32).step_by(4) {
-                    let w = self.read_mem(sp.wrapping_add(off), 4);
-                    let in_code = (0x0600_0000..0x0610_0000).contains(&w)
-                        || (0x0000_0000..0x0008_0000).contains(&w);
-                    if in_code && w & 1 == 0 {
-                        chain.push((sp.wrapping_add(off), w));
-                    }
-                }
-                println!("  stack call-chain (sp={sp:08X}, likely return addrs):");
-                for (at, w) in chain.iter().take(16) {
-                    println!("    [{at:08X}] = {w:08X}");
-                }
+            if let Some(h) = self.sat.take_master_bp_hit() {
+                self.report_bp_hit("master", f, &h, true);
                 return;
             }
-            if let Some((r, pr, gbr, code, probe)) = self.sat.take_slave_bp_hit() {
-                println!(
-                    "slave breakpoint hit at frame {f}: pc={:08X}",
-                    self.slave_bp.unwrap_or(0)
-                );
-                if let Some(a) = self.bp_probe {
-                    println!("  probe [{a:08X}] = {probe:08X} (raw WRAM via bus)");
-                }
-                println!(
-                    "  r0-7:  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
-                );
-                println!(
-                    "  r8-15: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                    r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
-                );
-                println!(
-                    "  pr={pr:08X} gbr={gbr:08X} code={:04X?}",
-                    &code[..code.len().min(8)]
-                );
+            if let Some(h) = self.sat.take_slave_bp_hit() {
+                self.report_bp_hit("slave", f, &h, false);
                 return;
             }
         }
         println!(
-            "ran {max_frames} frames; master @ {:08X} slave @ {:08X} disp={}",
-            self.sat.master().regs.pc,
-            self.sat.slave().regs.pc,
+            "ran {max_frames} frames; master @ {} slave @ {} disp={}",
+            self.fmt_addr(self.sat.master().regs.pc),
+            self.fmt_addr(self.sat.slave().regs.pc),
             self.sat.bus.vdp2.regs.display_enabled(),
         );
+    }
+
+    /// Print a captured SH-2 breakpoint hit: the PC (with symbol label), the
+    /// probe value, R0..R15, a code preview, and — for the master — the
+    /// best-effort stack call-chain (return-address-shaped stack words). No
+    /// frame pointers on SH-2, so the chain is heuristic but reliably surfaces
+    /// the callers; symbols annotate each.
+    fn report_bp_hit(&mut self, which: &str, frame: u64, h: &saturn::scheduler::BpHit, chain: bool) {
+        println!("{which} breakpoint hit at frame {frame}: pc={}", self.fmt_addr(h.pc));
+        if let Some(a) = self.bp_probe {
+            println!("  probe [{a:08X}] = {:08X} (raw WRAM via bus)", h.probe);
+        }
+        let r = h.regs;
+        println!(
+            "  r0-7:  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+        );
+        println!(
+            "  r8-15: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+        );
+        println!("  pr={:08X} gbr={:08X} code={:04X?}", h.pr, h.gbr, &h.code[..h.code.len().min(8)]);
+        if chain {
+            let sp = r[15];
+            println!("  stack call-chain (sp={sp:08X}, likely return addrs):");
+            let mut shown = 0;
+            for off in (0..0x100u32).step_by(4) {
+                let w = self.read_mem(sp.wrapping_add(off), 4);
+                let in_code = (0x0600_0000..0x0610_0000).contains(&w)
+                    || (0x0000_0000..0x0008_0000).contains(&w);
+                if in_code && w & 1 == 0 {
+                    println!("    [{:08X}] = {}", sp.wrapping_add(off), self.fmt_addr(w));
+                    shown += 1;
+                    if shown == 16 {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Reference master-PC **trace-diff**: run ours through the real
@@ -808,13 +931,13 @@ impl Dbg {
                 Some(path) => self.tdiff(path, a2.and_then(parse_dec).unwrap_or(600)),
                 None => println!("usage: tdiff <ref-pc-trace> [max_frames]"),
             },
-            "bw" => match a1.and_then(parse_num) {
+            "bw" => match a1.and_then(|t| self.resolve(t)) {
                 Some(addr) => self.write_break(
                     addr,
                     a2.and_then(parse_num),
                     a3.and_then(parse_dec).unwrap_or(6000),
                 ),
-                None => println!("usage: bw <addr-hex> [val-hex] [max-frames]"),
+                None => println!("usage: bw <addr|sym> [val-hex] [max-frames]"),
             },
             "find32" => match a1.and_then(parse_num) {
                 Some(v) => self.find32(
@@ -863,49 +986,64 @@ impl Dbg {
                     println!("usage: run <cycles>");
                 }
             }
-            "b" => match a1.and_then(parse_num) {
-                Some(pc) => {
-                    self.master_bp = Some(pc);
-                    // Optional register guard: `b <addr> <regidx> <val>`.
-                    self.master_bp_cond = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
-                        (Some(idx), Some(val)) if idx < 16 => Some((idx as usize, val)),
-                        _ => None,
-                    };
-                    match self.master_bp_cond {
-                        Some((idx, val)) => {
-                            println!("master bp @ {pc:08X} when R{idx}=={val:08X}")
+            // `b` (no arg) lists; `b <addr> [ri v]` adds a master breakpoint.
+            "b" => match a1 {
+                None => self.list_bps(),
+                Some(tok) => match self.resolve(tok) {
+                    Some(pc) => {
+                        let g = Self::parse_guard(a2, a3);
+                        self.mbps.push((pc, g));
+                        println!("master bp #{} @ {}", self.mbps.len() - 1, self.fmt_addr(pc));
+                    }
+                    None => println!("unknown symbol/address {tok:?}"),
+                },
+            },
+            "bs" => match a1 {
+                None => self.list_bps(),
+                Some(tok) => match self.resolve(tok) {
+                    Some(pc) => {
+                        let g = Self::parse_guard(a2, a3);
+                        self.sbps.push((pc, g));
+                        println!("slave bp #{} @ {}", self.mbps.len() + self.sbps.len() - 1, self.fmt_addr(pc));
+                    }
+                    None => println!("unknown symbol/address {tok:?}"),
+                },
+            },
+            "bd" => match a1 {
+                Some("*") => {
+                    self.mbps.clear();
+                    self.sbps.clear();
+                    self.bp68 = None;
+                    println!("all breakpoints cleared");
+                }
+                Some(s) => match parse_dec(s) {
+                    Some(id) => self.delete_bp(id as usize),
+                    None => println!("usage: bd <id|*>"),
+                },
+                None => println!("usage: bd <id|*>  (ids from `b`)"),
+            },
+            "sym" => match (a1, a2.and_then(|t| self.resolve(t))) {
+                (Some(name), Some(addr)) => {
+                    self.define_sym(name, addr);
+                    println!("sym {name} = {addr:08X}");
+                }
+                _ => println!("usage: sym <name> <addr>"),
+            },
+            "syms" => match a1 {
+                Some(path) => self.load_syms(path),
+                None => {
+                    if self.syms.is_empty() {
+                        println!("(no symbols; `syms <file>` or `sym <name> <addr>`)");
+                    } else {
+                        let mut s = self.syms.clone();
+                        s.sort_by_key(|(_, a)| *a);
+                        for (n, a) in &s {
+                            println!("  {a:08X}  {n}");
                         }
-                        None => println!("master bp @ {pc:08X}"),
                     }
                 }
-                None => {
-                    self.master_bp = None;
-                    self.master_bp_cond = None;
-                    println!("master bp cleared");
-                }
             },
-            "bs" => match a1.and_then(parse_num) {
-                Some(pc) => {
-                    self.slave_bp = Some(pc);
-                    // Optional register guard: `bs <addr> <regidx> <val>`.
-                    self.slave_bp_cond = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
-                        (Some(idx), Some(val)) if idx < 16 => Some((idx as usize, val)),
-                        _ => None,
-                    };
-                    match self.slave_bp_cond {
-                        Some((idx, val)) => {
-                            println!("slave bp @ {pc:08X} when R{idx}=={val:08X}")
-                        }
-                        None => println!("slave bp @ {pc:08X}"),
-                    }
-                }
-                None => {
-                    self.slave_bp = None;
-                    self.slave_bp_cond = None;
-                    println!("slave bp cleared");
-                }
-            },
-            "b68" => match a1.and_then(parse_num) {
+            "b68" => match a1.and_then(|t| self.resolve(t)) {
                 Some(pc) => {
                     // Optional register guard: `b68 <addr> <reg> <val>` where reg
                     // 0-7 = D0-D7, 8-15 = A0-A7.
@@ -931,22 +1069,25 @@ impl Dbg {
                     println!("68k bp cleared");
                 }
             },
-            "probe" => match a1.and_then(parse_num) {
-                Some(addr) => {
+            "probe" => match a1.map(|t| self.resolve(t)) {
+                Some(Some(addr)) => {
                     self.bp_probe = Some(addr);
                     println!("bp probe @ {addr:08X} (raw WRAM captured on next bp hit)");
                 }
+                Some(None) => println!("unknown symbol/address"),
                 None => {
                     self.bp_probe = None;
                     println!("bp probe cleared");
                 }
             },
-            "m" | "x" => match a1.and_then(parse_num) {
+            "m" | "x" => match a1.and_then(|t| self.resolve(t)) {
                 Some(addr) => self.dump_mem(addr, a2.and_then(parse_num).unwrap_or(64)),
-                None => println!("usage: m <addr> [len]"),
+                None => println!("usage: m <addr|sym> [len]"),
             },
             "d" | "dis" => {
-                let addr = a1.and_then(parse_num).unwrap_or(self.sat.master().regs.pc);
+                let addr = a1
+                    .and_then(|t| self.resolve(t))
+                    .unwrap_or(self.sat.master().regs.pc);
                 self.dump_disasm(addr, a2.and_then(parse_num).unwrap_or(16));
             }
             "d68" => match a1.and_then(parse_num) {
@@ -1049,13 +1190,13 @@ impl Dbg {
                     );
                 }
             }
-            "w" => match a1.and_then(parse_num) {
+            "w" => match a1.and_then(|t| self.resolve(t)) {
                 Some(addr) => {
                     let sz = a2.and_then(parse_num).unwrap_or(2) as u8;
                     self.watches.push((addr, sz));
                     println!("watch {addr:08X} ({sz}B); {} total", self.watches.len());
                 }
-                None => println!("usage: w <addr> [size=1|2|4]"),
+                None => println!("usage: w <addr|sym> [size=1|2|4]"),
             },
             "dw" => {
                 self.watches.clear();
@@ -1109,17 +1250,20 @@ sdbg commands:
                   (hex; optional CR_in[3] match), preserving setup in cdlog
   frame [n]       run n full frames (slave+VDP+CD advance)         [alias f]
   run <cyc>       run_for <cyc> master cycles (full system)
-  b [pc] [ri v]   set/clear master bp (hex); optional guard: fire only when R[ri]==v
-  bs [pc] [ri v]  set/clear slave breakpoint (opt. guard: fire when slave R<ri>==v); use with fc
-  b68 [pc] [r v]  set/clear SCSP 68k breakpoint (opt. guard: fire when r==v; r 0-7=D, 8-15=A); use with fc
+  b [addr] [ri v]  add a master breakpoint (addr = hex or symbol); guard: fire only when R[ri]==v.
+                  `b` with no addr LISTS all breakpoints (with ids); honoured by both `c` and `fc`
+  bs <addr> [ri v]  add a slave breakpoint (honoured by `fc`)
+  bd <id|*>       delete breakpoint by id (from `b`), or `*` for all
+  b68 <addr> [r v]  set/clear SCSP 68k breakpoint (guard: r 0-7=D, 8-15=A); use with fc
+  sym <name> <addr>  define a symbol; syms <file> loads `name addr` pairs (`syms` lists them)
   probe [addr]    set/clear bp memory probe — capture raw-WRAM [addr] (via bus, no cache) on a bp hit
   w <addr> [sz]   add a poll watchpoint (size 1/2/4, default 2), checked in `c`
   dw              clear watchpoints
   find32 <v> [start] [len]  scan memory for a 32-bit value (default: high WRAM)
   find <bytes> [start] [len]  scan memory for a hex byte pattern
   regs            dump master + slave registers (r0-r15 each)       [alias r]
-  m <addr> [len]  hex-dump memory                                  [alias x]
-  d [addr] [n]    disassemble n insns from addr (default: master pc) [alias dis]
+  m <addr> [len]  hex-dump memory (addr = hex or symbol)           [alias x]
+  d [addr] [n]    disassemble n insns from addr/symbol (default: master pc) [alias dis]
   d68 <addr> [n]  disassemble n SCSP 68k insns at 68k addr (sound RAM)
   t68 [n]         dump last n 68k PCs (disassembled) from the trace ring
   cd              CD-block state (status/hirq/curfad/partitions)
@@ -1152,6 +1296,7 @@ fn main() {
     let mut disc_path = None;
     let mut region = saturn::smpc::region::JAPAN;
     let mut rtc: u64 = 1_700_000_000;
+    let mut syms_path: Option<String> = None;
     for a in &args {
         if let Some(r) = a.strip_prefix("--region=") {
             region = match r {
@@ -1161,6 +1306,8 @@ fn main() {
             };
         } else if let Some(t) = a.strip_prefix("--rtc=") {
             rtc = t.parse().unwrap_or(rtc);
+        } else if let Some(t) = a.strip_prefix("--syms=") {
+            syms_path = Some(t.to_string());
         } else if bios_path.is_none() {
             bios_path = Some(a.clone());
         } else if disc_path.is_none() {
@@ -1168,7 +1315,9 @@ fn main() {
         }
     }
     let Some(bios_path) = bios_path else {
-        eprintln!("usage: sdbg <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>]");
+        eprintln!(
+            "usage: sdbg <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>] [--syms=<file>]"
+        );
         std::process::exit(2);
     };
     let bios = match std::fs::read(&bios_path) {
@@ -1207,14 +1356,16 @@ fn main() {
         // Full-size so `frame`/`f` can't panic when VDP2 switches to hi-res
         // (run_frame asserts the buffer fits the active resolution).
         fb: vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES],
-        master_bp: None,
-        master_bp_cond: None,
+        mbps: Vec::new(),
+        sbps: Vec::new(),
+        syms: Vec::new(),
         bp68: None,
-        slave_bp: None,
-        slave_bp_cond: None,
         bp_probe: None,
         watches: Vec::new(),
     };
+    if let Some(path) = syms_path {
+        dbg.load_syms(&path);
+    }
     println!(
         "sdbg ready. BIOS={bios_path}. type `help`. master @ {:08X}",
         dbg.sat.master().regs.pc

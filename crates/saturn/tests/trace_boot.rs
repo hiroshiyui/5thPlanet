@@ -499,13 +499,14 @@ fn dump_giveup_state() {
         }
     }
 
-    let Some((r, pr, gbr, code, _probe)) = hit else {
+    let Some(h) = hit else {
         println!(
             "give-up 0x{giveup:08X} NOT hit in {frames} frames (pc=0x{:08X})",
             sat.master().regs.pc
         );
         return;
     };
+    let (r, pr, gbr, code) = (h.regs, h.pr, h.gbr, &h.code);
     println!("PR=0x{pr:08X} GBR=0x{gbr:08X}");
     for row in 0..4 {
         let b = row * 4;
@@ -3578,7 +3579,8 @@ fn menu_savestate_probe() {
     );
     if let Some(bp_pc) = master_bp {
         match sat.take_master_bp_hit() {
-            Some((r, pr, gbr, _code, probe)) => {
+            Some(h) => {
+                let (r, pr, gbr, probe) = (h.regs, h.pr, h.gbr, h.probe);
                 println!("MASTER BP hit @0x{bp_pc:06X}:");
                 for b in (0..16).step_by(4) {
                     println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
@@ -3591,7 +3593,8 @@ fn menu_savestate_probe() {
     }
     if let Some(bp_pc) = slave_bp {
         match sat.take_slave_bp_hit() {
-            Some((r, pr, gbr, _code, probe)) => {
+            Some(h) => {
+                let (r, pr, gbr, probe) = (h.regs, h.pr, h.gbr, h.probe);
                 println!("SLAVE BP hit @0x{bp_pc:06X}:");
                 for b in (0..16).step_by(4) {
                     println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",

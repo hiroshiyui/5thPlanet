@@ -134,10 +134,19 @@ pub struct EntityId(pub(crate) usize);
 
 // ---- Concrete entity: SH-2 wrapped for the Saturn bus context. -----------
 
-/// A captured breakpoint hit: `(R0..R15, PR, GBR, 48 code words at the bp,
-/// probe-value)`. The probe value is the bus (raw-WRAM) read of the configured
+/// A captured breakpoint hit: the `pc` it fired at (so a caller with several
+/// breakpoints armed knows *which* one), R0..R15, PR, GBR, 48 code words at the
+/// bp PC, and the probe value — the bus (raw-WRAM) read of the configured
 /// [`Sh2Entity::set_bp_probe`] address at the hit cycle (0 if unset).
-pub type BpHit = ([u32; 16], u32, u32, Vec<u16>, u32);
+#[derive(Clone, Debug)]
+pub struct BpHit {
+    pub pc: u32,
+    pub regs: [u32; 16],
+    pub pr: u32,
+    pub gbr: u32,
+    pub code: Vec<u16>,
+    pub probe: u32,
+}
 
 /// Schedulable wrapper around an `sh2::Cpu`. The entity's `next_deadline`
 /// is the CPU's `pipeline.cycles` when running, or `u64::MAX` when
@@ -162,20 +171,17 @@ pub struct Sh2Entity {
     /// [`set_trace_freeze`]. `#[serde(skip)]` like the trace itself.
     #[serde(skip)]
     trace_freeze: (u32, u32),
-    /// Debug-only full-speed breakpoint: when set and the master reaches this
-    /// PC, [`bp_hit`] captures R0..R15 + PR + GBR plus 96 bytes of code at the
-    /// PC (so a transient work-RAM routine can be disassembled — and its caller
-    /// found via PR — at the instant it runs).
+    /// Debug-only full-speed breakpoints: each `(pc, guard)` fires when the CPU
+    /// reaches `pc` (and, if `guard` is `Some((idx, val))`, only when
+    /// `regs.r[idx] == val` — to stop at a shared routine on the *one* call
+    /// carrying a specific argument). The first one reached in a step captures
+    /// [`bp_hit`] (R0..R15 + PR + GBR + 96 bytes of code at the PC, so a
+    /// transient work-RAM routine can be disassembled — and its caller found via
+    /// PR — at the instant it runs). Several may be armed at once.
     #[serde(skip)]
-    bp: Option<u32>,
+    bps: Vec<(u32, Option<(usize, u32)>)>,
     #[serde(skip)]
     bp_hit: Option<BpHit>,
-    /// Optional register guard on [`bp`]: when `Some((idx, val))` the breakpoint
-    /// fires only if `regs.r[idx] == val` at the PC. Lets a debugger stop at a
-    /// shared routine (e.g. the generic CD-command writer) on the *one* call
-    /// that carries a specific argument, instead of the first call. `#[serde(skip)]`.
-    #[serde(skip)]
-    bp_cond: Option<(usize, u32)>,
     /// Optional memory probe: when set, a breakpoint hit also captures the
     /// 32-bit value at this address read **through the bus** (raw WRAM, *not*
     /// the CPU cache). Lets a debugger compare what a CPU loaded (via its cache /
@@ -192,9 +198,8 @@ impl Sh2Entity {
             halted: false,
             pc_trace: None,
             trace_freeze: (0x0602_0000, 0x0605_0000),
-            bp: None,
+            bps: Vec::new(),
             bp_hit: None,
-            bp_cond: None,
             bp_probe: None,
         }
     }
@@ -206,9 +211,8 @@ impl Sh2Entity {
             halted: true,
             pc_trace: None,
             trace_freeze: (0x0602_0000, 0x0605_0000),
-            bp: None,
+            bps: Vec::new(),
             bp_hit: None,
-            bp_cond: None,
             bp_probe: None,
         }
     }
@@ -240,20 +244,27 @@ impl Sh2Entity {
         self.halted = halted;
     }
 
-    /// Arm a full-speed breakpoint at `pc` (debug; see [`bp`]). Clears any
-    /// register guard previously set via [`set_bp_cond`].
+    /// Arm a single full-speed breakpoint at `pc` (debug; see [`bps`]),
+    /// replacing any previously-armed set. Convenience for the common one-bp
+    /// case; use [`set_bps`] to arm several.
     pub fn set_bp(&mut self, pc: u32) {
-        self.bp = Some(pc);
+        self.bps = vec![(pc, None)];
         self.bp_hit = None;
-        self.bp_cond = None;
     }
 
-    /// Arm a register-guarded breakpoint: fires at `pc` only when
-    /// `regs.r[idx] == val` (see [`bp_cond`]).
+    /// Arm a single register-guarded breakpoint: fires at `pc` only when
+    /// `regs.r[idx] == val` (replaces the armed set).
     pub fn set_bp_cond(&mut self, pc: u32, idx: usize, val: u32) {
-        self.bp = Some(pc);
+        self.bps = vec![(pc, Some((idx, val)))];
         self.bp_hit = None;
-        self.bp_cond = Some((idx, val));
+    }
+
+    /// Arm a *set* of breakpoints `(pc, optional (reg, val) guard)`, replacing
+    /// any previously armed. The first one reached captures [`bp_hit`]; the
+    /// hit's `pc` field says which fired.
+    pub fn set_bps(&mut self, bps: Vec<(u32, Option<(usize, u32)>)>) {
+        self.bps = bps;
+        self.bp_hit = None;
     }
 
     /// Set (or clear) the breakpoint memory probe — the 32-bit address whose
@@ -290,12 +301,17 @@ impl SchedEntity for Sh2Entity {
             ctx.cycle = self.cpu.pipeline.cycles;
             ctx.step_pc = self.cpu.regs.pc;
             self.cpu.step(ctx);
-            if let Some(bp) = self.bp
-                && self.cpu.regs.pc == bp
+            // First armed breakpoint whose PC (and optional register guard)
+            // matches the just-executed instruction. `find_map` returns the
+            // matching PC by value, releasing the `self.bps` borrow before the
+            // capture (which needs `&mut ctx`).
+            let pc = self.cpu.regs.pc;
+            let bp = self.bps.iter().find_map(|&(p, guard)| {
+                (p == pc && guard.is_none_or(|(idx, val)| self.cpu.regs.r[idx] == val))
+                    .then_some(p)
+            });
+            if let Some(bp) = bp
                 && self.bp_hit.is_none()
-                && self
-                    .bp_cond
-                    .is_none_or(|(idx, val)| self.cpu.regs.r[idx] == val)
             {
                 use sh2::bus::{AccessKind, Bus};
                 let mut code = Vec::with_capacity(48);
@@ -308,13 +324,14 @@ impl SchedEntity for Sh2Entity {
                     .bp_probe
                     .map(|a| ctx.read32(a, AccessKind::Data).0)
                     .unwrap_or(0);
-                self.bp_hit = Some((
-                    self.cpu.regs.r,
-                    self.cpu.regs.pr,
-                    self.cpu.regs.gbr,
+                self.bp_hit = Some(BpHit {
+                    pc: bp,
+                    regs: self.cpu.regs.r,
+                    pr: self.cpu.regs.pr,
+                    gbr: self.cpu.regs.gbr,
                     code,
                     probe,
-                ));
+                });
             }
             if let Some(trace) = &mut self.pc_trace {
                 let pc = self.cpu.regs.pc;

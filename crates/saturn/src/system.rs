@@ -630,9 +630,19 @@ impl Saturn {
             .set_bp_cond(pc, idx, val);
     }
 
-    /// Debug-only: take a master breakpoint hit's (R0..R15, PR, GBR, code words,
-    /// probe-value), if it fired. The probe value is the bus read of the address
-    /// set via [`set_master_bp_probe`] at the hit cycle (0 if unset).
+    /// Debug-only: arm a *set* of master breakpoints `(pc, optional (reg, val)
+    /// guard)`, replacing any previously armed. The first one reached fires; the
+    /// hit's `pc` says which (see [`crate::scheduler::Sh2Entity::set_bps`]).
+    pub fn set_master_bps(&mut self, bps: Vec<(u32, Option<(usize, u32)>)>) {
+        self.scheduler
+            .entity_mut(self.master_id)
+            .sh2_mut()
+            .set_bps(bps);
+    }
+
+    /// Debug-only: take a master breakpoint hit, if it fired (the captured PC +
+    /// R0..R15 + PR + GBR + code words + probe-value). The probe value is the
+    /// bus read of the address set via [`set_master_bp_probe`] at the hit cycle.
     pub fn take_master_bp_hit(&mut self) -> Option<crate::scheduler::BpHit> {
         self.scheduler
             .entity_mut(self.master_id)
@@ -668,9 +678,18 @@ impl Saturn {
             .set_bp_cond(pc, idx, val);
     }
 
-    /// Debug-only: take the slave breakpoint hit's (R0..R15, PR, GBR, code words,
-    /// probe-value). The probe value is the bus read of [`set_slave_bp_probe`]'s
-    /// address at the hit cycle (0 if unset).
+    /// Debug-only: arm a *set* of slave breakpoints (mirror of
+    /// [`set_master_bps`]).
+    pub fn set_slave_bps(&mut self, bps: Vec<(u32, Option<(usize, u32)>)>) {
+        self.scheduler
+            .entity_mut(self.slave_id)
+            .sh2_mut()
+            .set_bps(bps);
+    }
+
+    /// Debug-only: take the slave breakpoint hit (captured PC + R0..R15 + PR +
+    /// GBR + code words + probe-value). The probe value is the bus read of
+    /// [`set_slave_bp_probe`]'s address at the hit cycle (0 if unset).
     pub fn take_slave_bp_hit(&mut self) -> Option<crate::scheduler::BpHit> {
         self.scheduler
             .entity_mut(self.slave_id)

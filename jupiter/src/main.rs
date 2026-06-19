@@ -1725,7 +1725,7 @@ fn run(
                 saturn.take_master_bp_hit()
             };
             if let Some(h) = h {
-                let matched = rreg.is_none_or(|r| (rlo..rhi).contains(&h.0[r]));
+                let matched = rreg.is_none_or(|r| (rlo..rhi).contains(&h.regs[r]));
                 if matched {
                     hit = Some(h);
                     break;
@@ -1739,7 +1739,8 @@ fn run(
             }
         }
         match hit {
-            Some((r, pr, gbr, code, _probe)) => {
+            Some(h) => {
+                let (r, pr, gbr, code) = (h.regs, h.pr, h.gbr, &h.code);
                 eprintln!("FBP {bp:08X} hit. PR={pr:08X} GBR={gbr:08X} regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");

@@ -321,3 +321,79 @@ fn pending_smpc_command_does_not_stall_run_for() {
     assert!(sat.now() >= before + 2000, "run_for advanced the full budget");
     assert!(!sat.bus.smpc.has_pending(), "the queued command was dispatched");
 }
+
+/// Debug multi-breakpoint: several breakpoints can be armed at once, and the
+/// one **first reached in execution** fires (not the first in the armed list),
+/// with the hit's `pc` field identifying which. Exercises the core check via
+/// the real `run_for` → `step_cpus` → `entity.step` path that `fc` uses.
+#[test]
+fn multiple_master_breakpoints_fire_at_the_first_reached() {
+    const PC: u32 = 0x0020_2000;
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&PC.to_be_bytes()); // reset PC vector
+    bios[4..8].copy_from_slice(&0x0020_8000u32.to_be_bytes()); // reset SP vector
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // Straight-line adds in low WRAM, then a self-spin.
+    load(
+        &mut sat.bus,
+        PC,
+        &[
+            0x7001, // ADD #1, R0   @ PC
+            0x7002, // ADD #2, R0   @ PC+2   <- the earlier breakpoint
+            0x7004, // ADD #4, R0   @ PC+4
+            0x7008, // ADD #8, R0   @ PC+6   <- the later breakpoint
+            0xAFFE, // BRA -2 (spin on self)
+            0x0009, // NOP (delay slot)
+        ],
+    );
+    {
+        let m = sat.master_mut();
+        m.regs.pc = PC;
+        m.regs.r[0] = 0;
+        m.regs.r[15] = 0x0020_8000;
+    }
+    // Arm BOTH — the *later* PC first in the list, to prove ordering is by
+    // execution, not by list position.
+    sat.set_master_bps(vec![(PC + 6, None), (PC + 2, None)]);
+    sat.run_for(64);
+    let hit = sat.take_master_bp_hit().expect("a breakpoint must fire");
+    assert_eq!(hit.pc, PC + 2, "the first PC reached fires, not the first listed");
+    // The bp fires when `regs.pc == bp` (the bp instruction is *pending*), so
+    // only the ADD #1 ahead of it has retired: R0 == 1.
+    assert_eq!(hit.regs[0], 1, "regs are captured at the bp instruction (pre-execute)");
+}
+
+/// A register-guarded breakpoint in a multi-bp set fires only on the matching
+/// iteration; an unrelated armed bp at a never-reached PC is inert.
+#[test]
+fn guarded_breakpoint_in_a_set_waits_for_its_register_value() {
+    const PC: u32 = 0x0020_2000;
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&PC.to_be_bytes());
+    bios[4..8].copy_from_slice(&0x0020_8000u32.to_be_bytes());
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    // Loop: ADD #1,R0 ; BRA back ; (NOP slot) — R0 counts laps; the bp at the
+    // ADD fires only when R0 has reached 5 (guard reg 0 == 5).
+    load(
+        &mut sat.bus,
+        PC,
+        &[
+            0x7001, // ADD #1, R0   @ PC
+            0xAFFD, // BRA -3 (back to PC)
+            0x0009, // NOP (delay slot)
+        ],
+    );
+    {
+        let m = sat.master_mut();
+        m.regs.pc = PC;
+        m.regs.r[0] = 0;
+        m.regs.r[15] = 0x0020_8000;
+    }
+    sat.set_master_bps(vec![(0x0020_3000, None), (PC, Some((0, 5)))]);
+    sat.run_for(256);
+    let hit = sat.take_master_bp_hit().expect("the guarded bp must fire");
+    assert_eq!(hit.pc, PC);
+    assert_eq!(hit.regs[0], 5, "fires on the iteration where R0 == the guard value");
+}
