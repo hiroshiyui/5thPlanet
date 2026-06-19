@@ -85,6 +85,41 @@ fn parse_hex_bytes(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Parse a reference master-PC trace (one hex PC per line — e.g. a Mednafen
+/// `SS_PCTRACE` dump) into a PC vector. Tolerant: strips a `0x` prefix and
+/// surrounding whitespace, takes the leading hex token (so trailing
+/// comments/fields are ignored), and skips blank / non-hex lines (headers).
+fn parse_trace_pcs(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let t = t
+                .strip_prefix("0x")
+                .or_else(|| t.strip_prefix("0X"))
+                .unwrap_or(t);
+            let tok: String = t.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            (!tok.is_empty())
+                .then(|| u32::from_str_radix(&tok, 16).ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// The loop-collapse both ours (`gen_vf2_pc_trace`) and Mednafen's
+/// `SS_LogMasterPC` apply: suppress a PC already seen in the last 64 logged PCs,
+/// so an idle/poll spin logs one pass instead of its thousands of iterations.
+/// Returns `true` if `pc` should be logged; updates `recent` in place.
+fn collapse_should_log(recent: &mut std::collections::VecDeque<u32>, pc: u32) -> bool {
+    if recent.contains(&pc) {
+        return false;
+    }
+    if recent.len() == 64 {
+        recent.pop_front();
+    }
+    recent.push_back(pc);
+    true
+}
+
 /// Decode set HIRQ bits to their names (for the `hirqlog` CD-timing trace).
 fn hirq_bits(v: u16) -> String {
     const NAMES: [(u16, &str); 12] = [
@@ -621,6 +656,115 @@ impl Dbg {
         );
     }
 
+    /// Reference master-PC **trace-diff**: run ours through the real
+    /// full-system path (`run_for_traced` — slave + peripherals advancing, the
+    /// Mednafen-aligned interrupt timing) and compare the loop-collapsed master
+    /// PC stream against a reference dump, stopping at the **first divergent PC**
+    /// with a both-sides context window. This hosts the project's primary
+    /// debugging methodology (the LLE↔Mednafen PC-trace-diff) inside the REPL,
+    /// instead of generating two trace files and grep-diffing them by hand.
+    ///
+    /// Conventions, to line ours up with a Mednafen `SS_PCTRACE` log:
+    /// - `TDIFF_ADD` (default 4) is added to our exec-PC before the compare —
+    ///   Mednafen logs the *fetch*-PC (= our exec-PC + 4). Set `TDIFF_ADD=0` for
+    ///   an exec-PC reference (e.g. one produced by `gen_vf2_pc_trace`).
+    /// - `PCTRACE_LO` / `PCTRACE_HI` range-filter both sides *before* the
+    ///   collapse, exactly like `gen_vf2_pc_trace`. Pick a window where BOTH
+    ///   emulators log identically (e.g. `PCTRACE_LO=06000000` to keep work-RAM
+    ///   and drop the cache-through `0x20xxxxxx` PCs Mednafen logs but we don't),
+    ///   or the first "divergence" is a logging artifact, not a bug.
+    /// - `PCTRACE_DELAYSLOTS=1` includes delay-slot PCs (honored by
+    ///   `run_for_traced`).
+    ///
+    /// Advances the machine like `fc`/`run`; run it on a fresh load (or after
+    /// `load`) so ours starts where the reference does.
+    fn tdiff(&mut self, ref_path: &str, max_frames: u64) {
+        let text = match std::fs::read_to_string(ref_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("read {ref_path} failed: {e}");
+                return;
+            }
+        };
+        let reference = parse_trace_pcs(&text);
+        if reference.is_empty() {
+            println!("no PCs parsed from {ref_path} (expected one hex PC per line)");
+            return;
+        }
+        let env_hex = |k: &str, d: u32| -> u32 {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let add = env_hex("TDIFF_ADD", 4);
+        let lo = env_hex("PCTRACE_LO", 0);
+        let hi = env_hex("PCTRACE_HI", u32::MAX);
+        println!(
+            "tdiff: {} ref PCs · add=+{add} · range {lo:08X}..={hi:08X} · up to {max_frames} frames",
+            reference.len()
+        );
+
+        let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
+        let mut cursor = 0usize; // index into `reference` matched so far
+        let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
+        for f in 0..max_frames {
+            pcs.clear();
+            self.sat.run_for_traced(CYCLES_PER_FRAME, &mut pcs);
+            for &raw in &pcs {
+                let pc = raw.wrapping_add(add);
+                if pc < lo || pc > hi {
+                    continue;
+                }
+                if !collapse_should_log(&mut recent, pc) {
+                    continue;
+                }
+                if cursor >= reference.len() {
+                    println!(
+                        "\n✓ matched all {} reference PCs (frame {f}); ours continues past the reference. No divergence.",
+                        reference.len()
+                    );
+                    return;
+                }
+                if pc != reference[cursor] {
+                    self.report_divergence(&reference, cursor, pc, add, f);
+                    return;
+                }
+                cursor += 1;
+            }
+        }
+        println!(
+            "\nran {max_frames} frames; matched {cursor}/{} reference PCs, no divergence \
+             (ours stopped at the frame budget — raise the frame count if the reference is longer).",
+            reference.len()
+        );
+    }
+
+    /// Print the first-divergence context: the matched-prefix tail (both sides
+    /// agree), the diverging PC on each side, the reference's continuation, and
+    /// a disassembly of what *ours* executed there.
+    fn report_divergence(&mut self, reference: &[u32], i: usize, our_pc: u32, add: u32, frame: u64) {
+        const TAIL: usize = 6; // matched context before the split
+        const AHEAD: usize = 8; // reference continuation after the split
+        let exec = our_pc.wrapping_sub(add);
+        println!("\n*** DIVERGENCE at logged PC #{i} (frame {frame}) ***");
+        println!("  common prefix tail (both sides agree):");
+        let from = i.saturating_sub(TAIL);
+        for (k, &pc) in reference[from..i].iter().enumerate() {
+            println!("    #{:<7} {pc:08X}", from + k);
+        }
+        println!("  ----- diverge -----");
+        println!("    ref  #{i} -> {:08X}", reference[i]);
+        println!("    ours #{i} -> {our_pc:08X}   (exec-PC {exec:08X})");
+        println!("  reference would continue:");
+        for &pc in &reference[i..(i + AHEAD).min(reference.len())] {
+            println!("    {pc:08X}");
+        }
+        println!("  ours executed @ {exec:08X}:");
+        self.dump_disasm(exec, 4);
+        println!("  inspect regs there:  (re)load a snapshot, `b {exec:08X}`, then `fc`");
+    }
+
     /// Full-system run until the CD-block first logs a host command matching
     /// `cmd` (and `cr4` in CR_in[3], if given). Stops on the first occurrence,
     /// preserving the preceding setup commands in the (1024-entry) `cmd_log`.
@@ -660,6 +804,10 @@ impl Dbg {
             "t" => self.trace(a1.and_then(parse_dec).unwrap_or(32), a2),
             "c" | "cont" => self.cont(a1.and_then(parse_dec).unwrap_or(5_000_000)),
             "fc" => self.frame_cont(a1.and_then(parse_dec).unwrap_or(600)),
+            "tdiff" => match a1 {
+                Some(path) => self.tdiff(path, a2.and_then(parse_dec).unwrap_or(600)),
+                None => println!("usage: tdiff <ref-pc-trace> [max_frames]"),
+            },
             "bw" => match a1.and_then(parse_num) {
                 Some(addr) => self.write_break(
                     addr,
@@ -951,6 +1099,10 @@ sdbg commands:
   t [n] [file]    trace n master insns (PC+disasm) to stdout or file
   c [n]           continue master single-step until bp/watch/max-n insns
   fc [n]          full-system continue up to n frames, stop at master bp
+  tdiff <ref> [n]  master-PC trace-diff vs a reference dump (Mednafen SS_PCTRACE):
+                  full-system run, stop at the FIRST divergent PC + context.
+                  Envs: TDIFF_ADD (default 4 = Mednafen fetch-PC), PCTRACE_LO/HI
+                  (filter to a window both log identically, e.g. LO=06000000)
   bw <addr> [val] [maxf]  full-system run until a bus write to <addr>
                   (optional ==val), report the storing instruction's PC
   cb <cmd> [cr4] [maxf]  full-system run until the CD logs host command <cmd>
@@ -1085,5 +1237,46 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collapse_should_log, parse_trace_pcs};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn parse_trace_pcs_is_tolerant() {
+        let t = "\
+06004000
+0x06004004
+  06004008  ; trailing comment
+0600400C\textra-field
+
+not-a-pc
+== header ==
+0600 4010";
+        // Bare hex, 0x-prefixed, leading whitespace, and trailing junk all parse
+        // to the leading hex token; blank/non-hex/`==`-header lines are skipped;
+        // `0600 4010` stops at the space → 0x0600.
+        assert_eq!(
+            parse_trace_pcs(t),
+            vec![0x0600_4000, 0x0600_4004, 0x0600_4008, 0x0600_400C, 0x0600],
+        );
+    }
+
+    #[test]
+    fn collapse_suppresses_repeats_within_the_64_window() {
+        let mut r = VecDeque::new();
+        assert!(collapse_should_log(&mut r, 0x100), "first sight logs");
+        assert!(collapse_should_log(&mut r, 0x200));
+        assert!(!collapse_should_log(&mut r, 0x100), "repeat within window suppressed");
+        assert!(!collapse_should_log(&mut r, 0x200));
+        // Fill the window past 64 distinct PCs so 0x100 is evicted, then it logs
+        // again — a spin that idles longer than the window re-logs one pass.
+        for i in 0..64u32 {
+            collapse_should_log(&mut r, 0x1000 + i);
+        }
+        assert!(collapse_should_log(&mut r, 0x100), "evicted PC logs again");
     }
 }
