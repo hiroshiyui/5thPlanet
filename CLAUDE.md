@@ -193,6 +193,27 @@ The diagnostics beyond `sdbg` (the interactive debugger — see the `crates/debu
 - **Frontend diagnostics (`jupiter`).** `SAT_PERFLOG` — per-second EMU/MAIN/audio counters: `frames/s`, the `burst[0/1/2]` distribution (the `burst[2]` attractor signature), `advance avg ms`, present/upload timing, audio-reserve depth. `SAT_FBP`/`SAT_SLAVE_FBP`(+`SAT_FBP_RREG`/`RLO`/`RHI`) — a headless register-window breakpoint for boot debugging in the real binary. Tuning-knobs-as-diagnostics: `SAT_RENDER_THREADS`, `SAT_AUDIO_MS`, `SAT_MAX_BURST`, `SAT_SMP_BATCH`.
 - **Disassemblers.** `sh2::debug::disasm` (SH-2) and the standalone MC68000 disassembler in `crates/debugger/src/m68k_disasm.rs`; both surface via `sdbg`'s `d`/`d68`.
 
+## References
+
+The authoritative documents this emulator is built against (cited in per-module doc comments). Treat these as the truth where they're specific; for coupled timing they leave gaps, which is why the behavioral oracle (Mednafen/MAME, ADR-0017) is the reference of last resort.
+
+- **CPUs (fully official, reliably sourced via Renesas/NXP):**
+  - **Hitachi SH-1/SH-2 (SH7604) Programming/Software Manual** — SH-2 ISA, exact encodings, and **cycle counts (Appendix A)**. The basis of `crates/sh2/` (cite the section for non-obvious opcode semantics).
+  - **Hitachi SH7604 Hardware Manual** — on-chip peripherals (cache, BSC, INTC, DMAC, FRT, WDT, DIVU); the basis of `crates/sh2/src/onchip/`.
+  - **Motorola/Freescale MC68000 + MC68EC000 User's Manual** — the SCSP sound CPU (`crates/m68k/`).
+- **Saturn chips (SEGA official developer manuals — the primary truth for the system layer):**
+  - **VDP1 User's Manual** — sprite/polygon command processor (`vdp1/`).
+  - **VDP2 User's Manual** — background/compositor (`vdp2/`; e.g. the `MZCTL` mosaic register).
+  - **SCU User's Manual** — System Control Unit + the embedded SCU-DSP (`scu.rs`, `scu_dsp`).
+  - **SMPC User's Manual** — System Manager & Peripheral Control; command codes + INTBACK (`smpc.rs`).
+  - **ST-V (Sega Titan Video) service/technical manual** — the arcade variant; the **memory-map** reference (`memory.rs` cites its memory-map appendix).
+  - **SEGA Saturn Technical Bulletins** — official errata / dev notes.
+  - ⚠️ **SCSP** — the official material is thin/incomplete; there is no complete authoritative manual, so the SCSP engine + DSP are modeled on MAME `scspdsp.cpp` + Mednafen rather than a doc (see [ADR-0012](doc/adr/0012-scsp-sound-driver-hle.md) and the `scsp-bios-bgm-audio` memory).
+- **SDK conventions (leaked but widely used):** **SGL** (Sega Graphics Library) / **SBL** (Sega Basic Library) programmer's guides — pin down conventions the hardware manuals omit (e.g. the SGL `PER_DGT_*` pad wire-format the SMPC pad layout follows).
+- **Behavioral oracles (accurate emulator source, not a document — ADR-0017):** **Mednafen / Beetle Saturn** (`mednaref/`, the game-level reference), **MAME** Saturn/ST-V driver (`mameref/`, low-level mechanics; `saturn_cd_hle.cpp` for the HLE CD-block), **Yabause** (`yabref/`, secondary). Charles MacDonald's Sega hardware notes are the respected community RE reference where they exist.
+
+NB: the SEGA hardware-manual set is SEGA-confidential material that circulated publicly; we *observe* it as a spec and never copy or derive emulator code (ADR-0017). Locations move — web-search the current source (Renesas for the SH manuals; community archives for the SEGA set) rather than trusting a stale link.
+
 ## Skills available in `.claude/skills/`
 
 `code-review`, `commit-and-push`, `docs-engineering`, `release-engineering`, `security-audit` — all tailored to this project. Prefer invoking them over re-deriving their checklists.
