@@ -471,6 +471,18 @@ MAME with an audio CD inserted — ours now plays the animation, and Doukyuusei
 SCSP voice-keying issue, since **resolved** — see
 [§B.7](#b7-the-boot--cd-player-panel-bgm-resolved-2026-06-06).
 
+**Post-spin-up, ours settles straight to PAUSE at FAD 150** — where Mednafen
+issues a `StartSeek(0x800096)` (a real seek to 150) first. This is the source of
+the M12 residual −47-seq-tick (~1%) BGM-phase gap (roadmap M12 #9): ours reaches
+ready a seek-duration early. A 2026-06-19 cross-emulator check **settled this as
+leave-as-is**: MAME (`stvcd` / `saturn_cd_hle`) and Yabause (`cs2.c`) **also**
+settle straight to PAUSE@150 with no auto-seek — ours matches them, and Mednafen
+is the lone outlier. There is no document for the drive-servo behaviour
+([ADR-0015](adr/0015-cd-block-hle.md): undumped firmware + analog servo = no
+digital ground truth; only the host-visible STATUS codes are specified), so
+matching Mednafen here would trade three-oracle consensus + boot safety for one
+oracle's unverifiable refinement, for ~1%. Left as-is per the M4 stop rule.
+
 #### B.4 Authentication & region
 
 `Auth (0xE0)` is header-only HLE: it checks the `"SEGA SEGASATURN"` security
