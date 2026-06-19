@@ -43,6 +43,9 @@ pub const FB_END: u32 = 0x05CB_FFFF;
 pub const REGS_BASE: u32 = 0x05D0_0000;
 pub const REGS_END: u32 = 0x05D0_0017;
 
+/// The VDP1 sprite/polygon engine: VRAM + the double-buffered frame buffer +
+/// the register bank, driving the command-list plotter. A `PTMR` write runs
+/// the list and latches draw-end status.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp1 {

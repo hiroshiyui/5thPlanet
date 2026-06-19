@@ -8,6 +8,8 @@
 
 pub const VRAM_BYTES: usize = 512 * 1024;
 
+/// VDP2 VRAM storage (512 KiB; the four hardware banks treated as one flat
+/// region). Offsets fold modulo size so the region mirrors; big-endian.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vram {

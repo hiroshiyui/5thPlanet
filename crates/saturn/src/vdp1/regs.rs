@@ -30,6 +30,8 @@ const REG_BYTES: usize = 0x18;
 /// EDSR.CEF — current-frame draw end. Set when a plot finishes.
 pub const EDSR_CEF: u16 = 0x0002;
 
+/// VDP1's 24-byte register bank (TVMR/FBCR/PTMR/… control + EDSR/LOPR/COPR/MODR
+/// status). Plain register storage; the plotter and frame-change logic read it.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp1Regs {

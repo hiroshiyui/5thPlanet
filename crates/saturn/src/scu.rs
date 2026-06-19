@@ -136,6 +136,9 @@ const ALL_SOURCES: &[Source] = &[
     Source::SpriteDrawEnd,
 ];
 
+/// One SCU DMA channel's register set (`D*R/W/C/AD/EN/MD`). The three levels
+/// differ only in transfer-count width; the accessors below decode the
+/// mode/add fields (direct vs indirect, address-update, increments).
 #[derive(Clone, Copy, Debug, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DmaChannel {
@@ -188,6 +191,11 @@ impl DmaChannel {
     }
 }
 
+/// The System Control Unit: three DMA channels, the interrupt mask/status
+/// (IMS/IST) and priority aggregation toward the master SH-2, the dual timers,
+/// the A-bus refresh/wait registers, and the embedded [`scu_dsp::Dsp`]. The
+/// transfers and the DSP run at the Saturn aggregate, since the SCU can't reach
+/// the bus from inside it.
 #[derive(Clone, Debug, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scu {
@@ -710,6 +718,10 @@ impl Scu {
         }
     }
 
+    /// The highest-priority unmasked pending source as `(source, level)`,
+    /// clearing it from IST on this acknowledge cycle. Sampled once per master
+    /// instruction so an interrupt lands the exact cycle `SR.imask` drops below
+    /// its level; returns `None` when nothing qualifies.
     pub fn take_pending_interrupt(&mut self, sh2_imask: u8) -> Option<(Source, u8)> {
         // External interrupts (bits 16+, i.e. the CD-block) are masked by IMS
         // **bit 15**: Mednafen computes `IPending & ~(int16)IMask`, sign-

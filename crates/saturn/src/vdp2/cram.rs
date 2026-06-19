@@ -13,6 +13,9 @@
 
 const CRAM_BYTES: usize = 4 * 1024;
 
+/// VDP2 Color RAM (4 KiB): the palette / colour-bank store the compositor
+/// reads, in one of the three RAMCTL modes (RGB555 ×1024 or ×2048, RGB888
+/// ×1024). Offsets fold modulo size; big-endian.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cram {

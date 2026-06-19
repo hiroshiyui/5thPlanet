@@ -904,6 +904,7 @@ impl ScspCtrl {
         (eg_mul * t.tl[tl]) >> PHASE_SHIFT
     }
 
+    /// Whether slot `i` is currently producing output (its EG hasn't finished).
     pub fn slot_active(&self, i: usize) -> bool {
         self.slots[i].active
     }
@@ -1285,6 +1286,10 @@ fn effect_send_level(voice: i32, imxl: u32) -> i32 {
     (s << 4) >> (7 - imxl)
 }
 
+/// The Sound Processor (SCSP): 512 KiB sound RAM, the 32-slot FM/PCM engine +
+/// effect [`dsp::Dsp`], the hosted MC68EC000 sound CPU, and the 44.1 kHz output
+/// mixer (CD-DA arrives on the EXTS inputs). Released from reset by SMPC
+/// `SNDON`; the frontend drains [`Scsp::take_audio`] each frame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scsp {
     /// 512 KiB sound RAM, shared between the SH-2 (at 0x05A0_0000) and the 68k.

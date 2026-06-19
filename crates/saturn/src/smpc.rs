@@ -100,6 +100,10 @@ impl Command {
     }
 }
 
+/// System Manager & Peripheral Control: the low-speed controller for reset and
+/// clock, the RTC, peripheral input via `INTBACK` (digital pad / Shuttle
+/// Mouse), and slave/sound on-off. Registers live at odd byte offsets; a write
+/// to COMREG queues a [`Command`] the Saturn aggregate drains.
 #[derive(Clone, Debug, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Smpc {

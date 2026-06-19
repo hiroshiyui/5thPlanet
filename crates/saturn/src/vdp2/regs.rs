@@ -39,6 +39,10 @@
 
 const REG_BYTES: usize = 0x200;
 
+/// VDP2's 512-byte register bank (~50 mostly-16-bit registers: display mode,
+/// background enables, plane/scroll/priority, special effects). Mostly passive
+/// storage the renderer samples each frame; the named accessors below decode
+/// the renderer-critical fields.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp2Regs {

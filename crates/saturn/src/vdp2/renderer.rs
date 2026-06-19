@@ -409,6 +409,11 @@ impl FrameCtx {
     }
 }
 
+/// Composite the whole VDP2 scene (NBG0–3, RBG0/1, and the optional VDP1 sprite
+/// layer `sprite_fb`) into `out` as RGBA8888, returning the active
+/// `(width, height)` decoded from TVMD. `out` must hold at least
+/// `width × height × 4` bytes — size it to [`FRAMEBUFFER_BYTES`]; content is
+/// packed at a `width × 4` pitch.
 pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) -> (usize, usize) {
     // Active resolution from TVMD (320/352/640/704 × 224/240/256[×2]). The
     // content is packed tightly with row stride = `w`, so the caller uploads

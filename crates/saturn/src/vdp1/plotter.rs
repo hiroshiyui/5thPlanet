@@ -122,6 +122,10 @@ pub struct PlotResult {
     pub copr: u16,
 }
 
+/// One pass over a VDP1 command list: borrows VRAM (read) and the frame buffer
+/// (write), carries the local-coordinate / clipping / pixel-mode state the
+/// command stream mutates, and tallies the dots drawn for the draw-duration
+/// model. Built per plot by [`Plotter::new`] and driven by [`super::Vdp1`].
 pub struct Plotter<'a> {
     vram: &'a Vram,
     fb: &'a mut Framebuffer,

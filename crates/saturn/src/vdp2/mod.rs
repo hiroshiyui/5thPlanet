@@ -35,6 +35,9 @@ pub const CRAM_END: u32 = 0x05F0_0FFF;
 pub const REGS_BASE: u32 = 0x05F8_0000;
 pub const REGS_END: u32 = 0x05F8_01FF;
 
+/// The VDP2 background generator: VRAM + CRAM + the register bank. The
+/// multi-layer compositor (NBG0–3, RBG0/1, and the VDP1 sprite layer) lives in
+/// [`renderer`].
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Vdp2 {

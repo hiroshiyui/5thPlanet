@@ -602,6 +602,8 @@ impl Saturn {
             .sh2_mut()
             .enable_pc_trace();
     }
+    /// Drain the slave SH-2's recorded PC trace (debug; paired with the
+    /// trace-enable hook). Empty unless tracing was enabled.
     pub fn take_slave_pc_trace(&mut self) -> Vec<u32> {
         self.scheduler
             .entity_mut(self.slave_id)
@@ -1749,6 +1751,9 @@ impl Saturn {
         self.run_for(CYCLES_PER_FRAME);
     }
 
+    /// Advance one NTSC frame and composite it into `out`, returning the active
+    /// `(width, height)`. A single `run_for(CYCLES_PER_FRAME)` followed by a
+    /// render — see the note below on why the frame must not be split.
     pub fn run_frame(&mut self, out: &mut [u8]) -> (usize, usize) {
         // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
         // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short

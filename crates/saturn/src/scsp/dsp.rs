@@ -53,6 +53,10 @@ fn int_to_dspfloat(inv: i32) -> u16 {
     ret as u16
 }
 
+/// The SCSP effect DSP — the 128-step VLIW program plus its
+/// coefficient/temp/memory register files and the input/output mix bridges to
+/// the slot mixer (see the module header for the field roles). [`Dsp::step`]
+/// runs one full pass per output sample.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Dsp {
     #[serde(with = "BigArray")]

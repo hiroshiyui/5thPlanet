@@ -45,6 +45,10 @@ pub trait SchedEntity {
     fn step(&mut self, ctx: &mut Self::Context);
 }
 
+/// Generic deterministic scheduler: holds a set of [`SchedEntity`]s and steps
+/// the most-behind one each turn (ties break by insertion order). The live
+/// SH-2 pair is driven by [`crate::system::Saturn::step_cpus`] instead; this
+/// still runs the CD-block timer and backs the determinism test.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Scheduler<E: SchedEntity> {
     entities: Vec<E>,
