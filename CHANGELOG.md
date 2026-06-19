@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-19
+
+A documentation and internal-cleanup release — **no behavioural change**. The
+save-state format (v9) and the `bios_boot` golden hash are both unchanged, so
+existing save states still load.
+
+### Changed
+
+- **NBG renderer cleanup.** Hoisted the VDP2 NBG per-dot register decode (mosaic
+  `MZCTL`, line-scroll `SCRCTL`/`LSTAn`, vertical cell-scroll table addressing)
+  out of the per-dot path into the once-per-frame `NbgCtx`, matching the existing
+  `FrameCtx` hoist pattern. Bit-identical (golden + all 597 saturn tests
+  unchanged); a clarity/redundancy cleanup, not a measurable perf win on the
+  benched scenes (profiling confirmed `nbg_layer`'s cost is memory-bound
+  sampling, not register decode).
+- **Documentation overhaul.**
+  - Merged `bootstrapping.md` into `system-architecture.md` as a new §9, so the
+    reset→splash→game-boot sequence lives beside the chip→module map; refreshed
+    its status to M11-complete.
+  - Synced `system-architecture.md` to the current M11/M12/M13 reality — the M12
+    BSC bus-timing model, CD-DA via the SCSP EXTS inputs, Shuttle Mouse support,
+    the render-pipeline worker / audio-paced loop, and corrected test counts.
+  - Added module/struct/function `///` doc comments across every crate
+    (`saturn`, `sh2`, `m68k`, `scu_dsp`, `physdisc`, `jupiter`) via a
+    docs-engineering source-comment audit; the skill now enforces this.
+- **Four retroactive ADRs** recording settled, load-bearing decisions that the
+  code already relied on: the CD-block HLE exception (0015), master-leads-slave
+  SH-2 stepping (0016), the reference-oracle policy (0017), and the save-state
+  design (0018).
+
 ## [0.4.0] - 2026-06-14
 
 Adds the OSD disc-image browser and fixes VF2 input lag, plus an M13 A1
