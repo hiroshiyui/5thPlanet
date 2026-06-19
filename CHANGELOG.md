@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-19
+
+Grows the `sdbg` headless debugger into a full trace-diff workbench, and adds a
+reference/developer-tooling documentation layer. **No change to emulator runtime
+behaviour** — the `bios_boot` golden hash and the save-state format (v9) are
+unchanged, so existing save states still load.
+
+### Added
+
+- **`sdbg` reference master-PC trace-diff (`tdiff`).** `tdiff <ref> [frames]`
+  runs ours through the real full-system path and compares the loop-collapsed
+  master PC stream against a Mednafen `SS_PCTRACE` dump, stopping at the **first
+  divergent PC** with a both-sides context window. On a divergence it then
+  **rewinds to a pre-trace snapshot and re-runs to a breakpoint there**, printing
+  full registers + the stack call-chain and parking the machine at the
+  divergence. Knobs: `TDIFF_ADD` (Mednafen fetch-PC offset), `PCTRACE_LO`/`HI`.
+  This hosts the project's primary debugging methodology (the LLE↔Mednafen
+  trace-diff) inside the REPL instead of hand-diffing two trace files.
+- **`sdbg` multiple breakpoints + symbols.** Several register-guarded master /
+  slave breakpoints at once (`b <addr> [ri v]` adds, `b` lists, `bd <id|*>`
+  deletes), honoured by both `c` and `fc`. A symbol table (`sym`, `syms <file>`,
+  `--syms=<file>`) resolves names anywhere an address is expected and annotates
+  output (`name+0xNN`) in disassembly, breakpoint hits, and the call-chain.
+- **Core support:** `Sh2Entity` now holds a *set* of breakpoints and `BpHit`
+  carries the firing PC (`Saturn::set_master_bps`/`set_slave_bps`). Debug-only
+  and `#[serde(skip)]`, so the golden and save-state format are unaffected.
+
+### Changed
+
+- **Documentation layer.** Added a **Developer tools** catalog and a
+  **References** section (authoritative SEGA/Hitachi/Motorola manuals + the
+  behavioural oracles, with verified download locations) to `CLAUDE.md`; merged
+  `bootstrapping.md` into `system-architecture.md` §9; recorded four ADRs
+  (0015 CD-block HLE, 0016 master-leads-slave stepping, 0017 reference-oracle
+  policy, 0018 save-state design); and recorded the M12 #9 cycle-accuracy
+  residual's cross-emulator corroboration (the post-spin-up seek is Mednafen-only;
+  MAME and Yabause match ours — left as-is per the stop rule).
+
 ## [0.4.1] - 2026-06-19
 
 A documentation and internal-cleanup release — **no behavioural change**. The
