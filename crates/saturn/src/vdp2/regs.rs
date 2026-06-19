@@ -268,13 +268,25 @@ impl Vdp2Regs {
     /// clear the coordinate is returned unchanged (mosaic off → no-op).
     /// (*VDP2 User's Manual*, MZCTL.)
     pub fn mosaic_coord(&self, enable_bit: u16, x: u32, y: u32) -> (u32, u32) {
+        match self.mosaic_params(enable_bit) {
+            Some((szh, szv)) => (x - x % szh, y - y % szv),
+            None => (x, y),
+        }
+    }
+
+    /// The `(block_width, block_height)` of the mosaic block for the layer
+    /// selected by `enable_bit` (`1 << n` / `0x10`), or `None` when mosaic is off
+    /// for that layer. Frame-invariant decode of MZCTL, hoisted into the render
+    /// context so the per-dot path snaps without re-reading the register; the
+    /// snap itself stays in [`Vdp2Regs::mosaic_coord`].
+    pub fn mosaic_params(&self, enable_bit: u16) -> Option<(u32, u32)> {
         let mzctl = self.read16(0x022);
         if mzctl & enable_bit == 0 {
-            return (x, y);
+            return None;
         }
         let szh = (((mzctl >> 8) & 0xF) + 1) as u32;
         let szv = (((mzctl >> 12) & 0xF) + 1) as u32;
-        (x - x % szh, y - y % szv)
+        Some((szh, szv))
     }
 
     /// Priority number for NBG`n` (PRINA: N0 2..0 / N1 10..8;

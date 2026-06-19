@@ -300,6 +300,20 @@ impl RotGeo {
 /// One NBG layer's frame-constant register decode — everything `nbg_layer`,
 /// `sample_nbg`, `sample_bitmap`, and `sample_tile` previously re-parsed from
 /// the register file per dot (×4 layers × every screen dot).
+/// Frame-invariant decode of an NBG's line-scroll table layout (SCRCTL/LSTAn),
+/// hoisted out of the per-dot path. `stride` is the per-entry byte step (the
+/// enabled H-scroll/V-scroll/H-zoom longwords); a line's table read in
+/// [`line_scroll`] uses only these plus the screen line `y`.
+#[derive(Clone, Copy)]
+struct LineScrollCtx {
+    lscx: bool,
+    lscy: bool,
+    lzmx: bool,
+    table: u32,
+    interval: u32,
+    stride: u32,
+}
+
 struct NbgCtx {
     enabled: bool,
     winctl: u8,
@@ -308,12 +322,22 @@ struct NbgCtx {
     cc: Option<(u8, bool)>,
     sccm: u8,
     sfcode: u8,
+    /// Hoisted MZCTL block `(width, height)` for this layer, or `None` when
+    /// mosaic is off — the per-dot snap reads this instead of the register.
+    mosaic: Option<(u32, u32)>,
     // sample_nbg: scroll / zoom
     scroll: (u32, u32),
     frac: (u8, u8),
     inc: (u32, u32),
     line_zoom_x: bool,
     vcell: bool,
+    // Hoisted scroll-table layout (frame-invariant register decode lifted out
+    // of the per-dot path): NBG0/1 line scroll, and the shared vertical
+    // cell-scroll table addressing (multiplier/offset/base).
+    ls: LineScrollCtx,
+    vcell_mult: u32,
+    vcell_off: u32,
+    vcell_table: u32,
     depth: u8,
     bitmap: bool,
     coff: usize,
@@ -351,6 +375,32 @@ impl NbgCtx {
         let plane_base = core::array::from_fn(|p| {
             (((r.nbg_plane_page(n, p) & upper_mask) >> shift) * plsize_bytes) & 0x7_FFFF
         });
+        // Line scroll exists only on NBG0/1; the SCRCTL/LSTAn accessors are
+        // undefined for NBG2/3, so leave the descriptor inert there (the
+        // per-dot path only consults it under the same `n < 2` guard).
+        let ls = if n < 2 {
+            let lscx = r.nbg_line_scroll_x(n);
+            let lscy = r.nbg_line_scroll_y(n);
+            let lzmx = r.nbg_line_zoom_x(n);
+            LineScrollCtx {
+                lscx,
+                lscy,
+                lzmx,
+                table: r.nbg_line_scroll_table(n),
+                interval: r.nbg_line_scroll_interval(n),
+                stride: (lscx as u32 + lscy as u32 + lzmx as u32) * 4,
+            }
+        } else {
+            LineScrollCtx { lscx: false, lscy: false, lzmx: false, table: 0, interval: 1, stride: 0 }
+        };
+        // Vertical cell scroll shares one table; when both NBG0 and NBG1 use it
+        // their longwords interleave (NBG0 even, NBG1 odd). Frame-invariant.
+        let vcell_both = n < 2 && r.nbg_vcell_scroll(0) && r.nbg_vcell_scroll(1);
+        let (vcell_mult, vcell_off) = if vcell_both {
+            (2, if n == 1 { 1 } else { 0 })
+        } else {
+            (1, 0)
+        };
         Self {
             enabled: r.nbg_enabled(n),
             winctl: r.nbg_window_control(n),
@@ -359,11 +409,16 @@ impl NbgCtx {
             cc: r.nbg_color_calc(n),
             sccm: r.special_color_calc_mode(n),
             sfcode: r.special_function_code(n),
+            mosaic: r.mosaic_params(1 << n),
             scroll: r.nbg_scroll(n),
             frac: r.nbg_scroll_frac(n),
             inc: r.nbg_coord_inc(n),
             line_zoom_x: r.nbg_line_zoom_x(n),
             vcell: r.nbg_vcell_scroll(n),
+            ls,
+            vcell_mult,
+            vcell_off,
+            vcell_table: if n < 2 { r.vcell_scroll_table() } else { 0 },
             depth: r.nbg_color_mode(n),
             bitmap: r.nbg_bitmap_enabled(n),
             coff: r.nbg_color_ram_offset(n),
@@ -987,7 +1042,11 @@ fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: us
         return None;
     }
     // Mosaic (MZCTL): snap the colour-sampling coordinate to the block origin.
-    let (mx, my) = vdp2.regs.mosaic_coord(1 << n, x, y);
+    // Block size hoisted into `NbgCtx::mosaic` (the per-dot snap stays here).
+    let (mx, my) = match nc.mosaic {
+        Some((szh, szv)) => (x - x % szh, y - y % szv),
+        None => (x, y),
+    };
     let s = sample_nbg(vdp2, ctx, n, mx, my)?;
     let (pri, cc) = resolve_special(nc.prio, nc.cc, nc.priomode, nc.sccm, nc.sfcode, &s);
     Some(Dot {
@@ -1088,28 +1147,21 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
 /// (bits 26..16) and `zoom_x` is the horizontal step in 16.16 (1.0 when line
 /// zoom is off). Components present in the table in order H-scroll, V-scroll,
 /// H-zoom — only the enabled ones.
-fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32, u32) {
-    let r = &vdp2.regs;
-    let (lscx, lscy, lzmx) = (
-        r.nbg_line_scroll_x(n),
-        r.nbg_line_scroll_y(n),
-        r.nbg_line_zoom_x(n),
-    );
-    if !lscx && !lscy && !lzmx {
+fn line_scroll(vdp2: &Vdp2, ls: &LineScrollCtx, y: u32) -> (u32, u32, u32) {
+    if !ls.lscx && !ls.lscy && !ls.lzmx {
         return (0, 0, 1 << 16);
     }
-    let stride = (lscx as u32 + lscy as u32 + lzmx as u32) * 4;
-    let entry = r.nbg_line_scroll_table(n) + (y / r.nbg_line_scroll_interval(n)) * stride;
+    let entry = ls.table + (y / ls.interval) * ls.stride;
     let mut off = entry;
     let int = |w: u32| (w >> 16) & 0x07FF;
-    let dx = if lscx {
+    let dx = if ls.lscx {
         let v = int(vdp2.vram.read32(off));
         off += 4;
         v
     } else {
         0
     };
-    let dy = if lscy {
+    let dy = if ls.lscy {
         let v = int(vdp2.vram.read32(off));
         off += 4;
         v
@@ -1118,7 +1170,7 @@ fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32, u32) {
     };
     // Horizontal line zoom: a 16.16 per-dot step (integer bits 18..16,
     // fraction bits 15..8). 1.0 means no zoom.
-    let zoom = if lzmx {
+    let zoom = if ls.lzmx {
         (vdp2.vram.read32(off) & 0x0007_FF00).max(1)
     } else {
         1 << 16
@@ -1130,15 +1182,9 @@ fn line_scroll(vdp2: &Vdp2, n: usize, y: u32) -> (u32, u32, u32) {
 /// column `x/8`, read from the shared VCSTA table. When both NBG0 and NBG1 use
 /// it the table interleaves their longwords (NBG0 even, NBG1 odd); the value
 /// is an 11-bit signed scroll in bits 26..16.
-fn vcell_scroll(vdp2: &Vdp2, n: usize, x: u32) -> i32 {
-    let both = vdp2.regs.nbg_vcell_scroll(0) && vdp2.regs.nbg_vcell_scroll(1);
-    let (mult, off) = if both {
-        (2, if n == 1 { 1 } else { 0 })
-    } else {
-        (1, 0)
-    };
+fn vcell_scroll(vdp2: &Vdp2, nc: &NbgCtx, x: u32) -> i32 {
     let col = x / 8;
-    let addr = vdp2.regs.vcell_scroll_table() + (col * mult + off) * 4;
+    let addr = nc.vcell_table + (col * nc.vcell_mult + nc.vcell_off) * 4;
     let raw = (vdp2.vram.read32(addr) >> 16) & 0x07FF;
     // Sign-extend the 11-bit value.
     if raw & 0x0400 != 0 {
@@ -1176,7 +1222,7 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
         }
         // Per-line scroll deltas, plus per-line horizontal zoom — the latter,
         // when enabled, replaces the whole-layer X increment for this line.
-        let (dx, dy, lzoom) = line_scroll(vdp2, n, y);
+        let (dx, dy, lzoom) = line_scroll(vdp2, &nc.ls, y);
         base_x = base_x.wrapping_add(dx << 16);
         base_y = base_y.wrapping_add(dy << 16);
         if nc.line_zoom_x {
@@ -1184,7 +1230,7 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
         }
         // Per-column vertical cell scroll (signed; wraps in 16.16).
         if nc.vcell {
-            base_y = base_y.wrapping_add((vcell_scroll(vdp2, n, x) as u32) << 16);
+            base_y = base_y.wrapping_add((vcell_scroll(vdp2, nc, x) as u32) << 16);
         }
     }
     // Walk the source coordinate at `*inc` per screen dot and sample the integer
