@@ -53,10 +53,15 @@ We use Michael Nygard's lightweight format — see
 | [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Rejected |
 | [0013](0013-render-pipeline-worker-thread.md) | Render-pipeline worker thread (offload only the read-only render edge) | Accepted |
 | [0014](0014-audio-paced-emulation-loop.md) | Audio-paced emulation loop: real-time clock, reserve buffer, prebuffer | Accepted |
+| [0015](0015-cd-block-hle.md) | The CD-block is high-level-emulated — the one LLE exception | Accepted |
+| [0016](0016-master-leads-slave-cpu-stepping.md) | The live SH-2 pair is stepped master-leads-slave, not by the generic scheduler | Accepted |
+| [0017](0017-reference-oracle-policy.md) | Reference emulators are local, never-committed oracles — no code derived | Accepted |
+| [0018](0018-save-state-design.md) | Whole-machine bincode save states; external media referenced, not embedded | Accepted |
 
 ### Decisions worth recording (backlog)
 
 Significant choices already made in code/`CLAUDE.md` that are good
 candidates for retroactive ADRs:
 
-- Yabause as a reference oracle for cross-verification (no code derived).
+- _(none currently — the standing candidates were recorded as ADR-0015 to
+  0018, including the reference-oracle policy in [0017](0017-reference-oracle-policy.md).)_
