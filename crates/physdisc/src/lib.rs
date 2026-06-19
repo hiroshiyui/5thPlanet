@@ -458,6 +458,8 @@ mod ffi {
     unsafe impl Send for Cdio {}
 
     impl Cdio {
+        /// Open the named optical device (e.g. `/dev/sr0`); `Err` if libcdio
+        /// can't probe it. `driver_id 0` lets libcdio auto-detect the backend.
         pub fn open(device: &str) -> Result<Self, String> {
             let c = CString::new(device).map_err(|_| "device path has a NUL byte".to_string())?;
             // driver_id 0 = DRIVER_UNKNOWN → libcdio auto-detects.
