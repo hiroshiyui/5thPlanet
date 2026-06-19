@@ -44,6 +44,10 @@ pub struct Flags {
     pub exec: bool,
 }
 
+/// The SCU-DSP register file: the program counter and loop latches (PC/TOP/LOP),
+/// the multiply pipeline (RX/RY → MUL → PH:PL), the 48-bit ALU and its ACH:ACL
+/// holding registers, the per-bank data-RAM pointers (CT), the DMA address
+/// registers (RA0/WA0), the host RAM-address port (RA), and the [`Flags`].
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
@@ -72,6 +76,7 @@ pub struct Registers {
 }
 
 impl Registers {
+    /// An all-zero register file.
     pub fn new() -> Self {
         Self {
             pc: 0,

@@ -8,6 +8,8 @@
 
 use crate::isa::Op;
 
+/// Classify one 32-bit DSP word into its top-level [`Op`]; the operand fields
+/// are decoded at execution time (see the module header).
 pub fn decode(word: u32) -> Op {
     match (word >> 30) & 0b11 {
         0b00 => Op::Operation(word),

@@ -31,6 +31,8 @@ mod data_ram_serde {
     type Ram = [[u32; DATA_RAM_WORDS_PER_BANK]; DATA_RAM_BANKS];
     const N: usize = DATA_RAM_BANKS * DATA_RAM_WORDS_PER_BANK;
 
+    /// Serialize the `[[u32; 64]; 4]` data RAM as one flat `N`-element tuple
+    /// (serde-big-array is 1-D only, so this no_std codec flattens both dims).
     pub fn serialize<S: Serializer>(ram: &Ram, s: S) -> Result<S::Ok, S::Error> {
         let mut t = s.serialize_tuple(N)?;
         for bank in ram {
@@ -41,6 +43,8 @@ mod data_ram_serde {
         t.end()
     }
 
+    /// Inverse of the serializer above: read the flat `N`-word tuple back into
+    /// the banked data RAM.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Ram, D::Error> {
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -112,6 +116,7 @@ impl Default for Dsp {
 }
 
 impl Dsp {
+    /// A fresh SCU-DSP at reset (program and data RAM cleared, registers zeroed).
     pub fn new() -> Self {
         Self {
             regs: Registers::new(),
