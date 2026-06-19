@@ -35,6 +35,7 @@ impl Size {
         }
     }
 
+    /// The operand size in bytes (Byte = 1, Word = 2, Long = 4).
     pub fn bytes(self) -> u32 {
         match self {
             Size::Byte => 1,
@@ -93,6 +94,7 @@ pub enum Cond {
 }
 
 impl Cond {
+    /// Decode the 4-bit condition field (Bcc/Scc/DBcc) into a [`Cond`].
     pub fn from_bits(bits: u16) -> Cond {
         use Cond::*;
         match bits & 0xF {

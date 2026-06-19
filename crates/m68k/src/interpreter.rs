@@ -54,6 +54,9 @@ enum Ea {
     Imm(u32),
 }
 
+/// The MC68EC000 core — the register file plus the interpreter's run-state
+/// (cycle count, STOP/pending-IRQ/fault latches). Library-shaped: it reaches
+/// memory only through a [`crate::bus::Bus`] impl. Hosted by the SCSP.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cpu {
@@ -95,6 +98,8 @@ mod vector {
 }
 
 impl Cpu {
+    /// A 68000 core in the all-zero default state (the host loads the reset
+    /// vector before the first `step`).
     pub fn new() -> Self {
         Self::default()
     }

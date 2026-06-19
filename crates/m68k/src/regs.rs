@@ -70,6 +70,8 @@ impl Sr {
     }
 }
 
+/// The 68000 register file: data D0..D7, address A0..A7 (A7 = the active stack
+/// pointer), PC, SR, and the inactive USP/SSP swapped with A7 on an S-bit change.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Registers {
@@ -84,6 +86,7 @@ pub struct Registers {
 }
 
 impl Registers {
+    /// An all-zero register file.
     pub fn new() -> Self {
         Self::default()
     }
