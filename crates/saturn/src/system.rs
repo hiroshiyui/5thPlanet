@@ -475,6 +475,11 @@ impl Saturn {
         if slave.cpu.pipeline.cycles < now {
             slave.cpu.pipeline.cycles = now;
         }
+        // Re-anchor the FRT/WDT epoch to the resync'd cycle: `reset` zeroed the
+        // pipeline and we just jumped it to `now`, leaving the lazy timer's
+        // `lastts` stale (tiny). Without this the slave's first post-release
+        // `frt_wdt_update` would see a billions-cycle delta and spin/over-tick.
+        slave.cpu.onchip.reset_timer_epoch(now);
         slave.set_halted(false);
     }
 

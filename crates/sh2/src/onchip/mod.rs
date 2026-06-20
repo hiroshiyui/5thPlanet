@@ -61,6 +61,19 @@ pub struct OnChip {
     /// load forces one refresh, which self-corrects.
     #[cfg_attr(feature = "serde", serde(skip))]
     intc_sig: Option<(u8, u8, bool, u32, u32, u32, u32)>,
+    /// Global CPU cycle at which the FRT/WDT counters were last materialized
+    /// (Mednafen `FRT.lastts`). The lazy timer derives elapsed ticks from
+    /// `(now>>shift) - (lastts>>shift)`; since our global cycle is a monotone
+    /// `u64` that never rebases, this doubles as Mednafen's `ClockDivider`.
+    /// **Serialized** — it is genuine timer phase, not reconstructable.
+    lastts: u64,
+    /// Global cycle of the next FRT/WDT event (compare-match / overflow), or
+    /// `u64::MAX` when nothing is pending (FRT external + WDT off). Derived from
+    /// the registers by [`Self::frt_wdt_recalc_net`]; `#[serde(skip)]` with the
+    /// `0` default acting as a "stale, recompute on first use" sentinel after
+    /// load (`now >= 0` is always true, forcing one recompute).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    next_ts: u64,
 }
 
 impl OnChip {
@@ -158,13 +171,94 @@ impl OnChip {
         }
     }
 
-    /// Advance the time-driven on-chip timers (FRT + WDT) by `cycles` CPU
-    /// clocks. The CPU calls this once per instruction with the cycles that
-    /// instruction consumed, so the free-running counter and watchdog track
-    /// real elapsed time.
-    pub fn advance_timers(&mut self, cycles: u32) {
-        self.frt.tick(cycles);
-        self.wdt.tick(cycles);
+    /// True iff `addr` is an FRT or WDT register — the timer windows whose
+    /// reads/writes must materialize the lazy counters first (Stage B). FRT =
+    /// 0x010..0x01F, WDT = 0x080..0x09F (offsets from [`ONCHIP_BASE`]).
+    #[inline]
+    pub fn owns_timer(addr: u32) -> bool {
+        matches!(addr & 0x1FF, 0x010..=0x01F | 0x080..=0x09F)
+    }
+
+    /// Materialize the FRT/WDT counters up to global cycle `now` (Mednafen
+    /// `FRT_WDT_Update`). Elapsed prescaler ticks since [`Self::lastts`] are
+    /// `(now>>shift) - (lastts>>shift)` per peripheral — no per-cycle
+    /// accumulator, because our monotone-`u64` cycle never rebases (so it *is*
+    /// Mednafen's `ClockDivider`). FRT is skipped under the external clock
+    /// (TCR CKS=3); WDT only ticks while [`Wdt::counting`] (TME set).
+    pub fn frt_wdt_update(&mut self, now: u64) {
+        let prev = self.lastts;
+        self.lastts = now;
+        if self.frt.tcr & 0x03 != 0x03 {
+            let shift = Frt::shift(self.frt.tcr);
+            let ticks = (now >> shift).wrapping_sub(prev >> shift);
+            for _ in 0..ticks {
+                self.frt.clock_frc();
+            }
+        }
+        if self.wdt.counting() {
+            let shift = Wdt::shift(self.wdt.wtcsr);
+            let ticks = (now >> shift).wrapping_sub(prev >> shift);
+            for _ in 0..ticks {
+                self.wdt.clock_wtcnt();
+            }
+        }
+    }
+
+    /// Recompute [`Self::next_ts`] — the global cycle of the next FRT/WDT event
+    /// (Mednafen `FRT_WDT_Recalc_NET`): the nearest of the next FRT
+    /// compare-match / overflow and the next WDT overflow, or `u64::MAX` when
+    /// neither is live. Must be called after `now`-materialization and after any
+    /// write that changes a counter, OCR, prescaler, or enable.
+    pub fn frt_wdt_recalc_net(&mut self, now: u64) {
+        let mut rt = u64::MAX;
+        if self.frt.tcr & 0x03 != 0x03 {
+            let shift = Frt::shift(self.frt.tcr);
+            let frc = self.frt.frc as u64;
+            // The next FRC boundary that fires something: the nearest OCR above
+            // FRC, else the 0x10000 wrap (OVF).
+            let mut next_frc = 0x10000u64;
+            if (self.frt.ocra as u64) > frc {
+                next_frc = next_frc.min(self.frt.ocra as u64);
+            }
+            if (self.frt.ocrb as u64) > frc {
+                next_frc = next_frc.min(self.frt.ocrb as u64);
+            }
+            rt = rt.min(((next_frc - frc) << shift) - (now & ((1 << shift) - 1)));
+        }
+        if self.wdt.counting() {
+            let shift = Wdt::shift(self.wdt.wtcsr);
+            let to_ovf = 0x100u64 - self.wdt.wtcnt as u64;
+            rt = rt.min((to_ovf << shift) - (now & ((1 << shift) - 1)));
+        }
+        self.next_ts = if rt == u64::MAX { u64::MAX } else { now + rt };
+    }
+
+    /// Global cycle of the next FRT/WDT event (for the event-scheduled step gate).
+    #[inline]
+    pub fn timer_next_ts(&self) -> u64 {
+        self.next_ts
+    }
+
+    /// Re-anchor the timer epoch to `now` without ticking (Mednafen does this on
+    /// `Reset`/`AdjustTS`). The CPU calls this when its cycle counter jumps
+    /// discontinuously — chiefly on slave release ([`crate::Cpu::reset`] zeroes
+    /// `pipeline.cycles`, then the host bumps it to `now`): without re-anchoring,
+    /// the next [`Self::frt_wdt_update`] would see a billions-cycle delta from
+    /// the stale `lastts` and spin/over-tick. Invalidates `next_ts`.
+    pub fn reset_timer_epoch(&mut self, now: u64) {
+        self.lastts = now;
+        self.next_ts = 0; // force a recompute on the next access/step
+    }
+
+    /// Advance the time-driven on-chip timers (FRT + WDT) by `delta` CPU clocks
+    /// from the current epoch. **Test/host shim** over the lazy
+    /// [`Self::frt_wdt_update`] model — converts a relative cycle count into the
+    /// absolute `now` the lazy path expects, so callers/tests that think in
+    /// "advance by N cycles" keep working.
+    pub fn advance_timers(&mut self, delta: u32) {
+        let now = self.lastts + delta as u64;
+        self.frt_wdt_update(now);
+        self.frt_wdt_recalc_net(now);
     }
 
     /// Refresh the level-triggered on-chip interrupt pending bits — FRT
@@ -389,8 +483,8 @@ mod tests {
         let mut o = OnChip::new();
         // Write to TCR (offset 0x016 = FFFFFE16) selecting CKS=1 → φ/32.
         o.write8(0xFFFF_FE16, 0x01);
-        // Tick the FRT directly — register access doesn't auto-tick.
-        o.frt.tick(32);
+        // Advance 32 cycles → one φ/32 FRC tick (the lazy timer materializes it).
+        o.advance_timers(32);
         assert_eq!(o.read16(0xFFFF_FE12), 1, "FRC at FFFFFE12 after one φ/32 tick");
     }
 

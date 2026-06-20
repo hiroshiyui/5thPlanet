@@ -42,8 +42,11 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// persistent draw-cycle state of the M12 #6 draw-duration model: clip/local
 /// registers + the refresh-overhead residue) and
 /// `BusTiming::bbus_write_finish` (the exact B-bus deferred-write
-/// serialization, the M12 #8 residual).
-const VERSION: u32 = 9;
+/// serialization, the M12 #8 residual). v10 reworked the SH-2 on-chip FRT/WDT
+/// to the lazy/event-scheduled model: dropped the per-cycle prescaler
+/// accumulators (`Frt::pre`/`Wdt::pre`) and added `OnChip::lastts` (the timer
+/// epoch); `OnChip::next_ts` is derived (`#[serde(skip)]`).
+const VERSION: u32 = 10;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.

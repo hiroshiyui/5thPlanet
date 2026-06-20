@@ -34,18 +34,6 @@ pub struct Frt {
     pub tcr: u8,
     pub tocr: u8,
     pub ficr: u16,
-    /// Sub-cycle prescaler counter — accumulates instruction cycles and
-    /// emits FRC ticks at the prescaler period.
-    pre: u32,
-    /// Cached φ prescaler period (8/32/128) decoded from `TCR` bits 1..0, so
-    /// [`Frt::tick`] (called every instruction) need not re-decode `TCR` each
-    /// time. Written whenever `TCR` is written; `0` is a "stale/uncomputed"
-    /// sentinel — no real period is 0 — used after `Default`/savestate-load to
-    /// force one lazy recompute. Hence `#[serde(skip)]` derived state that
-    /// self-corrects, mirroring [`super::OnChip`]'s `intc_sig`. (The external-
-    /// clock mode CKS=3 is handled in [`Frt::tick`], not via this field.)
-    #[cfg_attr(feature = "serde", serde(skip))]
-    period: u32,
 }
 
 impl Frt {
@@ -53,58 +41,45 @@ impl Frt {
         Self::default()
     }
 
-    /// Decode the `TCR` prescaler bits (1..0) to the φ-derived FRC clock period
-    /// in CPU cycles: φ/8, φ/32, φ/128 for CKS1-0 = 0/1/2 (SH7604 HW manual,
-    /// FRT TCR). Never 0, so the caller can use 0 as the "not yet cached"
-    /// sentinel for [`Frt::period`]. CKS1-0 = 3 selects the external FTCI clock
-    /// and is handled in [`Frt::tick`] (the counter freezes), so it never
-    /// reaches here — the `_` arm folds into φ/128 but is unused.
-    const fn period_for(tcr: u8) -> u32 {
-        match tcr & 0x03 {
-            0 => 8,   // φ/8
-            1 => 32,  // φ/32
-            _ => 128, // φ/128 (CKS=3 external is filtered in tick, not decoded here)
-        }
+    /// FRT prescaler **shift** (a power of two) from TCR CKS1-0: φ/8 → 3,
+    /// φ/32 → 5, φ/128 → 7 (SH7604 HW manual; Mednafen `3 + ((TCR&3)<<1)`).
+    /// Only valid for CKS1-0 ∈ {0,1,2}; CKS=3 selects the external FTCI clock
+    /// and the caller ([`super::OnChip::frt_wdt_update`]) skips FRC ticking,
+    /// so this is never called with CKS=3. FRC ticks once per `1<<shift` φ
+    /// cycles — the lazy model derives the tick count from elapsed cycles
+    /// (`(now>>shift) - (lastts>>shift)`) instead of a per-cycle accumulator.
+    pub(super) const fn shift(tcr: u8) -> u32 {
+        3 + ((tcr as u32 & 0x03) << 1)
     }
 
-    /// Advance the timer by `cycles` CPU cycles. Performs all bookkeeping:
-    /// prescaler, counter increment, OCFA/OCFB match, OVF on wrap.
-    pub fn tick(&mut self, cycles: u32) {
-        // CKS1-0 = 3 selects the external clock input (FTCI). The Saturn does
-        // not drive it, so φ must NOT advance the FRC (matches Mednafen
-        // `FRT_WDT_Recalc_NET`'s `(TCR&3)!=3` guard and Yabause's "external
-        // input clock not implemented"). The counter simply freezes.
-        if self.tcr & 0x03 == 0x03 {
-            return;
+    /// Advance FRC by one prescaler tick (Mednafen `FRT_ClockFRC` + `FRT_CheckOCR`):
+    /// bump the counter, set OVF on wrap, OCFA/OCFB on a compare-match (with
+    /// CCLRA resetting FRC to 0 on the OCRA match for a periodic timer). Returns
+    /// whether any FTCSR status flag was set this tick, so the caller can fold
+    /// it into an interrupt recalc. Called `(now>>shift)-(lastts>>shift)` times
+    /// per update by [`super::OnChip::frt_wdt_update`].
+    pub(super) fn clock_frc(&mut self) -> bool {
+        let mut flagged = false;
+        let (new_frc, overflowed) = self.frc.overflowing_add(1);
+        self.frc = new_frc;
+        if overflowed {
+            self.ftcsr |= 0x02; // OVF
+            flagged = true;
         }
-        // `period` is cached on the TCR write; the `== 0` sentinel (after
-        // Default/savestate-load) forces one lazy recompute (see the field
-        // doc), turning the per-instruction path into a well-predicted zero
-        // check + load instead of re-decoding TCR every call.
-        if self.period == 0 {
-            self.period = Self::period_for(self.tcr);
-        }
-        let period = self.period;
-        self.pre = self.pre.saturating_add(cycles);
-        while self.pre >= period {
-            self.pre -= period;
-            let (new_frc, overflowed) = self.frc.overflowing_add(1);
-            self.frc = new_frc;
-            if overflowed {
-                self.ftcsr |= 0x02; // OVF
-            }
-            if self.frc == self.ocra {
-                self.ftcsr |= 0x08; // OCFA
-                // CCLRA (FTCSR bit 0): clear the counter on an OCRA match, so
-                // OCRA + the OCIA interrupt give a periodic timer.
-                if self.ftcsr & 0x01 != 0 {
-                    self.frc = 0;
-                }
-            }
-            if self.frc == self.ocrb {
-                self.ftcsr |= 0x04; // OCFB
+        if self.frc == self.ocra {
+            self.ftcsr |= 0x08; // OCFA
+            flagged = true;
+            // CCLRA (FTCSR bit 0): clear the counter on an OCRA match, so
+            // OCRA + the OCIA interrupt give a periodic timer.
+            if self.ftcsr & 0x01 != 0 {
+                self.frc = 0;
             }
         }
+        if self.frc == self.ocrb {
+            self.ftcsr |= 0x04; // OCFB
+            flagged = true;
+        }
+        flagged
     }
 
     /// Trigger a free-running-timer input capture (FTI edge): latch FRC into
@@ -160,10 +135,7 @@ impl Frt {
             0x03 => self.frc = (self.frc & 0xFF00) | val as u16,
             0x04 => self.write_ocr_high(val),
             0x05 => self.write_ocr_low(val),
-            0x06 => {
-                self.tcr = val;
-                self.period = Self::period_for(val); // refresh the cached φ prescaler (CKS=3 filtered in tick)
-            }
+            0x06 => self.tcr = val,
             0x07 => self.tocr = val,
             _ => {} // FICR is read-only.
         }
@@ -209,58 +181,49 @@ impl Frt {
 mod tests {
     use super::*;
 
-    #[test]
-    fn counter_ticks_at_phi_div_8_by_default() {
-        // TCR = 0 → φ/8 (the SH7604 FRT's fastest prescale; there is no φ/1).
-        let mut f = Frt::new();
-        f.tick(7);
-        assert_eq!(f.frc, 0, "below the φ/8 threshold");
-        f.tick(1);
-        assert_eq!(f.frc, 1, "8 cycles == 1 FRC tick");
+    /// Drive `n` prescaler ticks (the per-cycle→tick conversion is the lazy
+    /// model's job in `OnChip::frt_wdt_update`; here we exercise the FRC engine
+    /// directly, one tick at a time).
+    fn clock(f: &mut Frt, n: u32) {
+        for _ in 0..n {
+            f.clock_frc();
+        }
     }
 
     #[test]
-    fn prescaler_divides_clock() {
-        let mut f = Frt::new();
-        f.write8(0x06, 0x01); // TCR CKS=1 → φ/32
-        f.tick(31);
-        assert_eq!(f.frc, 0, "below the φ/32 threshold");
-        f.tick(1);
-        assert_eq!(f.frc, 1, "32 accumulated cycles == 1 FRC tick");
-        f.tick(64);
-        assert_eq!(f.frc, 3, "64 more cycles → 2 more ticks");
+    fn shift_decodes_the_prescaler() {
+        // CKS1-0 → power-of-two prescaler shift (φ/8, φ/32, φ/128). CKS=3
+        // (external) is filtered by the caller and never decoded here.
+        assert_eq!(Frt::shift(0), 3, "φ/8");
+        assert_eq!(Frt::shift(1), 5, "φ/32");
+        assert_eq!(Frt::shift(2), 7, "φ/128");
     }
 
     #[test]
-    fn external_clock_mode_freezes_the_phi_driven_counter() {
-        // TCR CKS=3 selects the external FTCI clock, undriven on the Saturn —
-        // the FRC must not advance from φ (matches Mednafen/Yabause).
+    fn counter_clocks_and_overflows() {
         let mut f = Frt::new();
-        f.write8(0x06, 0x03);
-        f.tick(10_000);
-        assert_eq!(f.frc, 0, "external clock: FRC frozen, no φ ticks");
-        // Switching back to a φ prescale resumes counting.
-        f.write8(0x06, 0x00); // φ/8
-        f.tick(8);
-        assert_eq!(f.frc, 1, "φ-driven counting resumes after CKS=3→0");
-    }
-
-    #[test]
-    fn overflow_sets_ovf_bit_and_continues_counting() {
-        let mut f = Frt::new();
+        clock(&mut f, 5);
+        assert_eq!(f.frc, 5);
         f.frc = 0xFFFE;
-        f.tick(24); // φ/8: 3 ticks → 0xFFFF → 0x0000 (OVF) → 0x0001
+        clock(&mut f, 3); // 0xFFFF → 0x0000 (OVF) → 0x0001
         assert_eq!(f.frc, 0x0001);
-        assert_eq!(f.ftcsr & 0x02, 0x02);
+        assert_eq!(f.ftcsr & 0x02, 0x02, "OVF set on wrap");
     }
 
     #[test]
-    fn output_compare_a_match_sets_ocfa() {
+    fn output_compare_a_match_sets_ocfa_and_cclra_reloads() {
         let mut f = Frt::new();
         f.write16(0x04, 0x0010); // OCRA = 0x10
-        f.tick(0x10 * 8); // φ/8: 0x10 ticks → FRC = 0x10
+        clock(&mut f, 0x10);
         assert_eq!(f.frc, 0x0010);
-        assert_eq!(f.ftcsr & 0x08, 0x08);
+        assert_eq!(f.ftcsr & 0x08, 0x08, "OCFA on the match");
+        // With CCLRA set, the OCRA match reloads FRC to 0 (periodic timer).
+        let mut g = Frt::new();
+        g.write16(0x04, 0x0004); // OCRA = 4
+        g.ftcsr |= 0x01; // CCLRA
+        clock(&mut g, 5); // 1,2,3,4(→match→reset 0),1
+        assert_eq!(g.frc, 1, "FRC reloaded to 0 on the OCRA match, then +1");
+        assert_eq!(g.ftcsr & 0x08, 0x08, "OCFA still flagged");
     }
 
     #[test]
@@ -279,33 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_period_matches_tcr_and_self_corrects_after_load() {
-        // The cached `period` must produce the same FRC behaviour as decoding
-        // TCR every tick, and recover correctly when it's been zeroed (the
-        // Default/savestate-load sentinel — `period` is #[serde(skip)]).
-        let mut f = Frt::new();
-        f.write8(0x06, 0x02); // TCR CKS=2 → φ/128 → period 128
-        f.tick(127);
-        assert_eq!(f.frc, 0, "below the φ/128 threshold");
-        f.tick(1);
-        assert_eq!(f.frc, 1, "128 accumulated cycles == 1 FRC tick");
-
-        // Simulate a savestate load: TCR is restored but the derived `period`
-        // comes back as the 0 sentinel. The next tick must recompute it from
-        // the restored TCR (φ/128), not fall back to a faster prescale.
-        f.period = 0;
-        f.pre = 0;
-        f.tick(127);
-        assert_eq!(f.frc, 1, "sentinel recompute keeps φ/128 (no fast-tick)");
-        f.tick(1);
-        assert_eq!(f.frc, 2, "recomputed period still 128");
-    }
-
-    #[test]
     fn input_capture_sets_icf_and_latches_frc() {
         let mut f = Frt::new();
         f.write16(0x04, 0xFFFF); // OCRA out of the way
-        f.tick(0x40 * 8); // φ/8: advance FRC to 0x40
+        clock(&mut f, 0x40); // advance FRC to 0x40
         assert_eq!(f.frc, 0x40);
         let icie = f.input_capture();
         assert_eq!(f.ftcsr & 0x80, 0x80, "ICF set");

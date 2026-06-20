@@ -21,8 +21,10 @@
 //! interrupt; a watchdog-mode reset only latches WOVF (forcing a real system
 //! reset needs host cooperation, which the SH-2 core alone can't do).
 
-/// CKS[2:0] → prescaler period in CPU clocks (φ/2 … φ/8192).
-const CKS_PERIODS: [u32; 8] = [2, 64, 128, 256, 512, 1024, 4096, 8192];
+/// CKS[2:0] → prescaler **shift** (φ/2 … φ/8192 = 2^1 … 2^13; Mednafen
+/// `wdt_cstab`). WTCNT ticks once per `1<<shift` φ cycles; the lazy model
+/// derives the tick count from elapsed cycles (`(now>>shift)-(lastts>>shift)`).
+const CKS_SHIFTS: [u32; 8] = [1, 6, 7, 8, 9, 10, 12, 13];
 
 /// The SH7604 watchdog timer (WDT): an 8-bit up-counter usable as an interval
 /// timer (ITI on overflow) or a true watchdog. See the module header.
@@ -32,8 +34,6 @@ pub struct Wdt {
     pub wtcsr: u8,
     pub wtcnt: u8,
     pub rstcsr: u8,
-    /// Sub-count prescaler accumulator.
-    pre: u32,
 }
 
 impl Wdt {
@@ -41,27 +41,32 @@ impl Wdt {
         Self::default()
     }
 
-    /// Advance the counter by `cycles` CPU clocks (only when TME is set),
-    /// setting OVF / WOVF on wrap per the timer mode.
-    pub fn tick(&mut self, cycles: u32) {
-        if self.wtcsr & 0x20 == 0 {
-            return; // TME (timer enable) clear → counter stopped
-        }
-        let period = CKS_PERIODS[(self.wtcsr & 0x07) as usize];
-        self.pre = self.pre.saturating_add(cycles);
-        while self.pre >= period {
-            self.pre -= period;
-            let (n, overflowed) = self.wtcnt.overflowing_add(1);
-            self.wtcnt = n;
-            if overflowed {
-                self.wtcsr |= 0x80; // OVF
-                if self.wtcsr & 0x40 != 0 {
-                    // Watchdog mode: latch the watchdog-overflow flag. A real
-                    // reset isn't forced here (see the module note).
-                    self.rstcsr |= 0x80; // WOVF
-                }
+    /// True while the counter is running (TME set). The caller
+    /// ([`super::OnChip::frt_wdt_update`]) gates `clock_wtcnt` on this.
+    pub(super) fn counting(&self) -> bool {
+        self.wtcsr & 0x20 != 0
+    }
+
+    /// WTCNT prescaler shift from CKS2-0. Only meaningful while [`Wdt::counting`].
+    pub(super) const fn shift(wtcsr: u8) -> u32 {
+        CKS_SHIFTS[(wtcsr & 0x07) as usize]
+    }
+
+    /// Advance WTCNT by one prescaler tick: set OVF on wrap (and, in watchdog
+    /// mode, latch RSTCSR.WOVF — a real reset isn't forced; see the module
+    /// note). Returns whether OVF was set this tick. Called
+    /// `(now>>shift)-(lastts>>shift)` times by [`super::OnChip::frt_wdt_update`].
+    pub(super) fn clock_wtcnt(&mut self) -> bool {
+        let (n, overflowed) = self.wtcnt.overflowing_add(1);
+        self.wtcnt = n;
+        if overflowed {
+            self.wtcsr |= 0x80; // OVF
+            if self.wtcsr & 0x40 != 0 {
+                self.rstcsr |= 0x80; // WOVF (watchdog mode)
             }
+            return true;
         }
+        false
     }
 
     /// Whether the interval-timer interrupt (ITI) is asserted: interval mode
@@ -114,20 +119,29 @@ mod tests {
         w.write16(0x00, 0xA500 | (0x20 | mode | (cks & 7)) as u16);
     }
 
+    fn clock(w: &mut Wdt, n: u32) {
+        for _ in 0..n {
+            w.clock_wtcnt();
+        }
+    }
+
     #[test]
-    fn disabled_counter_does_not_advance() {
+    fn counting_gate_and_shift_decode() {
         let mut w = Wdt::new();
-        w.tick(1000);
-        assert_eq!(w.wtcnt, 0);
+        assert!(!w.counting(), "TME clear → not counting (OnChip gates clock_wtcnt on this)");
+        enable(&mut w, true, 0);
+        assert!(w.counting(), "TME set → counting");
+        assert_eq!(Wdt::shift(0), 1, "φ/2");
+        assert_eq!(Wdt::shift(7), 13, "φ/8192");
     }
 
     #[test]
     fn interval_mode_overflow_sets_ovf_and_asserts_interrupt() {
         let mut w = Wdt::new();
-        enable(&mut w, true, 0); // φ/2
+        enable(&mut w, true, 0); // φ/2 (interval mode)
         w.write16(0x00, 0x5A00 | 0xFE); // WTCNT = 0xFE
         assert!(!w.interrupt_active());
-        w.tick(2 * 2); // 0xFE → 0xFF → 0x00 (overflow)
+        clock(&mut w, 2); // 0xFE → 0xFF → 0x00 (overflow)
         assert_eq!(w.wtcnt, 0x00);
         assert_eq!(w.wtcsr & 0x80, 0x80, "OVF set");
         assert!(w.interrupt_active(), "interval ITI asserted");
@@ -138,7 +152,7 @@ mod tests {
         let mut w = Wdt::new();
         enable(&mut w, false, 0); // watchdog mode, φ/2
         w.write16(0x00, 0x5A00 | 0xFF); // WTCNT = 0xFF
-        w.tick(2); // one count → overflow
+        clock(&mut w, 1); // one count → overflow
         assert_eq!(w.rstcsr & 0x80, 0x80, "WOVF latched");
         assert!(!w.interrupt_active(), "watchdog mode raises no ITI");
     }

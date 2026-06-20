@@ -219,7 +219,12 @@ impl Cpu {
     /// next instruction boundary. Returns the total cycles.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         let cost = self.step_instruction(bus);
-        self.onchip.advance_timers(cost);
+        // Materialize the FRT/WDT up to the cycle this instruction reached
+        // (`step_instruction` already advanced `pipeline.cycles` by `cost`, so
+        // the lazy update sees exactly `cost` elapsed cycles — identical to the
+        // old `advance_timers(cost)`). Stage A keeps this per-instruction; the
+        // `next_ts` event gate replaces it in Stage B.
+        self.onchip.frt_wdt_update(self.pipeline.cycles);
         self.run_dma(bus);
         self.onchip.refresh_interrupts();
         cost
