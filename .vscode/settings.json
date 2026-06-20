@@ -1,5 +1,5 @@
 {
     "files.associations": {
-        "jupiter/jupiter.toml.example": "toml"
+        "**/jupiter.toml.example": "toml"
     }
 }
