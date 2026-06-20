@@ -8,7 +8,9 @@ bios/*
 
 # CD-ROM disc images (CUE/BIN, CCD/IMG/SUB, ISO) live in roms/ and must
 # never be committed — they are copyrighted. Each developer supplies their own.
-roms/
+# Keep the directory documented via roms/README.md (whitelisted below).
+roms/*
+!roms/README.md
 
 # Reference emulators, used only as behavioral oracles for trace-diffing —
 # local, never-committed source checkouts/builds. No emulator code is part of
