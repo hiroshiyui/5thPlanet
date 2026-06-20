@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-20
+
+A frontend (`jupiter`) release: adds a Shuttle Mouse OSD toggle and config
+persistence, a portable (executable-adjacent) config location, and hi-res-aware
+OSD text scaling, plus a screenshots gallery and disc/BIOS documentation. **No
+emulation-core or save-state changes** — the save-state format stays v10 and
+both playable games (*Virtua Fighter 2*, *Doukyuusei ~if~*) are unaffected.
+
+### Added
+
+- **Shuttle Mouse toggle in the OSD.** The Controller settings screen gains a
+  live "Mouse: Off / Port 1 / Port 2" row that re-points the SMPC ports without
+  a reset (the game re-reads devices on the next INTBACK).
+- **Shuttle Mouse persisted in the config** via a new `mouse` key (`off`/`1`/`2`,
+  same vocabulary as the `--mouse[=1|2]` flag, which still overrides it).
+- **Portable config location.** A `jupiter.toml` sitting next to the executable
+  is now read and written, so a self-contained archive carries its own config.
+- **Documented sample config** `jupiter/jupiter.toml.example` (every key, guarded
+  by a test so it can't drift from the parser).
+- **Documentation:** a `doc/screenshots/` gallery README (with a trademarks &
+  copyright notice), a `roms/` README incl. a disc-dumping guide, and BIOS
+  SHA-512 checksums in `bios/README.md`.
+
+### Changed
+
+- **Config lookup is portable-first:** an existing `jupiter.toml` beside the
+  executable wins over `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`; the chosen
+  file is also the one written back to.
+- **OSD text/menu scales for hi-res framebuffers.** The 8×8 menu font is scaled
+  per-axis by whether that axis is hi-res (640/704-dot → 2× wide, 448/480
+  interlace → 2× tall), so the menu stays legible and correctly proportioned in
+  every video mode while still fitting non-square modes like 640×224. Lo-res
+  (320×224) is pixel-exact as before.
+
+### Removed
+
+- **F8 ("play the disc's CD-audio track") is gone from release builds.** It was
+  a developer diagnostic that drives CD-DA outside the BIOS path; it is now
+  gated behind `#[cfg(debug_assertions)]` (debug builds only).
+
+### Fixed
+
+- **OSD menu overflow in wide-but-short hi-res modes.** An interim uniform-2×
+  scaling overflowed 640×224 (only 224 lines), clipping the bottom menu rows;
+  the per-axis scaling above fixes it.
+- **VS Code TOML association** for `jupiter.toml.example` — the `files.associations`
+  glob is anchored with `**/` so it actually matches.
+
 ## [0.6.0] - 2026-06-20
 
 Reworks the SH-2 on-chip FRT/WDT timers and interrupt recalc to Mednafen's
