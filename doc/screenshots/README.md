@@ -42,3 +42,23 @@ graphics, looping CD-DA BGM, and SFX (tag `vf2-good-emulation`).
 | Image | What it shows |
 | ----- | ------------- |
 | [`osd-menu.png`](osd-menu.png) | The hand-rolled, software-composited OSD menu (Esc to open) overlaid on a paused VF2 — Resume / Save State / Load State / Reset / Eject Disc / Load Disc… / Settings / Quit. |
+
+## Trademarks & copyright
+
+These screenshots are reproduced **solely to demonstrate the emulator's
+capabilities**, with **no intent to infringe** any copyright or trademark.
+
+- *SEGA*, *SEGA Saturn*, the Saturn logos, and *Virtua Fighter 2* are
+  trademarks and/or registered trademarks of **SEGA Corporation**. © SEGA.
+- *Doukyuusei ~if~* (同級生 if) is © **NEC InterChannel, Ltd.** / élf.
+- All other game titles, logos, characters, and artwork shown are the property
+  of their respective owners.
+
+Each name and image is used here for **identification and illustration only**
+(nominative / fair use). No copyrighted game data, BIOS image, or disc content
+is distributed with this project — the emulator requires the user to supply
+their own legally-obtained dumps (see [`bios/README.md`](../../bios/README.md)
+and [`roms/README.md`](../../roms/README.md)). No affiliation with or
+endorsement by any rights holder is implied. If you are a rights holder and
+have a concern about any image here, please open an issue and it will be
+removed.
