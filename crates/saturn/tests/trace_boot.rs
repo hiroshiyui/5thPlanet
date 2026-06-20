@@ -3771,6 +3771,68 @@ fn doukyuusei_renders_non_black() {
     );
 }
 
+/// Game-render regression guard for Virtua Fighter 2 — the second "game golden"
+/// (cf. [`doukyuusei_renders_non_black`]). Boots VF2 fresh from its disc (JP
+/// v1.01 BIOS + its `.bup` clock state + Japan region, the verified-playable
+/// setup) and asserts the master runs game code (HWRAM) AND VDP2 composites a
+/// non-black frame by the time it reaches the title/attract. Together with the
+/// Doukyuusei golden this covers BOTH playable games against whole-frame render
+/// regressions (the class the BIOS-only golden misses, e.g. `b65cd18`). Needs
+/// bios/ + roms/vf2_full_lsb.cue; prints "skipped" and returns if absent. Run
+/// with --release:
+///
+///   cargo test --release -p saturn --test trace_boot vf2_renders_non_black \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "needs bios/ + roms/ VF2; the VF2 game-render golden (run with --release)"]
+fn vf2_renders_non_black() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "vf2_full_lsb.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    // VF2 boots through the JP BIOS clock check; its `.bup` carries the charged
+    // battery/clock state so the BIOS skips the date-set screen (see the VF2
+    // boot harnesses above).
+    if let Ok(bup) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bup")) {
+        sat.load_internal_backup(&bup);
+    }
+    sat.insert_disc(disc);
+    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2200);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut in_hwram = 0u32;
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        if f >= frames.saturating_sub(300) && (sat.master().regs.pc >> 24) == 0x06 {
+            in_hwram += 1;
+        }
+    }
+    let nonblack = fb.chunks_exact(4).filter(|p| (p[0] | p[1] | p[2]) != 0).count();
+    println!(
+        "vf2: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
+        sat.master().regs.pc
+    );
+    assert!(in_hwram >= 290, "master not running game code (HWRAM) — boot/exec regression");
+    assert!(
+        nonblack > 10_000,
+        "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
+    );
+}
+
 /// Measure ours' sustained emulation frame rate vs the real-machine target
 /// (~60 fps NTSC). Loads the cached menu snapshot (a 640 hi-res Doukyuusei
 /// scene — the heavy case) and times BENCH_FRAMES (default 600) two ways:
