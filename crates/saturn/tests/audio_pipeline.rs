@@ -1,11 +1,11 @@
-//! Audio-pipeline test ROM — a known signal end-to-end through the SCSP.
+//! Audio-pipeline test program — a known signal end-to-end through the SCSP.
 //!
 //! The BIOS audio path is opaque: when a sound is wrong we can't tell whether
 //! the BIOS, the 68k driver, or our SCSP synthesis is at fault. This test
 //! removes every variable except the synthesis: a ~16-instruction SH-2 program
 //! (no BIOS, no disc, no 68k sound driver) sets up **one SCSP slot to loop a
 //! sine sample** and keys it on; the harness seeds the sine into sound RAM,
-//! runs the ROM, and drains the SCSP output. Known input (a sine) → known
+//! runs the program, and drains the SCSP output. Known input (a sine) → known
 //! expected output (the same sine, looped, at full volume).
 //!
 //! Run it and dump the output for inspection:
@@ -13,16 +13,16 @@
 //! AUDIO_OUT=/tmp/sine.pcm cargo test -p saturn --test audio_pipeline \
 //!     -- --ignored --nocapture
 //! ```
-//! The same ROM image (`build_sine_rom`) is a valid Saturn boot image, so it
-//! can be run on Mednafen too for a sample-accurate cross-check (the next step:
-//! proving the synthesis, not just that it's non-silent).
+//! The same program image (`build_sine_program`) is a valid Saturn boot image,
+//! so it can be run on Mednafen too for a sample-accurate cross-check (the next
+//! step: proving the synthesis, not just that it's non-silent).
 
 use saturn::Saturn;
 use sh2::debug::disasm;
 use sh2::decoder::decode;
 
-// ---- a tiny SH-2 encoder (only the handful of forms this ROM needs) ----
-// Verified against the project's decoder in `rom_disassembles_as_expected`.
+// ---- a tiny SH-2 encoder (only the handful of forms this program needs) ----
+// Verified against the project's decoder in `program_disassembles_as_expected`.
 
 /// `MOV.L @(disp,PC), Rn` — load a 32-bit constant from the pool (disp in longs).
 fn movl_pcrel(rn: u16, disp: u16) -> u16 {
@@ -61,9 +61,9 @@ const M68K_PC: u32 = 0x0000_1000; // 68k driver program, sound-RAM offset
 const M68K_SSP: u32 = 0x0001_0000; // 68k supervisor stack pointer
 const M68K_SCSP: u32 = 0x0010_0000; // SCSP registers, as the 68k addresses them
 
-/// Build the self-contained sine-playback ROM. Layout: reset vector (PC, SP) at
-/// 0, code at 0x20, a longword + word constant pool after the code.
-fn build_sine_rom() -> Vec<u8> {
+/// Build the self-contained sine-playback program. Layout: reset vector (PC, SP)
+/// at 0, code at 0x20, a longword + word constant pool after the code.
+fn build_sine_program() -> Vec<u8> {
     // Code words (offsets relative to CODE_PC, computed below for the pool refs).
     // Pool: longword 0x05B0_0000 at 0x50, then words 0x4000/0xE000/0x1820.
     let code: [u16; 22] = [
@@ -91,21 +91,21 @@ fn build_sine_rom() -> Vec<u8> {
         BRA_SELF,                // 0x4A  spin forever
     ];
 
-    let mut rom = vec![0u8; 0x60];
-    rom[0..4].copy_from_slice(&CODE_PC.to_be_bytes()); // reset PC
-    rom[4..8].copy_from_slice(&STACK.to_be_bytes()); // reset SP
+    let mut prog = vec![0u8; 0x60];
+    prog[0..4].copy_from_slice(&CODE_PC.to_be_bytes()); // reset PC
+    prog[4..8].copy_from_slice(&STACK.to_be_bytes()); // reset SP
     let mut off = CODE_PC as usize;
     for w in code {
-        rom[off..off + 2].copy_from_slice(&w.to_be_bytes());
+        prog[off..off + 2].copy_from_slice(&w.to_be_bytes());
         off += 2;
     }
-    rom[0x4C..0x4E].copy_from_slice(&NOP.to_be_bytes()); // BRA delay slot
+    prog[0x4C..0x4E].copy_from_slice(&NOP.to_be_bytes()); // BRA delay slot
     // Constant pool.
-    rom[0x50..0x54].copy_from_slice(&SCSP_REGS.to_be_bytes());
-    rom[0x54..0x56].copy_from_slice(&SA_LOW.to_be_bytes());
-    rom[0x56..0x58].copy_from_slice(&DISDL_FULL.to_be_bytes());
-    rom[0x58..0x5A].copy_from_slice(&KEY_ON.to_be_bytes());
-    rom
+    prog[0x50..0x54].copy_from_slice(&SCSP_REGS.to_be_bytes());
+    prog[0x54..0x56].copy_from_slice(&SA_LOW.to_be_bytes());
+    prog[0x56..0x58].copy_from_slice(&DISDL_FULL.to_be_bytes());
+    prog[0x58..0x5A].copy_from_slice(&KEY_ON.to_be_bytes());
+    prog
 }
 
 /// One period of a sine, `n` samples, peak amplitude `amp`, as signed 16-bit.
@@ -119,15 +119,15 @@ fn sine_period(n: usize, amp: i16) -> Vec<i16> {
 }
 
 /// Self-check: our hand-encoded words round-trip through the real decoder, so
-/// the ROM is exactly the program the comments claim (and stays that way).
+/// the program is exactly what the comments claim (and stays that way).
 #[test]
-fn rom_disassembles_as_expected() {
-    let rom = build_sine_rom();
-    let at = |o: usize| u16::from_be_bytes([rom[o], rom[o + 1]]);
-    assert_eq!(u32::from_be_bytes(rom[0..4].try_into().unwrap()), CODE_PC);
-    assert_eq!(u32::from_be_bytes(rom[4..8].try_into().unwrap()), STACK);
+fn program_disassembles_as_expected() {
+    let prog = build_sine_program();
+    let at = |o: usize| u16::from_be_bytes([prog[o], prog[o + 1]]);
+    assert_eq!(u32::from_be_bytes(prog[0..4].try_into().unwrap()), CODE_PC);
+    assert_eq!(u32::from_be_bytes(prog[4..8].try_into().unwrap()), STACK);
     // The pool holds exactly the SCSP base + the three 16-bit register values.
-    assert_eq!(u32::from_be_bytes(rom[0x50..0x54].try_into().unwrap()), SCSP_REGS);
+    assert_eq!(u32::from_be_bytes(prog[0x50..0x54].try_into().unwrap()), SCSP_REGS);
     assert_eq!(at(0x54), SA_LOW);
     assert_eq!(at(0x58), KEY_ON);
     // Spot-check a couple of instructions decode to the intended ops.
@@ -141,7 +141,7 @@ fn audio_pipeline_sine() {
     const N: usize = 64; // 64-sample period at 1:1 → 44100/64 ≈ 689 Hz
     const AMP: i16 = 0x4000; // half-scale, so a clean tone can't clip on its own
 
-    let mut sat = Saturn::new(build_sine_rom());
+    let mut sat = Saturn::new(build_sine_program());
     sat.reset();
 
     // Seed the sine into sound RAM at the slot's SA (0x4000), and park the 68k
@@ -155,12 +155,12 @@ fn audio_pipeline_sine() {
     sat.bus.scsp.ram.write16(0x100, 0x60FE); // 68k: BRA self
     sat.bus.scsp.start(); // SNDON → SCSP generates
 
-    // Print the ROM disassembly — this *is* the trace of the pipeline setup.
-    println!("--- sine test ROM (master starts at {CODE_PC:#06X}) ---");
+    // Print the program disassembly — this *is* the trace of the pipeline setup.
+    println!("--- sine test program (master starts at {CODE_PC:#06X}) ---");
     for o in (CODE_PC..0x4C).step_by(2) {
         let w = u16::from_be_bytes([
-            build_sine_rom()[o as usize],
-            build_sine_rom()[o as usize + 1],
+            build_sine_program()[o as usize],
+            build_sine_program()[o as usize + 1],
         ]);
         println!("  {o:#06X}: {w:04X}  {}", disasm(decode(w)));
     }
@@ -195,7 +195,7 @@ fn audio_pipeline_sine() {
 // ===========================================================================
 // 68k-driven variant — the *sound CPU* sets up the slot, not the SH-2.
 //
-// The SH-2 sine ROM above proves the SCSP *synthesis* is correct, but in a real
+// The SH-2 sine program above proves the SCSP *synthesis* is correct, but in a real
 // boot it's the hosted MC68EC000 sound driver (not the SH-2) that programs the
 // slots and strobes key-on — and that path is the prime suspect for the silent
 // game/BIOS BGM. This test removes the SH-2 from the picture: the SH-2 just
@@ -218,7 +218,7 @@ fn m68k_movw_imm_abs(imm: u16, abs: u32) -> [u8; 8] {
     b
 }
 
-/// The 68k driver: program slot 0 (same values as the SH-2 sine ROM) through the
+/// The 68k driver: program slot 0 (same values as the SH-2 sine program) through the
 /// 68k's SCSP window, key-on last, then spin. `BRA *` is `0x60FE`.
 fn build_sine_68k_driver() -> Vec<u8> {
     let mut p = Vec::new();
@@ -231,15 +231,15 @@ fn build_sine_68k_driver() -> Vec<u8> {
     p
 }
 
-/// An SH-2 ROM that does nothing but spin (so the master keeps time advancing
+/// An SH-2 program that does nothing but spin (so the master keeps time advancing
 /// while the 68k does the real work).
-fn build_park_rom() -> Vec<u8> {
-    let mut rom = vec![0u8; 0x30];
-    rom[0..4].copy_from_slice(&CODE_PC.to_be_bytes()); // reset PC
-    rom[4..8].copy_from_slice(&STACK.to_be_bytes()); // reset SP
-    rom[CODE_PC as usize..CODE_PC as usize + 2].copy_from_slice(&BRA_SELF.to_be_bytes());
-    rom[CODE_PC as usize + 2..CODE_PC as usize + 4].copy_from_slice(&NOP.to_be_bytes());
-    rom
+fn build_park_program() -> Vec<u8> {
+    let mut prog = vec![0u8; 0x30];
+    prog[0..4].copy_from_slice(&CODE_PC.to_be_bytes()); // reset PC
+    prog[4..8].copy_from_slice(&STACK.to_be_bytes()); // reset SP
+    prog[CODE_PC as usize..CODE_PC as usize + 2].copy_from_slice(&BRA_SELF.to_be_bytes());
+    prog[CODE_PC as usize + 2..CODE_PC as usize + 4].copy_from_slice(&NOP.to_be_bytes());
+    prog
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn audio_pipeline_sine_68k() {
     const N: usize = 64;
     const AMP: i16 = 0x4000;
 
-    let mut sat = Saturn::new(build_park_rom()); // SH-2 just spins; the 68k works
+    let mut sat = Saturn::new(build_park_program()); // SH-2 just spins; the 68k works
     sat.reset();
 
     // Seed the sine into sound RAM at SA (shared RAM — same offset either CPU's
