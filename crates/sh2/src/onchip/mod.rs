@@ -11,13 +11,21 @@
 //!   FFFFFE00..0F  SCI       — serial communication interface (stub)
 //!   FFFFFE10..1F  FRT       — free-running timer
 //!   FFFFFE60..6F  INTC IPRB and VCRx
-//!   FFFFFE80..9F  WDT       — watchdog timer (stub)
+//!   FFFFFE80..9F  WDT       — watchdog timer
 //!   FFFFFEE0..FF  INTC ICR / IPRA / VCRWDT
 //!   FFFFFF00..1F  DIVU      — hardware divider
 //!   FFFFFF40..7F  UBC       — user break controller (stub)
 //!   FFFFFF80..BF  DMAC      — channels 0/1 + DMAOR + VCRDMA
 //!   FFFFFFC0..FF  BSC       — bus state controller (stub)
 //! ```
+//!
+//! The **FRT/WDT timers are lazy/event-scheduled** (Mednafen's model, M13 A1):
+//! [`OnChip::frt_wdt_update`] materializes the counters on demand from the
+//! elapsed cycle delta and [`OnChip::frt_wdt_recalc_net`] schedules the next
+//! event ([`OnChip::lastts`]/`next_ts`); the INTC is re-armed only on change via
+//! [`OnChip::refresh_interrupts`]. The CPU drives this from `Cpu::step`'s
+//! `next_ts` gate + the timer-register-access sync (see the crate `Cpu::step`
+//! notes), not a per-instruction tick.
 
 pub mod bsc;
 pub mod divu;
