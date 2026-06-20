@@ -93,9 +93,14 @@ jupiter/           — SDL2 frontend binary (window + framebuffer upload +
                      `config` module (M9, also sdl2-free) is the persisted
                      frontend config — a dependency-free flat `key = value`
                      TOML-subset at `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`
-                     (scale, fullscreen, region, cartridge, pad keymap;
-                     CLI flag > config > autodetect) written back on every OSD
-                     Settings change. The OSD's Controller screen rebinds the
+                     — falling back to a `jupiter.toml` beside the executable
+                     when no XDG config exists (the portable/self-contained-
+                     archive location; `Config::path` prefers an existing XDG
+                     file, then the existing portable file, then a fresh XDG
+                     write) — holding scale, fullscreen, region, cartridge, pad
+                     keymap (CLI flag > config > autodetect), written back on
+                     every OSD Settings change. A committed
+                     `jupiter/jupiter.toml.example` documents every key. The OSD's Controller screen rebinds the
                      keyboard map press-to-bind (the SDL thread owns the
                      capture; `UiMsg::ArmRebind`/`EmuIn::BindResult`), and its
                      BIOS screen power-cycles into a sibling 512-KiB image,
