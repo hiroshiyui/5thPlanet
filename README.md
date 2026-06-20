@@ -109,7 +109,6 @@ map to the mouse buttons and **Enter** doubles as the mouse's Start button.
 | Open / close the on-screen menu   | Esc |
 | Quick save (to the quick slot)    | F5 |
 | Quick load (from the quick slot)  | F9 |
-| Play the disc's CD-audio track    | F8 |
 | Toggle Shuttle Mouse capture      | F10 (with `--mouse`) |
 | Quit                              | Close the window, or Esc → **Quit** |
 

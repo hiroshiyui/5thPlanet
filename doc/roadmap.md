@@ -154,7 +154,8 @@ Related fix: no disc now reports `NODISC` (0x07), matching MAME.
   **EXTS inputs** (see M11), pulled through a ~0.5 s pre-roll jitter buffer
   (`take_cd_audio_buffered`, `87b85e9`) that absorbs the burst-vs-steady
   mismatch. Debug hooks `dbg_play_cdda`/`dbg_play_first_audio_track` (jupiter
-  F8) play CD-DA without a BIOS Play.
+  F8, **debug builds only** — `#[cfg(debug_assertions)]`) play CD-DA without a
+  BIOS Play.
 - **`physdisc` crate** — feature-gated libcdio `SectorSource` (the sole unsafe
   crate, ADR-0009); verified booting VF2 from a real drive on `/dev/sr0`.
 
