@@ -387,11 +387,11 @@ mod tests {
     #[test]
     fn frt_dispatch_via_byte_access() {
         let mut o = OnChip::new();
-        // Write to TCR (offset 0x016 = FFFFFE16) selecting φ/8.
+        // Write to TCR (offset 0x016 = FFFFFE16) selecting CKS=1 → φ/32.
         o.write8(0xFFFF_FE16, 0x01);
         // Tick the FRT directly — register access doesn't auto-tick.
-        o.frt.tick(8);
-        assert_eq!(o.read16(0xFFFF_FE12), 1, "FRC at FFFFFE12");
+        o.frt.tick(32);
+        assert_eq!(o.read16(0xFFFF_FE12), 1, "FRC at FFFFFE12 after one φ/32 tick");
     }
 
     #[test]
@@ -433,7 +433,7 @@ mod tests {
         o.write16(0xFFFF_FE60, 0x0700); // IPRB FRT priority (bits 11..8) = 7
         o.write8(0xFFFF_FE10, 0x08); // TIER: OCIAE (output-compare-A int enable)
         o.write16(0xFFFF_FE14, 0x0005); // OCRA = 5
-        o.advance_timers(5); // FRC reaches 5 → OCFA
+        o.advance_timers(5 * 8); // φ/8 (default TCR): FRC reaches 5 → OCFA
         o.refresh_interrupts();
         assert_eq!(
             o.intc.next_pending(0),
