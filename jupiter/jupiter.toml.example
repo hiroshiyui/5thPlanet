@@ -1,13 +1,17 @@
 # 5thPlanet frontend configuration — example / reference template
 #
-# Copy this file to the live config location and edit to taste:
+# Copy this file to the live config location and edit to taste. The frontend
+# looks for the config **portable-first**:
 #
-#   $XDG_CONFIG_HOME/5thplanet/jupiter.toml
-#   (fallback: ~/.config/5thplanet/jupiter.toml)
+#   1. a `jupiter.toml` right next to the `jupiter` executable — the portable /
+#      self-contained-archive location; if present it wins, overriding any
+#      global config, so the config travels with the binary.
+#   2. $XDG_CONFIG_HOME/5thplanet/jupiter.toml
+#      (fallback: ~/.config/5thplanet/jupiter.toml)
 #
-# Or, for a self-contained / portable archive, drop a `jupiter.toml` right
-# next to the `jupiter` executable — it is used (read and written) when no
-# XDG config exists, so the config travels with the binary.
+# Whichever file is chosen is also the one written back to. A fresh install with
+# no config yet writes the portable file when the exe location is known, else
+# the XDG path.
 #
 # The frontend writes this file itself whenever you change a setting in the
 # in-window OSD (Esc -> Settings), so hand-editing is optional. It is a tiny,
@@ -44,6 +48,14 @@ fullscreen = false
 #   "bram"   battery-backed RAM cart
 # Default: "none".
 cartridge = "none"
+
+# Shuttle Mouse, same vocabulary as the `--mouse[=1|2]` CLI flag:
+#   "off"  no mouse (default)
+#   "1"    mouse on port 1, replacing the keyboard pad
+#   "2"    mouse on port 2, keyboard pad stays on port 1
+# The host mouse drives it (motion + clicks; Return = the mouse Start button;
+# F10 toggles pointer capture). Default: "off".
+mouse = "off"
 
 # --- Keyboard bindings ------------------------------------------------------
 #

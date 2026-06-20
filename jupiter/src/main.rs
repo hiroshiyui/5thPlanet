@@ -122,6 +122,18 @@ fn main() -> ExitCode {
     // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
     let save_base = std::path::PathBuf::from(&bios_path);
 
+    // Shuttle Mouse: `--mouse[=1|2]` wins, else the config `mouse` token
+    // (`off` / `1` / `2`), mirroring how `--cart=` overrides `cfg.cartridge`.
+    let mouse_port = mouse_port.or_else(|| match cfg.mouse.as_str() {
+        "1" => Some(1),
+        "2" => Some(2),
+        "off" | "" => None,
+        other => {
+            eprintln!("config: bad mouse ('{other}'); using off");
+            None
+        }
+    });
+
     let region = detect_region(&bios_path, cfg.region.as_deref());
     run(bios, disc_spec, cart, save_base, region, mouse_port, cfg)
 }

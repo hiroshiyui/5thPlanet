@@ -2,11 +2,13 @@
 //!
 //! A deliberately tiny, dependency-free flat `key = value` file — a TOML
 //! subset (strings quoted, integers and booleans bare, `#` comments) — at
-//! `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (fallback `~/.config/…`), with a
-//! further fallback to a `jupiter.toml` sitting **next to the executable**
-//! (the portable / self-contained-archive location). Like the OSD this module
-//! is **`sdl2`-free**: key bindings are stored as SDL scancode *names*
-//! (strings); the frontend resolves them via `Scancode::from_name` at the edge.
+//! a `jupiter.toml` sitting **next to the executable** (the portable /
+//! self-contained-archive location), falling back to
+//! `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (then `~/.config/…`). The portable
+//! file wins so a bundled archive overrides any global config — see
+//! [`Config::path`]. Like the OSD this module is **`sdl2`-free**: key bindings
+//! are stored as SDL scancode *names* (strings); the frontend resolves them via
+//! `Scancode::from_name` at the edge.
 //!
 //! Precedence: a command-line flag beats the config file beats the built-in
 //! default (for the region, the BIOS-filename autodetect).
@@ -51,6 +53,10 @@ pub struct Config {
     /// Cartridge token, same vocabulary as `--cart=`: `none` / `ram1m` /
     /// `ram4m` / `bram`.
     pub cartridge: String,
+    /// Shuttle Mouse token, same vocabulary as `--mouse[=1|2]`: `off` (no
+    /// mouse, default), `1` (mouse on port 1, replacing the pad) or `2` (mouse
+    /// on port 2, keyboard pad stays on port 1). The CLI flag overrides this.
+    pub mouse: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -62,6 +68,7 @@ impl Default for Config {
             fullscreen: false,
             region: None,
             cartridge: "none".into(),
+            mouse: "off".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -93,6 +100,7 @@ impl Config {
                 }
                 "region" => cfg.region = Some(unquote(v)).filter(|s| !s.is_empty()),
                 "cartridge" => cfg.cartridge = unquote(v),
+                "mouse" => cfg.mouse = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -117,6 +125,7 @@ impl Config {
             out.push_str(&format!("region = \"{r}\"\n"));
         }
         out.push_str(&format!("cartridge = \"{}\"\n", self.cartridge));
+        out.push_str(&format!("mouse = \"{}\"\n", self.mouse));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -142,33 +151,37 @@ impl Config {
         Some(exe.parent()?.join("jupiter.toml"))
     }
 
-    /// The config path to use. An *existing* file wins — the XDG file is
-    /// preferred, then the portable file beside the executable; if neither
-    /// exists yet, a fresh write goes to the XDG path when available, else the
-    /// portable path. Both [`load`](Self::load) and [`save`](Self::save) route
-    /// through here, so a portable archive's local config is also written back.
+    /// The config path to use. **Portable-first:** an *existing* `jupiter.toml`
+    /// beside the executable wins (so a self-contained archive's bundled config
+    /// overrides any global one), then an *existing* XDG file; if neither exists
+    /// yet, a fresh write goes to the portable path when the exe location is
+    /// known, else the XDG path. Both [`load`](Self::load) and
+    /// [`save`](Self::save) route through here, so the chosen file is the one
+    /// written back to.
     pub fn path() -> Option<PathBuf> {
         Self::pick_path(Self::xdg_path(), Self::local_path(), |p| p.is_file())
     }
 
     /// Pure path-resolution policy (filesystem probing injected via `exists`),
-    /// so the precedence is unit-testable without touching real files.
+    /// so the precedence is unit-testable without touching real files. Portable
+    /// (executable-adjacent) beats XDG; an existing file beats a fresh-write
+    /// target.
     fn pick_path(
         xdg: Option<PathBuf>,
         local: Option<PathBuf>,
         exists: impl Fn(&std::path::Path) -> bool,
     ) -> Option<PathBuf> {
-        if let Some(p) = &xdg
-            && exists(p)
-        {
-            return xdg;
-        }
         if let Some(p) = &local
             && exists(p)
         {
             return local;
         }
-        xdg.or(local)
+        if let Some(p) = &xdg
+            && exists(p)
+        {
+            return xdg;
+        }
+        local.or(xdg)
     }
 
     /// Load from [`Config::path`]; a missing or unreadable file is the default.
@@ -209,6 +222,7 @@ mod tests {
             fullscreen: true,
             region: Some("europe-pal".into()),
             cartridge: "ram4m".into(),
+            mouse: "2".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -238,7 +252,16 @@ mod tests {
     }
 
     #[test]
-    fn pick_path_prefers_existing_xdg_then_portable_then_fresh_xdg() {
+    fn mouse_token_parses_and_defaults_to_off() {
+        assert_eq!(Config::default().mouse, "off");
+        assert_eq!(Config::parse("mouse = \"2\"\n").mouse, "2");
+        assert_eq!(Config::parse("mouse = \"1\"\n").mouse, "1");
+        // A missing key keeps the default; main.rs treats unknown tokens as off.
+        assert_eq!(Config::parse("scale = 2\n").mouse, "off");
+    }
+
+    #[test]
+    fn pick_path_prefers_existing_portable_then_xdg_then_fresh_portable() {
         let xdg = PathBuf::from("/cfg/jupiter.toml");
         let local = PathBuf::from("/app/jupiter.toml");
         let pick = |present: &[&str]| {
@@ -247,22 +270,22 @@ mod tests {
                 present.iter().any(|q| q == p)
             })
         };
-        // Existing XDG always wins, even when both are present.
-        assert_eq!(pick(&["/cfg/jupiter.toml", "/app/jupiter.toml"]), Some(xdg.clone()));
-        assert_eq!(pick(&["/cfg/jupiter.toml"]), Some(xdg.clone()));
-        // Only the portable file exists -> use it (self-contained archive).
+        // The portable file always wins when present, even alongside XDG —
+        // a self-contained archive's bundled config overrides the global one.
+        assert_eq!(pick(&["/cfg/jupiter.toml", "/app/jupiter.toml"]), Some(local.clone()));
         assert_eq!(pick(&["/app/jupiter.toml"]), Some(local.clone()));
-        // Neither exists yet -> a fresh write targets XDG.
-        assert_eq!(pick(&[]), Some(xdg));
+        // Only the XDG file exists -> use it.
+        assert_eq!(pick(&["/cfg/jupiter.toml"]), Some(xdg.clone()));
+        // Neither exists yet -> a fresh write targets the portable path.
+        assert_eq!(pick(&[]), Some(local));
     }
 
     #[test]
-    fn pick_path_falls_back_to_portable_when_no_xdg() {
-        let local = PathBuf::from("/app/jupiter.toml");
-        // No XDG location at all (no HOME/XDG_CONFIG_HOME) -> portable path,
-        // whether or not it exists yet.
-        assert_eq!(Config::pick_path(None, Some(local.clone()), |_| false), Some(local.clone()));
-        assert_eq!(Config::pick_path(None, Some(local.clone()), |_| true), Some(local));
+    fn pick_path_falls_back_to_xdg_when_no_portable() {
+        let xdg = PathBuf::from("/cfg/jupiter.toml");
+        // No exe location at all -> XDG path, whether or not it exists yet.
+        assert_eq!(Config::pick_path(Some(xdg.clone()), None, |_| false), Some(xdg.clone()));
+        assert_eq!(Config::pick_path(Some(xdg.clone()), None, |_| true), Some(xdg));
         // Nothing resolvable -> None.
         assert_eq!(Config::pick_path(None, None, |_| true), None);
     }
