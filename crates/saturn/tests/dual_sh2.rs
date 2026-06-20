@@ -230,6 +230,56 @@ fn word_write_to_fti_region_pulses_target_frt_input_capture() {
     assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "master ICF set");
 }
 
+/// Regression guard for the `b65cd18` black-screen bug: a pending SMPC command
+/// must NOT shorten (break) the SH-2 batch to dispatch its side effect early.
+/// b65cd18 added `if smpc.has_pending() { break }` to `step_cpus`; inside
+/// `run_frame`'s single `run_for` that re-anchored the event-clamped batch grid
+/// mid-frame and broke VDP2 raster/VBlank timing — Doukyuusei black-screened
+/// while the master ran normally. SMPC commands must drain only at the batch
+/// boundary (≤ one `SMPC_POLL_QUANTUM` late), as both playable games rely on.
+///
+/// Observable (cycle-cost-independent): queue SSHON, then `run_for` a budget
+/// *below* the poll quantum. The command drains at the boundary, so the slave
+/// is released — but it executes NOTHING within this window (which ends at that
+/// same boundary). The buggy mid-batch break released the slave early, so it
+/// would have counted instructions (R10 > 0).
+#[test]
+fn pending_smpc_command_does_not_break_the_batch() {
+    // SMPC COMREG at SMPC offset 0x1F via the cache-through alias; SSHON = 0x02.
+    const COMREG: u32 = 0x2010_001F;
+    const SSHON: u32 = 0x02;
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&SLAVE_PC.to_be_bytes()); // slave reset PC
+    bios[4..8].copy_from_slice(&0x0020_8400u32.to_be_bytes()); // slave reset SP
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    assert!(sat.slave_is_halted(), "precondition: slave halted at power-on");
+    // Master: MOV.B R2,@R1 (write SSHON to COMREG), then spin.
+    load(&mut sat.bus, MASTER_PC, &[0x2120, 0xAFFE, 0x0009]);
+    // Slave (entered via the reset vector on SSHON): ADD #1,R10 in a tight loop.
+    load(&mut sat.bus, SLAVE_PC, &[0x7A01, 0xAFFD, 0x0009]);
+    {
+        let m = sat.master_mut();
+        m.regs.pc = MASTER_PC;
+        m.regs.r[1] = COMREG;
+        m.regs.r[2] = SSHON;
+        m.regs.r[15] = 0x0020_8000;
+    }
+    // Budget < SMPC_POLL_QUANTUM (256): the whole window is one batch. SSHON
+    // drains at the boundary; with NO mid-batch break the released slave gets
+    // no cycles this window.
+    let before = sat.now();
+    sat.run_for(50);
+    assert!(sat.now() >= before + 50, "run_for advanced the full budget (no stall)");
+    assert!(!sat.slave_is_halted(), "SSHON drained at the boundary → slave released");
+    assert_eq!(
+        sat.slave().regs.r[10],
+        0,
+        "released slave ran INSIDE the window — the SMPC command broke the batch \
+         mid-window (the b65cd18 regression that black-screened Doukyuusei)"
+    );
+}
+
 /// Debug multi-breakpoint: several breakpoints can be armed at once, and the
 /// one **first reached in execution** fires (not the first in the armed list),
 /// with the hit's `pc` field identifying which. Exercises the core check via

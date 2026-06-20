@@ -3712,6 +3712,65 @@ fn menu_savestate_probe() {
     }
 }
 
+/// Game-render regression guard — the "game golden", analogous to the
+/// BIOS-splash `bios_boot` golden but for an actual game. Boots Doukyuusei ~if~
+/// fresh from its disc and asserts the master is running game code (HWRAM) AND
+/// VDP2 is compositing a non-black frame. Catches whole-frame render regressions
+/// the BIOS-only golden misses — e.g. the `b65cd18` mid-batch-SMPC bug that
+/// black-screened the game while the CPU ran normally (fixed `4d0c67f`): there
+/// the master sat 100% in HWRAM yet the framebuffer was all zeros. Needs a real
+/// JP BIOS + the Doukyuusei disc in roms/ (like every harness here); prints
+/// "skipped" and returns if absent. Run with --release:
+///
+///   cargo test --release -p saturn --test trace_boot doukyuusei_renders_non_black \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "needs bios/ + roms/ Doukyuusei; the game-render golden (run with --release)"]
+fn doukyuusei_renders_non_black() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name =
+        std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2200);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut in_hwram = 0u32;
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        // Over the last 300 frames, the master should be executing the loaded
+        // game (HWRAM 0x06xx), not parked in the BIOS (0x00xx).
+        if f >= frames.saturating_sub(300) && (sat.master().regs.pc >> 24) == 0x06 {
+            in_hwram += 1;
+        }
+    }
+    let nonblack = fb.chunks_exact(4).filter(|p| (p[0] | p[1] | p[2]) != 0).count();
+    println!(
+        "doukyuusei: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
+        sat.master().regs.pc
+    );
+    assert!(in_hwram >= 290, "master not running game code (HWRAM) — boot/exec regression");
+    assert!(
+        nonblack > 10_000,
+        "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
+    );
+}
+
 /// Measure ours' sustained emulation frame rate vs the real-machine target
 /// (~60 fps NTSC). Loads the cached menu snapshot (a 640 hi-res Doukyuusei
 /// scene — the heavy case) and times BENCH_FRAMES (default 600) two ways:
