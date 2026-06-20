@@ -29,6 +29,48 @@ Notes:
 - BIN tracks must be **2352-byte raw sectors** (the cue `MODE1/2352` form),
   matching how the read pump and authentication expect to see sector data.
 
+## Dumping your own discs to .cue + .bin
+
+To play a game you own, dump its disc to a CUE/BIN set yourself. A Saturn disc
+is a single session with a data track plus (usually) several CD-DA audio
+tracks, so the dumper must capture **all** tracks at **raw 2352-byte sectors**.
+Use a plain CD/DVD drive (PC SATA/USB optical drives work; many can read
+Saturn discs even without special "audio-extraction" support).
+
+Recommended tools, best first:
+
+- **DiscImageCreator** (Windows) — the [redump.org](http://redump.org)
+  preservation standard. Produces `.bin` + `.cue` (plus `.sub`, `.ccd`, log
+  files) with correct **LSB-first** audio. Roughly:
+
+  ```
+  DiscImageCreator.exe cd <drive-letter> game.bin 8
+  ```
+
+  (`8` = read speed; lower is safer on scratched discs.) You can then verify
+  your dump's hashes against the redump.org database.
+
+- **Redumper** (Windows/Linux/macOS) — a modern, cross-platform redump-style
+  dumper, also `.bin` + `.cue` with correct audio:
+
+  ```
+  redumper --drive=/dev/sr0 --speed=8 --image-name=game
+  ```
+
+- **cdrdao** (Linux/cross-platform) — widely available, but ⚠️ it writes audio
+  tracks **MSB-first (byte-swapped)**, which this emulator plays as noise (see
+  the gotcha below). Use it only if you can byte-swap the audio afterwards, or
+  prefer the two tools above.
+
+  ```
+  cdrdao read-cd --read-raw --driver generic-mmc-raw \
+      --device /dev/sr0 --datafile game.bin game.toc
+  toc2cue game.toc game.cue
+  ```
+
+Whatever the tool, drop the resulting `game.cue` + `game.bin` (keep them in the
+same directory — the cue `FILE`-references the bin by name) into `roms/`.
+
 ## Loading a disc
 
 ```bash
