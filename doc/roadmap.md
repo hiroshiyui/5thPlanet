@@ -134,8 +134,9 @@ core-free so it's unit-tested without a window. Esc opens it: save/load slots
 (10), Reset, Eject/Insert disc, a **Load Disc…** filesystem image browser
 (navigate dirs, pick a `.cue`/`.iso`/`.ccd`, load + boot — frontend owns the
 `fs`, the menu stays pure), Quit, plus Settings — **Graphics** (scale
-1×–4×, fullscreen), **Controller** (press-to-bind keyboard rebind),
-**Region**, **Cartridge**, **BIOS** (power-cycle into a sibling 512-KiB image,
+1×–4×, fullscreen), **Controller** (press-to-bind keyboard rebind + a live
+Shuttle Mouse port toggle Off/1/2), **Region**, **Cartridge**,
+**BIOS** (power-cycle into a sibling 512-KiB image,
 save files re-keyed). All persisted to a flat TOML-subset config, **portable-first**: a `jupiter.toml`
 beside the executable wins (portable/self-contained archive), falling back to
 `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (a committed
