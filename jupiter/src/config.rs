@@ -2,10 +2,11 @@
 //!
 //! A deliberately tiny, dependency-free flat `key = value` file — a TOML
 //! subset (strings quoted, integers and booleans bare, `#` comments) — at
-//! `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (fallback `~/.config/…`). Like
-//! the OSD this module is **`sdl2`-free**: key bindings are stored as SDL
-//! scancode *names* (strings); the frontend resolves them via
-//! `Scancode::from_name` at the edge.
+//! `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (fallback `~/.config/…`), with a
+//! further fallback to a `jupiter.toml` sitting **next to the executable**
+//! (the portable / self-contained-archive location). Like the OSD this module
+//! is **`sdl2`-free**: key bindings are stored as SDL scancode *names*
+//! (strings); the frontend resolves them via `Scancode::from_name` at the edge.
 //!
 //! Precedence: a command-line flag beats the config file beats the built-in
 //! default (for the region, the BIOS-filename autodetect).
@@ -122,14 +123,52 @@ impl Config {
         out
     }
 
-    /// `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`, falling back to
-    /// `~/.config/5thplanet/jupiter.toml`; `None` if neither env var exists.
-    pub fn path() -> Option<PathBuf> {
+    /// The XDG location: `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`, falling
+    /// back to `~/.config/5thplanet/jupiter.toml`; `None` if neither env var
+    /// exists.
+    pub fn xdg_path() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
         Some(base.join("5thplanet").join("jupiter.toml"))
+    }
+
+    /// The portable location: a `jupiter.toml` in the same directory as the
+    /// running executable — ship it inside a self-contained archive and the
+    /// config travels with the binary. `None` if the exe path is unknown.
+    pub fn local_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join("jupiter.toml"))
+    }
+
+    /// The config path to use. An *existing* file wins — the XDG file is
+    /// preferred, then the portable file beside the executable; if neither
+    /// exists yet, a fresh write goes to the XDG path when available, else the
+    /// portable path. Both [`load`](Self::load) and [`save`](Self::save) route
+    /// through here, so a portable archive's local config is also written back.
+    pub fn path() -> Option<PathBuf> {
+        Self::pick_path(Self::xdg_path(), Self::local_path(), |p| p.is_file())
+    }
+
+    /// Pure path-resolution policy (filesystem probing injected via `exists`),
+    /// so the precedence is unit-testable without touching real files.
+    fn pick_path(
+        xdg: Option<PathBuf>,
+        local: Option<PathBuf>,
+        exists: impl Fn(&std::path::Path) -> bool,
+    ) -> Option<PathBuf> {
+        if let Some(p) = &xdg
+            && exists(p)
+        {
+            return xdg;
+        }
+        if let Some(p) = &local
+            && exists(p)
+        {
+            return local;
+        }
+        xdg.or(local)
     }
 
     /// Load from [`Config::path`]; a missing or unreadable file is the default.
@@ -196,5 +235,44 @@ mod tests {
         assert_eq!(cfg.scale, 1);
         assert_eq!(cfg.keys[12], "Space");
         assert_eq!(cfg.keys[0], "Up");
+    }
+
+    #[test]
+    fn pick_path_prefers_existing_xdg_then_portable_then_fresh_xdg() {
+        let xdg = PathBuf::from("/cfg/jupiter.toml");
+        let local = PathBuf::from("/app/jupiter.toml");
+        let pick = |present: &[&str]| {
+            let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
+            Config::pick_path(Some(xdg.clone()), Some(local.clone()), |p| {
+                present.iter().any(|q| q == p)
+            })
+        };
+        // Existing XDG always wins, even when both are present.
+        assert_eq!(pick(&["/cfg/jupiter.toml", "/app/jupiter.toml"]), Some(xdg.clone()));
+        assert_eq!(pick(&["/cfg/jupiter.toml"]), Some(xdg.clone()));
+        // Only the portable file exists -> use it (self-contained archive).
+        assert_eq!(pick(&["/app/jupiter.toml"]), Some(local.clone()));
+        // Neither exists yet -> a fresh write targets XDG.
+        assert_eq!(pick(&[]), Some(xdg));
+    }
+
+    #[test]
+    fn pick_path_falls_back_to_portable_when_no_xdg() {
+        let local = PathBuf::from("/app/jupiter.toml");
+        // No XDG location at all (no HOME/XDG_CONFIG_HOME) -> portable path,
+        // whether or not it exists yet.
+        assert_eq!(Config::pick_path(None, Some(local.clone()), |_| false), Some(local.clone()));
+        assert_eq!(Config::pick_path(None, Some(local.clone()), |_| true), Some(local));
+        // Nothing resolvable -> None.
+        assert_eq!(Config::pick_path(None, None, |_| true), None);
+    }
+
+    /// The committed `jupiter.toml.example` must stay parseable and document
+    /// the real defaults — with `region` commented out it parses to exactly
+    /// `Config::default()`. Guards the sample against drifting from the parser.
+    #[test]
+    fn example_file_parses_to_defaults() {
+        let text = include_str!("../jupiter.toml.example");
+        assert_eq!(Config::parse(text), Config::default());
     }
 }

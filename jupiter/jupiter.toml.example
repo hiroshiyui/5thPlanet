@@ -1,0 +1,68 @@
+# 5thPlanet frontend configuration — example / reference template
+#
+# Copy this file to the live config location and edit to taste:
+#
+#   $XDG_CONFIG_HOME/5thplanet/jupiter.toml
+#   (fallback: ~/.config/5thplanet/jupiter.toml)
+#
+# Or, for a self-contained / portable archive, drop a `jupiter.toml` right
+# next to the `jupiter` executable — it is used (read and written) when no
+# XDG config exists, so the config travels with the binary.
+#
+# The frontend writes this file itself whenever you change a setting in the
+# in-window OSD (Esc -> Settings), so hand-editing is optional. It is a tiny,
+# dependency-free TOML *subset*: flat `key = value` lines only — strings are
+# quoted, integers and booleans are bare, and `#` starts a comment. Nested
+# tables and arrays are NOT parsed. The reader is tolerant: unknown keys,
+# blank lines and malformed lines are skipped, and any missing key keeps its
+# built-in default, so an old or partial file never blocks boot.
+#
+# Precedence for every setting: a command-line flag beats this file, which
+# beats the built-in default (for `region`, the BIOS-filename autodetect).
+
+# --- Graphics ---------------------------------------------------------------
+
+# Window scale: integer 1..=4, multiplying the 320x224 base. Out-of-range
+# values are clamped into [1, 4]. Default: 2.
+scale = 2
+
+# Start in fullscreen. Default: false.
+fullscreen = false
+
+# --- System -----------------------------------------------------------------
+
+# SMPC region token. Omit this key entirely to autodetect from the BIOS
+# filename (the default). Valid values:
+#   "japan"          "north-america"
+#   "europe-pal"     "asia-ntsc"
+# region = "japan"
+
+# Rear expansion cartridge, same vocabulary as the `--cart=` CLI flag:
+#   "none"   empty slot
+#   "ram1m"  1 MiB Extension RAM
+#   "ram4m"  4 MiB Extension RAM
+#   "bram"   battery-backed RAM cart
+# Default: "none".
+cartridge = "none"
+
+# --- Keyboard bindings ------------------------------------------------------
+#
+# Each Saturn digital-pad button is bound to one SDL *scancode name* (a
+# string; resolved via SDL_Scancode::from_name at the edge). The defaults
+# below are: arrows = D-pad, Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R,
+# Return = Start. Rebind interactively via OSD -> Settings -> Controller,
+# or edit the names here. Find scancode names in the SDL documentation.
+
+key_up    = "Up"
+key_down  = "Down"
+key_left  = "Left"
+key_right = "Right"
+key_a     = "Z"
+key_b     = "X"
+key_c     = "C"
+key_x     = "A"
+key_y     = "S"
+key_z     = "D"
+key_l     = "Q"
+key_r     = "W"
+key_start = "Return"
