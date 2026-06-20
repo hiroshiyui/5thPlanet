@@ -297,7 +297,7 @@ fn run(
     cart: Cartridge,
     save_base: std::path::PathBuf,
     region: u8,
-    mouse_port: Option<u8>,
+    mut mouse_port: Option<u8>,
     cfg: config::Config,
 ) -> ExitCode {
     use sdl2::audio::AudioSpecDesired;
@@ -315,19 +315,11 @@ fn run(
     let mut saturn = Saturn::new(bios);
     saturn.reset();
     saturn.set_region(region);
-    // Plug the Shuttle Mouse into the requested port. On port 2 (the default)
-    // the keyboard pad stays on port 1; --mouse=1 replaces the pad (the
-    // mouse's Start button is on the Return key either way).
-    match mouse_port {
-        Some(1) => saturn.set_port_devices(
-            saturn::smpc::PortDevice::Mouse,
-            saturn::smpc::PortDevice::None,
-        ),
-        Some(_) => saturn.set_port_devices(
-            saturn::smpc::PortDevice::Pad,
-            saturn::smpc::PortDevice::Mouse,
-        ),
-        None => {}
+    // Plug the Shuttle Mouse into the requested port (None = power-on default,
+    // pad on 1). On port 2 the keyboard pad stays on port 1; --mouse=1 replaces
+    // the pad (the mouse's Start button is on the Return key either way).
+    if mouse_port.is_some() {
+        apply_mouse_port(&mut saturn, mouse_port);
     }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
@@ -620,6 +612,7 @@ fn run(
                     fullscreen: sess.ui.fullscreen,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
+                    mouse: mouse_port_to_osd(sess.mouse_port),
                     // pad_keys/bios_names are read only by the Controller/BIOS
                     // settings sub-screens (via `items()`, gated on the menu
                     // being open), so skip cloning them on the gameplay hot path
@@ -1091,6 +1084,11 @@ fn run(
                                 .expect("default scancode name")
                         });
                     }
+                    UiMsg::SetMouse(port) => {
+                        // Off (None) releases any active pointer grab next frame
+                        // (the grab loop is gated on `mouse_port.is_some()`).
+                        mouse_port = port;
+                    }
                     UiMsg::Quit => quit = true,
                 }
             }
@@ -1190,6 +1188,9 @@ enum UiMsg {
     ArmRebind(u8),
     /// Restore the default keyboard→pad bindings.
     ResetKeymap,
+    /// Move the Shuttle Mouse (or remove it): updates the SDL thread's capture
+    /// gate so motion/clicks are fed only while a mouse port is active.
+    SetMouse(Option<u8>),
     Quit,
 }
 
@@ -1350,6 +1351,39 @@ fn osd_cart_to_cartridge(c: osd::OsdCart) -> Cartridge {
     }
 }
 
+/// The Shuttle Mouse port as the OSD names it (`None`/`1`/`2` ↔ Off/Port1/Port2).
+#[cfg(feature = "sdl2-frontend")]
+fn mouse_port_to_osd(port: Option<u8>) -> osd::OsdMouse {
+    match port {
+        Some(1) => osd::OsdMouse::Port1,
+        Some(_) => osd::OsdMouse::Port2,
+        None => osd::OsdMouse::Off,
+    }
+}
+
+/// Inverse of [`mouse_port_to_osd`]: the port index the rest of the frontend
+/// tracks (the config token and the SDL capture gate use this).
+#[cfg(feature = "sdl2-frontend")]
+fn osd_mouse_to_port(m: osd::OsdMouse) -> Option<u8> {
+    match m {
+        osd::OsdMouse::Off => None,
+        osd::OsdMouse::Port1 => Some(1),
+        osd::OsdMouse::Port2 => Some(2),
+    }
+}
+
+/// Point the SMPC ports at the chosen mouse layout: port 1 mouse (no pad),
+/// port 2 mouse (pad stays on 1), or off (the power-on default, pad on 1).
+fn apply_mouse_port(saturn: &mut saturn::Saturn, port: Option<u8>) {
+    use saturn::smpc::PortDevice::{Mouse, None as NoDev, Pad};
+    let (p1, p2) = match port {
+        Some(1) => (Mouse, NoDev),
+        Some(_) => (Pad, Mouse),
+        None => (Pad, NoDev),
+    };
+    saturn.set_port_devices(p1, p2);
+}
+
 /// Carry out a menu action against the running machine. Returns `true` if the
 /// emulator should quit. Save-state slots live at `<bios>.<n>.state`.
 #[cfg(feature = "sdl2-frontend")]
@@ -1491,17 +1525,7 @@ fn dispatch_osd(
                     *saturn = saturn::Saturn::new(bytes);
                     saturn.reset();
                     saturn.set_region(osd_region_to_code(sess.ui.region));
-                    match sess.mouse_port {
-                        Some(1) => saturn.set_port_devices(
-                            saturn::smpc::PortDevice::Mouse,
-                            saturn::smpc::PortDevice::None,
-                        ),
-                        Some(_) => saturn.set_port_devices(
-                            saturn::smpc::PortDevice::Pad,
-                            saturn::smpc::PortDevice::Mouse,
-                        ),
-                        None => {}
-                    }
+                    apply_mouse_port(saturn, sess.mouse_port);
                     saturn.set_rtc_unix(host_unix_secs());
                     if let Some(spec) = &sess.launched_spec
                         && let Err(e) = insert_from_spec(saturn, spec)
@@ -1552,6 +1576,23 @@ fn dispatch_osd(
             osd.set_toast(format!("Cartridge: {name} (reset)"), 150);
             osd.close();
         }
+        OsdAction::SetMouse(m) => {
+            // A peripheral swap, not a hardware reset: re-point the SMPC ports
+            // live (the game re-reads devices on the next INTBACK poll), tell
+            // the SDL thread so its mouse-capture gate follows, and persist.
+            let port = osd_mouse_to_port(m);
+            sess.mouse_port = port;
+            apply_mouse_port(saturn, port);
+            let _ = ui_tx.send(UiMsg::SetMouse(port));
+            let (token, name) = match m {
+                osd::OsdMouse::Off => ("off", "Off"),
+                osd::OsdMouse::Port1 => ("1", "Port 1"),
+                osd::OsdMouse::Port2 => ("2", "Port 2"),
+            };
+            sess.cfg.mouse = token.to_string();
+            sess.cfg.save();
+            osd.set_toast(format!("Mouse: {name}"), 120);
+        }
     }
     false
 }
@@ -1581,19 +1622,11 @@ fn run(
     let mut saturn = Saturn::new(bios);
     saturn.reset();
     saturn.set_region(region);
-    // Plug the Shuttle Mouse into the requested port. On port 2 (the default)
-    // the keyboard pad stays on port 1; --mouse=1 replaces the pad (the
-    // mouse's Start button is on the Return key either way).
-    match mouse_port {
-        Some(1) => saturn.set_port_devices(
-            saturn::smpc::PortDevice::Mouse,
-            saturn::smpc::PortDevice::None,
-        ),
-        Some(_) => saturn.set_port_devices(
-            saturn::smpc::PortDevice::Pad,
-            saturn::smpc::PortDevice::Mouse,
-        ),
-        None => {}
+    // Plug the Shuttle Mouse into the requested port (None = power-on default,
+    // pad on 1). On port 2 the keyboard pad stays on port 1; --mouse=1 replaces
+    // the pad (the mouse's Start button is on the Return key either way).
+    if mouse_port.is_some() {
+        apply_mouse_port(&mut saturn, mouse_port);
     }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.

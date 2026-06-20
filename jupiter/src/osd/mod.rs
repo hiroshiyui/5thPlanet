@@ -55,6 +55,37 @@ pub enum OsdCart {
     BackupRam,
 }
 
+/// Which SMPC port carries the Shuttle Mouse (frontend maps to
+/// `saturn::smpc::PortDevice`): `Off` = both ports default (pad on 1), `Port1`
+/// replaces the pad on port 1, `Port2` keeps the pad on 1 and adds a mouse on 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsdMouse {
+    Off,
+    Port1,
+    Port2,
+}
+
+impl OsdMouse {
+    /// The next setting in the Off → Port 1 → Port 2 → Off cycle (the Controller
+    /// screen advances through these on each activation).
+    fn next(self) -> Self {
+        match self {
+            OsdMouse::Off => OsdMouse::Port1,
+            OsdMouse::Port1 => OsdMouse::Port2,
+            OsdMouse::Port2 => OsdMouse::Off,
+        }
+    }
+
+    /// Short label for the cycling Controller-screen row.
+    fn label(self) -> &'static str {
+        match self {
+            OsdMouse::Off => "Off",
+            OsdMouse::Port1 => "Port 1",
+            OsdMouse::Port2 => "Port 2",
+        }
+    }
+}
+
 /// One row in the disc-image browser ([`Screen::DiscBrowser`]). The frontend
 /// builds the list from the current directory (`..` first when not at the
 /// filesystem root, then sub-directories, then disc-image files); the OSD only
@@ -89,6 +120,8 @@ pub enum OsdAction {
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
     SetCartridge(OsdCart),
+    /// Move the Shuttle Mouse (frontend re-points the SMPC ports live, no reset).
+    SetMouse(OsdMouse),
     /// Rebind a pad button ([`crate::config::BUTTON_NAMES`] index): the
     /// frontend captures the next host key and reports back via
     /// [`Osd::end_capture`].
@@ -122,6 +155,8 @@ pub struct OsdCtx {
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
     pub cart: OsdCart,
+    /// Current Shuttle Mouse port — the Controller screen shows it.
+    pub mouse: OsdMouse,
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
     pub pad_keys: [String; PAD_BUTTONS],
@@ -338,6 +373,11 @@ impl Osd {
                         Select::Emit(OsdAction::StartRebind(i as u8)),
                     ));
                 }
+                // Shuttle Mouse port cycles Off → Port 1 → Port 2 → Off.
+                v.push(mk(
+                    &format!("Mouse: {}", ctx.mouse.label()),
+                    Select::Emit(OsdAction::SetMouse(ctx.mouse.next())),
+                ));
                 v.push(mk("Reset Defaults", Select::Emit(OsdAction::ResetBinds)));
                 v.push(mk("Back", Select::Close));
                 v
@@ -495,11 +535,14 @@ impl Osd {
     /// frame is dimmed first so the overlay reads clearly; when closed only a
     /// lingering toast is drawn. Keeps [`Canvas`] private to this module.
     pub fn render_overlay(&self, buf: &mut [u8], w: usize, h: usize, ctx: &OsdCtx) {
-        // Hi-res / interlaced framebuffers (640/704-dot, double-density) draw
-        // the OSD at 2× so the 8×8 glyphs don't shrink to half-size and smear
-        // under the window's fractional downscale. Lo-res stays pixel-exact.
-        let scale = if w >= 640 || h >= 400 { 2 } else { 1 };
-        let mut c = Canvas::new(buf, w, h, scale);
+        // Scale each axis independently by whether *that* axis is hi-res, so the
+        // 8×8 glyphs don't shrink/smear yet the menu still fits: 640/704-dot is a
+        // double-rate horizontal clock (sx=2), 448/480 is interlace (sy=2). A
+        // wide-but-short 640×224 frame gets sx=2, sy=1 — readable and fitting;
+        // doubling both would overflow its 224 lines. Lo-res stays pixel-exact.
+        let sx = if w >= 640 { 2 } else { 1 };
+        let sy = if h >= 400 { 2 } else { 1 };
+        let mut c = Canvas::new(buf, w, h, sx, sy);
         if self.open {
             c.dim();
         }
@@ -627,6 +670,7 @@ mod tests {
             fullscreen: false,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
+            mouse: OsdMouse::Off,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
             bios_active: 0,
@@ -769,6 +813,30 @@ mod tests {
     }
 
     #[test]
+    fn osd_mouse_cycles_and_labels() {
+        assert_eq!(OsdMouse::Off.next(), OsdMouse::Port1);
+        assert_eq!(OsdMouse::Port1.next(), OsdMouse::Port2);
+        assert_eq!(OsdMouse::Port2.next(), OsdMouse::Off);
+        assert_eq!(OsdMouse::Off.label(), "Off");
+        assert_eq!(OsdMouse::Port1.label(), "Port 1");
+        assert_eq!(OsdMouse::Port2.label(), "Port 2");
+    }
+
+    #[test]
+    fn controller_mouse_row_emits_next_port() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // mouse = Off
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Controller");
+        // The row reads "Mouse: Off"; activating it cycles to Port 1.
+        assert_eq!(
+            select_main(&mut osd, &c, "Mouse: Off"),
+            Some(OsdAction::SetMouse(OsdMouse::Port1))
+        );
+    }
+
+    #[test]
     fn graphics_scale_wraps_4_to_1() {
         let mut osd = Osd::new();
         osd.toggle();
@@ -833,8 +901,10 @@ mod tests {
             select_main(&mut osd, &c, "Start  Return"),
             Some(OsdAction::StartRebind(12))
         );
-        // Selection stays on Start (12); one Down reaches Reset Defaults.
-        osd.handle(Nav::Down, &c);
+        // Selection stays on Start (12); the rows below are Mouse (13) then
+        // Reset Defaults (14), so two Downs reach Reset Defaults.
+        osd.handle(Nav::Down, &c); // Mouse
+        osd.handle(Nav::Down, &c); // Reset Defaults
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ResetBinds));
     }
 
