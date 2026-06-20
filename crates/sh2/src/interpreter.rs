@@ -221,7 +221,9 @@ impl Cpu {
     /// `refresh_interrupts` (per-instruction in Stage B).
     pub fn fti_input_capture(&mut self) -> bool {
         self.onchip.frt_wdt_update(self.pipeline.cycles);
-        self.onchip.frt.input_capture()
+        let icie = self.onchip.frt.input_capture();
+        self.onchip.refresh_interrupts(); // recalc-on-change: ICF may arm ICI
+        icie
     }
 
     /// Fetch + decode + execute one instruction, then advance the on-chip
@@ -245,7 +247,11 @@ impl Cpu {
             self.onchip.frt_wdt_recalc_net(now);
         }
         self.run_dma(bus);
-        self.onchip.refresh_interrupts();
+        // Recalc-on-change (Stage C): the INTC is no longer re-armed every
+        // instruction. Its inputs change only at timer events (handled in
+        // frt_wdt_update), on-chip register writes (mem_write*), DMAC
+        // transfer-end (run_dma_channel), and FTI capture (fti_input_capture) —
+        // each calls refresh_interrupts itself.
         cost
     }
 
@@ -1381,6 +1387,9 @@ impl Cpu {
             self.timer_sync_pre(addr);
             self.onchip.write8(addr, val);
             self.timer_sync_post(addr);
+            // Recalc-on-change: any on-chip write may have touched an INTC
+            // input (TIER/FTCSR/DVCR/CHCR/IPR…); re-arm now (signature-gated).
+            self.onchip.refresh_interrupts();
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
@@ -1411,6 +1420,7 @@ impl Cpu {
             self.timer_sync_pre(addr);
             self.onchip.write16(addr, val);
             self.timer_sync_post(addr);
+            self.onchip.refresh_interrupts(); // recalc-on-change (see mem_write8)
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
@@ -1439,6 +1449,7 @@ impl Cpu {
             self.timer_sync_pre(addr);
             self.onchip.write32(addr, val);
             self.timer_sync_post(addr);
+            self.onchip.refresh_interrupts(); // recalc-on-change (see mem_write8)
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
@@ -1595,6 +1606,10 @@ impl Cpu {
         // with TCR still non-zero, leaving TE clear). SAR/DAR/TCR write back.
         if tcr == 0 {
             self.onchip.dmac.channels[ch].chcr |= 0b10; // TE
+            // Recalc-on-change (Stage C): TE just latched; if CHCR.IE is set the
+            // transfer-end interrupt is now pending. Re-arm the INTC here rather
+            // than via a per-instruction refresh.
+            self.onchip.refresh_interrupts();
         }
         let c = &mut self.onchip.dmac.channels[ch];
         c.sar = sar;

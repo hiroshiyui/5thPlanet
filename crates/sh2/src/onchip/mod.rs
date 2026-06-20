@@ -191,19 +191,25 @@ impl OnChip {
     pub fn frt_wdt_update(&mut self, now: u64) {
         let prev = self.lastts;
         self.lastts = now;
+        let mut flagged = false;
         if self.frt.tcr & 0x03 != 0x03 {
             let shift = Frt::shift(self.frt.tcr);
             let ticks = (now >> shift).wrapping_sub(prev >> shift);
             for _ in 0..ticks {
-                self.frt.clock_frc();
+                flagged |= self.frt.clock_frc();
             }
         }
         if self.wdt.counting() {
             let shift = Wdt::shift(self.wdt.wtcsr);
             let ticks = (now >> shift).wrapping_sub(prev >> shift);
             for _ in 0..ticks {
-                self.wdt.clock_wtcnt();
+                flagged |= self.wdt.clock_wtcnt();
             }
+        }
+        // Recalc-on-change (Stage C): a timer event set an FTCSR/WTCSR flag, so
+        // re-arm the INTC now instead of relying on a per-instruction refresh.
+        if flagged {
+            self.refresh_interrupts();
         }
     }
 
