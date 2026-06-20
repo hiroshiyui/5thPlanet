@@ -35,6 +35,14 @@ pub struct Frt {
     /// Sub-cycle prescaler counter — accumulates instruction cycles and
     /// emits FRC ticks at the prescaler period.
     pre: u32,
+    /// Cached prescaler period (1/8/32/128) decoded from `TCR` bits 1..0, so
+    /// [`Frt::tick`] (called every instruction) need not re-decode `TCR` each
+    /// time. Written whenever `TCR` is written; `0` is a "stale/uncomputed"
+    /// sentinel — no real period is 0 — used after `Default`/savestate-load to
+    /// force one lazy recompute. Hence `#[serde(skip)]` derived state that
+    /// self-corrects, mirroring [`super::OnChip`]'s `intc_sig`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    period: u32,
 }
 
 impl Frt {
@@ -42,15 +50,29 @@ impl Frt {
         Self::default()
     }
 
-    /// Advance the timer by `cycles` CPU cycles. Performs all bookkeeping:
-    /// prescaler, counter increment, OCFA/OCFB match, OVF on wrap.
-    pub fn tick(&mut self, cycles: u32) {
-        let period = match self.tcr & 0x03 {
+    /// Decode the `TCR` prescaler bits (1..0) to the FRC clock period in CPU
+    /// cycles: φ, φ/8, φ/32, φ/128 (SH7604 HW manual, FRT TCR). Never 0, so the
+    /// caller can use 0 as the "not yet cached" sentinel for [`Frt::period`].
+    const fn period_for(tcr: u8) -> u32 {
+        match tcr & 0x03 {
             0 => 1,   // φ
             1 => 8,   // φ/8
             2 => 32,  // φ/32
             _ => 128, // φ/128
-        };
+        }
+    }
+
+    /// Advance the timer by `cycles` CPU cycles. Performs all bookkeeping:
+    /// prescaler, counter increment, OCFA/OCFB match, OVF on wrap.
+    pub fn tick(&mut self, cycles: u32) {
+        // `period` is cached on the TCR write; the `== 0` sentinel (after
+        // Default/savestate-load) forces one lazy recompute (see the field
+        // doc), turning the per-instruction path into a well-predicted zero
+        // check + load instead of re-decoding TCR every call.
+        if self.period == 0 {
+            self.period = Self::period_for(self.tcr);
+        }
+        let period = self.period;
         self.pre = self.pre.saturating_add(cycles);
         while self.pre >= period {
             self.pre -= period;
@@ -126,7 +148,10 @@ impl Frt {
             0x03 => self.frc = (self.frc & 0xFF00) | val as u16,
             0x04 => self.write_ocr_high(val),
             0x05 => self.write_ocr_low(val),
-            0x06 => self.tcr = val,
+            0x06 => {
+                self.tcr = val;
+                self.period = Self::period_for(val); // refresh the cached prescaler
+            }
             0x07 => self.tocr = val,
             _ => {} // FICR is read-only.
         }
@@ -223,6 +248,29 @@ mod tests {
         f.ftcsr = 0x0E;
         f.write8(0x01, 0x0E); // status bits = 1 → kept
         assert_eq!(f.ftcsr, 0x0E, "write-1 keeps the status flags (not W1C)");
+    }
+
+    #[test]
+    fn cached_period_matches_tcr_and_self_corrects_after_load() {
+        // The cached `period` must produce the same FRC behaviour as decoding
+        // TCR every tick, and recover correctly when it's been zeroed (the
+        // Default/savestate-load sentinel — `period` is #[serde(skip)]).
+        let mut f = Frt::new();
+        f.write8(0x06, 0x02); // TCR: φ/32 → period 32
+        f.tick(31);
+        assert_eq!(f.frc, 0, "below the φ/32 threshold");
+        f.tick(1);
+        assert_eq!(f.frc, 1, "32 accumulated cycles == 1 FRC tick");
+
+        // Simulate a savestate load: TCR is restored but the derived `period`
+        // comes back as the 0 sentinel. The next tick must recompute it from
+        // the restored TCR (φ/32), not fall back to φ.
+        f.period = 0;
+        f.pre = 0;
+        f.tick(31);
+        assert_eq!(f.frc, 1, "sentinel recompute keeps φ/32 (no φ fast-tick)");
+        f.tick(1);
+        assert_eq!(f.frc, 2, "recomputed period still 32");
     }
 
     #[test]
