@@ -6,7 +6,7 @@ tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
 referenced below.
 
-Current test count: **1105 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1104 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
 ## Component status
