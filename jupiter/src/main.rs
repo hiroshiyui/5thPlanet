@@ -670,6 +670,7 @@ fn run(
                             },
                             Err(e) => eprintln!("no state to load ({e})"),
                         },
+                        #[cfg(debug_assertions)]
                         EmuIn::PlayCdda => {
                             if saturn.dbg_play_first_audio_track() {
                                 osd.set_toast("Playing CD audio", 120);
@@ -879,6 +880,9 @@ fn run(
                     } => {
                         let _ = emu_tx.send(EmuIn::Quickload);
                     }
+                    // F8 CD-audio play is a debug-build-only diagnostic (it
+                    // drives CD-DA outside the BIOS path); release builds omit it.
+                    #[cfg(debug_assertions)]
                     Event::KeyDown {
                         keycode: Some(Keycode::F8),
                         ..
@@ -1168,7 +1172,9 @@ enum EmuIn {
     /// F5/F9 quickslot save/load.
     Quicksave,
     Quickload,
-    /// F8: play the disc's first CD-DA track.
+    /// F8 (debug builds only): play the disc's first CD-DA track — a diagnostic
+    /// that drives CD-DA outside the BIOS path.
+    #[cfg(debug_assertions)]
     PlayCdda,
     /// Shuttle Mouse: motion since the last message (host convention,
     /// X+ right / Y+ down) + the held `saturn::smpc::mouse` button mask.
