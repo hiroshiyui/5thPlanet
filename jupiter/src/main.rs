@@ -608,8 +608,22 @@ fn run(
                     fullscreen: sess.ui.fullscreen,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
-                    pad_keys: sess.cfg.keys.clone(),
-                    bios_names: sess.bios_names.clone(),
+                    // pad_keys/bios_names are read only by the Controller/BIOS
+                    // settings sub-screens (via `items()`, gated on the menu
+                    // being open), so skip cloning them on the gameplay hot path
+                    // — same rationale as browse_entries below. pad_keys is a
+                    // fixed array, so the closed case is empty (non-allocating)
+                    // strings rather than an empty Vec.
+                    pad_keys: if osd.is_open() {
+                        sess.cfg.keys.clone()
+                    } else {
+                        std::array::from_fn(|_| String::new())
+                    },
+                    bios_names: if osd.is_open() {
+                        sess.bios_names.clone()
+                    } else {
+                        Vec::new()
+                    },
                     bios_active: sess.bios_active,
                     // The browser listing can be large; it's only read while the
                     // menu is open, so skip cloning it on the gameplay hot path.
