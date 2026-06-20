@@ -495,7 +495,11 @@ impl Osd {
     /// frame is dimmed first so the overlay reads clearly; when closed only a
     /// lingering toast is drawn. Keeps [`Canvas`] private to this module.
     pub fn render_overlay(&self, buf: &mut [u8], w: usize, h: usize, ctx: &OsdCtx) {
-        let mut c = Canvas { buf, w, h };
+        // Hi-res / interlaced framebuffers (640/704-dot, double-density) draw
+        // the OSD at 2× so the 8×8 glyphs don't shrink to half-size and smear
+        // under the window's fractional downscale. Lo-res stays pixel-exact.
+        let scale = if w >= 640 || h >= 400 { 2 } else { 1 };
+        let mut c = Canvas::new(buf, w, h, scale);
         if self.open {
             c.dim();
         }

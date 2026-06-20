@@ -113,24 +113,57 @@ const FONT: [[u8; 8]; 95] = [
     [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // ~
 ];
 
-/// A simple RGBA target: a `[R,G,B,A]` byte buffer of `w × h` pixels.
+/// A simple RGBA target over a `[R,G,B,A]` byte buffer. The OSD draws in
+/// **logical** coordinates (`w × h`); an internal integer [`scale`](Canvas::new)
+/// blows each logical pixel up to a `scale × scale` block on the physical
+/// framebuffer, so glyphs *and* box metrics keep a constant apparent size
+/// regardless of the game's video resolution (an 8×8 glyph is tiny in a 704-dot
+/// frame; at scale 2 it reads the same as in 320-dot). Lo-res uses scale 1, so
+/// the pixel-exact behaviour is unchanged there.
 pub struct Canvas<'a> {
     pub buf: &'a mut [u8],
+    /// Logical canvas size the OSD lays out in (= physical / `scale`).
     pub w: usize,
     pub h: usize,
+    /// Physical row stride (pixels) and height — the real framebuffer extent.
+    stride: usize,
+    ph: usize,
+    /// Each logical pixel becomes a `scale × scale` physical block (>= 1).
+    scale: usize,
 }
 
-impl Canvas<'_> {
+impl<'a> Canvas<'a> {
+    /// Wrap a physical `pw × ph` RGBA framebuffer, laying out the OSD in logical
+    /// units `scale`× smaller. A 0 scale clamps to 1. With `scale == 1` the
+    /// logical and physical spaces coincide (pixel-exact, the lo-res path).
+    pub fn new(buf: &'a mut [u8], pw: usize, ph: usize, scale: usize) -> Self {
+        let scale = scale.max(1);
+        Self { buf, w: pw / scale, h: ph / scale, stride: pw, ph, scale }
+    }
+
+    /// Paint one logical pixel — a `scale × scale` block — clipped to both the
+    /// logical bounds and the physical framebuffer.
     #[inline]
     fn put(&mut self, x: usize, y: usize, c: Rgb) {
         if x >= self.w || y >= self.h {
             return;
         }
-        let i = (y * self.w + x) * 4;
-        self.buf[i] = c.0;
-        self.buf[i + 1] = c.1;
-        self.buf[i + 2] = c.2;
-        self.buf[i + 3] = 0xFF;
+        let (px0, py0) = (x * self.scale, y * self.scale);
+        for yy in py0..py0 + self.scale {
+            if yy >= self.ph {
+                break;
+            }
+            for xx in px0..px0 + self.scale {
+                if xx >= self.stride {
+                    break;
+                }
+                let i = (yy * self.stride + xx) * 4;
+                self.buf[i] = c.0;
+                self.buf[i + 1] = c.1;
+                self.buf[i + 2] = c.2;
+                self.buf[i + 3] = 0xFF;
+            }
+        }
     }
 
     /// Fill an axis-aligned rectangle (clipped to the canvas).
@@ -212,24 +245,14 @@ mod tests {
     #[test]
     fn space_glyph_is_blank() {
         let mut buf = blank(8, 8);
-        Canvas {
-            buf: &mut buf,
-            w: 8,
-            h: 8,
-        }
-        .draw_char(0, 0, ' ', (255, 255, 255));
+        Canvas::new(&mut buf, 8, 8, 1).draw_char(0, 0, ' ', (255, 255, 255));
         assert!(buf.iter().all(|&b| b == 0), "space draws nothing");
     }
 
     #[test]
     fn printable_glyph_sets_pixels_and_alpha() {
         let mut buf = blank(8, 8);
-        Canvas {
-            buf: &mut buf,
-            w: 8,
-            h: 8,
-        }
-        .draw_char(0, 0, 'A', (10, 20, 30));
+        Canvas::new(&mut buf, 8, 8, 1).draw_char(0, 0, 'A', (10, 20, 30));
         // Some pixels are lit, and lit pixels carry the colour + opaque alpha.
         let lit: Vec<_> = buf.chunks_exact(4).filter(|p| p[3] == 0xFF).collect();
         assert!(!lit.is_empty(), "'A' lights pixels");
@@ -237,33 +260,40 @@ mod tests {
     }
 
     #[test]
+    fn scale_2_doubles_glyph_and_blocks_pixels() {
+        // The same glyph at scale 2 lights exactly 4× the pixels (each logical
+        // pixel becomes a 2×2 block) on a physically-doubled framebuffer.
+        let lit_at = |scale: usize, side: usize| {
+            let mut buf = blank(side, side);
+            Canvas::new(&mut buf, side, side, scale).draw_char(0, 0, 'A', (255, 255, 255));
+            buf.chunks_exact(4).filter(|p| p[3] == 0xFF).count()
+        };
+        let n1 = lit_at(1, 8);
+        let n2 = lit_at(2, 16);
+        assert!(n1 > 0);
+        assert_eq!(n2, n1 * 4, "scale 2 quadruples lit pixels");
+        // A scale-2 canvas exposes half-size logical dims; 0 clamps to 1.
+        let mut b = blank(16, 16);
+        let c = Canvas::new(&mut b, 16, 16, 2);
+        assert_eq!((c.w, c.h), (8, 8));
+        let mut b0 = blank(8, 8);
+        assert_eq!(Canvas::new(&mut b0, 8, 8, 0).scale, 1, "0 scale clamps to 1");
+    }
+
+    #[test]
     fn fill_rect_and_dim_clip_and_halve() {
         let (w, h) = (4, 4);
         let mut buf = blank(w, h);
-        Canvas {
-            buf: &mut buf,
-            w,
-            h,
-        }
-        .fill_rect(0, 0, 100, 100, (200, 100, 50)); // over-large → clipped
+        Canvas::new(&mut buf, w, h, 1).fill_rect(0, 0, 100, 100, (200, 100, 50)); // over-large → clipped
         assert_eq!(&buf[0..4], &[200, 100, 50, 0xFF]);
-        Canvas {
-            buf: &mut buf,
-            w,
-            h,
-        }
-        .dim();
+        Canvas::new(&mut buf, w, h, 1).dim();
         assert_eq!(&buf[0..4], &[100, 50, 25, 0xFF]);
     }
 
     #[test]
     fn out_of_bounds_draw_is_safe() {
         let mut buf = blank(8, 8);
-        let mut c = Canvas {
-            buf: &mut buf,
-            w: 8,
-            h: 8,
-        };
+        let mut c = Canvas::new(&mut buf, 8, 8, 1);
         c.draw_text(100, 100, "off screen", (255, 255, 255)); // must not panic
         c.draw_char(7, 7, 'W', (255, 255, 255)); // partially clipped
     }
