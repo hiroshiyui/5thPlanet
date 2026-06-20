@@ -212,6 +212,18 @@ impl Cpu {
         self.pending_branch.is_some()
     }
 
+    /// Apply an inter-CPU FRT input-capture (FTI) edge, materializing the lazy
+    /// FRC up to this CPU's current cycle first so FICR latches the *current*
+    /// counter, not a stale event-time value (Stage B). Returns whether the
+    /// input-capture interrupt is enabled (TIER.ICIE). The host calls this on
+    /// the *target* CPU (the sibling pulses its FTI); it reads the cycle from
+    /// the target's own `pipeline.cycles`. The set ICF arms ICI on the next
+    /// `refresh_interrupts` (per-instruction in Stage B).
+    pub fn fti_input_capture(&mut self) -> bool {
+        self.onchip.frt_wdt_update(self.pipeline.cycles);
+        self.onchip.frt.input_capture()
+    }
+
     /// Fetch + decode + execute one instruction, then advance the on-chip
     /// time-driven peripherals by the cycles consumed: the FRT and WDT
     /// counters tick, any enabled DMAC channel runs, and the level-triggered
@@ -219,12 +231,19 @@ impl Cpu {
     /// next instruction boundary. Returns the total cycles.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         let cost = self.step_instruction(bus);
-        // Materialize the FRT/WDT up to the cycle this instruction reached
-        // (`step_instruction` already advanced `pipeline.cycles` by `cost`, so
-        // the lazy update sees exactly `cost` elapsed cycles — identical to the
-        // old `advance_timers(cost)`). Stage A keeps this per-instruction; the
-        // `next_ts` event gate replaces it in Stage B.
-        self.onchip.frt_wdt_update(self.pipeline.cycles);
+        // Event-scheduled FRT/WDT (Stage B): only materialize when this
+        // instruction reached the next scheduled timer edge — otherwise the
+        // per-instruction cost is a single (well-predicted) compare. Gating at
+        // end-of-step (rather than top-of-step) keeps the materialize cycle and
+        // the interrupt phase identical to the per-instruction model, so the
+        // event gate is behaviour-neutral; register reads/writes catch the
+        // counters up on demand via `timer_sync_pre`/`_post`. A timer-register
+        // write may have pulled `next_ts` in, so re-check after `run_dma`.
+        let now = self.pipeline.cycles;
+        if now >= self.onchip.timer_next_ts() {
+            self.onchip.frt_wdt_update(now);
+            self.onchip.frt_wdt_recalc_net(now);
+        }
         self.run_dma(bus);
         self.onchip.refresh_interrupts();
         cost
@@ -1207,6 +1226,28 @@ impl Cpu {
     // matching so a cached and cache-through access to the same physical
     // memory see the same line storage.
 
+    /// Materialize the lazy FRT/WDT counters up to the current cycle before a
+    /// timer-register access (Stage B). The event-scheduled timer only advances
+    /// FRC/WTCNT at its `next_ts` edge otherwise, so a register read/write must
+    /// catch them up to the access cycle (Mednafen calls `FRT_WDT_Update` at the
+    /// top of every FRT/WDT MMIO handler). No-op for non-timer on-chip registers.
+    #[inline]
+    fn timer_sync_pre(&mut self, addr: u32) {
+        if OnChip::owns_timer(addr) {
+            self.onchip.frt_wdt_update(self.pipeline.cycles);
+        }
+    }
+
+    /// Recompute the next FRT/WDT event after a timer-register access — a write
+    /// may have changed a counter / OCR / prescaler / enable, moving the edge
+    /// (Mednafen `FRT_WDT_Recalc_NET`). No-op otherwise.
+    #[inline]
+    fn timer_sync_post(&mut self, addr: u32) {
+        if OnChip::owns_timer(addr) {
+            self.onchip.frt_wdt_recalc_net(self.pipeline.cycles);
+        }
+    }
+
     #[inline]
     pub(crate) fn mem_read8(
         &mut self,
@@ -1219,7 +1260,10 @@ impl Cpu {
         }
         if OnChip::owns(addr) {
             let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
-            return (self.onchip.read8(addr), stall);
+            self.timer_sync_pre(addr);
+            let v = self.onchip.read8(addr);
+            self.timer_sync_post(addr);
+            return (v, stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1254,7 +1298,10 @@ impl Cpu {
     ) -> (u16, u32) {
         if OnChip::owns(addr) {
             let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
-            return (self.onchip.read16(addr), stall);
+            self.timer_sync_pre(addr);
+            let v = self.onchip.read16(addr);
+            self.timer_sync_post(addr);
+            return (v, stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1289,7 +1336,10 @@ impl Cpu {
     ) -> (u32, u32) {
         if OnChip::owns(addr) {
             let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
-            return (self.onchip.read32(addr), stall);
+            self.timer_sync_pre(addr);
+            let v = self.onchip.read32(addr);
+            self.timer_sync_post(addr);
+            return (v, stall);
         }
         if is_assoc_purge(addr) {
             self.cache.assoc_purge(addr);
@@ -1328,7 +1378,9 @@ impl Cpu {
             return 0;
         }
         if OnChip::owns(addr) {
+            self.timer_sync_pre(addr);
             self.onchip.write8(addr, val);
+            self.timer_sync_post(addr);
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
@@ -1356,7 +1408,9 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> u32 {
         if OnChip::owns(addr) {
+            self.timer_sync_pre(addr);
             self.onchip.write16(addr, val);
+            self.timer_sync_post(addr);
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
@@ -1382,7 +1436,9 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> u32 {
         if OnChip::owns(addr) {
+            self.timer_sync_pre(addr);
             self.onchip.write32(addr, val);
+            self.timer_sync_post(addr);
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }

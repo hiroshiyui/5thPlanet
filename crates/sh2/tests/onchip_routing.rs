@@ -129,3 +129,25 @@ fn intc_raise_and_query_via_public_api() {
     assert_eq!(pending.0, InterruptSource::DivuOvf);
     assert_eq!(pending.1, 0xC);
 }
+
+#[test]
+fn frc_read_materializes_the_lazy_counter() {
+    // Stage B (event-scheduled FRT): between scheduled events the FRC *field* is
+    // not advanced — a register READ must catch it up to the access cycle
+    // (the interpreter's timer_sync_pre → frt_wdt_update). Run NOPs to elapse
+    // cycles without touching the FRT, then read FRC via MOV.W @R1,R3: it must
+    // reflect the elapsed time, not the stale event-time value.
+    let mut bus = MemBus::new(64 * 1024);
+    let mut prog = vec![0x0009u16; 80]; // NOP × 80 (~80 cycles, 1/NOP)
+    prog.push(0x6311); // MOV.W @R1, R3   (R3 = sign-extended [R1])
+    bus.load_program(PC0, &prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PC0;
+    cpu.regs.r[1] = 0xFFFF_FE12; // FRC register address (default TCR → φ/8)
+    for _ in 0..prog.len() {
+        cpu.step(&mut bus);
+    }
+    // 80 φ cycles at φ/8 → FRC ≈ 10. The point is it's non-zero: without the
+    // read-path materialization the field would still read its event-time value.
+    assert_eq!(cpu.regs.r[3], 80 / 8, "FRC read reflects elapsed cycles (materialized)");
+}

@@ -178,3 +178,27 @@ fn ocfb_arms_the_ocib_interrupt_at_the_frt_priority() {
         "OCIB asserted while OCFB is set"
     );
 }
+
+// ---- Event scheduling (next_ts) ----
+
+#[test]
+fn next_ts_schedules_the_nearest_ocra_match() {
+    // With OCRA = 0x10 at φ/8 from a fresh epoch, the next event is the OCRA
+    // compare-match 0x10 ticks = 0x80 cycles out (Mednafen FRT_WDT_Recalc_NET).
+    let mut o = OnChip::new();
+    o.write16(OCR, 0x0010); // OCRA = 0x10 (TOCR.OCRS clear → OCRA)
+    o.advance_timers(0); // force a recalc at cycle 0
+    assert_eq!(o.timer_next_ts(), 0x10 * 8, "next_ts at the OCRA match cycle");
+}
+
+#[test]
+fn next_ts_is_never_when_external_clock_and_wdt_off() {
+    // CKS=3 (external, FRC frozen) with the WDT disabled → no event will ever
+    // fire, so next_ts is u64::MAX and the step gate never wakes the timer.
+    let mut o = OnChip::new();
+    o.write8(TCR, 0x03); // external clock
+    o.advance_timers(0); // recalc
+    assert_eq!(o.timer_next_ts(), u64::MAX, "no live timer → never");
+    o.advance_timers(1_000_000);
+    assert_eq!(o.frt.frc, 0, "FRC stays frozen under the external clock");
+}

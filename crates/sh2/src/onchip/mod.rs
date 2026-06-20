@@ -69,10 +69,13 @@ pub struct OnChip {
     lastts: u64,
     /// Global cycle of the next FRT/WDT event (compare-match / overflow), or
     /// `u64::MAX` when nothing is pending (FRT external + WDT off). Derived from
-    /// the registers by [`Self::frt_wdt_recalc_net`]; `#[serde(skip)]` with the
-    /// `0` default acting as a "stale, recompute on first use" sentinel after
-    /// load (`now >= 0` is always true, forcing one recompute).
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// the registers by [`Self::frt_wdt_recalc_net`]. **Serialized**: with the
+    /// event gate the FRC/WTCNT *fields* are lazy (materialized only at events /
+    /// register reads), so a loaded state must restore the exact same next-event
+    /// edge as the original — otherwise the two would materialize at different
+    /// points and their stale counter fields would diverge (the determinism
+    /// contract). The `0` value (fresh `Default`, before any recompute) is a
+    /// "recompute on first use" sentinel (`now >= 0` always fires).
     next_ts: u64,
 }
 

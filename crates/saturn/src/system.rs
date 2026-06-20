@@ -1092,22 +1092,10 @@ impl Saturn {
         macro_rules! apply_fti {
             () => {
                 if core::mem::take(&mut bus.slave_input_capture) {
-                    scheduler
-                        .entity_mut(*slave_id)
-                        .sh2_mut()
-                        .cpu
-                        .onchip
-                        .frt
-                        .input_capture();
+                    scheduler.entity_mut(*slave_id).sh2_mut().cpu.fti_input_capture();
                 }
                 if core::mem::take(&mut bus.master_input_capture) {
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .onchip
-                        .frt
-                        .input_capture();
+                    scheduler.entity_mut(*master_id).sh2_mut().cpu.fti_input_capture();
                 }
             };
         }
@@ -1727,22 +1715,10 @@ impl Saturn {
     /// interrupt itself need not be delivered.
     fn drain_input_capture(&mut self) {
         if std::mem::take(&mut self.bus.slave_input_capture) {
-            self.scheduler
-                .entity_mut(self.slave_id)
-                .sh2_mut()
-                .cpu
-                .onchip
-                .frt
-                .input_capture();
+            self.scheduler.entity_mut(self.slave_id).sh2_mut().cpu.fti_input_capture();
         }
         if std::mem::take(&mut self.bus.master_input_capture) {
-            self.scheduler
-                .entity_mut(self.master_id)
-                .sh2_mut()
-                .cpu
-                .onchip
-                .frt
-                .input_capture();
+            self.scheduler.entity_mut(self.master_id).sh2_mut().cpu.fti_input_capture();
         }
     }
 
