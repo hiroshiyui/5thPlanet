@@ -147,9 +147,9 @@ map to the mouse buttons and **Enter** doubles as the mouse's Start button.
 - [`jupiter`](jupiter) — SDL2 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open) and
-  the persisted config file (`src/config.rs`,
-  `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`, or a `jupiter.toml` beside the
-  executable for a portable install — see `jupiter/jupiter.toml.example`).
+  the persisted config file (`src/config.rs`) — a `jupiter.toml` beside the
+  executable (portable install) takes precedence, else
+  `$XDG_CONFIG_HOME/5thplanet/jupiter.toml`; see `jupiter/jupiter.toml.example`.
   `cargo run -p jupiter -- <bios.bin> [disc.cue]`. (The binary is named
   `jupiter` for Jupiter — the 5th planet, hence the project name
   *5thPlanet* — the neighbour of Saturn: closest to it, but not identical.)

@@ -136,11 +136,11 @@ core-free so it's unit-tested without a window. Esc opens it: save/load slots
 `fs`, the menu stays pure), Quit, plus Settings — **Graphics** (scale
 1×–4×, fullscreen), **Controller** (press-to-bind keyboard rebind),
 **Region**, **Cartridge**, **BIOS** (power-cycle into a sibling 512-KiB image,
-save files re-keyed). All persisted to a flat TOML-subset config at
-`$XDG_CONFIG_HOME/5thplanet/jupiter.toml`, falling back to a `jupiter.toml`
-beside the executable when no XDG config exists (portable/self-contained
-archive; a committed `jupiter/jupiter.toml.example` documents every key)
-(CLI flag > config > autodetect).
+save files re-keyed). All persisted to a flat TOML-subset config, **portable-first**: a `jupiter.toml`
+beside the executable wins (portable/self-contained archive), falling back to
+`$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (a committed
+`jupiter/jupiter.toml.example` documents every key; CLI flag > config >
+autodetect).
 Basic hot-plug SDL2 GameController support (fixed Xbox-style mapping, OSD
 navigation); per-button gamepad rebind + analog devices ride with M13 E2.
 Related fix: no disc now reports `NODISC` (0x07), matching MAME.
