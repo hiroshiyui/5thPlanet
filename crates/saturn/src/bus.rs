@@ -347,6 +347,16 @@ impl SaturnBus {
     }
 }
 
+/// Debug (`SAT_FTILOG`): trace inter-CPU FRT input-capture (FTI) wake pulses.
+/// The env var is read once and cached, so the per-write check on the FTI path
+/// is a single atomic load (not a process-global env lookup) when unset.
+#[inline]
+fn ftilog() -> bool {
+    use std::sync::OnceLock;
+    static FTILOG: OnceLock<bool> = OnceLock::new();
+    *FTILOG.get_or_init(|| std::env::var_os("SAT_FTILOG").is_some())
+}
+
 /// Debug write-watchpoint (boot-divergence investigation): when `SAT_WWATCH=0xADDR`
 /// is set, log any write whose byte span covers `ADDR`, with width, value, access
 /// kind and cycle. No-op (one cheap env check, cached) when unset.
@@ -711,13 +721,13 @@ impl Bus for SaturnBus {
             // (the Saturn slave/master "wake" signal). Drained at the aggregate.
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
-                if std::env::var("SAT_FTILOG").is_ok() {
+                if ftilog() {
                     eprintln!("FTI->slave addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
                 }
             }
             MASTER_FTI_BASE..=MASTER_FTI_END => {
                 self.master_input_capture = true;
-                if std::env::var("SAT_FTILOG").is_ok() {
+                if ftilog() {
                     eprintln!("FTI->master addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
                 }
             }

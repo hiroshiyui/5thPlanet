@@ -33,6 +33,16 @@ use super::vram::Vram;
 /// 16.16 fixed-point fraction shift for sub-pixel edge stepping.
 const FRAC_SHIFT: i32 = 16;
 
+/// Debug (`SAT_VDP1LOG`): dump each drawn command at plot time. The env var is
+/// read once and cached, so `Plotter::new` (per plot) pays a single atomic load
+/// rather than a process-global env lookup.
+#[inline]
+fn vdp1log() -> bool {
+    use std::sync::OnceLock;
+    static VDP1LOG: OnceLock<bool> = OnceLock::new();
+    *VDP1LOG.get_or_init(|| std::env::var_os("SAT_VDP1LOG").is_some())
+}
+
 /// Inclusive clipping rectangle in frame-buffer pixel coordinates.
 #[derive(Clone, Copy, Debug)]
 struct Rect {
@@ -179,7 +189,7 @@ impl<'a> Plotter<'a> {
             bpp8,
             die,
             dil,
-            log: std::env::var_os("SAT_VDP1LOG").is_some(),
+            log: vdp1log(),
         }
     }
 
