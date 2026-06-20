@@ -180,10 +180,11 @@ impl OnChip {
         // per-instruction case). The signature captures every input below; a
         // change in any forces the full refresh, so the result is identical to
         // re-arming unconditionally.
+        let wdt_active = self.wdt.interrupt_active();
         let sig = (
             self.frt.tier,
             self.frt.ftcsr,
-            self.wdt.interrupt_active(),
+            wdt_active,
             self.divu.dvcr,
             self.divu.vcrdiv,
             self.dmac.channels[0].chcr,
@@ -202,8 +203,7 @@ impl OnChip {
             .set_pending(Source::FrtOcib, tier & 0x04 != 0 && ftcsr & 0x04 != 0);
         self.intc
             .set_pending(Source::FrtOvi, tier & 0x02 != 0 && ftcsr & 0x02 != 0);
-        self.intc
-            .set_pending(Source::Wdt, self.wdt.interrupt_active());
+        self.intc.set_pending(Source::Wdt, wdt_active);
         // DIVU overflow interrupt: DVCR.OVF (bit 0) AND DVCR.OVFIE (bit 1) both
         // set (level-triggered; cleared when software writes DVCR.OVF back to 0).
         // VCRDIV lives in the DIVU register block, so mirror it into the INTC

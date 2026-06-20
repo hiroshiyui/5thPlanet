@@ -370,7 +370,12 @@ impl Cache {
     fn touch(&mut self, set_idx: usize, way: u8) {
         let row = &mut self.lru[set_idx];
         if let Some(pos) = row.iter().position(|&w| w == way) {
-            row[..=pos].rotate_right(1);
+            // pos == 0 means the way is already most-recently-used, so the
+            // rotate would be a no-op — skip it (the common case on a re-hit
+            // of the just-touched line). Bit-identical LRU order.
+            if pos != 0 {
+                row[..=pos].rotate_right(1);
+            }
         }
     }
 }
@@ -466,6 +471,32 @@ mod tests {
             panic!("tag 0 still resident");
         };
         assert_eq!(d0_after[0], 0x00);
+    }
+
+    #[test]
+    fn retouching_mru_way_preserves_lru_order() {
+        // Exercises the `touch` pos==0 early-out: re-hitting the
+        // most-recently-used way must leave the eviction order unchanged
+        // (bit-identical to the unconditional rotate).
+        let mut c = Cache::new();
+        c.set_ccr(0x01);
+        let base: u32 = 0x6000_0000;
+        for i in 0..4u32 {
+            let addr = base | (i << 10);
+            c.lookup_data(addr); // miss
+            c.install(addr, line_with(i as u8 * 0x10));
+        }
+        // Tag 3 is MRU (installed last). Re-hit it several times — each hit is
+        // the pos==0 case and must NOT reorder anything; tag 0 stays the LRU.
+        for _ in 0..5 {
+            assert!(matches!(c.lookup_data(base | (3 << 10)), Lookup::Hit(_)));
+        }
+        // A new install must still evict tag 0 (the untouched LRU).
+        let evict_addr = base | (4 << 10);
+        c.lookup_data(evict_addr); // miss
+        c.install(evict_addr, line_with(0xC0));
+        assert_eq!(c.lookup_data(base), Lookup::Miss, "tag 0 (LRU) evicted");
+        assert!(matches!(c.lookup_data(base | (3 << 10)), Lookup::Hit(_)), "tag 3 resident");
     }
 
     #[test]
