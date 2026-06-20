@@ -477,19 +477,6 @@ impl Smpc {
         self.pending.take()
     }
 
-    /// Whether a queued command is awaiting dispatch. `step_cpus` probes this
-    /// per instruction so a COMREG write breaks the current batch immediately
-    /// (the command's emulator-wide side effect — slave release, SNDON, the
-    /// INTBACK arm — then lands within one instruction of the write at the
-    /// boundary `drain_smpc`, not up to a `SMPC_POLL_QUANTUM` batch late). The
-    /// dispatch itself stays at the aggregate to keep the bus/scheduler borrows
-    /// disjoint (the queue-and-drain pattern, ADR-0005); this only shortens the
-    /// batch. Mirrors `Scu::dma_pending`.
-    #[inline]
-    pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
     /// Signal that the last queued command has finished — clears SF so
     /// software polling sees "not busy". `INTBACK` may also want to
     /// populate OREG0..31 first; the caller does that before calling.

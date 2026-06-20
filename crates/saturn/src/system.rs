@@ -1228,18 +1228,16 @@ impl Saturn {
                         .cycles += dma_cost;
                 }
             }
-            // M13 A1: a queued SMPC command becomes an immediate event edge.
-            // Break the batch so the boundary `drain_smpc` dispatches the
-            // command's side effect (slave release, SNDON, the INTBACK arm)
-            // within one instruction of the COMREG write rather than up to a
-            // `SMPC_POLL_QUANTUM` batch late. The master has already retired
-            // ≥1 instruction this iteration, so progress is guaranteed; and
-            // `drain_smpc` consumes `pending` before the next batch, so this
-            // cannot re-trigger. The dispatch stays at the aggregate to keep
-            // the bus/scheduler borrows disjoint (queue-and-drain, ADR-0005).
-            if bus.smpc.has_pending() {
-                break;
-            }
+            // NOTE: do NOT break the batch on a pending SMPC command to
+            // dispatch it sooner (tried in `b65cd18`, reverted here). Within
+            // `run_frame`'s single `run_for`, an early break re-anchors the
+            // event-clamped batch grid mid-frame — the exact hazard the
+            // "`run_frame` must be one `run_for`" contract warns about — so the
+            // raster/VBlank edges no longer land cycle-exactly and VDP2 stops
+            // compositing: Doukyuusei black-screened while the master ran
+            // normally. SMPC commands drain at the batch boundary (≤ one
+            // `SMPC_POLL_QUANTUM` late), which is what both playable games were
+            // verified against. Revisit only with the event-driven timeline.
         }
         // Trailing CD-block ticks up to the batch target.
         while scheduler.entity(*cd_id).next_deadline() <= target {
