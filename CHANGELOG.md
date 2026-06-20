@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-20
+
+Reworks the SH-2 on-chip FRT/WDT timers and interrupt recalc to Mednafen's
+lazy/event-scheduled model, fixes a regression that black-screened *Doukyuusei
+~if~*, and corrects the FRT prescaler. **Save-state format break: v9 → v10** —
+existing `.sav`/`.state` files (and cached bench snapshots) are rejected and
+must be recreated. Both playable games (*Virtua Fighter 2*, *Doukyuusei ~if~*)
+remain fully playable (user-verified); the `bios_boot` golden hash is unchanged.
+
+### Fixed
+
+- **_Doukyuusei ~if~_ black screen (regression since v0.4.0).** A mid-batch SMPC
+  command dispatch (`smpc.has_pending()` breaking the SH-2 batch) re-anchored
+  `run_frame`'s event-clamped batch grid mid-frame, so VDP2 stopped compositing
+  while the CPU ran normally — the game booted to an all-black framebuffer. The
+  batch break is removed; SMPC commands drain at the batch boundary as before.
+  Found by bisecting from the last working tag with a headless render probe.
+- **FRT prescaler mapping.** TCR CKS1-0 now decodes to φ/8, φ/32, φ/128,
+  external clock (the SH7604 mapping; Mednafen + Yabause agree) instead of the
+  shifted φ/1, φ/8, φ/32, φ/128 — the FRC no longer runs 4–8× too fast, and the
+  external-clock setting (CKS=3) freezes the counter rather than ticking it.
+
+### Changed
+
+- **On-chip FRT/WDT timers + INTC are now event-driven** (advances roadmap M13
+  A1). The per-instruction `advance_timers` (FRC/WTCNT tick) and
+  `refresh_interrupts` (INTC re-arm) are gone: the timers materialize lazily
+  from the elapsed-cycle delta and are scheduled by a next-event timestamp, and
+  the INTC is recomputed only when an input changes (timer events, on-chip
+  register writes, DMAC transfer-end, FTI capture). Bit-identical to the prior
+  model (ported in four golden-invariant stages); removes ~10 percentage points
+  of per-instruction timer/interrupt overhead in poll-heavy scenes.
+- **Save-state format v9 → v10** — the FRT/WDT rework dropped the per-cycle
+  prescaler accumulators and added the timer epoch/next-event state. Old saves
+  are rejected by the version check.
+- **Minor allocation/CPU tidy-ups** (all bit-identical): cache the FRT prescaler
+  decode, skip a no-op cache-LRU rotate, dedup a WDT interrupt read, cache the
+  `SAT_FTILOG`/`SAT_VDP1LOG` debug-env flags behind `OnceLock`, and skip the OSD
+  context clones while the menu is closed.
+
+### Added
+
+- **Game-render goldens.** `doukyuusei_renders_non_black` and
+  `vf2_renders_non_black` boot each game and assert the master runs game code
+  (HWRAM) and VDP2 composites a non-black frame — the game-level analogue of the
+  BIOS-splash golden, closing the gap that let the black-screen regression
+  through (the BIOS golden never exercised a game's render path).
+- **SMPC batch-break regression guard** (`pending_smpc_command_does_not_break_the_batch`)
+  — a CI-runnable synthetic test that fails if the mid-batch dispatch is reintroduced.
+
 ## [0.5.0] - 2026-06-19
 
 Grows the `sdbg` headless debugger into a full trace-diff workbench, and adds a
