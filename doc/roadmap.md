@@ -6,17 +6,17 @@ tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
 referenced below.
 
-Current test count: **1121 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1123 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
-**Homebrew test-disc framework (in progress):** `tests/disc/` is a
-royalty-free libyaul (MIT) Saturn disc that boots on the real-BIOS path and
-posts a machine-readable result to High-WRAM; `crates/saturn/tests/homebrew_disc.rs`
-boots it headless and asserts the result (+ optional framebuffer golden). Unlike
-the gitignored commercial `roms/`/`bios/`, an MIT disc image is committable, so
-this is a path to **CI-able accuracy regressions**. Scaffold + harness are in;
-filling it with per-feature checks (driven by
-`doc/emulation-capabilities-evaluation.md`) needs the libyaul toolchain.
+**Self-diagnostics suite:** `saturn::diagnostics` runs a battery of tiny
+hand-assembled SH-2 programs from reset (no BIOS, no disc, no external
+toolchain — the `audio_pipeline.rs` "Tier A" pattern), each verifying one
+behavior by reading back a result it wrote to Work RAM. Surfaced three ways off
+one engine: `jupiter doctor` (headless report, exit 0/1), an OSD
+**"Diagnostics…"** screen, and a `cargo test` asserting all pass — a **CI-able
+accuracy regression** that needs none of the gitignored commercial media. Grow
+the check set from `doc/emulation-capabilities-evaluation.md`.
 
 ## Component status
 
