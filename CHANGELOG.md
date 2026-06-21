@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-22
+
+Adds two new user-visible capabilities — **CHD compressed disc-image support**
+and a **built-in self-diagnostics suite** — plus disc-dumping tooling. **No
+emulation-core or save-state changes**: the save-state format stays v10 and both
+playable games (*Virtua Fighter 2*, *Doukyuusei ~if~*) are unaffected.
+
+### Added
+
+- **CHD disc images** (roadmap **G1** ✅). `saturn::chd_image::from_chd` decodes
+  a CD CHD — MAME's compressed multi-track container — by decompressing every
+  hunk and concatenating each track's raw 2352-byte sectors into the shared
+  `Disc` builder, so the TOC, read paths, save-state fingerprint, and the
+  cdrdao byte-swap warning are identical to the CUE/CCD parsers. Uses the
+  pure-Rust `chd` crate behind a `chd` feature (no FFI/`unsafe`, unlike
+  `physdisc`); `jupiter` enables it by default and reads `.chd` directly.
+  Legacy `CHCD`/GD-ROM are rejected with a clear message. Validated
+  byte-identical to the `.ccd` loader on a multitrack disc.
+- **Built-in self-diagnostics** (`saturn::diagnostics`). A battery of tiny
+  hand-assembled SH-2 programs run from reset on throwaway machines (no BIOS,
+  no disc, no external toolchain), each verifying one behavior — `ADD`/`SUB`,
+  `MUL.L`→MACL, a taken `BRA` delay slot, Low/High WRAM store-load round-trips
+  — with an `all_diagnostics_pass` test making it a CI accuracy regression.
+  Surfaced via a new **`jupiter doctor`** CLI subcommand (headless report, exit
+  `0` all-pass / `1` on failure) and an OSD **Settings → "Diagnostics…"** screen
+  with a "Run all" item and a scrollable `[PASS]`/`[FAIL]` list.
+- **Disc-dumping tooling.** A `dump-game-disc` skill and `tools/dump_game_disc.sh`
+  automate ripping an owned Saturn disc to a loadable image (cdrdao →
+  `toc2cue` → verify → optional CHD), handling the cdrdao MSB-first CD-DA
+  byte-swap gotcha.
+
 ## [0.7.0] - 2026-06-20
 
 A frontend (`jupiter`) release: adds a Shuttle Mouse OSD toggle and config
