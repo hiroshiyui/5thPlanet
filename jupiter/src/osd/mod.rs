@@ -138,6 +138,18 @@ pub enum OsdAction {
     /// Load + boot the disc image at an [`OsdCtx::browse_entries`] index (a file
     /// entry). The frontend inserts the disc, resets the machine, and closes.
     LoadDisc(usize),
+    /// Run the built-in self-diagnostics; the frontend fills
+    /// [`OsdCtx::diag_results`] for the next draw. The screen stays open.
+    RunDiagnostics,
+}
+
+/// One self-diagnostics result row for the Diagnostics screen. OSD-local (the
+/// frontend maps `saturn::diagnostics::DiagOutcome` into this) so the OSD stays
+/// core-free.
+#[derive(Clone)]
+pub struct DiagResultRow {
+    pub label: String,
+    pub passed: bool,
 }
 
 /// Dynamic context the frontend supplies each draw so labels reflect live
@@ -170,6 +182,9 @@ pub struct OsdCtx {
     pub browse_entries: Vec<BrowseEntry>,
     /// The browser's current directory path, shown as the screen title.
     pub browse_dir: String,
+    /// Last self-diagnostics results (empty until "Run all" is selected) —
+    /// the Diagnostics screen lists them as `[PASS]`/`[FAIL]`.
+    pub diag_results: Vec<DiagResultRow>,
 }
 
 /// Which screen is on top of the stack.
@@ -189,6 +204,8 @@ enum Screen {
     Bios,
     /// Filesystem browser for picking a disc image to load.
     DiscBrowser,
+    /// Built-in self-diagnostics: a "Run all" item plus the last results.
+    Diagnostics,
 }
 
 /// One menu item: its label is computed from [`OsdCtx`] at draw time.
@@ -346,6 +363,7 @@ impl Osd {
                 mk("Region", Select::Push(Screen::Region)),
                 mk("Cartridge", Select::Push(Screen::Cartridge)),
                 mk("BIOS", Select::Push(Screen::Bios)),
+                mk("Diagnostics...", Select::Push(Screen::Diagnostics)),
                 mk("Back", Select::Close),
             ],
             Screen::Graphics => {
@@ -452,6 +470,23 @@ impl Osd {
                 v.push(mk("Back", Select::Close));
                 v
             }
+            Screen::Diagnostics => {
+                // "Run all" plus one inert row per result. The 15-row scrolling
+                // viewport handles a long list. PASS/FAIL is shown in the label.
+                let mut v = Vec::with_capacity(ctx.diag_results.len() + 2);
+                v.push(mk("Run all", Select::Emit(OsdAction::RunDiagnostics)));
+                if ctx.diag_results.is_empty() {
+                    v.push(mk("(not run yet)", Select::Close));
+                } else {
+                    for r in &ctx.diag_results {
+                        let tag = if r.passed { "PASS" } else { "FAIL" };
+                        let short: String = r.label.chars().take(20).collect();
+                        v.push(mk(&format!("[{tag}] {short}"), Select::Close));
+                    }
+                }
+                v.push(mk("Back", Select::Close));
+                v
+            }
         }
     }
 
@@ -467,6 +502,7 @@ impl Osd {
             Screen::Cartridge => "Cartridge",
             Screen::Bios => "BIOS",
             Screen::DiscBrowser => "Load Disc",
+            Screen::Diagnostics => "Diagnostics",
         }
     }
 
@@ -676,6 +712,7 @@ mod tests {
             bios_active: 0,
             browse_entries: Vec::new(),
             browse_dir: "/games".into(),
+            diag_results: Vec::new(),
         }
     }
 
@@ -750,6 +787,29 @@ mod tests {
         // and resets to the root.
         osd.close();
         assert!(!osd.is_open());
+    }
+
+    #[test]
+    fn diagnostics_screen_runs_and_lists_results() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        // Main → Settings → Diagnostics…
+        assert_eq!(select_main(&mut osd, &c, "Settings"), None);
+        assert_eq!(select_main(&mut osd, &c, "Diagnostics..."), None);
+        // "Run all" emits the action; the frontend then fills diag_results.
+        assert_eq!(
+            select_main(&mut osd, &c, "Run all"),
+            Some(OsdAction::RunDiagnostics)
+        );
+        // With results present, each renders as a [PASS]/[FAIL] row.
+        c.diag_results = vec![
+            DiagResultRow { label: "cpu/cpu_add_imm".into(), passed: true },
+            DiagResultRow { label: "memory/mem_roundtrip_low".into(), passed: false },
+        ];
+        let labels: Vec<String> = osd.items(osd.screen(), &c).into_iter().map(|it| it.label).collect();
+        assert!(labels.iter().any(|l| l.starts_with("[PASS] cpu/cpu_add_imm")));
+        assert!(labels.iter().any(|l| l.starts_with("[FAIL] memory/mem_roundtrip")));
     }
 
     #[test]

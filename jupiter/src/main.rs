@@ -37,6 +37,26 @@ fn host_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Run the built-in self-diagnostics (`jupiter doctor`) and return an exit code:
+/// `0` if every check passes, `1` otherwise. Needs no BIOS, disc, or window —
+/// each check runs a tiny SH-2 program on a throwaway machine in `saturn`.
+fn run_doctor() -> ExitCode {
+    let results = saturn::diagnostics::run_all();
+    let mut passed = 0usize;
+    println!("5thPlanet self-diagnostics:");
+    for o in &results {
+        let tag = if o.passed { passed += 1; "PASS" } else { "FAIL" };
+        println!("  [{tag}] {}/{}  {}", o.category, o.name, o.detail);
+    }
+    let total = results.len();
+    println!("{passed}/{total} checks passed");
+    if passed == total {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 fn main() -> ExitCode {
     // Split flags (`--cart=…`) from positional args (BIOS, disc).
     let mut positionals: Vec<String> = Vec::new();
@@ -54,11 +74,17 @@ fn main() -> ExitCode {
         }
     }
 
+    // `jupiter doctor` — run the built-in self-diagnostics and exit, before any
+    // BIOS/disc/config handling (the diagnostics need none of it).
+    if positionals.first().map(String::as_str) == Some("doctor") {
+        return run_doctor();
+    }
+
     let bios_path = match positionals.first() {
         Some(p) => p.clone(),
         None => {
             eprintln!(
-                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd|.chd | cdrom:<device>] [--cart=<kind>]"
+                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd|.chd | cdrom:<device>] [--cart=<kind>]\n       jupiter doctor                 run built-in self-diagnostics and exit"
             );
             eprintln!();
             eprintln!(
@@ -574,6 +600,7 @@ fn run(
         mouse_port,
         browse_dir,
         browse_entries: Vec::new(),
+        diag_results: Vec::new(),
     };
     sess.refresh_browse();
 
@@ -648,6 +675,17 @@ fn run(
                         sess.browse_dir.to_string_lossy().into_owned()
                     } else {
                         String::new()
+                    },
+                    diag_results: if osd.is_open() {
+                        sess.diag_results
+                            .iter()
+                            .map(|o| osd::DiagResultRow {
+                                label: format!("{}/{}", o.category, o.name),
+                                passed: o.passed,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
                     },
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
@@ -1238,6 +1276,8 @@ struct Session {
     /// only as the user navigates, not every frame.
     browse_dir: std::path::PathBuf,
     browse_entries: Vec<osd::BrowseEntry>,
+    /// Last self-diagnostics results (Settings → Diagnostics → "Run all").
+    diag_results: Vec<saturn::diagnostics::DiagOutcome>,
 }
 
 /// Disc-image extensions the browser offers (lower-cased compare). `.chd` is
@@ -1480,6 +1520,20 @@ fn dispatch_osd(
                 }
                 _ => osd.set_toast("No such disc", 120),
             }
+        }
+        OsdAction::RunDiagnostics => {
+            // Runs ~6 tiny SH-2 programs on throwaway machines (sub-millisecond),
+            // synchronously here on the emu thread; it does NOT touch the live
+            // `saturn`. Results surface on the next draw via OsdCtx; the screen
+            // stays open. (`::saturn` — the param shadows the crate name.)
+            sess.diag_results = ::saturn::diagnostics::run_all();
+            let fails = sess.diag_results.iter().filter(|o| !o.passed).count();
+            let msg = if fails == 0 {
+                "Diagnostics: all passed".to_string()
+            } else {
+                format!("Diagnostics: {fails} failed")
+            };
+            osd.set_toast(msg, 150);
         }
         OsdAction::SetScale(s) => {
             sess.ui.scale = s;
