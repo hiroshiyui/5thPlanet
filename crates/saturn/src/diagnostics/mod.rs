@@ -46,6 +46,7 @@ const REGISTRY: &[Diag] = &[
     Diag { name: "timer_frc_advances", category: "onchip", run: timer_frc_advances },
     Diag { name: "cpu_logic_ops", category: "cpu", run: cpu_logic_ops },
     Diag { name: "cpu_shift_ops", category: "cpu", run: cpu_shift_ops },
+    Diag { name: "scu_dma_copy", category: "scu", run: scu_dma_copy },
 ];
 
 /// Run every built-in diagnostic and collect the outcomes (registry order).
@@ -276,6 +277,45 @@ fn cpu_shift_ops() -> (bool, String) {
     code.extend(build_low_scratch_addr());
     code.extend([movl_store(1, 0), bra_self(), NOP]);
     verdict(read_low(&run_program(&code), LOW_SCRATCH), 0x2A)
+}
+
+/// SCU **DMA** (the Saturn system peripheral, not an SH-2 on-chip block):
+/// program channel 0 to copy the sentinel one word from one Low-WRAM address to
+/// another and verify it moved. Mirrors `tests/scu.rs`'s proven manual-trigger
+/// sequence: D0R/D0W/D0C/D0AD/D0MD, then a 32-bit write to D0EN with the DGO bit
+/// fires it (the engine drains within `run_for`). Source `0x0020_0200` →
+/// dest `0x0020_0300` (both Low WRAM — a legal DMA source, not the BIOS A-bus).
+fn scu_dma_copy() -> (bool, String) {
+    const DEST: u32 = 0x0020_0300;
+    let mut code = vec![
+        // R0 = sentinel 0x2A2A2A2A
+        mov_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A),
+        // R2 = source 0x0020_0200, plant the sentinel there
+        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
+        movl_store(2, 0),
+        // R3 = dest 0x0020_0300
+        mov_imm(3, 0x20), shll16(3), mov_imm(4, 3), shll8(4), add(3, 4),
+        // R1 = SCU base 0x05FE_0000 (6<<8 = 0x600, -2 = 0x5FE, <<16)
+        mov_imm(1, 6), shll8(1), add_imm(1, -2), shll16(1),
+        movl_store(1, 2), // D0R (base+0x00) = source
+    ];
+    // D0W (base+0x04) = dest
+    code.extend([mov_imm(4, 0x04), add(4, 1), movl_store(4, 3)]);
+    // D0C (base+0x08) = 4 bytes
+    code.extend([mov_imm(4, 0x08), add(4, 1), mov_imm(5, 4), movl_store(4, 5)]);
+    // D0AD (base+0x0C) = 0x101 (read +4, write +2 — the contiguous-copy form)
+    code.extend([mov_imm(5, 1), shll8(5), add_imm(5, 1), mov_imm(4, 0x0C), add(4, 1), movl_store(4, 5)]);
+    // D0MD (base+0x14) = (1<<16)|(1<<8)|7 = 0x10107 (RUP | WUP | manual factor)
+    code.extend([
+        mov_imm(5, 1), shll16(5),
+        mov_imm(6, 1), shll8(6), add(5, 6),
+        add_imm(5, 7),
+        mov_imm(4, 0x14), add(4, 1), movl_store(4, 5),
+    ]);
+    // D0EN (base+0x10) = DGO (0x100) — triggers the transfer
+    code.extend([mov_imm(5, 1), shll8(5), mov_imm(4, 0x10), add(4, 1), movl_store(4, 5)]);
+    code.extend([bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), DEST), SENTINEL)
 }
 
 /// `BRA disp` (`0xA000 | disp12`). Kept here (not in `asm`) because only the
