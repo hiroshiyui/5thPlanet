@@ -12,7 +12,7 @@ physdisc = { path = "../crates/physdisc" }
 sdl2 = { version = "0.37", optional = true }
 
 [features]
-default = ["sdl2-frontend"]
+default = ["sdl2-frontend", "chd"]
 # Toggle the SDL2 window off if the host doesn't have libsdl2-dev
 # installed or if you want a headless build for CI. With the feature
 # off, `cargo run -p jupiter -- BIOS` still loads the BIOS,
@@ -23,6 +23,11 @@ sdl2-frontend = ["dep:sdl2"]
 # Off by default so the standard build needs no libcdio; enabling it links
 # the system library through the `physdisc` crate.
 physical-disc = ["physdisc/libcdio"]
+# Read `.chd` (compressed) disc images (roadmap G1). On by default — the `chd`
+# crate is pure Rust with no system dependency (unlike `physical-disc`), so it
+# costs the standard build nothing but the compile. Turn it off for a leaner
+# headless build that only needs CUE/ISO/CCD.
+chd = ["saturn/chd"]
 
 [lints]
 workspace = true

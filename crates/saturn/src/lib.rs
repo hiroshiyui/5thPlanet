@@ -47,6 +47,8 @@
 pub mod bus;
 pub mod cartridge;
 pub mod cd_block;
+#[cfg(feature = "chd")]
+pub mod chd_image;
 pub mod disc;
 pub mod memory;
 pub mod scheduler;

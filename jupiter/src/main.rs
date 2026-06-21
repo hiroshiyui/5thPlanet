@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         Some(p) => p.clone(),
         None => {
             eprintln!(
-                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd | cdrom:<device>] [--cart=<kind>]"
+                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd|.chd | cdrom:<device>] [--cart=<kind>]"
             );
             eprintln!();
             eprintln!(
@@ -246,8 +246,9 @@ fn insert_from_spec(sat: &mut saturn::Saturn, spec: &str) -> Result<(), String> 
 }
 
 /// Load a disc image, picking the parser by file extension: `.iso` (raw
-/// 2048-byte data track), `.cue` (CUE sheet + its `.bin`s), or `.ccd`
-/// (CloneCD control file + sibling `.img`).
+/// 2048-byte data track), `.cue` (CUE sheet + its `.bin`s), `.ccd`
+/// (CloneCD control file + sibling `.img`), or `.chd` (compressed hunks;
+/// only when built with the `chd` feature).
 fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
     use saturn::disc::Disc;
     use std::path::Path;
@@ -271,8 +272,14 @@ fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
             let bytes = fs::read(&img).map_err(|e| format!("{}: {e}", img.display()))?;
             Disc::from_ccd(&ccd, bytes)
         }
+        #[cfg(feature = "chd")]
+        "chd" => {
+            let f = fs::File::open(p).map_err(|e| e.to_string())?;
+            saturn::chd_image::from_chd(f)
+        }
         other => Err(format!(
-            "unknown disc format '.{other}' (use .cue / .iso / .ccd)"
+            "unknown disc format '.{other}' (use .cue / .iso / .ccd{})",
+            if cfg!(feature = "chd") { " / .chd" } else { "" }
         )),
     }
 }
@@ -1233,9 +1240,12 @@ struct Session {
     browse_entries: Vec<osd::BrowseEntry>,
 }
 
-/// Disc-image extensions the browser offers (lower-cased compare).
-#[cfg(feature = "sdl2-frontend")]
-const DISC_EXTS: [&str; 3] = ["cue", "iso", "ccd"];
+/// Disc-image extensions the browser offers (lower-cased compare). `.chd` is
+/// included only when the `chd` feature is built in (it's the loadable set).
+#[cfg(all(feature = "sdl2-frontend", feature = "chd"))]
+const DISC_EXTS: &[&str] = &["cue", "iso", "ccd", "chd"];
+#[cfg(all(feature = "sdl2-frontend", not(feature = "chd")))]
+const DISC_EXTS: &[&str] = &["cue", "iso", "ccd"];
 
 #[cfg(feature = "sdl2-frontend")]
 impl Session {

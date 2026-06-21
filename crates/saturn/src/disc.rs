@@ -6,7 +6,8 @@
 //! (Frame ADdress): `FAD = LBA + 150`, the CD's 2-second lead-in offset, so the
 //! first user sector is FAD 150. The Saturn CD-block speaks FAD throughout.
 //!
-//! Three image formats are parsed, all producing the same [`Disc`]:
+//! Several image formats are parsed, all producing the same [`Disc`] via the
+//! shared [`Disc::from_pending_tracks`] assembler:
 //!
 //! - **raw ISO** ([`Disc::from_iso`]) — one Mode-1 data track of 2048-byte
 //!   sectors starting at FAD 150. The common single-data-track case.
@@ -16,6 +17,9 @@
 //! - **CloneCD CCD/IMG** ([`Disc::from_ccd`]) — the `.ccd` carries a full TOC
 //!   (`[Entry]` points `0xA0`/`0xA1`/`0xA2` + per-track `PLBA`); the `.img`
 //!   is raw 2352-byte sectors. This is what `roms/` ships for testing.
+//! - **CHD** ([`crate::chd_image::from_chd`], behind the `chd` feature) —
+//!   MAME's compressed multi-track container; decompressed to the same track
+//!   table. See that module for the layout.
 //!
 //! Sector data is normalised to the 2048-byte user payload regardless of the
 //! on-disc sector size (2352 raw sectors carry sync/header/EDC around it).
@@ -339,7 +343,11 @@ impl Disc {
     /// Build a [`Disc`] from `(number, mode, sector_size, image_byte_offset)`
     /// tuples in track order, deriving each track's FAD/length from the next
     /// track's start (and the image end for the last).
-    fn from_pending_tracks(
+    /// Build a disc from a concatenated sector image plus a per-track
+    /// `(number, mode, sector_size, image_offset)` list. The CUE/CCD/CHD
+    /// parsers all funnel here so the track-table geometry, TOC, fingerprint,
+    /// and byte-swapped-audio warning are computed in exactly one place.
+    pub(crate) fn from_pending_tracks(
         image: Vec<u8>,
         tracks: impl Iterator<Item = (u8, TrackMode, usize, usize)>,
     ) -> Result<Disc, String> {
