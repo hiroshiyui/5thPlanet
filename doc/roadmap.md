@@ -6,8 +6,17 @@ tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
 referenced below.
 
-Current test count: **1114 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1121 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
+
+**Homebrew test-disc framework (in progress):** `tests/disc/` is a
+royalty-free libyaul (MIT) Saturn disc that boots on the real-BIOS path and
+posts a machine-readable result to High-WRAM; `crates/saturn/tests/homebrew_disc.rs`
+boots it headless and asserts the result (+ optional framebuffer golden). Unlike
+the gitignored commercial `roms/`/`bios/`, an MIT disc image is committable, so
+this is a path to **CI-able accuracy regressions**. Scaffold + harness are in;
+filling it with per-feature checks (driven by
+`doc/emulation-capabilities-evaluation.md`) needs the libyaul toolchain.
 
 ## Component status
 
