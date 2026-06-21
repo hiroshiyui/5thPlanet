@@ -25,6 +25,9 @@ const ITEM_SEL: Rgb = (0xFF, 0xFF, 0xFF);
 const HILITE_BAR: Rgb = (0x28, 0x2C, 0x80);
 const TOAST_BG: Rgb = (0x00, 0x00, 0x00);
 const TOAST_FG: Rgb = (0x80, 0xF8, 0x80);
+/// Diagnostics result row colours (green pass / red fail).
+const DIAG_PASS: Rgb = (0x50, 0xE0, 0x50);
+const DIAG_FAIL: Rgb = (0xF0, 0x50, 0x50);
 
 /// Abstract navigation input (the frontend maps keys/pad to these).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +216,9 @@ struct Item {
     label: String,
     /// What activating it does: push a screen, emit an action, or close.
     on_select: Select,
+    /// Optional text colour override (e.g. green/red diagnostics rows). `None`
+    /// uses the default selected/unselected colour.
+    color: Option<Rgb>,
 }
 
 #[derive(Clone, Copy)]
@@ -325,6 +331,7 @@ impl Osd {
         let mk = |label: &str, on_select: Select| Item {
             label: label.to_string(),
             on_select,
+            color: None,
         };
         match screen {
             Screen::Main => vec![
@@ -471,17 +478,25 @@ impl Osd {
                 v
             }
             Screen::Diagnostics => {
-                // "Run all" plus one inert row per result. The 15-row scrolling
-                // viewport handles a long list. PASS/FAIL is shown in the label.
+                // "Run all" plus one inert, colour-coded row per result. The
+                // panel auto-sizes to the widest row and the 15-row scrolling
+                // viewport handles a long list (Back is one Up-wrap away).
                 let mut v = Vec::with_capacity(ctx.diag_results.len() + 2);
                 v.push(mk("Run all", Select::Emit(OsdAction::RunDiagnostics)));
                 if ctx.diag_results.is_empty() {
                     v.push(mk("(not run yet)", Select::Close));
                 } else {
                     for r in &ctx.diag_results {
-                        let tag = if r.passed { "PASS" } else { "FAIL" };
-                        let short: String = r.label.chars().take(20).collect();
-                        v.push(mk(&format!("[{tag}] {short}"), Select::Close));
+                        let (tag, col) = if r.passed {
+                            ("PASS", DIAG_PASS)
+                        } else {
+                            ("FAIL", DIAG_FAIL)
+                        };
+                        v.push(Item {
+                            label: format!("[{tag}] {}", r.label),
+                            on_select: Select::Close,
+                            color: Some(col),
+                        });
                     }
                 }
                 v.push(mk("Back", Select::Close));
@@ -627,8 +642,18 @@ impl Osd {
             (first, MAX_VISIBLE_ROWS)
         };
 
-        // Panel geometry: centred, sized to the visible rows.
-        let pw = 180usize;
+        // Panel geometry: centred, height from the visible rows, width auto-
+        // sized to the widest row (so a screen with long labels — the
+        // diagnostics results — doesn't overflow). Floored at 180 so the
+        // short-label screens look identical, capped to the framebuffer.
+        const TEXT_INSET: usize = 12;
+        let widest = items
+            .iter()
+            .map(|it| Canvas::text_width(&it.label))
+            .max()
+            .unwrap_or(0);
+        let pw = (widest + TEXT_INSET + 8)
+            .clamp(180, c.w.saturating_sub(8).max(180));
         let ph = 28 + shown * 12 + 8;
         let px = c.w.saturating_sub(pw) / 2;
         let py = c.h.saturating_sub(ph) / 2;
@@ -657,12 +682,15 @@ impl Osd {
         for vis in 0..shown {
             let i = first + vis;
             let ry = row0 + vis * 12;
-            let color = if i == sel {
+            let base = if i == sel {
                 c.fill_rect(px + 4, ry - 2, pw - 8, 11, HILITE_BAR);
                 ITEM_SEL
             } else {
                 ITEM
             };
+            // A per-item colour (diagnostics PASS/FAIL) overrides the default,
+            // but the selected row stays white so the highlight stays legible.
+            let color = if i == sel { base } else { items[i].color.unwrap_or(base) };
             c.draw_text(px + 12, ry, &items[i].label, color);
         }
 
