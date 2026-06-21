@@ -11,6 +11,14 @@ as a compressed archive). The pipeline is **rip → fix byte order → verify �
 (optionally) compress**. Confirm the user owns the disc before starting; never
 help circumvent disc copy-protection.
 
+**Automation:** `tools/dump_game_disc.sh` runs the rip → cue → verify →
+(optional) CHD pipeline below in one command (e.g.
+`tools/dump_game_disc.sh -n mygame --bios bios/saturn_bios.bin`, add
+`--byteswap` if the audio comes out MSB-first). Use it for the happy path;
+fall back to the manual steps when a stage needs hands-on attention (a flaky
+rip, or the post-process per-track swap in step 4). Run `tools/dump_game_disc.sh
+--help` for options.
+
 Always follow these steps:
 
 1. **Find the optical drive and confirm tooling.** Run `lsblk -o NAME,TYPE | grep rom` or check `ls /dev/sr*` to locate the drive (usually `/dev/sr0`). Confirm `cdrdao` is installed (`cdrdao --version`); note that `toc2cue` ships with it. If the user also has `chdman` (from MAME) it enables the optional CHD step; if not, skip step 6. Do all intermediate I/O under the project's `tmp/` subdirectory (never `/tmp`).
