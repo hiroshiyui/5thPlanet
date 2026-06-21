@@ -14,7 +14,10 @@
 mod asm;
 
 use crate::system::Saturn;
-use asm::{NOP, add, add_imm, assemble, bra_self, mov_imm, movl_load, movl_store, mul_l, shll8, shll16, sts_macl, sub};
+use asm::{
+    NOP, add, add_imm, and_, assemble, bra_self, mov_imm, movl_load, movl_store, movw_load, mul_l,
+    or_, shll, shll8, shll16, shlr, sts_macl, sub, xor_,
+};
 
 /// The result of one diagnostic check.
 #[derive(Clone, Debug)]
@@ -39,6 +42,10 @@ const REGISTRY: &[Diag] = &[
     Diag { name: "branch_delay_slot", category: "branch", run: branch_delay_slot },
     Diag { name: "mem_roundtrip_low", category: "memory", run: mem_roundtrip_low },
     Diag { name: "mem_roundtrip_high", category: "memory", run: mem_roundtrip_high },
+    Diag { name: "divu_divide", category: "onchip", run: divu_divide },
+    Diag { name: "timer_frc_advances", category: "onchip", run: timer_frc_advances },
+    Diag { name: "cpu_logic_ops", category: "cpu", run: cpu_logic_ops },
+    Diag { name: "cpu_shift_ops", category: "cpu", run: cpu_shift_ops },
 ];
 
 /// Run every built-in diagnostic and collect the outcomes (registry order).
@@ -81,6 +88,11 @@ fn verdict(got: u32, want: u32) -> (bool, String) {
 }
 fn alloc_detail(got: u32, want: u32) -> String {
     format!("got 0x{got:08X}, want 0x{want:08X}")
+}
+/// Pass iff `second > first` (a monotonic-advance check, e.g. a free-running
+/// counter). Detail shows both samples.
+fn verdict_advanced(first: u32, second: u32) -> (bool, String) {
+    (second > first, format!("advanced {first} -> {second}"))
 }
 
 /// Emit the five instructions that build `0x0020_0100` into R1 (clobbers R2).
@@ -181,6 +193,91 @@ fn roundtrip_code(base_addr_seq: Vec<u16>, result_off: i8) -> Vec<u16> {
     code
 }
 
+/// SH-2 on-chip **DIVU**: 126 ÷ 3 = 42. Builds the DVSR address `0xFFFFFF00`
+/// (`MOV #-1; SHLL8`), writes divisor then dividend (which triggers the 32÷32
+/// divide), and reads the quotient back from DVDNT — the read auto-stalls until
+/// the divider retires (~39 cycles), so no manual wait is needed.
+fn divu_divide() -> (bool, String) {
+    let code = [
+        mov_imm(1, -1),
+        shll8(1),         // R1 = 0xFFFFFF00 (DVSR)
+        mov_imm(2, 4),
+        add(2, 1),        // R2 = 0xFFFFFF04 (DVDNT)
+        mov_imm(3, 3),
+        movl_store(1, 3), // DVSR = 3
+        mov_imm(4, 126),
+        movl_store(2, 4), // DVDNT = 126 → trigger divide
+        movl_load(0, 2),  // R0 = quotient (stalls until ready)
+        // store the quotient to Low scratch
+        mov_imm(1, 0x20),
+        shll16(1),
+        mov_imm(5, 1),
+        shll8(5),
+        add(1, 5),        // R1 = 0x0020_0100
+        movl_store(1, 0),
+        bra_self(),
+        NOP,
+    ];
+    verdict(read_low(&run_program(&code), LOW_SCRATCH), 42)
+}
+
+/// SH-2 on-chip **FRT**: the free-running counter advances. Builds the FRC
+/// address `0xFFFFFE12` (`MOV #-2; SHLL8` → `0xFFFFFE00`, + `0x12`), reads FRC,
+/// burns cycles, reads it again, and verifies the second sample is larger. The
+/// lazy FRT materializes on each register read, so the delta reflects the
+/// cycles between them (≥ the φ/8 8-cycle tick at reset).
+fn timer_frc_advances() -> (bool, String) {
+    let mut code = vec![
+        mov_imm(1, -2),
+        shll8(1),    // R1 = 0xFFFFFE00
+        mov_imm(2, 0x12),
+        add(1, 2),   // R1 = 0xFFFFFE12 (FRC, 16-bit)
+        // Low scratch base in R5 (= 0x0020_0100).
+        mov_imm(5, 0x20),
+        shll16(5),
+        mov_imm(6, 1),
+        shll8(6),
+        add(5, 6),
+        movw_load(3, 1), // R3 = FRC (first)
+        movl_store(5, 3), // scratch[0x100] = first
+    ];
+    code.extend([NOP; 16]); // burn cycles so the counter ticks
+    code.extend([
+        movw_load(4, 1),  // R4 = FRC (second)
+        mov_imm(6, 4),
+        add(6, 5),        // R6 = 0x0020_0104
+        movl_store(6, 4), // scratch[0x104] = second
+        bra_self(),
+        NOP,
+    ]);
+    let sat = run_program(&code);
+    verdict_advanced(read_low(&sat, LOW_SCRATCH), read_low(&sat, LOW_SCRATCH + 4))
+}
+
+/// ALU logic: `0x0F OR 0x30 → 0x3F`, `XOR 0x15 → 0x2A`, `AND 0x2F → 0x2A`.
+fn cpu_logic_ops() -> (bool, String) {
+    let mut code = vec![
+        mov_imm(0, 0x0F),
+        mov_imm(2, 0x30),
+        or_(0, 2), // 0x3F
+        mov_imm(2, 0x15),
+        xor_(0, 2), // 0x2A
+        mov_imm(2, 0x2F),
+        and_(0, 2), // 0x2A
+    ];
+    code.extend(build_low_scratch_addr());
+    code.extend([movl_store(1, 0), bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), LOW_SCRATCH), 0x2A)
+}
+
+/// ALU shifts: `0x2A SHLR → 0x15 SHLL → 0x2A` (round-trips both shift ops).
+fn cpu_shift_ops() -> (bool, String) {
+    let mut code = vec![mov_imm(0, 0x2A), shlr(0), shll(0)];
+    code.extend(build_low_scratch_addr());
+    code.extend([movl_store(1, 0), bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), LOW_SCRATCH), 0x2A)
+}
+
 /// `BRA disp` (`0xA000 | disp12`). Kept here (not in `asm`) because only the
 /// delay-slot check needs a non-self branch displacement.
 fn asm_bra(disp: i16) -> u16 {
@@ -214,6 +311,12 @@ mod tests {
         assert!(matches!(decode(add(1, 2)), Op::Add { rn: 1, rm: 2 }));
         assert!(matches!(decode(sub(0, 5)), Op::Sub { rn: 0, rm: 5 }));
         assert!(matches!(decode(asm_bra(1)), Op::Bra { disp: 1 }));
+        assert!(matches!(decode(movw_load(3, 1)), Op::MovWL { rn: 3, rm: 1 }));
+        assert!(matches!(decode(and_(0, 2)), Op::And { rn: 0, rm: 2 }));
+        assert!(matches!(decode(or_(0, 2)), Op::Or { rn: 0, rm: 2 }));
+        assert!(matches!(decode(xor_(0, 2)), Op::Xor { rn: 0, rm: 2 }));
+        assert!(matches!(decode(shll(0)), Op::Shll { rn: 0 }));
+        assert!(matches!(decode(shlr(0)), Op::Shlr { rn: 0 }));
         // No program word decodes to Illegal.
         for d in REGISTRY {
             let _ = (d.run)(); // also exercises every program end-to-end

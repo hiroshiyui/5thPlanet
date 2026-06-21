@@ -53,6 +53,30 @@ pub fn movl_store(addr_rn: u16, src_rm: u16) -> u16 {
 pub fn movl_load(dst_rn: u16, addr_rm: u16) -> u16 {
     0x6002 | (dst_rn << 8) | (addr_rm << 4)
 }
+/// `MOV.W @Rm, Rn` — load a sign-extended 16-bit word from @Rm (`0x6nm1`, `MovWL`).
+pub fn movw_load(dst_rn: u16, addr_rm: u16) -> u16 {
+    0x6001 | (dst_rn << 8) | (addr_rm << 4)
+}
+/// `AND Rm, Rn` (`0x2nm9`).
+pub fn and_(rn: u16, rm: u16) -> u16 {
+    0x2009 | (rn << 8) | (rm << 4)
+}
+/// `OR Rm, Rn` (`0x2nmB`).
+pub fn or_(rn: u16, rm: u16) -> u16 {
+    0x200B | (rn << 8) | (rm << 4)
+}
+/// `XOR Rm, Rn` (`0x2nmA`).
+pub fn xor_(rn: u16, rm: u16) -> u16 {
+    0x200A | (rn << 8) | (rm << 4)
+}
+/// `SHLL Rn` — logical shift left 1 (`0x4n00`).
+pub fn shll(rn: u16) -> u16 {
+    0x4000 | (rn << 8)
+}
+/// `SHLR Rn` — logical shift right 1 (`0x4n01`).
+pub fn shlr(rn: u16) -> u16 {
+    0x4001 | (rn << 8)
+}
 /// `SHLL8 Rn` — logical shift left 8 (`0x4n18`).
 pub fn shll8(rn: u16) -> u16 {
     0x4018 | (rn << 8)
