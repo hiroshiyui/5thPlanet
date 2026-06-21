@@ -1,0 +1,9 @@
+# libyaul build output is regenerable — ignore the intermediates (.o/.elf/.map,
+# IP.BIN, etc.) but allow the final disc image to be committed. The disc is our
+# own MIT homebrew, so committing it is what lets the headless harness run in CI
+# (a clone without the toolchain still has the disc to boot).
+build/*
+!build/saturn-tests.iso
+!build/saturn-tests.cue
+!build/saturn-tests.bin
+!build/saturn-tests.chd
