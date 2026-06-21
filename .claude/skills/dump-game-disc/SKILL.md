@@ -47,14 +47,14 @@ Always follow these steps:
    Use the user's real BIOS path. Watch stderr for the byte-swap warning while it loads.
    Watch stderr for the `audio tracks appear byte-swapped` warning. If it fires, return to step 4. The acceptance bar is: boots to the game, and audio-track BGM sounds correct.
 
-6. **(Optional) Compress to CHD for archival.** Only if the user wants a compact single-file archive *and* `chdman` is available (note: the emulator does not yet read `.chd` — that's roadmap task G1 — so this is storage-only, not a loadable format today):
+6. **(Optional) Compress to CHD.** Only if the user wants a compact single-file image *and* `chdman` is available. The emulator **reads `.chd` directly** (the `chd` feature, on by default in `jupiter` — roadmap G1 landed), so this is a fully loadable format, not just archival:
    ```bash
-   chdman createcd -i tmp/game.cue -o tmp/game.chd        # archive
-   chdman extractcd -i tmp/game.chd -o out.cue -ob out.bin # to get CUE-BIN back later
+   chdman createcd -i tmp/game.cue -o tmp/game.chd         # compress (loadable)
+   chdman extractcd -i tmp/game.chd -o out.cue -ob out.bin # back to CUE-BIN if ever needed
    ```
-   Make clear to the user that until G1 lands they must extract back to CUE-BIN to actually play it.
+   Note: `chdman` needs a `.cue`/`.toc`/`.gdi` input — it does **not** ingest CloneCD `.ccd` directly (it reports 0 tracks). Convert `.ccd` to a `.cue` first if that's the source.
 
-7. **Place the result and clean up.** Move the verified `.cue` + `.bin` (and `.chd` if made) to the user's chosen library path; leave nothing stray in `tmp/`. Remind the user which file to point the frontend at (the `.cue`).
+7. **Place the result and clean up.** Move the verified `.cue` + `.bin` (and `.chd` if made) to the user's chosen library path; leave nothing stray in `tmp/`. Remind the user which file to point the frontend at — either the `.cue` or, if compressed, the `.chd` (both load directly).
 
 Notes:
 - This skill is **observer-only on the codebase** — it dumps and fixes disc images at the file level and does not modify emulator source. The byte-swap is always corrected in the *image* (step 4), not in the loader.
