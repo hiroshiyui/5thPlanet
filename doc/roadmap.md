@@ -306,15 +306,14 @@ Part C.1.
 **Triage (2026-06-14 re-verified at HEAD):** all rows still hold. **G2 and G3
 are the two most likely to actually surface** (both audio, both plausibly hit by
 a real sound driver) — check them first if a future game has a sound bug. The
-proactive items are G1's two halves: **`.m3u` is cheap** (playlist parser +
-the existing eject/insert path) and unlocks the multi-disc games; **CHD is the
-bigger usability win but its own scoped task** (a feature-gated reader crate,
-mirroring `physdisc`, not hand-rolled codecs). G2/G6 carry real regression risk
-(the current behaviour is load-bearing) — fix only with a repro.
+one proactive item is **G1 CHD** — a usability win, but its own scoped task (a
+feature-gated reader crate, mirroring `physdisc`, not hand-rolled codecs).
+G2/G6 carry real regression risk (the current behaviour is load-bearing) — fix
+only with a repro.
 
 | # | Gap | Status |
 |---|-----|--------|
-| G1 | CHD disc images + multi-disc `.m3u` playlist swapping (disc/frontend) | ⬜ Mednafen reads `.chd` and swaps via playlists; ours handles ISO/CUE-BIN/CCD + manual eject/insert only. Split effort: `.m3u` low, CHD high (compressed hunk container — prefer a feature-gated crate) |
+| G1 | CHD disc images (disc) | ⬜ Mednafen reads `.chd`; ours handles ISO/CUE-BIN/CCD only. High effort (compressed hunk container — prefer a feature-gated reader crate, mirroring `physdisc`) |
 | G2 | SCSP `SNDON` does a full 68k reset, not an un-halt | ⬜ a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
 | G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | ⬜ only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
 | G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | ⬜ `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
