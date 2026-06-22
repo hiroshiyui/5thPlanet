@@ -22,13 +22,22 @@ suspect.
 
 **Crucially, no fully-working title exercises the Cinepak FILM player, so it is
 effectively unvalidated.** A disc scan for the Sega FILM / Cinepak markers
-(`FDSC` description chunk, `cvid` Cinepak fourCC, `STAB` sample table) shows:
-*VF2* = 0/0/0 — its fighter-intro "FMV" is **real-time 3D**, not movie playback;
-*Doukyuusei ~if~* = 1/0/3 — at most one non-Cinepak FILM; *SAN5* = 18/18/21 —
-eighteen genuine Cinepak FILM files; *PDZ* uses Cinepak FILM too. So SAN5 and PDZ
-are the **first real users** of the Cinepak movie path — which is exactly why
-both fail there while VF2/Doukyuusei don't (they never touch it). VF2 playing its
-intro flawlessly is *not* a counterexample.
+(`FDSC` description chunk, `cvid` Cinepak fourCC, `STAB` sample table) — and for
+other movie codecs — shows:
+- *VF2* = 0/0/0 Cinepak, but its opening **does** include a movie (scene 1):
+  it's **Duck TrueMotion** (three `DUCK`-headed files; scenes 2–3 are real-time
+  3D). A *different* codec and player from Cinepak FILM.
+- *Doukyuusei ~if~* = 1/0/3 — at most one non-Cinepak FILM.
+- *SAN5* = 18/18/21 — eighteen genuine Cinepak FILM files; *PDZ* uses Cinepak too.
+
+So SAN5 and PDZ are the **first real users of the Cinepak FILM path**, which is
+why both fail there while VF2/Doukyuusei don't. And VF2's TrueMotion movie
+playing flawlessly is the *opposite* of a counterexample — it proves our
+**CD-streaming + a software movie player work end-to-end**, so the defect is
+specifically in the **Cinepak FILM player's timing-sensitive read/pacing logic**,
+not in the CD block or movie streaming in general. (Both the Cinepak and
+TrueMotion decoders are the games' own SH-2 software, run by LLE — no decoder to
+implement either way; see the FMV note below.)
 
 ---
 
