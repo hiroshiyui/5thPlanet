@@ -9,14 +9,17 @@ referenced below.
 Current test count: **1123 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
-**Self-diagnostics suite:** `saturn::diagnostics` runs a battery of tiny
-hand-assembled SH-2 programs from reset (no BIOS, no disc, no external
-toolchain — the `audio_pipeline.rs` "Tier A" pattern), each verifying one
-behavior by reading back a result it wrote to Work RAM. Surfaced three ways off
-one engine: `jupiter doctor` (headless report, exit 0/1), an OSD
-**"Diagnostics…"** screen, and a `cargo test` asserting all pass — a **CI-able
-accuracy regression** that needs none of the gitignored commercial media. Grow
-the check set from `doc/emulation-capabilities-evaluation.md`.
+**Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
+checks** (`run_all`, 16 so far across cpu / branch / memory / onchip DIVU·FRT·DMAC
+/ scu DMA / vdp2 render / scsp audio) run hermetically from reset — no BIOS, no
+disc, no toolchain — each verifying one behavior on a throwaway machine; they're
+golden, deterministic, and CI-able (the `all_diagnostics_pass` test). **System /
+boot-compatibility checks** (`run_system`) are heuristic and *do* need real
+media: given a BIOS (+ optional disc) they boot a throwaway and observe video /
+TOC / the 1st-read program reaching High WRAM. Surfaced via `jupiter doctor`
+(`doctor` = feature checks; `doctor <BIOS> [disc]` adds the boot checks), an OSD
+**"Diagnostics…"** screen (feature checks), and the CI test. Grow the feature
+set as chips/games surface needs.
 
 ## Component status
 
