@@ -154,6 +154,7 @@ fn audio_pipeline_sine() {
     sat.bus.scsp.ram.write32(4, 0x0000_0100); // 68k PC
     sat.bus.scsp.ram.write16(0x100, 0x60FE); // 68k: BRA self
     sat.bus.scsp.start(); // SNDON → SCSP generates
+    sat.bus.scsp.ctrl.write16(0x400, 0x000F); // MVOL = unity (a reset SCSP is silent)
 
     // Print the program disassembly — this *is* the trace of the pipeline setup.
     println!("--- sine test program (master starts at {CODE_PC:#06X}) ---");
@@ -264,6 +265,7 @@ fn audio_pipeline_sine_68k() {
         sat.bus.scsp.ram.write8(M68K_PC + i as u32, b);
     }
     sat.bus.scsp.start();
+    sat.bus.scsp.ctrl.write16(0x400, 0x000F); // MVOL = unity (a reset SCSP is silent)
 
     let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
     let mut pcm: Vec<i16> = Vec::new();
