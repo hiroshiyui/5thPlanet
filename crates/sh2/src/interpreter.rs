@@ -133,6 +133,27 @@ pub struct Cpu {
     /// cache treatment — see [`ReadWatch`]. Set via [`Cpu::enable_read_watch`].
     #[cfg_attr(feature = "serde", serde(skip))]
     pub read_watch: Option<ReadWatch>,
+    /// Debug only: register-write watch — `Some((idx, val))` logs the executing
+    /// PC each time `R[idx]` *transitions to* `val`. Only active once the cycle
+    /// reaches [`Self::dbg_regwatch_after`], so a long run stays full-speed until
+    /// the window of interest. Beats the bp stack-heuristic / line-granular
+    /// read-watch confounds when hunting where a value is computed into a
+    /// register. Off by default; not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_regwatch: Option<(u8, u32)>,
+    /// Debug only: only check [`Self::dbg_regwatch`] once `pipeline.cycles >=`
+    /// this (0 = always). Keeps the per-instruction cost off the hot path until
+    /// the target window. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_regwatch_after: u64,
+    /// Debug only: whether `R[idx] == val` held after the previous instruction —
+    /// the transition-edge detector for [`Self::dbg_regwatch`]. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_regwatch_armed: bool,
+    /// Debug only: transitions [`Self::dbg_regwatch`] fired, as
+    /// `(executing_pc, cycle)`. Capped to avoid unbounded growth. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_regwatch_log: alloc::vec::Vec<(u32, u64)>,
     /// Pre-decoded instruction table: `decode(w)` for every 16-bit word `w`.
     /// Turns the per-instruction decode (a match + operand-field extraction +
     /// `Op` construction, ~7% of run time) into one indexed load. Pure function
@@ -176,6 +197,10 @@ impl Cpu {
             dbg_stale_checks: 0,
             dbg_slow_fetch: 0,
             read_watch: None,
+            dbg_regwatch: None,
+            dbg_regwatch_after: 0,
+            dbg_regwatch_armed: false,
+            dbg_regwatch_log: alloc::vec::Vec::new(),
             decode_lut: build_decode_lut(),
         }
     }
@@ -260,7 +285,20 @@ impl Cpu {
     /// on-chip interrupt pending bits are refreshed so they're visible at the
     /// next instruction boundary. Returns the total cycles.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
+        // Register-write watch (debug): if `R[idx]` transitions to the target
+        // value within the cycle window, log the executing PC. Off-path when
+        // disabled (one `is_some` check); `instr_pc` is captured only when armed.
+        let instr_pc = if self.dbg_regwatch.is_some() { self.regs.pc } else { 0 };
         let cost = self.step_instruction(bus);
+        if let Some((idx, val)) = self.dbg_regwatch
+            && self.pipeline.cycles >= self.dbg_regwatch_after
+        {
+            let now_match = self.regs.r[(idx & 0x0F) as usize] == val;
+            if now_match && !self.dbg_regwatch_armed && self.dbg_regwatch_log.len() < 4096 {
+                self.dbg_regwatch_log.push((instr_pc, self.pipeline.cycles));
+            }
+            self.dbg_regwatch_armed = now_match;
+        }
         // Event-scheduled FRT/WDT (Stage B): only materialize when this
         // instruction reached the next scheduled timer edge — otherwise the
         // per-instruction cost is a single (well-predicted) compare. Gating at

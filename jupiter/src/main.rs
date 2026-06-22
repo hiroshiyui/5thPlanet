@@ -2031,6 +2031,23 @@ fn run(
     // cache hit on both SH-2s — a timing-probe to test inter-CPU-race hypotheses
     // (changes timing only, no cache value/content change). 0 = off.
     let slow_fetch: u32 = std::env::var("SAT_SLOW_FETCH").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Debug: `SAT_REGWATCH=idx:hexval[:after_cyc]` logs (on the master) every PC
+    // where R[idx] transitions to the value — finds where a value is computed
+    // into a register, beating the bp-stack / line-granular-read-watch confounds.
+    // The optional after_cyc keeps the run full-speed until that cycle (so a long
+    // run reaching a late window stays fast). e.g. SAT_REGWATCH=12:B1:470000000.
+    if let Ok(spec) = std::env::var("SAT_REGWATCH") {
+        let p: Vec<&str> = spec.split(':').collect();
+        if let (Some(i), Some(v)) = (p.first(), p.get(1))
+            && let Ok(idx) = i.trim().parse::<u8>()
+            && let Ok(val) = u32::from_str_radix(v.trim().trim_start_matches("0x"), 16)
+        {
+            let after = p.get(2).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            let m = saturn.master_mut();
+            m.dbg_regwatch = Some((idx, val));
+            m.dbg_regwatch_after = after;
+        }
+    }
     let mut last_pc = u32::MAX;
     let mut dump_dims = (FRAME_WIDTH, FRAME_HEIGHT);
     for f in 0..headless_frames {
@@ -2050,6 +2067,14 @@ fn run(
                 eprintln!("frame {f:4} master PC=0x{pc:08X}");
                 last_pc = pc;
             }
+        }
+    }
+
+    if std::env::var_os("SAT_REGWATCH").is_some() {
+        let log = std::mem::take(&mut saturn.master_mut().dbg_regwatch_log);
+        eprintln!("REGWATCH: {} transition(s) to target value:", log.len());
+        for (pc, cyc) in &log {
+            eprintln!("  pc={pc:08X}  cyc={cyc}");
         }
     }
 

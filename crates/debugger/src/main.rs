@@ -1246,6 +1246,30 @@ impl Dbg {
             "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
             "cd" => self.cd_state(),
             "frt" => self.dump_frt(),
+            // Register-write watch: `rwatch <reg> <hexval> [after_cyc]` logs (on
+            // the master) the executing PC each time R[reg] transitions to the
+            // value (only past after_cyc, so a long `fc` stays full-speed); dump
+            // with `rwdump`. Finds where a value (e.g. a movie read-count) is
+            // computed into a register — beats the bp-stack/read-watch confounds.
+            "rwatch" => {
+                // reg is DECIMAL (R0..R15); val is hex.
+                let reg = (a1.and_then(parse_dec).unwrap_or(12) as u8) & 0x0F;
+                let val = a2.and_then(parse_num).unwrap_or(0);
+                let after = a3.and_then(parse_dec).unwrap_or(0);
+                let m = self.sat.master_mut();
+                m.dbg_regwatch = Some((reg, val));
+                m.dbg_regwatch_after = after;
+                m.dbg_regwatch_armed = false;
+                m.dbg_regwatch_log.clear();
+                println!("regwatch armed: R{reg} -> {val:#X} (after cyc {after})");
+            }
+            "rwdump" => {
+                let log = core::mem::take(&mut self.sat.master_mut().dbg_regwatch_log);
+                println!("regwatch: {} transition(s) to target value:", log.len());
+                for (pc, cyc) in &log {
+                    println!("  pc={} cyc={cyc}", self.fmt_addr(*pc));
+                }
+            }
             "cache" => self.dump_cache(),
             "caudit" => self.cache_audit(),
             "stale" => self.detect_stale(a1.and_then(parse_dec).unwrap_or(2000)),
