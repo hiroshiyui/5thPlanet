@@ -20,6 +20,16 @@ with status stuck at `PLAY`; SAN5 = the master stalls between movie chunks on a
 timing-dependent gate). The FILM-player ↔ CD/timing interaction is the common
 suspect.
 
+**Crucially, no fully-working title exercises the Cinepak FILM player, so it is
+effectively unvalidated.** A disc scan for the Sega FILM / Cinepak markers
+(`FDSC` description chunk, `cvid` Cinepak fourCC, `STAB` sample table) shows:
+*VF2* = 0/0/0 — its fighter-intro "FMV" is **real-time 3D**, not movie playback;
+*Doukyuusei ~if~* = 1/0/3 — at most one non-Cinepak FILM; *SAN5* = 18/18/21 —
+eighteen genuine Cinepak FILM files; *PDZ* uses Cinepak FILM too. So SAN5 and PDZ
+are the **first real users** of the Cinepak movie path — which is exactly why
+both fail there while VF2/Doukyuusei don't (they never touch it). VF2 playing its
+intro flawlessly is *not* a counterexample.
+
 ---
 
 ## Panzer Dragoon Zwei (PDZ) — PAUSED
