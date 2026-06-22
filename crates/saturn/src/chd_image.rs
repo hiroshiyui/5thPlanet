@@ -119,12 +119,15 @@ fn pad_to_track_boundary(frames: u32) -> u32 {
 fn assemble(tracks: &[ChdTrack], raw: &[u8]) -> Result<Disc, String> {
     let mut image = Vec::new();
     let mut pending: Vec<(u8, TrackMode, usize, usize)> = Vec::with_capacity(tracks.len());
-    let mut chd_frame: u32 = 0; // running frame offset into `raw`
+    let mut chd_frame: usize = 0; // running frame offset into `raw`
 
     for t in tracks {
-        // Skip any pregap frames physically stored ahead of the track data.
-        let data_start = chd_frame + t.pregap_in_file;
-        let need = (data_start + t.frames) as usize * CD_FRAME_SIZE;
+        // Skip any pregap frames physically stored ahead of the track data. The
+        // frame counts come from (untrusted) CHD metadata, so do the offset math
+        // in `usize` — a crafted `FRAMES`/`PREGAP` must yield a clean "runs past
+        // the data" error, not a u32 wrap that bypasses the bounds check below.
+        let data_start = chd_frame + t.pregap_in_file as usize;
+        let need = (data_start + t.frames as usize) * CD_FRAME_SIZE;
         if need > raw.len() {
             return Err(format!(
                 "CHD track {} runs past the decompressed data ({} > {} bytes)",
@@ -134,12 +137,13 @@ fn assemble(tracks: &[ChdTrack], raw: &[u8]) -> Result<Disc, String> {
         let offset = image.len();
         // Copy this track's sectors: the first 2352 of each 2448-byte frame.
         for f in 0..t.frames as usize {
-            let fbase = (data_start as usize + f) * CD_FRAME_SIZE;
+            let fbase = (data_start + f) * CD_FRAME_SIZE;
             image.extend_from_slice(&raw[fbase..fbase + CD_SECTOR_SIZE]);
         }
         pending.push((t.number, t.mode, CD_SECTOR_SIZE, offset));
         // Advance past this track's stored span, padded to a 4-frame boundary.
-        chd_frame += pad_to_track_boundary(t.pregap_in_file + t.frames);
+        // Safe in u32: this track passed the bounds check, so its frame span fits.
+        chd_frame += pad_to_track_boundary(t.pregap_in_file + t.frames) as usize;
     }
     Disc::from_pending_tracks(image, pending.into_iter())
 }
@@ -291,5 +295,17 @@ mod tests {
         assert_eq!(d.tracks().len(), 2);
         assert_eq!(d.first_track(), 1);
         assert_eq!(d.last_track(), 2);
+    }
+
+    /// A track that claims more frames than the decompressed data holds must be
+    /// a clean error (not a panic / out-of-bounds) — guards the corrupt-CHD path
+    /// and the `usize` bounds arithmetic in `assemble`.
+    #[test]
+    fn assemble_rejects_a_track_past_the_data() {
+        // Claims 4 frames; only 1 frame of data is present.
+        let tracks = [ChdTrack { number: 1, mode: TrackMode::Mode1, frames: 4, pregap_in_file: 0 }];
+        let raw = vec![0u8; CD_FRAME_SIZE];
+        let err = assemble(&tracks, &raw).unwrap_err();
+        assert!(err.contains("runs past"), "expected a bounds error, got: {err}");
     }
 }
