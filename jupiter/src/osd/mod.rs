@@ -226,6 +226,8 @@ enum Screen {
     DiscBrowser,
     /// Built-in self-diagnostics: a "Run all" item plus the last results.
     Diagnostics,
+    /// Program version + license notice (read-only).
+    About,
 }
 
 /// One menu item: its label is computed from [`OsdCtx`] at draw time.
@@ -363,6 +365,7 @@ impl Osd {
                 },
                 mk("Load Disc...", Select::Push(Screen::DiscBrowser)),
                 mk("Settings", Select::Push(Screen::Settings)),
+                mk("About...", Select::Push(Screen::About)),
                 mk("Quit", Select::Emit(OsdAction::Quit)),
             ],
             Screen::Slots { saving } => {
@@ -529,6 +532,21 @@ impl Osd {
                 v.push(mk("Back", Select::Close));
                 v
             }
+            Screen::About => {
+                // Static program identity + license notice (read-only rows).
+                // Version/license/author are this crate's compile-time package
+                // metadata (inherited workspace-wide); the product name is
+                // 5thPlanet (the binary is `jupiter`).
+                vec![
+                    mk(concat!("5thPlanet  v", env!("CARGO_PKG_VERSION")), Select::Close),
+                    mk("An accuracy-first SEGA Saturn emulator", Select::Close),
+                    mk(concat!("(C) ", env!("CARGO_PKG_AUTHORS")), Select::Close),
+                    mk(concat!("License: ", env!("CARGO_PKG_LICENSE")), Select::Close),
+                    mk("Provided AS IS, without warranty.", Select::Close),
+                    mk("Full terms: see the LICENSE file.", Select::Close),
+                    mk("Back", Select::Close),
+                ]
+            }
         }
     }
 
@@ -545,6 +563,7 @@ impl Osd {
             Screen::Bios => "BIOS",
             Screen::DiscBrowser => "Load Disc",
             Screen::Diagnostics => "Diagnostics",
+            Screen::About => "About",
         }
     }
 
@@ -871,6 +890,24 @@ mod tests {
         assert!(labels.iter().any(|l| l == "Region: Japan"));
         assert!(labels.iter().any(|l| l == "Disc: present"));
         assert!(labels.iter().any(|l| l == "Master PC: 06001234 High WRAM (game)"));
+    }
+
+    #[test]
+    fn about_screen_shows_version_and_license() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        assert_eq!(select_main(&mut osd, &c, "About..."), None); // pushes About
+        let labels: Vec<String> =
+            osd.items(osd.screen(), &c).into_iter().map(|it| it.label).collect();
+        assert!(
+            labels.iter().any(|l| l.contains(env!("CARGO_PKG_VERSION"))),
+            "About lists the version: {labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.starts_with("License:")), "About lists the license");
+        // Back pops to Main (still open).
+        assert_eq!(osd.handle(Nav::Back, &c), None);
+        assert!(osd.is_open());
     }
 
     #[test]
