@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-06-22
+
+Expands the built-in self-diagnostics into a broad accuracy/boot tool and adds
+two OSD screens. **No emulation-core or save-state changes** — the save-state
+format stays v10, both playable games are unaffected, and the diagnostics run on
+throwaway machines that never touch live state.
+
+### Added
+
+- **Self-diagnostics suite expanded 6 → 16 checks** across CPU ALU / branch /
+  memory, the SH-2 on-chip **DIVU** (divider), **FRT** (free-running timer) and
+  **DMAC**, the **SCU DMA** engine, **VDP2** back-screen rendering, and **SCSP**
+  slot synthesis — each a tiny from-reset program (or bus-driven chip setup) on
+  a throwaway machine, run via `jupiter doctor` and the OSD Diagnostics screen,
+  with `all_diagnostics_pass` as a CI accuracy regression.
+- **Boot/compatibility diagnostics** — `jupiter doctor <BIOS> [disc]` boots a
+  throwaway machine and reports heuristic checks: the BIOS produces video, the
+  disc TOC is valid, and the disc's 1st-read program reaches game RAM (auth +
+  IP.BIN load + jump). The hermetic `doctor` (no media) is unchanged.
+- **OSD "About…" screen** — product name, version, author, and the MIT license
+  notice (read from compile-time package metadata).
+- **OSD Diagnostics live-status** — a read-only region / disc / current
+  master-PC-region readout of the running session (no boot involved).
+
+### Changed
+
+- **OSD panels auto-size to their content** (the old fixed 180px panel clipped
+  long rows), and Diagnostics results are colour-coded **PASS** green / **FAIL**
+  red.
+
+### Fixed
+
+- **CHD: corrupt or oversized track metadata** now produces a clean
+  "runs past the data" error instead of risking a u32 overflow / out-of-bounds
+  (the `assemble` offset math moved to `usize`).
+- **`audio_pipeline` test** now programs MVOL — a fresh-reset SCSP has MVOL = 0
+  and is silent, so the synthesis proof (a `#[ignore]` test) had silently
+  regressed to peak 0; both variants produce full-scale output again.
+
 ## [0.8.0] - 2026-06-22
 
 Adds two new user-visible capabilities — **CHD compressed disc-image support**
