@@ -12,9 +12,13 @@ MAME, Yabause) are the never-committed local oracles described in
 
 Both titles below share a profile: **Mednafen boots them with no per-game hack**
 (checked against `mednaref/src/ss/db.cpp`), so each is an **our-side fidelity
-gap**, not a bad dump or a game that needs a quirk flag. Both are CD/timing
-sensitive boot blockers that pass authentication and run real game code before
-stalling.
+gap**, not a bad dump or a game that needs a quirk flag. Both pass authentication
+and run real game code, then **stall in the CD-driven Sega FILM/Cinepak movie
+player** (PDZ's intro movie; SAN5's KOEI-logo FMV) — a shared fragile subsystem,
+though by different proximate mechanisms (PDZ = the CD read pump freezes mid-Play
+with status stuck at `PLAY`; SAN5 = the master stalls between movie chunks on a
+timing-dependent gate). The FILM-player ↔ CD/timing interaction is the common
+suspect.
 
 ---
 
@@ -112,8 +116,31 @@ Fully deterministic (same PC/cycle each run).
   call graph rooted at **`060E4672`**.
 - **Master *speed* changes the PATH** (fast → no-logo → deadlock; slow → logo →
   deadlock), so a **timing-dependent branch** several call-levels deep drives the
-  divergence — a race shape (e.g. a per-iteration vs per-VBlank/peripheral
-  counter; the main loop is not strictly frame-paced).
+  divergence.
+- **★ The blocker is the FILM/Cinepak movie player — the KOEI logo is an FMV
+  (same subsystem PDZ dies in).** At the main-loop scene gate `060199B2` the
+  registers show **R2 = `0x46494C4D` = "FILM"**, and the gate fn (`060E4A2C`,
+  called at `060199AE`) returns **R0 ≠ 1** ("scene not done") *every iteration*
+  → the scene-advance block at `060199B6` is always skipped. (`060E4A2C` loops
+  over up to 32 display objects and reports "done" only when every object's
+  state field `== 1`; one object — the FILM/movie — never reaches `1` because
+  playback stalled.) The main loop keeps
+  running (PC sequence at the hang cycles `060199AC → …4A2C… → …49D6… → 06019A5E
+  → 060EA3xx`, confirmed by a raw 180-PC `SAT_INLOOP` capture — an earlier
+  "`060199AC` hit once" reading was the `fc`-then-`c` debugger-stall artifact,
+  not reality), but the FILM player never advances the movie.
+- **The movie read stalls.** The CD command ring (`@0601411A`) shows the master
+  reading movie sectors via the buffer/partition dance (`CalcActualSize →
+  GetSectorData → EndDataXfer → DeleteSectorData → GetBufStat`); `SAT_CDSEEKLOG`
+  shows the movie read in **count-limited chunks** (…, `fad=5092 count=141`,
+  `fad=5234 count=177 → end_fad=5411`), then **no further chunk reads** (drive
+  PAUSEd at FAD 5411, partitions drained, `GetBufStat → 0`). So the FILM player's
+  per-chunk advance is gated off by a **timing-dependent condition** our fast
+  master never satisfies; `SAT_SLOW_FETCH` lets it pass (logo renders briefly)
+  then fails a later chunk. The exact gate (likely a movie-frame pacing /
+  decode-done / per-chunk slave-dispatch condition — note the slave was
+  dispatched only once, frame 877) is in the `060E46xx–060E4Axx` FILM-player
+  code and `060E4A2C` — not yet pinned.
 
 ### Ruled out (with evidence)
 | Hypothesis | Verdict / evidence |
