@@ -48,6 +48,18 @@ pub enum OsdRegion {
     AsiaNtsc,
 }
 
+impl OsdRegion {
+    /// Short display name (used by the Diagnostics live-status readout).
+    fn label(self) -> &'static str {
+        match self {
+            OsdRegion::Japan => "Japan",
+            OsdRegion::NorthAmerica => "North America",
+            OsdRegion::EuropePal => "Europe (PAL)",
+            OsdRegion::AsiaNtsc => "Asia (NTSC)",
+        }
+    }
+}
+
 /// Rear-slot cartridge kind, in the OSD's own terms (frontend maps to
 /// `saturn::cartridge::Cartridge`). Backup-RAM size is the frontend's default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +200,11 @@ pub struct OsdCtx {
     /// Last self-diagnostics results (empty until "Run all" is selected) —
     /// the Diagnostics screen lists them as `[PASS]`/`[FAIL]`.
     pub diag_results: Vec<DiagResultRow>,
+    /// Live master-SH-2 PC and a label for the region it's executing in (BIOS /
+    /// Low WRAM / High WRAM (game) / other) — the Diagnostics screen's
+    /// "current session" readout. `cpu_where` is empty when the menu is closed.
+    pub cpu_pc: u32,
+    pub cpu_where: &'static str,
 }
 
 /// Which screen is on top of the stack.
@@ -481,8 +498,18 @@ impl Osd {
                 // "Run all" plus one inert, colour-coded row per result. The
                 // panel auto-sizes to the widest row and the 15-row scrolling
                 // viewport handles a long list (Back is one Up-wrap away).
-                let mut v = Vec::with_capacity(ctx.diag_results.len() + 2);
+                let mut v = Vec::with_capacity(ctx.diag_results.len() + 5);
                 v.push(mk("Run all", Select::Emit(OsdAction::RunDiagnostics)));
+                // Live "current session" status (read-only) — no boot involved.
+                v.push(mk(&format!("Region: {}", ctx.region.label()), Select::Close));
+                v.push(mk(
+                    &format!("Disc: {}", if ctx.disc_present { "present" } else { "none" }),
+                    Select::Close,
+                ));
+                v.push(mk(
+                    &format!("Master PC: {:08X} {}", ctx.cpu_pc, ctx.cpu_where),
+                    Select::Close,
+                ));
                 if ctx.diag_results.is_empty() {
                     v.push(mk("(not run yet)", Select::Close));
                 } else {
@@ -741,6 +768,8 @@ mod tests {
             browse_entries: Vec::new(),
             browse_dir: "/games".into(),
             diag_results: Vec::new(),
+            cpu_pc: 0x0600_1234,
+            cpu_where: "High WRAM (game)",
         }
     }
 
@@ -838,6 +867,10 @@ mod tests {
         let labels: Vec<String> = osd.items(osd.screen(), &c).into_iter().map(|it| it.label).collect();
         assert!(labels.iter().any(|l| l.starts_with("[PASS] cpu/cpu_add_imm")));
         assert!(labels.iter().any(|l| l.starts_with("[FAIL] memory/mem_roundtrip")));
+        // Live "current session" status rows reflect ctx (region/disc/PC).
+        assert!(labels.iter().any(|l| l == "Region: Japan"));
+        assert!(labels.iter().any(|l| l == "Disc: present"));
+        assert!(labels.iter().any(|l| l == "Master PC: 06001234 High WRAM (game)"));
     }
 
     #[test]

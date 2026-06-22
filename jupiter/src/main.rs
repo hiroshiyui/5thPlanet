@@ -37,6 +37,18 @@ fn host_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Classify a master-SH-2 PC into a coarse memory region for the OSD's live
+/// status readout (cache-through `0x2…` aliases fold onto the same regions).
+#[cfg(feature = "sdl2-frontend")]
+fn classify_pc(pc: u32) -> &'static str {
+    match pc & 0x0FFF_FFFF {
+        0x0000_0000..=0x000F_FFFF => "BIOS",
+        0x0020_0000..=0x002F_FFFF => "Low WRAM",
+        0x0600_0000..=0x060F_FFFF => "High WRAM (game)",
+        _ => "other",
+    }
+}
+
 /// Print one diagnostics section and return whether every check passed.
 fn print_diag_section(title: &str, results: &[saturn::diagnostics::DiagOutcome]) -> bool {
     println!("{title}");
@@ -717,6 +729,12 @@ fn run(
                             .collect()
                     } else {
                         Vec::new()
+                    },
+                    cpu_pc: if osd.is_open() { saturn.master().regs.pc } else { 0 },
+                    cpu_where: if osd.is_open() {
+                        classify_pc(saturn.master().regs.pc)
+                    } else {
+                        ""
                     },
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
