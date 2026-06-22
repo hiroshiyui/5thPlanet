@@ -572,6 +572,32 @@ mod tests {
         }
     }
 
+    /// Negative control for the CI gate: prove a *failing* check is actually
+    /// detected, so `all_diagnostics_pass` can't be a false green. We don't put
+    /// a failing check in `REGISTRY` (that would wedge CI); instead we run the
+    /// real `cpu_add_imm` program (which computes 42) through the same
+    /// assemble→run→readback→verdict path but with a deliberately-wrong `want`,
+    /// and confirm the outcome is reported failed and the gate's predicate
+    /// rejects it.
+    #[test]
+    fn a_wrong_result_is_detected_as_failure() {
+        let mut code = vec![mov_imm(0, 0), add_imm(0, 10), add_imm(0, 32)];
+        code.extend(build_low_scratch_addr());
+        code.extend([movl_store(1, 0), bra_self(), NOP]);
+        let (passed, detail) = verdict(read_low(&run_program(&code), LOW_SCRATCH), 99);
+        assert!(!passed, "a wrong expectation must be reported as failure (detail: {detail})");
+        assert!(
+            detail.contains("0000002A") && detail.contains("00000063"),
+            "detail should show got 0x2A vs want 0x63: {detail}"
+        );
+        // The same all-pass predicate `all_diagnostics_pass` relies on must flag it.
+        let outcomes = [DiagOutcome { name: "neg_control", category: "test", passed, detail }];
+        assert!(
+            !outcomes.iter().all(|o| o.passed),
+            "the CI gate's all-pass predicate must reject a failing outcome"
+        );
+    }
+
     /// Self-check: the hand-encoded opcodes decode to the intended ops (catches
     /// a mistyped bit pattern independently of the functional run).
     #[test]
