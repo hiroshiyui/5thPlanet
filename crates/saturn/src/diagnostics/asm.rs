@@ -20,6 +20,8 @@ pub const CODE_BASE: u32 = 0x20;
 pub const STACK: u32 = 0x0601_0000;
 
 pub const NOP: u16 = 0x0009;
+/// `CLRMAC` — clear the MAC accumulator (`0x0028`).
+pub const CLRMAC: u16 = 0x0028;
 
 /// `MOV #imm, Rn` — load an 8-bit signed immediate (`0xExii`).
 pub fn mov_imm(rn: u16, imm: i8) -> u16 {
@@ -76,6 +78,20 @@ pub fn shll(rn: u16) -> u16 {
 /// `SHLR Rn` — logical shift right 1 (`0x4n01`).
 pub fn shlr(rn: u16) -> u16 {
     0x4001 | (rn << 8)
+}
+/// `MAC.L @Rm+, @Rn+` — multiply two longwords (post-incrementing both pointers)
+/// and accumulate into MAC (`0x0nmF`).
+pub fn mac_l(rn: u16, rm: u16) -> u16 {
+    0x000F | (rn << 8) | (rm << 4)
+}
+/// `CMP/EQ Rm, Rn` — set T if `Rn == Rm` (`0x3nm0`).
+pub fn cmp_eq(rn: u16, rm: u16) -> u16 {
+    0x3000 | (rn << 8) | (rm << 4)
+}
+/// `BT disp` — branch if T==1 (no delay slot), `target = PC + 4 + disp*2`
+/// (`0x89dd`).
+pub fn bt(disp: i8) -> u16 {
+    0x8900 | (disp as u8 as u16)
 }
 /// `SHLL8 Rn` — logical shift left 8 (`0x4n18`).
 pub fn shll8(rn: u16) -> u16 {

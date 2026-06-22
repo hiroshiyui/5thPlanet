@@ -15,8 +15,8 @@ mod asm;
 
 use crate::system::Saturn;
 use asm::{
-    NOP, add, add_imm, and_, assemble, bra_self, mov_imm, movl_load, movl_store, movw_load, mul_l,
-    or_, shll, shll8, shll16, shlr, sts_macl, sub, xor_,
+    CLRMAC, NOP, add, add_imm, and_, assemble, bra_self, bt, cmp_eq, mac_l, mov_imm, movl_load,
+    movl_store, movw_load, mul_l, or_, shll, shll8, shll16, shlr, sts_macl, sub, xor_,
 };
 
 /// The result of one diagnostic check.
@@ -47,6 +47,9 @@ const REGISTRY: &[Diag] = &[
     Diag { name: "cpu_logic_ops", category: "cpu", run: cpu_logic_ops },
     Diag { name: "cpu_shift_ops", category: "cpu", run: cpu_shift_ops },
     Diag { name: "scu_dma_copy", category: "scu", run: scu_dma_copy },
+    Diag { name: "dmac_transfer", category: "onchip", run: dmac_transfer },
+    Diag { name: "cpu_mac_l", category: "cpu", run: cpu_mac_l },
+    Diag { name: "cpu_cmp_branch", category: "branch", run: cpu_cmp_branch },
 ];
 
 /// Run every built-in diagnostic and collect the outcomes (registry order).
@@ -318,6 +321,83 @@ fn scu_dma_copy() -> (bool, String) {
     verdict(read_low(&run_program(&code), DEST), SENTINEL)
 }
 
+/// SH-2 on-chip **DMAC** (the CPU's own 2-channel DMA controller, distinct from
+/// the SCU engine): program channel 0 for an auto-request longword copy and
+/// verify it moved the sentinel. The transfer runs in `Cpu::step` once DE
+/// (CHCR0) and DME (DMAOR) are both set, reading/writing the external bus.
+/// SAR0 base `0xFFFFFF80` builds cleanly as `mov_imm(-128)` (sign-extended).
+/// Mirrors `crates/sh2/tests/dmac.rs` (CHCR0 `0x5C01` = DM/SM increment, TS
+/// longword, DE set). Source `0x0020_0200` → dest `0x0020_0300`.
+fn dmac_transfer() -> (bool, String) {
+    const DEST: u32 = 0x0020_0300;
+    let mut code = vec![
+        // R0 = sentinel 0x2A2A2A2A
+        mov_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A),
+        // R2 = source 0x0020_0200, plant the sentinel
+        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
+        movl_store(2, 0),
+        // R3 = dest 0x0020_0300
+        mov_imm(3, 0x20), shll16(3), mov_imm(4, 3), shll8(4), add(3, 4),
+        // R1 = SAR0 base 0xFFFFFF80
+        mov_imm(1, -128),
+        movl_store(1, 2), // SAR0 (base+0x00) = source
+    ];
+    // DAR0 (base+0x04) = dest
+    code.extend([mov_imm(4, 0x04), add(4, 1), movl_store(4, 3)]);
+    // TCR0 (base+0x08) = 1 longword
+    code.extend([mov_imm(4, 0x08), add(4, 1), mov_imm(5, 1), movl_store(4, 5)]);
+    // CHCR0 (base+0x0C) = 0x5C01 (DM=inc, SM=inc, TS=long, DE=1)
+    code.extend([mov_imm(5, 0x5C), shll8(5), add_imm(5, 1), mov_imm(4, 0x0C), add(4, 1), movl_store(4, 5)]);
+    // DMAOR (base+0x30) = 1 (DME) — arms the master enable, runs the transfer
+    code.extend([mov_imm(5, 1), mov_imm(4, 0x30), add(4, 1), movl_store(4, 5)]);
+    code.extend([bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), DEST), SENTINEL)
+}
+
+/// `MAC.L` multiply-accumulate over two 2-element longword arrays (exercises the
+/// MAC unit, the accumulator, and `@Rn+` post-increment addressing):
+/// `[3,4]·[10,3] = 3*10 + 4*3 = 42`. Plants both arrays in Low WRAM, CLRMACs,
+/// runs two `MAC.L @R2+,@R3+`, then `STS MACL`.
+fn cpu_mac_l() -> (bool, String) {
+    let mut code = vec![
+        // R1 = 0x0020_0200 (array base)
+        mov_imm(1, 0x20), shll16(1), mov_imm(4, 2), shll8(4), add(1, 4),
+        // A = [3, 4] at +0x00 / +0x04
+        mov_imm(5, 3), movl_store(1, 5),
+        mov_imm(4, 4), add(4, 1), mov_imm(5, 4), movl_store(4, 5),
+        // B = [10, 3] at +0x10 / +0x14
+        mov_imm(4, 0x10), add(4, 1), mov_imm(5, 10), movl_store(4, 5),
+        mov_imm(4, 0x14), add(4, 1), mov_imm(5, 3), movl_store(4, 5),
+        // R2 = &A (0x200200), R3 = &B (0x200210)
+        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
+        mov_imm(3, 0x20), shll16(3), mov_imm(4, 2), shll8(4), add(3, 4), mov_imm(4, 0x10), add(3, 4),
+        CLRMAC,
+        mac_l(2, 3), // 3*10 = 30
+        mac_l(2, 3), // + 4*3 = 42
+        sts_macl(0),
+    ];
+    code.extend(build_low_scratch_addr());
+    code.extend([movl_store(1, 0), bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), LOW_SCRATCH), 42)
+}
+
+/// `CMP/EQ` + conditional `BT`: equal operands set T, the taken branch skips the
+/// "wrong" store. R0 = 42 only if both CMP/EQ and BT behave (a broken either
+/// way leaves the wrong value).
+fn cpu_cmp_branch() -> (bool, String) {
+    let mut code = vec![
+        mov_imm(1, 5),   // 0x20
+        mov_imm(2, 5),   // 0x22
+        cmp_eq(2, 1),    // 0x24  T = (R2 == R1) = 1
+        bt(0),           // 0x26  if T: target = PC+4 = 0x2A (skips the next insn)
+        mov_imm(0, 7),   // 0x28  wrong value (must be skipped)
+        mov_imm(0, 42),  // 0x2A  target: correct value
+    ];
+    code.extend(build_low_scratch_addr());
+    code.extend([movl_store(1, 0), bra_self(), NOP]);
+    verdict(read_low(&run_program(&code), LOW_SCRATCH), 42)
+}
+
 /// `BRA disp` (`0xA000 | disp12`). Kept here (not in `asm`) because only the
 /// delay-slot check needs a non-self branch displacement.
 fn asm_bra(disp: i16) -> u16 {
@@ -357,6 +437,10 @@ mod tests {
         assert!(matches!(decode(xor_(0, 2)), Op::Xor { rn: 0, rm: 2 }));
         assert!(matches!(decode(shll(0)), Op::Shll { rn: 0 }));
         assert!(matches!(decode(shlr(0)), Op::Shlr { rn: 0 }));
+        assert!(matches!(decode(mac_l(2, 3)), Op::MacL { rn: 2, rm: 3 }));
+        assert!(matches!(decode(cmp_eq(2, 1)), Op::CmpEq { rn: 2, rm: 1 }));
+        assert!(matches!(decode(bt(0)), Op::Bt { disp: 0 }));
+        assert!(matches!(decode(CLRMAC), Op::Clrmac));
         // No program word decodes to Illegal.
         for d in REGISTRY {
             let _ = (d.run)(); // also exercises every program end-to-end
