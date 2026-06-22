@@ -78,6 +78,11 @@ pub struct Cache {
     /// associative purge. Observer-only; never serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     dbg_assoc_purges: u64,
+    /// Debug only: lifetime count of full [`Cache::purge`] (CCR.CP) flushes —
+    /// the companion to `dbg_assoc_purges` for a coherency investigation.
+    /// Observer-only; never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dbg_purges: u64,
     /// Debug only: lifetime hit/miss tallies, split by access kind
     /// (`[fetch_hit, fetch_miss, data_hit, data_miss]`). Observer-only; never
     /// serialized. Drives the cache-internals perf probe (`bench_cache`): the
@@ -133,13 +138,37 @@ impl Cache {
             sets: [[Line::default(); WAYS]; SETS],
             lru,
             dbg_assoc_purges: 0,
+            dbg_purges: 0,
             dbg_stats: [0; 4],
         }
     }
 
-    /// Debug only: how many associative purges have been performed.
+    /// Debug only: every valid cache line as `(line-base address, 16 bytes)`.
+    /// The address is reconstructed from tag+set, so it's the cacheable address
+    /// the line was installed from. Lets a coherency audit compare each line
+    /// against the backing memory to find **stale** lines (memory written by
+    /// DMA / the other CPU after the line was filled, without a purge taking
+    /// effect) — the instruction-cache-staleness game-hang class.
+    pub fn dbg_lines(&self) -> alloc::vec::Vec<(u32, [u8; LINE_BYTES])> {
+        let mut out = alloc::vec::Vec::new();
+        for (set_idx, set) in self.sets.iter().enumerate() {
+            for line in set {
+                if line.valid {
+                    out.push(((line.tag << 10) | ((set_idx as u32) << 4), line.data));
+                }
+            }
+        }
+        out
+    }
+
+    /// Debug only: how many associative purges, and full (CCR.CP) purges, have
+    /// been performed over the cache's lifetime.
     pub fn dbg_assoc_purges(&self) -> u64 {
         self.dbg_assoc_purges
+    }
+    /// Debug only: how many full (CCR.CP) flushes have been performed.
+    pub fn dbg_purges(&self) -> u64 {
+        self.dbg_purges
     }
 
     /// Debug only: lifetime `[fetch_hit, fetch_miss, data_hit, data_miss]`
@@ -188,6 +217,7 @@ impl Cache {
 
     /// Full cache flush (CCR.CP): invalidate every line.
     pub fn purge(&mut self) {
+        self.dbg_purges += 1;
         for set in &mut self.sets {
             for line in set {
                 line.valid = false;

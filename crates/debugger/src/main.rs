@@ -382,6 +382,73 @@ impl Dbg {
         }
     }
 
+    /// Dump both SH-2s' free-running-timer (FRT) state — the inter-CPU FTI
+    /// input-capture handshake lives here (FTCSR.ICF bit 7 = input captured,
+    /// TIER.ICIE bit 7 = capture-interrupt enabled). Lets a deadlock between
+    /// a master/slave dispatch loop be inspected: a slave parked polling
+    /// FTCSR.ICF with ICF clear is waiting for the master to pulse its FTI.
+    fn dump_frt(&self) {
+        for (who, f) in [
+            ("MASTER", &self.sat.master().onchip.frt),
+            ("SLAVE ", &self.sat.slave().onchip.frt),
+        ] {
+            println!(
+                "{who} FRT: TIER={:02X}(ICIE={}) FTCSR={:02X}(ICF={} OCFA={} OCFB={} OVF={}) FRC={:04X} FICR={:04X}",
+                f.tier, (f.tier >> 7) & 1,
+                f.ftcsr, (f.ftcsr >> 7) & 1, (f.ftcsr >> 3) & 1, (f.ftcsr >> 2) & 1, (f.ftcsr >> 1) & 1,
+                f.frc, f.ficr,
+            );
+        }
+    }
+
+    /// Dump both SH-2s' cache state — CCR (enable / instruction- & data-
+    /// replacement-disable / two-way) and the fetch/data hit·miss tallies.
+    /// A stale instruction-cache (a fetch hit returning code the game has
+    /// since overwritten via DMA) is a known game-hang class; this surfaces
+    /// how heavily each core caches instructions.
+    fn dump_cache(&self) {
+        for (who, c) in [
+            ("MASTER", &self.sat.master().cache),
+            ("SLAVE ", &self.sat.slave().cache),
+        ] {
+            let [fh, fm, dh, dm] = c.dbg_stats();
+            println!(
+                "{who} CACHE: CCR={:02X} enabled={} Idis={} Ddis={} 2way={} | fetch {fh}h/{fm}m  data {dh}h/{dm}m | purges full={} assoc={}",
+                c.ccr(), c.enabled() as u8, c.inst_disabled() as u8, c.data_disabled() as u8, c.two_way() as u8,
+                c.dbg_purges(), c.dbg_assoc_purges(),
+            );
+        }
+    }
+
+    /// Cache coherency audit: compare every valid master cache line against the
+    /// raw backing memory (read through the bus, which bypasses the SH-2 cache).
+    /// A mismatch is a **stale line** — memory a DMA / the other CPU wrote after
+    /// the line was filled, that a purge didn't drop. Reports the first stale
+    /// lines (address + cached-vs-memory first bytes) — the smoking gun for the
+    /// instruction-cache-staleness hang class.
+    fn cache_audit(&mut self) {
+        let lines = self.sat.master().cache.dbg_lines();
+        let total = lines.len();
+        let mut stale = 0u32;
+        for (addr, data) in lines {
+            let mut mem = [0u8; 16];
+            for i in 0..4 {
+                let w = self.sat.bus.read32(addr.wrapping_add(i * 4), AccessKind::Data).0;
+                mem[i as usize * 4..i as usize * 4 + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if mem != data {
+                stale += 1;
+                if stale <= 24 {
+                    println!(
+                        "STALE @{addr:08X}: cache {:02X?} vs mem {:02X?}",
+                        &data[..8], &mem[..8]
+                    );
+                }
+            }
+        }
+        println!("cache audit: {stale} stale of {total} valid lines");
+    }
+
     /// Step the slave one instruction (master frozen) and show its new PC.
     fn step_slave(&mut self, n: u64) {
         for _ in 0..n {
@@ -1133,6 +1200,9 @@ impl Dbg {
             },
             "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
             "cd" => self.cd_state(),
+            "frt" => self.dump_frt(),
+            "cache" => self.dump_cache(),
+            "caudit" => self.cache_audit(),
             "cdlog" => self.cdlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(20)),
             "hirqlog" => self.hirqlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(40)),
             "vdp" => println!(
