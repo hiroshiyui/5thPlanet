@@ -1,4 +1,5 @@
-//! SH7604 unified 4 KiB, 4-way set-associative cache (16-byte lines, LRU).
+//! SH7604 unified 4 KiB, 4-way set-associative cache (16-byte lines, 6-bit
+//! pseudo-LRU replacement — see [`LRU_UPDATE`]).
 //!
 //! Geometry, per *SH7604 Hardware Manual* §8:
 //!
@@ -39,6 +40,31 @@ pub const LINE_BYTES: usize = 16;
 const WAYS: usize = 4;
 const SETS: usize = 64; // 4096 / (16 * 4)
 
+/// SH7604 4-way **pseudo-LRU** update masks, indexed by the way just accessed:
+/// the 6-bit per-set LRU state becomes `(state & AND) | OR`. The SH7604 does
+/// *not* use a true LRU — it tracks the 6 pairwise way orderings in 6 bits.
+/// Ported verbatim from the hardware behaviour Mednafen models (`sh7095.inc`
+/// `LRU_Update_Tab`); using a true LRU instead picks a different eviction
+/// victim on some sequences, leaving a stale line a game expects evicted
+/// (the Sangokushi V instruction-cache-coherency hang). (*SH7604 HW Manual* §8.)
+const LRU_UPDATE: [(u8, u8); WAYS] = [
+    (0x07, 0x00), // way 0
+    (0x19, 0x20), // way 1
+    (0x2A, 0x14), // way 2
+    (0x34, 0x0B), // way 3
+];
+
+/// SH7604 4-way pseudo-LRU replacement table: the 6-bit per-set LRU state
+/// indexes the way to evict next. `-1` marks an LRU state unreachable from the
+/// reset value `0` via [`LRU_UPDATE`] (so never indexed in practice). Ported
+/// verbatim from Mednafen `sh7095.inc` `LRU_Replace_Tab`.
+const LRU_REPLACE: [i8; 0x40] = [
+    0x03, 0x02, -1, 0x02, 0x03, -1, 0x01, 0x01, -1, 0x02, -1, 0x02, -1, -1, 0x01, 0x01,
+    0x03, -1, -1, -1, 0x03, -1, 0x01, 0x01, -1, -1, -1, -1, -1, -1, 0x01, 0x01,
+    0x03, 0x02, -1, 0x02, 0x03, -1, -1, -1, -1, 0x02, -1, 0x02, -1, -1, -1, -1,
+    0x03, -1, -1, -1, 0x03, -1, -1, -1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Line {
@@ -69,10 +95,12 @@ pub struct Cache {
     // (4) serializes natively.
     #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
     sets: [[Line; WAYS]; SETS],
-    /// Per-set access order. Index 0 is the most-recently used way; index
-    /// `WAYS-1` is the least-recently used (next eviction victim).
+    /// Per-set 6-bit SH7604 pseudo-LRU state (not a true LRU): [`LRU_UPDATE`]
+    /// advances it on each way access, [`LRU_REPLACE`] maps it to the next
+    /// eviction victim. Reset value 0. Matching the hardware's exact
+    /// replacement order is load-bearing — see [`LRU_UPDATE`].
     #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
-    lru: [[u8; WAYS]; SETS],
+    lru: [u8; SETS],
     /// Debug only: lifetime count of [`Cache::assoc_purge`] invocations. Lets a
     /// coherency investigation see whether software actually relies on the
     /// associative purge. Observer-only; never serialized.
@@ -127,16 +155,10 @@ pub enum Probe {
 
 impl Cache {
     pub fn new() -> Self {
-        let mut lru = [[0u8; WAYS]; SETS];
-        for row in &mut lru {
-            for (i, slot) in row.iter_mut().enumerate() {
-                *slot = i as u8;
-            }
-        }
         Self {
             ccr: 0,
             sets: [[Line::default(); WAYS]; SETS],
-            lru,
+            lru: [0u8; SETS], // SH7604 reset LRU state
             dbg_assoc_purges: 0,
             dbg_purges: 0,
             dbg_stats: [0; 4],
@@ -215,7 +237,9 @@ impl Cache {
         self.ccr & 0x08 != 0
     }
 
-    /// Full cache flush (CCR.CP): invalidate every line.
+    /// Full cache flush (CCR.CP): invalidate every line and reset the per-set
+    /// LRU state to 0 (Mednafen `sh7095.inc`: `Cache_LRU[entry] = 0` in the
+    /// CCR-purge loop).
     pub fn purge(&mut self) {
         self.dbg_purges += 1;
         for set in &mut self.sets {
@@ -223,6 +247,7 @@ impl Cache {
                 line.valid = false;
             }
         }
+        self.lru = [0u8; SETS];
     }
 
     /// Associative purge — invalidate the single line whose tag matches `addr`,
@@ -305,8 +330,9 @@ impl Cache {
     #[inline]
     fn lookup_loc(&mut self, addr: u32) -> Option<(usize, usize)> {
         let (tag, set_idx) = decompose(addr);
-        let active_ways = if self.two_way() { 2 } else { WAYS };
-        for way in 0..active_ways {
+        // Scan all ways (SH7604 `Cache_FindWay` tag-matches all 4 regardless of
+        // two-way mode; two-way only restricts the *replacement* way set).
+        for way in 0..WAYS {
             let l = &self.sets[set_idx][way];
             if l.valid && l.tag == tag {
                 self.touch(set_idx, way as u8);
@@ -318,8 +344,7 @@ impl Cache {
 
     fn lookup(&mut self, addr: u32) -> Lookup {
         let (tag, set_idx) = decompose(addr);
-        let active_ways = if self.two_way() { 2 } else { WAYS };
-        for way in 0..active_ways {
+        for way in 0..WAYS {
             if self.sets[set_idx][way].valid && self.sets[set_idx][way].tag == tag {
                 let data = self.sets[set_idx][way].data;
                 self.touch(set_idx, way as u8);
@@ -335,8 +360,7 @@ impl Cache {
     /// way most-recently used.
     pub fn install(&mut self, addr: u32, data: [u8; LINE_BYTES]) {
         let (tag, set_idx) = decompose(addr);
-        let active_ways = if self.two_way() { 2 } else { WAYS };
-        let victim = self.pick_victim(set_idx, active_ways);
+        let victim = self.pick_victim(set_idx);
         self.sets[set_idx][victim as usize] = Line {
             tag,
             valid: true,
@@ -378,8 +402,7 @@ impl Cache {
             return None;
         }
         let (tag, set_idx) = decompose(addr);
-        let active_ways = if self.two_way() { 2 } else { WAYS };
-        for way in 0..active_ways {
+        for way in 0..WAYS {
             if self.sets[set_idx][way].valid && self.sets[set_idx][way].tag == tag {
                 return Some((set_idx, way));
             }
@@ -387,26 +410,21 @@ impl Cache {
         None
     }
 
-    fn pick_victim(&self, set_idx: usize, active_ways: usize) -> u8 {
-        // Walk LRU order back-to-front; pick the oldest way still in range.
-        for &w in self.lru[set_idx].iter().rev() {
-            if (w as usize) < active_ways {
-                return w;
-            }
-        }
-        0
+    fn pick_victim(&self, set_idx: usize) -> u8 {
+        // SH7604 pseudo-LRU: the 6-bit state indexes the victim way. Two-way
+        // mode masks the state to 1 bit (Mednafen `CCRC_Replace_AND`), so it
+        // cycles ways 3/2. A `-1` entry is an unreachable state (see
+        // [`LRU_REPLACE`]); fall back to way 0 rather than panic.
+        let mask = if self.two_way() { 0x01 } else { 0x3F };
+        let v = LRU_REPLACE[(self.lru[set_idx] & mask) as usize];
+        debug_assert!(v >= 0, "unreachable LRU state {:#04x}", self.lru[set_idx]);
+        v.max(0) as u8
     }
 
     fn touch(&mut self, set_idx: usize, way: u8) {
-        let row = &mut self.lru[set_idx];
-        if let Some(pos) = row.iter().position(|&w| w == way) {
-            // pos == 0 means the way is already most-recently-used, so the
-            // rotate would be a no-op — skip it (the common case on a re-hit
-            // of the just-touched line). Bit-identical LRU order.
-            if pos != 0 {
-                row[..=pos].rotate_right(1);
-            }
-        }
+        // SH7604 pseudo-LRU update: fold the accessed way into the 6-bit state.
+        let (and, or) = LRU_UPDATE[way as usize];
+        self.lru[set_idx] = (self.lru[set_idx] & and) | or;
     }
 }
 
@@ -482,8 +500,8 @@ mod tests {
             c.lookup_data(addr); // miss
             c.install(addr, line_with(i as u8 * 0x10));
         }
-        // Way containing tag 0 is now the LRU (it was filled first and
-        // never touched again). Touching tag 0 demotes tag 1 to LRU.
+        // After filling all four ways, re-hitting tag 0 leaves the pseudo-LRU
+        // pointing the next eviction at the way holding tag 1.
         let Lookup::Hit(d0) = c.lookup_data(base) else {
             panic!();
         };
@@ -505,9 +523,10 @@ mod tests {
 
     #[test]
     fn retouching_mru_way_preserves_lru_order() {
-        // Exercises the `touch` pos==0 early-out: re-hitting the
-        // most-recently-used way must leave the eviction order unchanged
-        // (bit-identical to the unconditional rotate).
+        // Re-hitting the most-recently-used way must not change the next
+        // eviction victim: under the SH7604 pseudo-LRU, touching the way whose
+        // `LRU_UPDATE` is idempotent for the current state leaves the state
+        // (and thus `pick_victim`) unchanged.
         let mut c = Cache::new();
         c.set_ccr(0x01);
         let base: u32 = 0x6000_0000;
@@ -565,7 +584,8 @@ mod tests {
         }
         assert!(matches!(c.lookup_data(base), Lookup::Hit(_)));
         assert!(matches!(c.lookup_data(base | (1 << 10)), Lookup::Hit(_)));
-        // Touching tag 1 most recently → tag 0 is LRU within the active 2 ways.
+        // Two-way mode confines replacement to a 1-bit LRU (the pseudo-LRU
+        // state masked to bit 0): the third fill recycles tag 0's way.
         let a2 = base | (2 << 10);
         c.lookup_data(a2);
         c.install(a2, line_with(2));

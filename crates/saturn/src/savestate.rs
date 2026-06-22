@@ -45,8 +45,12 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// serialization, the M12 #8 residual). v10 reworked the SH-2 on-chip FRT/WDT
 /// to the lazy/event-scheduled model: dropped the per-cycle prescaler
 /// accumulators (`Frt::pre`/`Wdt::pre`) and added `OnChip::lastts` (the timer
-/// epoch); `OnChip::next_ts` is derived (`#[serde(skip)]`).
-const VERSION: u32 = 10;
+/// epoch); `OnChip::next_ts` is derived (`#[serde(skip)]`). v11 changed the
+/// SH-2 cache LRU representation from a per-set way-order array
+/// (`[[u8; WAYS]; SETS]`, true LRU) to the SH7604's 6-bit pseudo-LRU state
+/// (`[u8; SETS]`) — the hardware-faithful replacement order (fixes the
+/// Sangokushi V instruction-cache-coherency hang).
+const VERSION: u32 = 11;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
