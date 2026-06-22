@@ -185,6 +185,22 @@ Fully deterministic (same PC/cycle each run).
   is the precise unpinned target. VF2's TrueMotion movie proves the CD block,
   read pump, and a software movie player all work end-to-end, so the defect is
   contained to this Cinepak-FILM read-sizing/pacing path.
+- **★★ The read-count is a pinned bytes→sectors divide; the bug is one number
+  (2026-06-23).** A new register-write trace (`SAT_REGWATCH` / sdbg `rwatch` —
+  the `dbg_regwatch` core instrument, cycle-gated + golden-safe, commit
+  `7697467`) pinned it: at FILM-player `060E4412` → `JSR 0x06010300` (the SH-2
+  software divide), **read-count = 177 sectors = bytes-to-read (362496) ÷ 2048
+  (bytes/sector)**. The ÷2048 is a correct units conversion (2048 is a hardcoded
+  literal); **the bug is the dividend — bytes-to-read = 362496, ~4.5× too
+  small.** Mednafen reads ~804 sectors ≈ 1646592 bytes ≈ the *whole* movie;
+  ours' full-movie size is known-correct (`0x191878`=1644152 in the descriptor)
+  yet it reads only ~22% of it, then underflows and stalls. So the blocker now
+  reduces to **why the FILM player computes 362496 bytes-to-read instead of
+  ~1.64 M.** 362496 lives in stack local `@[R15+8]` and is **clamped** inside
+  `060E4412` (`CMP/GT @R15`, sub-calls) — likely `min(remaining, per-read_limit)`
+  where the limit (~362496 = 177 sectors) is the ~5×-too-small quantity. Pinning
+  that limit's origin (and the timing value it derives from — the CD reads are
+  byte-identical to Mednafen up to here) is the final layer.
 
 ### Ruled out (with evidence)
 | Hypothesis | Verdict / evidence |
