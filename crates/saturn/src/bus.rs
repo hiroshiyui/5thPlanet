@@ -247,6 +247,11 @@ pub struct SaturnBus {
     /// `#[serde(skip)]` so it never affects save-state determinism.
     #[serde(skip)]
     pub step_pc: u32,
+    /// Which core is currently stepping (`false` = master, `true` = slave),
+    /// set by `step_cpus`. Debug-only (lets `SAT_FTILOG` / write-watches name
+    /// the *issuing* core); `#[serde(skip)]`, never affects determinism.
+    #[serde(skip)]
+    pub cur_is_slave: bool,
     /// Pending FRT input-capture (FTI) triggers from inter-CPU signalling: a
     /// 16-bit write to `0x0100_0000..0x017F_FFFF` pulses the *slave*'s FTI,
     /// `0x0180_0000..0x01FF_FFFF` the *master*'s. The bus can't reach the cores,
@@ -331,6 +336,7 @@ impl SaturnBus {
             timing: BusTiming::default(),
             cycle: 0,
             step_pc: 0,
+            cur_is_slave: false,
             slave_input_capture: false,
             master_input_capture: false,
             watch: None,
@@ -735,13 +741,13 @@ impl Bus for SaturnBus {
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->slave addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
+                    eprintln!("FTI->slave addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
                 }
             }
             MASTER_FTI_BASE..=MASTER_FTI_END => {
                 self.master_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->master addr={addr:08X} val={val:04X} pc={:08X} cyc={}", self.step_pc, self.cycle);
+                    eprintln!("FTI->master addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
                 }
             }
             _ => {}

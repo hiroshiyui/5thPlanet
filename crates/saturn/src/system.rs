@@ -1173,6 +1173,7 @@ impl Saturn {
                         log.push((pc, e.cpu.regs.r, e.cpu.regs.pr, e.cpu.pipeline.cycles));
                     }
                 }
+                bus.cur_is_slave = false;
                 scheduler.entity_mut(*master_id).step(bus);
                 apply_fti!(); // master may have pulsed the slave's (or its own) FTI
                 record_raster!(); // log any raster read the master just did
@@ -1201,6 +1202,7 @@ impl Saturn {
                 let s = scheduler.entity(*slave_id).sh2();
                 !s.is_halted() && s.cpu.pipeline.cycles < mcyc
             } {
+                bus.cur_is_slave = true;
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
                 record_raster!(); // log any raster read the slave just did

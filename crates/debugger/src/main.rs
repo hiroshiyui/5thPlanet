@@ -388,15 +388,23 @@ impl Dbg {
     /// a master/slave dispatch loop be inspected: a slave parked polling
     /// FTCSR.ICF with ICF clear is waiting for the master to pulse its FTI.
     fn dump_frt(&self) {
-        for (who, f) in [
-            ("MASTER", &self.sat.master().onchip.frt),
-            ("SLAVE ", &self.sat.slave().onchip.frt),
+        for (who, oc) in [
+            ("MASTER", &self.sat.master().onchip),
+            ("SLAVE ", &self.sat.slave().onchip),
         ] {
+            let f = &oc.frt;
             println!(
                 "{who} FRT: TIER={:02X}(ICIE={}) FTCSR={:02X}(ICF={} OCFA={} OCFB={} OVF={}) FRC={:04X} FICR={:04X}",
                 f.tier, (f.tier >> 7) & 1,
                 f.ftcsr, (f.ftcsr >> 7) & 1, (f.ftcsr >> 3) & 1, (f.ftcsr >> 2) & 1, (f.ftcsr >> 1) & 1,
                 f.frc, f.ficr,
+            );
+            let w = &oc.wdt;
+            // WTCSR: OVF bit7, WT/IT bit6 (1=watchdog,0=interval), TME bit5 (enable), CKS bits2-0.
+            println!(
+                "{who} WDT: WTCSR={:02X}(TME={} WT/IT={} OVF={} CKS={}) WTCNT={:02X} RSTCSR={:02X} int_active={}",
+                w.wtcsr, (w.wtcsr >> 5) & 1, (w.wtcsr >> 6) & 1, (w.wtcsr >> 7) & 1, w.wtcsr & 7,
+                w.wtcnt, w.rstcsr, w.interrupt_active() as u8,
             );
         }
     }
