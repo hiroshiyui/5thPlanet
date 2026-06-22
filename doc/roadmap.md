@@ -4,7 +4,9 @@ Accuracy-first SEGA Saturn emulator in Rust. Milestones are scoped tightly so
 the foundation is solid before the next chip is added. This file is a status
 tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
-referenced below.
+referenced below. Commercial titles that don't yet boot/run correctly (the
+active boot-blocker investigations) are tracked in
+[`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
 Current test count: **1121 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
