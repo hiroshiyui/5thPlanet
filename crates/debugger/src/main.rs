@@ -449,6 +449,43 @@ impl Dbg {
         println!("cache audit: {stale} stale of {total} valid lines");
     }
 
+    /// Live stale-instruction-fetch detector: enable [`Cpu::dbg_detect_stale`]
+    /// on both SH-2s and advance frame-by-frame (up to `max_frames`) until one
+    /// fetches a cache-hit that disagrees with backing memory — the exact
+    /// instruction-cache-coherency divergence. Reports `(addr, cached, memory,
+    /// cycle, frame)` and stops there so the context can be inspected.
+    fn detect_stale(&mut self, max_frames: u64) {
+        self.sat.master_mut().dbg_detect_stale = true;
+        self.sat.master_mut().dbg_stale_fetch = None;
+        self.sat.slave_mut().dbg_detect_stale = true;
+        self.sat.slave_mut().dbg_stale_fetch = None;
+        let mut caught = false;
+        for f in 0..max_frames {
+            self.frame_cont(1);
+            let m = self.sat.master().dbg_stale_fetch;
+            let s = self.sat.slave().dbg_stale_fetch;
+            if m.is_some() || s.is_some() {
+                if let Some((a, c, mem, cyc)) = m {
+                    println!("MASTER STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})");
+                }
+                if let Some((a, c, mem, cyc)) = s {
+                    println!("SLAVE STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})");
+                }
+                caught = true;
+                break;
+            }
+        }
+        if !caught {
+            println!(
+                "no stale read in {max_frames} frames ({} master + {} slave comparisons made)",
+                self.sat.master().dbg_stale_checks,
+                self.sat.slave().dbg_stale_checks,
+            );
+        }
+        self.sat.master_mut().dbg_detect_stale = false;
+        self.sat.slave_mut().dbg_detect_stale = false;
+    }
+
     /// Step the slave one instruction (master frozen) and show its new PC.
     fn step_slave(&mut self, n: u64) {
         for _ in 0..n {
@@ -1203,6 +1240,7 @@ impl Dbg {
             "frt" => self.dump_frt(),
             "cache" => self.dump_cache(),
             "caudit" => self.cache_audit(),
+            "stale" => self.detect_stale(a1.and_then(parse_dec).unwrap_or(2000)),
             "cdlog" => self.cdlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(20)),
             "hirqlog" => self.hirqlog(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(40)),
             "vdp" => println!(

@@ -38,4 +38,14 @@ pub trait Bus {
     fn write8(&mut self, addr: u32, val: u8, kind: AccessKind) -> u32;
     fn write16(&mut self, addr: u32, val: u16, kind: AccessKind) -> u32;
     fn write32(&mut self, addr: u32, val: u32, kind: AccessKind) -> u32;
+
+    /// Debug-only, side-effect-free peek of the 16 bits at `addr` from the
+    /// backing memory (RAM/ROM), bypassing the cache, timing, and watches.
+    /// Returns `None` for addresses with no stable backing (registers, open
+    /// bus) or when the host doesn't implement it. Used by the cache
+    /// stale-fetch detector to compare a cache-hit against true memory; it
+    /// must not perturb emulation state.
+    fn peek16(&self, _addr: u32) -> Option<u16> {
+        None
+    }
 }

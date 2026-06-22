@@ -634,6 +634,19 @@ impl Bus for SaturnBus {
         (v, self.charge(addr, 2, false, k))
     }
 
+    /// Side-effect-free peek of the cacheable backing-memory regions (RAM/ROM
+    /// where code lives) for the cache stale-fetch detector. Other regions
+    /// (registers, open bus) return `None` — there's no stable value to
+    /// compare a cached line against. Touches no timing/watch state.
+    fn peek16(&self, addr: u32) -> Option<u16> {
+        match addr {
+            BIOS_BASE..=BIOS_END => Some(self.bios.read16(addr - BIOS_BASE)),
+            LOW_WRAM_BASE..=LOW_WRAM_END => Some(self.low_wram.read16(addr - LOW_WRAM_BASE)),
+            HIGH_WRAM_BASE..=HIGH_WRAM_END => Some(self.high_wram.read16(addr - HIGH_WRAM_BASE)),
+            _ => None,
+        }
+    }
+
     fn read32(&mut self, addr: u32, k: AccessKind) -> (u32, u32) {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read32(addr - BIOS_BASE),

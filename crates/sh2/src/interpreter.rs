@@ -105,6 +105,23 @@ pub struct Cpu {
     /// compared against the external-memory word (a mismatch = stale I-cache).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub last_illegal_word: Option<u16>,
+    /// Debug only: when set, every instruction-fetch cache *hit* is compared
+    /// against true backing memory ([`Bus::peek16`]); the first mismatch is
+    /// recorded in [`Self::dbg_stale_fetch`]. The stale-instruction-cache
+    /// coherency-hang detector (e.g. Sangokushi V). Off by default — the
+    /// per-fetch `peek16` is a debug cost. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_detect_stale: bool,
+    /// Debug only: the first stale instruction-fetch caught while
+    /// [`Self::dbg_detect_stale`] is set, as `(phys_addr, cached, memory,
+    /// cycle)`. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_stale_fetch: Option<(u32, u16, u16, u64)>,
+    /// Debug only: count of stale-detector comparisons actually performed
+    /// (cache hits where [`Bus::peek16`] returned a value). Confirms the
+    /// detector ran rather than silently skipping. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_stale_checks: u64,
     /// Debug only: when `Some`, tallies `Data` reads to a physical range by
     /// cache treatment — see [`ReadWatch`]. Set via [`Cpu::enable_read_watch`].
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -147,6 +164,9 @@ impl Cpu {
             load_dest_pending: None,
             last_fault: None,
             last_illegal_word: None,
+            dbg_detect_stale: false,
+            dbg_stale_fetch: None,
+            dbg_stale_checks: 0,
             read_watch: None,
             decode_lut: build_decode_lut(),
         }
@@ -1280,7 +1300,20 @@ impl Cpu {
             match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
                 cache::Probe::Hit(set, way) => {
                     self.note_watched_read(phys, kind, 1);
-                    return (cache::extract_u8(self.cache.line_at(set, way), phys), 0);
+                    let v = cache::extract_u8(self.cache.line_at(set, way), phys);
+                    // peek16 the containing halfword, extract the byte.
+                    if self.dbg_detect_stale
+                        && self.dbg_stale_fetch.is_none()
+                        && let Some(hw) = bus.peek16(phys & !1)
+                    {
+                        self.dbg_stale_checks += 1;
+                        let mem = (hw >> (if phys & 1 == 0 { 8 } else { 0 })) as u8;
+                        if mem != v {
+                            self.dbg_stale_fetch =
+                                Some((phys, v as u16, mem as u16, self.pipeline.cycles));
+                        }
+                    }
+                    return (v, 0);
                 }
                 cache::Probe::Miss => {
                     self.note_watched_read(phys, kind, 2);
@@ -1318,7 +1351,20 @@ impl Cpu {
             match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
                 cache::Probe::Hit(set, way) => {
                     self.note_watched_read(phys, kind, 1);
-                    return (cache::extract_u16(self.cache.line_at(set, way), phys), 0);
+                    let v = cache::extract_u16(self.cache.line_at(set, way), phys);
+                    // Compare the cache-hit (fetch *or* data) against true
+                    // memory: a mismatch is a stale cache line (the
+                    // coherency-hang smoking gun).
+                    if self.dbg_detect_stale
+                        && self.dbg_stale_fetch.is_none()
+                        && let Some(mem) = bus.peek16(phys)
+                    {
+                        self.dbg_stale_checks += 1;
+                        if mem != v {
+                            self.dbg_stale_fetch = Some((phys, v, mem, self.pipeline.cycles));
+                        }
+                    }
+                    return (v, 0);
                 }
                 cache::Probe::Miss => {
                     self.note_watched_read(phys, kind, 2);
@@ -1356,7 +1402,20 @@ impl Cpu {
             match self.cache.probe(phys, matches!(kind, AccessKind::Fetch)) {
                 cache::Probe::Hit(set, way) => {
                     self.note_watched_read(phys, kind, 1);
-                    return (cache::extract_u32(self.cache.line_at(set, way), phys), 0);
+                    let v = cache::extract_u32(self.cache.line_at(set, way), phys);
+                    if self.dbg_detect_stale
+                        && self.dbg_stale_fetch.is_none()
+                        && let (Some(hi), Some(lo)) =
+                            (bus.peek16(phys), bus.peek16(phys.wrapping_add(2)))
+                    {
+                        self.dbg_stale_checks += 1;
+                        let mem = ((hi as u32) << 16) | lo as u32;
+                        if mem != v {
+                            self.dbg_stale_fetch =
+                                Some((phys, v as u16, mem as u16, self.pipeline.cycles));
+                        }
+                    }
+                    return (v, 0);
                 }
                 cache::Probe::Miss => {
                     self.note_watched_read(phys, kind, 2);
