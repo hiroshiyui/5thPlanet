@@ -39,6 +39,22 @@ Saturn discs even without special "audio-extraction" support).
 
 Recommended tools, best first:
 
+- **redumper** (Windows/Linux/macOS) — a modern, cross-platform redump-style
+  dumper, and what `tools/dump_game_disc.sh` drives. Its `disc` command dumps,
+  re-reads bad sectors, splits into per-track `.bin`s, and writes the `.cue` +
+  a log + hashes, all with correct **LSB-first** audio and per-drive read-offset
+  correction:
+
+  ```
+  redumper disc --drive=/dev/sr0 --retries=50 \
+      --image-path=roms --image-name=game --overwrite
+  ```
+
+  Output is redump-style: `game.cue` plus one `game (Track N).bin` per track
+  (the loader concatenates multi-`FILE` cues into one image). If redumper warns
+  that your drive isn't in its offset database (`read offset: +0, using generic
+  drive`), the dump still plays fine but won't be a submission-grade hash match.
+
 - **DiscImageCreator** (Windows) — the [redump.org](http://redump.org)
   preservation standard. Produces `.bin` + `.cue` (plus `.sub`, `.ccd`, log
   files) with correct **LSB-first** audio. Roughly:
@@ -50,17 +66,10 @@ Recommended tools, best first:
   (`8` = read speed; lower is safer on scratched discs.) You can then verify
   your dump's hashes against the redump.org database.
 
-- **Redumper** (Windows/Linux/macOS) — a modern, cross-platform redump-style
-  dumper, also `.bin` + `.cue` with correct audio:
-
-  ```
-  redumper --drive=/dev/sr0 --speed=8 --image-name=game
-  ```
-
 - **cdrdao** (Linux/cross-platform) — widely available, but ⚠️ it writes audio
   tracks **MSB-first (byte-swapped)**, which this emulator plays as noise (see
-  the gotcha below). Use it only if you can byte-swap the audio afterwards, or
-  prefer the two tools above.
+  the gotcha below). Use it only when redumper isn't available, and byte-swap
+  the audio afterwards:
 
   ```
   cdrdao read-cd --read-raw --driver generic-mmc-raw \
@@ -68,8 +77,8 @@ Recommended tools, best first:
   toc2cue game.toc game.cue
   ```
 
-Whatever the tool, drop the resulting `game.cue` + `game.bin` (keep them in the
-same directory — the cue `FILE`-references the bin by name) into `roms/`.
+Whatever the tool, drop the resulting `game.cue` + `game.bin`(s) (keep them in
+the same directory — the cue `FILE`-references the bins by name) into `roms/`.
 
 ## Loading a disc
 

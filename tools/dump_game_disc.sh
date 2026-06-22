@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # dump_game_disc.sh — companion automation for the `dump-game-disc` skill.
 #
-# Dumps a *legally-owned* SEGA Saturn disc to a 5thPlanet-loadable CUE-BIN,
-# handling the cdrdao MSB-first CD-DA byte-swap gotcha. A Saturn disc is
-# multi-track (track 1 = ISO9660 data, tracks 2+ = Red Book CD-DA audio), so we
-# always rip raw/all-tracks — a plain .iso would drop the audio.
+# Dumps a *legally-owned* SEGA Saturn disc to a 5thPlanet-loadable CUE-BIN using
+# redumper (https://github.com/superg/redumper) — the redump.org-grade dumper.
+# A Saturn disc is multi-track (track 1 = ISO9660 data, tracks 2+ = Red Book
+# CD-DA audio); redumper rips every track raw, applies the drive's read-offset
+# correction, and writes the audio in correct (LSB-first) byte order. That means
+# the old cdrdao MSB-first byte-swap gotcha no longer applies — there is no
+# --byteswap path to get wrong.
 #
-# Pipeline:  rip (raw, all tracks) -> toc2cue -> [verify]
+# redumper emits a redump-style split: one `<name> (Track N).bin` per track plus
+# a multi-FILE `<name>.cue`. Our loader concatenates multi-FILE cues into one
+# image (`Disc::from_cue`), so the result loads directly.
 #
-# The byte-swap fix is applied at *rip time* via cdrdao's byteswap driver flag
-# (`--byteswap`); if your drive needs the post-process per-track swap instead,
-# see the skill's step 4 (that path is manual on purpose).
+# Pipeline:  redumper disc (dump -> refine -> split + hash) -> [verify]
 #
 # Usage:
 #   tools/dump_game_disc.sh [options]
@@ -20,10 +23,8 @@
 #   -o, --out DIR       output directory (default: tmp)
 #   -n, --name NAME     base name for the image (default: auto — the disc's own
 #                       Saturn game title, slug-ified; falls back to "game")
-#       --byteswap      re-read audio LSB-first via the cdrdao driver flag
-#                       (drive-dependent; verify the result by listening)
-#       --driver STR    override the cdrdao --driver string used with --byteswap
-#                       (default: $CDRDAO_BYTESWAP_DRIVER or generic-mmc-raw:0x20000)
+#       --retries N     sector re-read retries on a SCSI/C2 error (default: 50)
+#       --speed N       drive read speed (default: redumper picks the optimal)
 #       --bios PATH     after ripping, smoke-load the image in jupiter (headless)
 #                       and report whether the audio still looks byte-swapped
 #   -h, --help          show this help
@@ -35,9 +36,9 @@ DEVICE="/dev/sr0"
 OUTDIR="tmp"
 NAME="game"
 NAME_EXPLICIT=0
-DO_BYTESWAP=0
+RETRIES=50
+SPEED=""
 BIOS=""
-DRIVER="${CDRDAO_BYTESWAP_DRIVER:-generic-mmc-raw:0x20000}"
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -65,20 +66,19 @@ slugify() { printf '%s' "$1" | tr ' ' '_' | tr -cd 'A-Za-z0-9._-'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -d|--device) DEVICE="${2:?}"; shift 2;;
-        -o|--out)    OUTDIR="${2:?}"; shift 2;;
-        -n|--name)   NAME="${2:?}"; NAME_EXPLICIT=1; shift 2;;
-        --byteswap)  DO_BYTESWAP=1;   shift;;
-        --driver)    DRIVER="${2:?}"; shift 2;;
-        --bios)      BIOS="${2:?}";   shift 2;;
-        -h|--help)   usage; exit 0;;
+        -d|--device)  DEVICE="${2:?}"; shift 2;;
+        -o|--out)     OUTDIR="${2:?}"; shift 2;;
+        -n|--name)    NAME="${2:?}"; NAME_EXPLICIT=1; shift 2;;
+        --retries)    RETRIES="${2:?}"; shift 2;;
+        --speed)      SPEED="${2:?}"; shift 2;;
+        --bios)       BIOS="${2:?}"; shift 2;;
+        -h|--help)    usage; exit 0;;
         *) die "unknown argument: $1 (try --help)";;
     esac
 done
 
 # --- preflight ------------------------------------------------------------
-have cdrdao  || die "cdrdao not found — install it (also provides toc2cue)."
-have toc2cue || die "toc2cue not found — it ships with cdrdao."
+have redumper || die "redumper not found — install it (https://github.com/superg/redumper)."
 [ -e "$DEVICE" ] || die "optical device $DEVICE not found (try -d /dev/srN)."
 [ -n "$BIOS" ] && [ ! -f "$BIOS" ] && die "--bios path does not exist: $BIOS"
 
@@ -96,55 +96,47 @@ if [ "$NAME_EXPLICIT" -eq 0 ]; then
     fi
 fi
 
-TOC="$OUTDIR/$NAME.toc"
-BIN="$OUTDIR/$NAME.bin"
 CUE="$OUTDIR/$NAME.cue"
+LOG="$OUTDIR/$NAME.log"
 
-# --- step 1: rip raw, all tracks -----------------------------------------
-echo ">> [1/3] ripping $DEVICE -> $BIN (raw, all tracks) ..."
-RIP_ARGS=(read-cd --read-raw --datafile "$BIN")
-if [ "$DO_BYTESWAP" -eq 1 ]; then
-    echo "        (byteswap mode: --driver $DRIVER — drive-dependent, verify by ear)"
-    RIP_ARGS+=(--driver "$DRIVER")
-fi
-RIP_ARGS+=(--device "$DEVICE" "$TOC")
-cdrdao "${RIP_ARGS[@]}"
+# --- step 1: redumper disc (dump + refine + split + hash) -----------------
+echo ">> [1/2] redumper: dumping $DEVICE -> $OUTDIR/$NAME.* (raw, all tracks) ..."
+RD_ARGS=(disc --drive="$DEVICE" --retries="$RETRIES"
+         --image-path="$OUTDIR" --image-name="$NAME" --overwrite)
+[ -n "$SPEED" ] && RD_ARGS+=(--speed="$SPEED")
+redumper "${RD_ARGS[@]}"
 
-# --- step 2: TOC -> CUE ---------------------------------------------------
-echo ">> [2/3] converting $TOC -> $CUE ..."
-toc2cue "$TOC" "$CUE"
-# toc2cue copies the datafile *path* (e.g. "tmp/NAME.bin") into the FILE line,
-# but the .cue and .bin live in the same directory and a loader joins the FILE
-# name with the cue's own dir — so strip any directory prefix to the basename.
-sed -i -E 's#^(FILE )"[^"]*/([^"/]+)"#\1"\2"#' "$CUE"
+[ -f "$CUE" ] || die "redumper finished but no cue at $CUE — check $LOG."
+
 if grep -qi 'AUDIO' "$CUE"; then
     echo "        audio tracks present: $(grep -ci 'AUDIO' "$CUE")"
 else
     echo "        note: no AUDIO tracks in the cue (data-only game, or an incomplete rip)."
 fi
 
-# --- step 3: verify (optional) -------------------------------------------
+# Surface redumper's own error tally from the log (errors/SCSI/C2 lines).
+if [ -f "$LOG" ]; then
+    echo "        redumper log summary:"
+    grep -iE 'errors|SCSI|C2|redump match|read offset|disc write offset' "$LOG" \
+        | sed 's/^/          /' | tail -20 || true
+fi
+
+# --- step 2: verify (optional) -------------------------------------------
 if [ -n "$BIOS" ]; then
-    echo ">> [3/3] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
-    LOG="$OUTDIR/$NAME.verify.log"
+    echo ">> [2/2] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
+    VLOG="$OUTDIR/$NAME.verify.log"
     # The loader prints a warning when the audio tracks look MSB-first
     # (Disc::audio_looks_msb_first). Run briefly and scrape stderr.
     timeout 15 cargo run -q -p jupiter --no-default-features -- "$BIOS" "$CUE" \
-        >"$LOG" 2>&1 || true
-    if grep -qi 'byte-swapped' "$LOG"; then
+        >"$VLOG" 2>&1 || true
+    if grep -qi 'byte-swapped' "$VLOG"; then
         echo "   !! audio tracks look BYTE-SWAPPED (MSB-first) — CD-DA will be noise."
-        if [ "$DO_BYTESWAP" -eq 0 ]; then
-            echo "      re-run with --byteswap, or apply the post-process per-track"
-            echo "      swap from the dump-game-disc skill (step 4)."
-        else
-            echo "      --byteswap did not correct it for this drive; try a different"
-            echo "      --driver value, or the post-process swap (skill step 4)."
-        fi
+        echo "      Unexpected with redumper; inspect $VLOG and the redumper log."
     else
         echo "        no byte-swap warning — audio byte order looks correct."
     fi
 else
-    echo ">> [3/3] skipping verify (no --bios given)."
+    echo ">> [2/2] skipping verify (no --bios given)."
 fi
 
 echo
