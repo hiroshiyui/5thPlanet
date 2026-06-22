@@ -171,6 +171,20 @@ Fully deterministic (same PC/cycle each run).
   master/frame-timing state) is wrong because of the upstream timing
   divergence. So the root is still the timing-dependent control flow, now seen
   to corrupt the FILM player's read-length calculation.
+- **★ Quantitative clue (the magnitude lines up).** Ours reads **177** sectors
+  where Mednafen reads **803** from the same FAD — a **~4.5× ratio**, closely
+  matching the **~5× slowdown** (`SAT_SLOW_FETCH` 5 fails, 7 renders) needed to
+  make ours progress. So the FILM player's read-length is ~linearly tied to a
+  timing metric that's **~5× off** in our run — i.e. it is *not* the diffuse
+  ~1% master drift (which couldn't move a 4.5× gap), but a **specific ~5×
+  error** in whatever frame/pacing quantity the player uses to size each read
+  (e.g. main-loop iterations per movie-frame period, or a per-frame work
+  budget). The CD-command primitive `060140FA` merely writes the 4 CRs from a
+  caller-built struct (`@R4`); the read-length (CR4) is computed up the FILM
+  player's caller chain — that computation + the ~5×-off timing input it reads
+  is the precise unpinned target. VF2's TrueMotion movie proves the CD block,
+  read pump, and a software movie player all work end-to-end, so the defect is
+  contained to this Cinepak-FILM read-sizing/pacing path.
 
 ### Ruled out (with evidence)
 | Hypothesis | Verdict / evidence |
