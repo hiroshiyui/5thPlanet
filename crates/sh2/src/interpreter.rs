@@ -122,6 +122,13 @@ pub struct Cpu {
     /// detector ran rather than silently skipping. Not serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub dbg_stale_checks: u64,
+    /// Debug only: extra stall cycles charged on every instruction-fetch cache
+    /// hit. A timing-probe knob to slow the master (or slave) without changing
+    /// any cache value/content — used to test timing-sensitivity hypotheses
+    /// (e.g. the Sangokushi V inter-CPU race). 0 = no effect (default). Not
+    /// serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_slow_fetch: u32,
     /// Debug only: when `Some`, tallies `Data` reads to a physical range by
     /// cache treatment — see [`ReadWatch`]. Set via [`Cpu::enable_read_watch`].
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -167,6 +174,7 @@ impl Cpu {
             dbg_detect_stale: false,
             dbg_stale_fetch: None,
             dbg_stale_checks: 0,
+            dbg_slow_fetch: 0,
             read_watch: None,
             decode_lut: build_decode_lut(),
         }
@@ -1364,7 +1372,8 @@ impl Cpu {
                             self.dbg_stale_fetch = Some((phys, v, mem, self.pipeline.cycles));
                         }
                     }
-                    return (v, 0);
+                    let extra = if matches!(kind, AccessKind::Fetch) { self.dbg_slow_fetch } else { 0 };
+                    return (v, extra);
                 }
                 cache::Probe::Miss => {
                     self.note_watched_read(phys, kind, 2);

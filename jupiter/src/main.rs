@@ -2027,6 +2027,10 @@ fn run(
     // whether a stale-cache fetch is the blocker (if a game runs past a spurious
     // illegal-instruction fault only with this on, the cache is incoherent).
     let cache_purge = std::env::var_os("SAT_CACHE_PURGE").is_some();
+    // Debug: `SAT_SLOW_FETCH=N` charges N extra stall cycles per instruction-fetch
+    // cache hit on both SH-2s — a timing-probe to test inter-CPU-race hypotheses
+    // (changes timing only, no cache value/content change). 0 = off.
+    let slow_fetch: u32 = std::env::var("SAT_SLOW_FETCH").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut last_pc = u32::MAX;
     let mut dump_dims = (FRAME_WIDTH, FRAME_HEIGHT);
     for f in 0..headless_frames {
@@ -2034,6 +2038,10 @@ fn run(
         if cache_purge {
             saturn.master_mut().cache.purge();
             saturn.slave_mut().cache.purge();
+        }
+        if slow_fetch != 0 {
+            saturn.master_mut().dbg_slow_fetch = slow_fetch;
+            saturn.slave_mut().dbg_slow_fetch = slow_fetch;
         }
         dump_dims = saturn.run_frame(&mut framebuffer);
         if pctrace {
