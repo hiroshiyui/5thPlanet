@@ -12,16 +12,6 @@ m68k = { path = "../m68k", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
 bincode = { version = "2", features = ["serde"] }
-# Optional CHD (Compressed Hunks of Data) disc-image reader — pure-Rust, so
-# unlike the libcdio FFI in `physdisc` it needs no separate crate or unsafe
-# (the workspace `unsafe_code = "forbid"` lint is per-crate; a dependency's
-# internal unsafe is irrelevant). Off by default so headless/test builds stay
-# lean; `jupiter` turns it on. See roadmap G1.
-chd = { version = "0.3", optional = true, default-features = false, features = ["std", "cd_full"] }
-
-[features]
-# Decode `.chd` disc images (roadmap G1). Pulls the `chd` crate.
-chd = ["dep:chd"]
 
 [lints]
 workspace = true

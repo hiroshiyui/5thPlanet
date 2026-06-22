@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # dump_game_disc.sh — companion automation for the `dump-game-disc` skill.
 #
-# Dumps a *legally-owned* SEGA Saturn disc to a 5thPlanet-loadable CUE-BIN
-# (optionally a CHD archive), handling the cdrdao MSB-first CD-DA byte-swap
-# gotcha. A Saturn disc is multi-track (track 1 = ISO9660 data, tracks 2+ =
-# Red Book CD-DA audio), so we always rip raw/all-tracks — a plain .iso would
-# drop the audio.
+# Dumps a *legally-owned* SEGA Saturn disc to a 5thPlanet-loadable CUE-BIN,
+# handling the cdrdao MSB-first CD-DA byte-swap gotcha. A Saturn disc is
+# multi-track (track 1 = ISO9660 data, tracks 2+ = Red Book CD-DA audio), so we
+# always rip raw/all-tracks — a plain .iso would drop the audio.
 #
-# Pipeline:  rip (raw, all tracks) -> toc2cue -> [verify] -> [chd]
+# Pipeline:  rip (raw, all tracks) -> toc2cue -> [verify]
 #
 # The byte-swap fix is applied at *rip time* via cdrdao's byteswap driver flag
 # (`--byteswap`); if your drive needs the post-process per-track swap instead,
@@ -27,8 +26,6 @@
 #                       (default: $CDRDAO_BYTESWAP_DRIVER or generic-mmc-raw:0x20000)
 #       --bios PATH     after ripping, smoke-load the image in jupiter (headless)
 #                       and report whether the audio still looks byte-swapped
-#       --chd           also produce a compressed .chd image (needs chdman;
-#                       the emulator loads .chd directly)
 #   -h, --help          show this help
 #
 # Per project convention, default output lands in ./tmp (never /tmp).
@@ -39,7 +36,6 @@ OUTDIR="tmp"
 NAME="game"
 NAME_EXPLICIT=0
 DO_BYTESWAP=0
-DO_CHD=0
 BIOS=""
 DRIVER="${CDRDAO_BYTESWAP_DRIVER:-generic-mmc-raw:0x20000}"
 
@@ -75,7 +71,6 @@ while [ $# -gt 0 ]; do
         --byteswap)  DO_BYTESWAP=1;   shift;;
         --driver)    DRIVER="${2:?}"; shift 2;;
         --bios)      BIOS="${2:?}";   shift 2;;
-        --chd)       DO_CHD=1;        shift;;
         -h|--help)   usage; exit 0;;
         *) die "unknown argument: $1 (try --help)";;
     esac
@@ -85,7 +80,6 @@ done
 have cdrdao  || die "cdrdao not found — install it (also provides toc2cue)."
 have toc2cue || die "toc2cue not found — it ships with cdrdao."
 [ -e "$DEVICE" ] || die "optical device $DEVICE not found (try -d /dev/srN)."
-[ "$DO_CHD" -eq 1 ] && ! have chdman && die "--chd requested but chdman (MAME) not found."
 [ -n "$BIOS" ] && [ ! -f "$BIOS" ] && die "--bios path does not exist: $BIOS"
 
 mkdir -p "$OUTDIR"
@@ -105,10 +99,9 @@ fi
 TOC="$OUTDIR/$NAME.toc"
 BIN="$OUTDIR/$NAME.bin"
 CUE="$OUTDIR/$NAME.cue"
-CHD="$OUTDIR/$NAME.chd"
 
 # --- step 1: rip raw, all tracks -----------------------------------------
-echo ">> [1/4] ripping $DEVICE -> $BIN (raw, all tracks) ..."
+echo ">> [1/3] ripping $DEVICE -> $BIN (raw, all tracks) ..."
 RIP_ARGS=(read-cd --read-raw --datafile "$BIN")
 if [ "$DO_BYTESWAP" -eq 1 ]; then
     echo "        (byteswap mode: --driver $DRIVER — drive-dependent, verify by ear)"
@@ -118,7 +111,7 @@ RIP_ARGS+=(--device "$DEVICE" "$TOC")
 cdrdao "${RIP_ARGS[@]}"
 
 # --- step 2: TOC -> CUE ---------------------------------------------------
-echo ">> [2/4] converting $TOC -> $CUE ..."
+echo ">> [2/3] converting $TOC -> $CUE ..."
 toc2cue "$TOC" "$CUE"
 # toc2cue copies the datafile *path* (e.g. "tmp/NAME.bin") into the FILE line,
 # but the .cue and .bin live in the same directory and a loader joins the FILE
@@ -132,7 +125,7 @@ fi
 
 # --- step 3: verify (optional) -------------------------------------------
 if [ -n "$BIOS" ]; then
-    echo ">> [3/4] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
+    echo ">> [3/3] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
     LOG="$OUTDIR/$NAME.verify.log"
     # The loader prints a warning when the audio tracks look MSB-first
     # (Disc::audio_looks_msb_first). Run briefly and scrape stderr.
@@ -151,17 +144,8 @@ if [ -n "$BIOS" ]; then
         echo "        no byte-swap warning — audio byte order looks correct."
     fi
 else
-    echo ">> [3/4] skipping verify (no --bios given)."
-fi
-
-# --- step 4: CHD archive (optional) --------------------------------------
-if [ "$DO_CHD" -eq 1 ]; then
-    echo ">> [4/4] compressing -> $CHD ..."
-    chdman createcd -i "$CUE" -o "$CHD"
-else
-    echo ">> [4/4] skipping CHD (no --chd given)."
+    echo ">> [3/3] skipping verify (no --bios given)."
 fi
 
 echo
 echo "done. load it with:  cargo run -p jupiter -- <BIOS.bin> $CUE"
-[ "$DO_CHD" -eq 1 ] && echo "      (or the compressed image: cargo run -p jupiter -- <BIOS.bin> $CHD)"

@@ -133,15 +133,6 @@ use chunky, which the renderer handles.
 [SCU]. Bits 0–2 select start factor; bit 8 (DGO) is the manual-fire
 trigger.
 
-**CHD** — Compressed Hunks of Data: MAME's compressed, single-file,
-multi-track disc-image container — the lossless equivalent of a CUE+BIN
-(data track *and* Red Book [CDDA] tracks), with sectors stored as
-compressed "hunks". Decoded into a `Disc` by
-`crates/saturn/src/chd_image.rs` (feature-gated `chd`; pure-Rust `chd`
-crate, no FFI) — decompress every hunk, concatenate each track's raw
-2352-byte sectors, then funnel through the [CD-block]'s shared track-table
-/ TOC path. Roadmap **G1**.
-
 **Colour offset (CLOFEN / CLOFSL / COxx)** — VDP2 per-screen signed RGB
 offset added *after* colour calculation. CLOFEN (`0x05F8_0110`, bits 0..6,
 one per [NBG] / [RBG] / sprite layer) enables it; CLOFSL (`0x0112`) picks

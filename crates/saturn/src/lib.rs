@@ -32,8 +32,7 @@
 //! - [`system`] — `Saturn` aggregate: owns bus + scheduler, runs the
 //!   headless main loop / `run_frame`, maintains VDP2 raster timing,
 //!   and drains queued peripheral commands between scheduler batches.
-//! - [`disc`] — disc-image media (ISO / CUE-BIN / CCD) + TOC; `chd_image`
-//!   (feature `chd`) decodes compressed CHD images into a `Disc`.
+//! - [`disc`] — disc-image media (ISO / CUE-BIN / CCD) + TOC.
 //! - [`diagnostics`] — built-in self-diagnostics (the `jupiter doctor`
 //!   subcommand + the OSD screen): tiny from-reset checks of the CPU and
 //!   each chip, plus heuristic boot/compatibility checks.
@@ -51,8 +50,6 @@
 pub mod bus;
 pub mod cartridge;
 pub mod cd_block;
-#[cfg(feature = "chd")]
-pub mod chd_image;
 pub mod diagnostics;
 pub mod disc;
 pub mod memory;

@@ -6,7 +6,7 @@ tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
 referenced below.
 
-Current test count: **1129 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1121 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -37,7 +37,7 @@ set as chips/games surface needs.
 | VDP1 | ✅ Full plotter (all primitives/colour modes, gouraud), erase, double-buffer (FBCR), TVM 8bpp + DIE interlace, cycle-accurate draw-end IRQ. TVM=3 (8bpp+rotate) deferred |
 | MC68EC000 (sound CPU) | ✅ Full ISA + exception/interrupt model, exact MUL/DIV timing, address/bus/trace exceptions |
 | SCSP | ✅ 32-slot PCM+FM engine, ADSR, LFO, mixer/DAC, MVOL, slot monitor (0x408), 128-step effect DSP, CD-DA via EXTS, 44.1 kHz output |
-| CD-block | 🟡 HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD/CHD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
+| CD-block | 🟡 HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
 | Cartridge slot | ✅ Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
 | SDL2 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
 | Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
@@ -317,13 +317,14 @@ Part C.1.
 
 **Triage (2026-06-14 re-verified at HEAD):** all rows still hold. **G2 and G3
 are the two most likely to actually surface** (both audio, both plausibly hit by
-a real sound driver) — check them first if a future game has a sound bug.
-**G1 CHD is now done** (the `chd` feature; see the row below). G2/G6 carry real
-regression risk (the current behaviour is load-bearing) — fix only with a repro.
+a real sound driver) — check them first if a future game has a sound bug. G2/G6
+carry real regression risk (the current behaviour is load-bearing) — fix only
+with a repro. (G1, CHD disc images, was implemented in v0.8.0 and **removed**
+after v0.9.0 — the `chd` dependency wasn't worth it; convert `.chd` → CUE-BIN
+with `chdman extractcd`. The G2–G7 IDs are unchanged.)
 
 | # | Gap | Status |
 |---|-----|--------|
-| G1 | CHD disc images (disc) | ✅ `saturn::chd_image::from_chd` decodes a CD CHD (decompress hunks → concatenate each track's 2352-byte sectors → `Disc::from_pending_tracks`, so TOC/read/fingerprint/byte-swap-warning are shared with the other parsers). Pure-Rust `chd` crate behind the `chd` feature (no FFI/unsafe, unlike `physdisc`); on by default in `jupiter`. Validated byte-identical to the `.ccd` loader on the multitrack Boot Disc (`tests/chd.rs`, env-driven `#[ignore]`). GD-ROM/legacy `CHCD` rejected with a clear message |
 | G2 | SCSP `SNDON` does a full 68k reset, not an un-halt | ⬜ a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
 | G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | ⬜ only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
 | G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | ⬜ `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
