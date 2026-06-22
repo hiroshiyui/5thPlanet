@@ -141,6 +141,17 @@ Fully deterministic (same PC/cycle each run).
   decode-done / per-chunk slave-dispatch condition — note the slave was
   dispatched only once, frame 877) is in the `060E46xx–060E4Axx` FILM-player
   code and `060E4A2C` — not yet pinned.
+- **★ It is an upstream divergence, NOT a CD Play-count parse bug (Mednafen
+  cross-check).** From the *same* movie start FAD 5234 (`0x1472`), Mednafen FULL
+  (`SS_CDTRACE`) issues `Play count=0x323`(803) then `0x3deb`(15851) — it reads
+  the **whole movie**; ours (`SAT_CDSEEKLOG`) issues a read ending at FAD 5411
+  (**count 177**) then stops. The commands genuinely differ (ours' end-CR
+  `0x1523` vs Mednafen's `0x0323`), so the CD-block's count/Play handling is
+  *correct* — the **game itself computes a different, truncated movie read** in
+  our run, i.e. the FILM player's read-size (which depends on diverged
+  master/frame-timing state) is wrong because of the upstream timing
+  divergence. So the root is still the timing-dependent control flow, now seen
+  to corrupt the FILM player's read-length calculation.
 
 ### Ruled out (with evidence)
 | Hypothesis | Verdict / evidence |
