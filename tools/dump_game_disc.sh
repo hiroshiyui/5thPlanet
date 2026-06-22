@@ -120,6 +120,10 @@ cdrdao "${RIP_ARGS[@]}"
 # --- step 2: TOC -> CUE ---------------------------------------------------
 echo ">> [2/4] converting $TOC -> $CUE ..."
 toc2cue "$TOC" "$CUE"
+# toc2cue copies the datafile *path* (e.g. "tmp/NAME.bin") into the FILE line,
+# but the .cue and .bin live in the same directory and a loader joins the FILE
+# name with the cue's own dir — so strip any directory prefix to the basename.
+sed -i -E 's#^(FILE )"[^"]*/([^"/]+)"#\1"\2"#' "$CUE"
 if grep -qi 'AUDIO' "$CUE"; then
     echo "        audio tracks present: $(grep -ci 'AUDIO' "$CUE")"
 else
