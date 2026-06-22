@@ -37,24 +37,54 @@ fn host_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the built-in self-diagnostics (`jupiter doctor`) and return an exit code:
-/// `0` if every check passes, `1` otherwise. Needs no BIOS, disc, or window —
-/// each check runs a tiny SH-2 program on a throwaway machine in `saturn`.
-fn run_doctor() -> ExitCode {
-    let results = saturn::diagnostics::run_all();
+/// Print one diagnostics section and return whether every check passed.
+fn print_diag_section(title: &str, results: &[saturn::diagnostics::DiagOutcome]) -> bool {
+    println!("{title}");
     let mut passed = 0usize;
-    println!("5thPlanet self-diagnostics:");
-    for o in &results {
+    for o in results {
         let tag = if o.passed { passed += 1; "PASS" } else { "FAIL" };
         println!("  [{tag}] {}/{}  {}", o.category, o.name, o.detail);
     }
-    let total = results.len();
-    println!("{passed}/{total} checks passed");
-    if passed == total {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+    println!("  {passed}/{} passed", results.len());
+    passed == results.len()
+}
+
+/// Run the diagnostics (`jupiter doctor [<BIOS> [<disc>]]`) and return an exit
+/// code: `0` if everything passed, `1` otherwise. The hermetic feature checks
+/// always run (no BIOS/disc/window needed). If a BIOS is given, the heuristic
+/// **System / boot-compatibility** checks also run against a fresh throwaway
+/// machine booted from that media (+ the disc, if given).
+fn run_doctor(bios_path: Option<String>, disc_path: Option<String>) -> ExitCode {
+    let mut ok = print_diag_section("5thPlanet self-diagnostics:", &saturn::diagnostics::run_all());
+
+    if let Some(bp) = bios_path {
+        match fs::read(&bp) {
+            Ok(bios) => {
+                let region = detect_region(&bp, None);
+                let disc = match disc_path {
+                    Some(dp) => match load_image_disc(&dp) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            eprintln!("doctor: disc load failed ({dp}): {e}");
+                            ok = false;
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                ok &= print_diag_section(
+                    "System (boot/compatibility — heuristic):",
+                    &saturn::diagnostics::run_system(bios, disc, region),
+                );
+            }
+            Err(e) => {
+                eprintln!("doctor: BIOS read failed ({bp}): {e}");
+                ok = false;
+            }
+        }
     }
+
+    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }
 
 fn main() -> ExitCode {
@@ -74,17 +104,18 @@ fn main() -> ExitCode {
         }
     }
 
-    // `jupiter doctor` — run the built-in self-diagnostics and exit, before any
-    // BIOS/disc/config handling (the diagnostics need none of it).
+    // `jupiter doctor [<BIOS> [<disc>]]` — run diagnostics and exit, before the
+    // normal BIOS/disc/config handling. The hermetic checks need no media; an
+    // optional BIOS (+ disc) adds the boot/compatibility checks.
     if positionals.first().map(String::as_str) == Some("doctor") {
-        return run_doctor();
+        return run_doctor(positionals.get(1).cloned(), positionals.get(2).cloned());
     }
 
     let bios_path = match positionals.first() {
         Some(p) => p.clone(),
         None => {
             eprintln!(
-                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd|.chd | cdrom:<device>] [--cart=<kind>]\n       jupiter doctor                 run built-in self-diagnostics and exit"
+                "usage: jupiter <BIOS.bin> [game.cue|.iso|.ccd|.chd | cdrom:<device>] [--cart=<kind>]\n       jupiter doctor [<BIOS> [<disc>]]   run diagnostics and exit (BIOS/disc add boot checks)"
             );
             eprintln!();
             eprintln!(

@@ -65,6 +65,82 @@ pub fn run_all() -> Vec<DiagOutcome> {
         .collect()
 }
 
+/// System / boot **compatibility** checks (heuristic, best-effort — **not**
+/// goldens, and **not** part of [`run_all`] or the CI test). Unlike the hermetic
+/// feature checks, these need real media: they boot a fresh throwaway machine
+/// from `bios` (+ optional `disc`, with the SMPC `region` code) and observe
+/// whether it produces video and — with a disc — whether the 1st-read program
+/// reaches High WRAM (i.e. authentication + IP.BIN read + load + jump all
+/// worked). Answers "does my setup boot?", which is distinct from "is the
+/// emulator correct?".
+pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) -> Vec<DiagOutcome> {
+    // TOC facts are pure — read them before the disc is moved into the machine.
+    let toc = disc.as_ref().map(|d| (d.first_track(), d.last_track(), d.lead_out_fad()));
+    let has_disc = disc.is_some();
+
+    let mut sat = Saturn::new(bios);
+    if let Some(d) = disc {
+        sat.insert_disc(d);
+    }
+    sat.reset();
+    sat.set_region(region);
+
+    // With a disc: boot until the 1st-read program reaches High WRAM (the strong
+    // auth+load+jump signal), early-exiting as soon as it does. Without a disc:
+    // run to the BIOS splash plateau and measure that it produced video.
+    let mut fb = vec![0u8; crate::vdp2::FRAMEBUFFER_BYTES];
+    let mut reached_hwram = false;
+    let mut max_non_black = 0usize;
+    for _ in 0..if has_disc { 400 } else { 180 } {
+        let dims = sat.run_frame(&mut fb);
+        if has_disc {
+            if (0x0600_0000..=0x060F_FFFF).contains(&sat.master().regs.pc) {
+                reached_hwram = true;
+                break;
+            }
+        } else {
+            let non_black = fb[..dims.0 * dims.1 * 4]
+                .chunks_exact(4)
+                .filter(|p| (p[0] | p[1] | p[2]) != 0)
+                .count();
+            max_non_black = max_non_black.max(non_black);
+        }
+    }
+
+    let mut out = Vec::new();
+    match toc {
+        // BIOS-only: did the boot chain produce video (the SEGA splash)?
+        None => out.push(DiagOutcome {
+            name: "bios_video",
+            category: "system",
+            passed: max_non_black > 64,
+            detail: format!("{max_non_black} non-black px (peak)"),
+        }),
+        // Disc present: structural TOC + the end-to-end boot (auth → IP.BIN →
+        // 1st-read load → jump into High WRAM). disc_boots passing implies the
+        // BIOS path itself is healthy, so a separate bios_video is redundant.
+        Some((first, last, lead_out)) => {
+            out.push(DiagOutcome {
+                name: "disc_toc",
+                category: "disc",
+                passed: first >= 1 && last >= first && lead_out > crate::disc::FAD_OFFSET,
+                detail: format!("tracks {first}..{last}, lead-out FAD {lead_out}"),
+            });
+            out.push(DiagOutcome {
+                name: "disc_boots",
+                category: "disc",
+                passed: reached_hwram,
+                detail: format!(
+                    "master PC=0x{:08X} ({})",
+                    sat.master().regs.pc,
+                    if reached_hwram { "reached HWRAM" } else { "never reached HWRAM" }
+                ),
+            });
+        }
+    }
+    out
+}
+
 /// Cycle budget for one check — every program parks in `BRA .` after a few
 /// dozen instructions, so over-running is free; this is ~100× margin.
 const RUN_CYCLES: u64 = 5_000;
