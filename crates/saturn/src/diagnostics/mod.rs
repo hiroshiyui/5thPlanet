@@ -50,6 +50,8 @@ const REGISTRY: &[Diag] = &[
     Diag { name: "dmac_transfer", category: "onchip", run: dmac_transfer },
     Diag { name: "cpu_mac_l", category: "cpu", run: cpu_mac_l },
     Diag { name: "cpu_cmp_branch", category: "branch", run: cpu_cmp_branch },
+    Diag { name: "vdp2_back_screen", category: "vdp2", run: vdp2_back_screen },
+    Diag { name: "scsp_tone", category: "scsp", run: scsp_tone },
 ];
 
 /// Run every built-in diagnostic and collect the outcomes (registry order).
@@ -396,6 +398,84 @@ fn cpu_cmp_branch() -> (bool, String) {
     code.extend(build_low_scratch_addr());
     code.extend([movl_store(1, 0), bra_self(), NOP]);
     verdict(read_low(&run_program(&code), LOW_SCRATCH), 42)
+}
+
+// --- frame-based chip checks ---------------------------------------------
+//
+// VDP2/SCSP need VRAM/sound-RAM data and a rendered frame / drained audio,
+// which is awkward to hand-assemble — so unlike the SH-2-program checks above
+// these drive the chip directly through the bus (a chip-in-isolation test) on a
+// machine whose CPUs are parked (master spins on `BRA .`, slave halted by
+// reset), then run a frame and inspect the output. Setups mirror the known-good
+// `tests/vdp2_render.rs` and `tests/audio_pipeline.rs`.
+
+/// VDP2 renders a solid back-screen colour: DISP on, no NBG/RBG layers, a single
+/// RGB555 green in the back-screen table → the whole frame is green. Verifies
+/// the register decode + compositor + the run_frame → framebuffer chain.
+fn vdp2_back_screen() -> (bool, String) {
+    use sh2::bus::{AccessKind, Bus};
+    let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
+    sat.reset();
+    sat.bus.write16(0x05F8_0000, 0x8000, AccessKind::Data); // TVMD: DISP on
+    sat.bus.write16(0x05F8_0020, 0x0000, AccessKind::Data); // BGON: all layers off
+    sat.bus.vdp2.vram.write16(0x200, 0x03E0); // RGB555 green at back-screen word 0x100
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU: hi=0, single-colour
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL: word 0x100
+    let mut fb = vec![0u8; crate::vdp2::FRAMEBUFFER_BYTES];
+    let (w, h) = sat.run_frame(&mut fb);
+    let px = ((h / 2) * w + w / 2) * 4;
+    let got = [fb[px], fb[px + 1], fb[px + 2], fb[px + 3]];
+    let want = [0x00, 0xFF, 0x00, 0xFF];
+    (got == want, format!("centre pixel {got:02X?}, want {want:02X?}"))
+}
+
+/// SCSP synthesis: program slot 0 to loop a full-scale 64-sample sine at full
+/// volume, key it on, run a few frames, and verify the drained audio reaches a
+/// meaningful peak (mirrors `tests/audio_pipeline.rs`). The 68k is parked in
+/// sound RAM so it can't disturb the slot after SNDON.
+fn scsp_tone() -> (bool, String) {
+    use sh2::bus::{AccessKind, Bus};
+    const SCSP: u32 = 0x05B0_0000;
+    const SA_LOW: u32 = 0x4000;
+    const AMP: i16 = 0x4000;
+    let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
+    sat.reset();
+    // Seed one sine period at the slot's sample start.
+    for i in 0..64u32 {
+        let phase = i as f64 / 64.0 * std::f64::consts::TAU;
+        let s = (phase.sin() * AMP as f64).round() as i16;
+        sat.bus.scsp.ram.write16(SA_LOW + i * 2, s as u16);
+    }
+    // Park the hosted 68k (SSP/PC at sound RAM [0]/[4], BRA-self at the PC) so
+    // SNDON doesn't run garbage over the SCSP registers, then release it.
+    sat.bus.scsp.ram.write32(0, 0x0000_1000);
+    sat.bus.scsp.ram.write32(4, 0x0000_0100);
+    sat.bus.scsp.ram.write16(0x100, 0x60FE);
+    sat.bus.scsp.start(); // SNDON (resets the 68k) — slot setup + key-on follow
+    // Master volume to unity: a fresh-reset SCSP has MVOL=0 and is silent (the
+    // BIOS/driver normally programs this — see scsp `master_volume`).
+    sat.bus.write16(SCSP + 0x400, 0x000F, AccessKind::Data); // MVOL = 0xF
+    // Slot 0: SA / loop window / instant attack / full direct level, key on last
+    // (the KYONEX strobe in reg0 is processed while the SCSP is running).
+    sat.bus.write16(SCSP + 0x02, SA_LOW as u16, AccessKind::Data); // reg1 SA-low
+    sat.bus.write16(SCSP + 0x04, 0, AccessKind::Data); // reg2 LSA
+    sat.bus.write16(SCSP + 0x06, 63, AccessKind::Data); // reg3 LEA (loop end)
+    sat.bus.write16(SCSP + 0x08, 0x001F, AccessKind::Data); // reg4 AR = max
+    sat.bus.write16(SCSP + 0x0C, 0, AccessKind::Data); // reg6 TL = 0 (max volume)
+    sat.bus.write16(SCSP + 0x10, 0, AccessKind::Data); // reg8 OCT/FNS = 0 (1:1 pitch)
+    sat.bus.write16(SCSP + 0x14, 0, AccessKind::Data); // reg0xA ISEL/IMXL = 0
+    sat.bus.write16(SCSP + 0x16, 0xE000, AccessKind::Data); // reg0xB DISDL = 7 (full)
+    sat.bus.write16(SCSP, 0x1820, AccessKind::Data); // reg0 KEY ON (last)
+    let mut fb = vec![0u8; crate::vdp2::FRAMEBUFFER_BYTES];
+    let mut peak = 0u16;
+    for _ in 0..8 {
+        sat.run_frame(&mut fb);
+        for s in sat.take_audio() {
+            peak = peak.max(s.unsigned_abs());
+        }
+    }
+    let want = (AMP as u16) / 4; // 0x1000 — the audio_pipeline acceptance bar
+    (peak >= want, format!("peak {peak}, want >= {want}"))
 }
 
 /// `BRA disp` (`0xA000 | disp12`). Kept here (not in `asm`) because only the
