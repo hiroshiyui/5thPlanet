@@ -21,6 +21,20 @@ use saturn::disc::Disc;
 use std::fs::File;
 use std::path::Path;
 
+/// CI coverage for `from_chd` (the round-trip below is `#[ignore]` + needs a
+/// real game disc). Decodes the committed silent-audio fixture and asserts its
+/// structure — exercises the full open → metadata → hunk-decompress → assemble
+/// path without any commercial media. See `tests/fixtures/README.md`.
+#[test]
+fn from_chd_decodes_the_silent_audio_fixture() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/audiocd.chd");
+    let disc = from_chd(File::open(path).expect("fixture present")).expect("decode fixture CHD");
+    assert_eq!(disc.first_track(), 1);
+    assert_eq!(disc.last_track(), 1, "single audio track");
+    assert_eq!(disc.lead_out_fad(), 900, "750 sectors + 150 lead-in");
+    assert_eq!(disc.image().len(), 750 * 2352, "750 raw 2352-byte sectors");
+}
+
 /// Load the reference image by extension, mirroring the jupiter frontend.
 fn load_ref(path: &str) -> Disc {
     let p = Path::new(path);

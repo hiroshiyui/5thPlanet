@@ -182,6 +182,21 @@ fn build_low_scratch_addr() -> [u16; 5] {
     [mov_imm(1, 0x20), shll16(1), mov_imm(2, 1), shll8(2), add(1, 2)]
 }
 
+/// Emit the seven instructions that build the [`SENTINEL`] (`0x2A2A2A2A`) into
+/// R0 via repeated `SHLL8; ADD #0x2A` — the value the memory/DMA checks move and
+/// read back. Shared by the round-trip and DMA checks (and unit-tested).
+fn sentinel_r0() -> [u16; 7] {
+    [
+        mov_imm(0, 0x2A),
+        shll8(0),
+        add_imm(0, 0x2A),
+        shll8(0),
+        add_imm(0, 0x2A),
+        shll8(0),
+        add_imm(0, 0x2A),
+    ]
+}
+
 // --- the checks ----------------------------------------------------------
 
 /// `ADD #imm` accumulates: 0 + 10 + 32 = 42.
@@ -251,16 +266,7 @@ fn mem_roundtrip_high() -> (bool, String) {
 /// take a prebuilt base-address sequence (leaving the base in R1), store/clear/
 /// load, then store the loaded value at base + `result_off`.
 fn roundtrip_code(base_addr_seq: Vec<u16>, result_off: i8) -> Vec<u16> {
-    // R0 = 0x2A2A2A2A via repeated (SHLL8; ADD #0x2A).
-    let mut code = vec![
-        mov_imm(0, 0x2A),
-        shll8(0),
-        add_imm(0, 0x2A),
-        shll8(0),
-        add_imm(0, 0x2A),
-        shll8(0),
-        add_imm(0, 0x2A),
-    ];
+    let mut code = sentinel_r0().to_vec(); // R0 = 0x2A2A2A2A
     code.extend(base_addr_seq); // R1 = base
     code.extend([
         movl_store(1, 0), // mem[base] = sentinel
@@ -368,9 +374,8 @@ fn cpu_shift_ops() -> (bool, String) {
 /// dest `0x0020_0300` (both Low WRAM — a legal DMA source, not the BIOS A-bus).
 fn scu_dma_copy() -> (bool, String) {
     const DEST: u32 = 0x0020_0300;
-    let mut code = vec![
-        // R0 = sentinel 0x2A2A2A2A
-        mov_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A),
+    let mut code = sentinel_r0().to_vec(); // R0 = sentinel 0x2A2A2A2A
+    code.extend([
         // R2 = source 0x0020_0200, plant the sentinel there
         mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
         movl_store(2, 0),
@@ -379,7 +384,7 @@ fn scu_dma_copy() -> (bool, String) {
         // R1 = SCU base 0x05FE_0000 (6<<8 = 0x600, -2 = 0x5FE, <<16)
         mov_imm(1, 6), shll8(1), add_imm(1, -2), shll16(1),
         movl_store(1, 2), // D0R (base+0x00) = source
-    ];
+    ]);
     // D0W (base+0x04) = dest
     code.extend([mov_imm(4, 0x04), add(4, 1), movl_store(4, 3)]);
     // D0C (base+0x08) = 4 bytes
@@ -408,9 +413,8 @@ fn scu_dma_copy() -> (bool, String) {
 /// longword, DE set). Source `0x0020_0200` → dest `0x0020_0300`.
 fn dmac_transfer() -> (bool, String) {
     const DEST: u32 = 0x0020_0300;
-    let mut code = vec![
-        // R0 = sentinel 0x2A2A2A2A
-        mov_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A), shll8(0), add_imm(0, 0x2A),
+    let mut code = sentinel_r0().to_vec(); // R0 = sentinel 0x2A2A2A2A
+    code.extend([
         // R2 = source 0x0020_0200, plant the sentinel
         mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
         movl_store(2, 0),
@@ -419,7 +423,7 @@ fn dmac_transfer() -> (bool, String) {
         // R1 = SAR0 base 0xFFFFFF80
         mov_imm(1, -128),
         movl_store(1, 2), // SAR0 (base+0x00) = source
-    ];
+    ]);
     // DAR0 (base+0x04) = dest
     code.extend([mov_imm(4, 0x04), add(4, 1), movl_store(4, 3)]);
     // TCR0 (base+0x08) = 1 longword
@@ -596,6 +600,16 @@ mod tests {
             !outcomes.iter().all(|o| o.passed),
             "the CI gate's all-pass predicate must reject a failing outcome"
         );
+    }
+
+    /// The extracted `sentinel_r0` fragment really leaves `0x2A2A2A2A` in R0
+    /// (independently exercises the shared helper).
+    #[test]
+    fn sentinel_r0_builds_the_sentinel() {
+        let mut code = sentinel_r0().to_vec(); // R0 = sentinel (uses R0 only)
+        code.extend(build_low_scratch_addr()); // R1 = scratch (uses R1/R2)
+        code.extend([movl_store(1, 0), bra_self(), NOP]);
+        assert_eq!(read_low(&run_program(&code), LOW_SCRATCH), SENTINEL);
     }
 
     /// Self-check: the hand-encoded opcodes decode to the intended ops (catches
