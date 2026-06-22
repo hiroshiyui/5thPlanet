@@ -32,15 +32,19 @@
 //! - [`system`] — `Saturn` aggregate: owns bus + scheduler, runs the
 //!   headless main loop / `run_frame`, maintains VDP2 raster timing,
 //!   and drains queued peripheral commands between scheduler batches.
+//! - [`disc`] — disc-image media (ISO / CUE-BIN / CCD) + TOC; `chd_image`
+//!   (feature `chd`) decodes compressed CHD images into a `Disc`.
+//! - [`diagnostics`] — built-in self-diagnostics (the `jupiter doctor`
+//!   subcommand + the OSD screen): tiny from-reset checks of the CPU and
+//!   each chip, plus heuristic boot/compatibility checks.
 //!
 //! # Milestone status
 //!
-//! - M2–M6 complete: bus + scheduler + dual SH-2 (M2); SCU + SMPC +
-//!   VDP2-minimal + SCU-DSP + SDL2 (M3); BIOS-to-splash, now pixel-
-//!   matching MAME (M4); VDP1 plotter + MC68EC000 + full VDP2 (M5);
-//!   SCSP audio (M6).
-//! - M7 active: the CD-block (HLE) — disc images, buffer/filter engine,
-//!   ISO9660 filesystem, and game boot.
+//! - M1–M12 complete; M13 is a fidelity/feature backlog. Two commercial
+//!   games are fully playable: *Virtua Fighter 2* and *Doukyuusei ~if~*.
+//!   Highlights: HLE CD-block + cartridge (M7), save states + battery
+//!   backup RAM (M8), the in-window OSD (M9), live disc + CDDA (M10),
+//!   commercial-game boot (M11), and the cycle-accuracy push (M12).
 //!
 //! See `doc/roadmap.md` in the repo root for task-by-task state.
 

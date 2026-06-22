@@ -32,8 +32,8 @@ foundation stays solid.
 commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
 3D fights with CD music and sound effects), and ***Doukyuusei ~if~* is fully
 playable** (graphics, sound effects, and voices), including Shuttle Mouse
-support. Games load from disc images (CUE/BIN, ISO,
-CloneCD) or straight from an original disc in a host optical drive; save
+support. Games load from disc images (CUE/BIN, ISO, CloneCD, and compressed
+CHD) or straight from an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
 in-window menu (Esc — save slots, controller rebinding, region/cartridge/BIOS
 switching, all persisted to a config file) are all in place.
@@ -63,6 +63,10 @@ cargo test -p sh2 -- decoder::tests::decodes_branches
 # SDL2 frontend (default-on `sdl2-frontend` feature): opens a window and
 # runs the supplied BIOS. Use --no-default-features for a headless run.
 cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
+
+# Built-in self-diagnostics (no window): exits 0 if all checks pass.
+# Add a BIOS (+ disc) to also run boot/compatibility checks.
+cargo run -p jupiter -- doctor
 ```
 
 ## Controls
