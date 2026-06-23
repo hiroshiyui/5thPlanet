@@ -435,26 +435,30 @@ impl Dbg {
     /// lines (address + cached-vs-memory first bytes) — the smoking gun for the
     /// instruction-cache-staleness hang class.
     fn cache_audit(&mut self) {
-        let lines = self.sat.master().cache.dbg_lines();
-        let total = lines.len();
-        let mut stale = 0u32;
-        for (addr, data) in lines {
-            let mut mem = [0u8; 16];
-            for i in 0..4 {
-                let w = self.sat.bus.read32(addr.wrapping_add(i * 4), AccessKind::Data).0;
-                mem[i as usize * 4..i as usize * 4 + 4].copy_from_slice(&w.to_be_bytes());
-            }
-            if mem != data {
-                stale += 1;
-                if stale <= 24 {
-                    println!(
-                        "STALE @{addr:08X}: cache {:02X?} vs mem {:02X?}",
-                        &data[..8], &mem[..8]
-                    );
+        // Audit BOTH SH-2 caches vs backing memory and print the FULL 16-byte
+        // line for each stale hit — so a partially-stale line (re-fetched
+        // mid-write: some bytes new, some old) is distinguishable from a wholly
+        // stale one (never re-fetched after an overwrite).
+        let master_lines = self.sat.master().cache.dbg_lines();
+        let slave_lines = self.sat.slave().cache.dbg_lines();
+        for (who, lines) in [("MASTER", master_lines), ("SLAVE ", slave_lines)] {
+            let total = lines.len();
+            let mut stale = 0u32;
+            for (addr, data) in lines {
+                let mut mem = [0u8; 16];
+                for i in 0..4 {
+                    let w = self.sat.bus.read32(addr.wrapping_add(i * 4), AccessKind::Data).0;
+                    mem[i as usize * 4..i as usize * 4 + 4].copy_from_slice(&w.to_be_bytes());
+                }
+                if mem != data {
+                    stale += 1;
+                    if stale <= 24 {
+                        println!("{who} STALE @{addr:08X}: cache {data:02X?} vs mem {mem:02X?}");
+                    }
                 }
             }
+            println!("{who} cache audit: {stale} stale of {total} valid lines");
         }
-        println!("cache audit: {stale} stale of {total} valid lines");
     }
 
     /// Live stale-instruction-fetch detector: enable [`Cpu::dbg_detect_stale`]
