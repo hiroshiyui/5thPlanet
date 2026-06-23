@@ -856,6 +856,87 @@ impl Dbg {
         );
     }
 
+    /// Replay an input movie recorded by the jupiter frontend (`SAT_INPUT_REC`)
+    /// — drives an input-gated boot path (FMV skips, dialogs, menus) headlessly
+    /// and deterministically. The file is a `rtc <unix>` header plus
+    /// `<frame> <pad-hex>` lines (one per port-1 pad change, `frame` counting
+    /// emulated frames from reset). We re-seed the recorded RTC, then advance
+    /// frame-by-frame from the current (boot) state applying each change, and
+    /// **drain audio per frame** to match jupiter's cadence exactly (the SCSP
+    /// mixer freezes if `take_audio` isn't drained → divergence over a long
+    /// replay). Runs `extra` frames past the last input, or stops at a master/
+    /// slave breakpoint. Run it as the first command on a freshly started sdbg
+    /// with the SAME bios/disc/region/cart the recording used.
+    fn replay(&mut self, path: &str, extra: u64) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("read failed: {e}");
+                return;
+            }
+        };
+        let mut events: Vec<(u64, u16)> = Vec::new();
+        let mut rtc: Option<u64> = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(r) = line.strip_prefix("rtc ") {
+                rtc = r.trim().parse().ok();
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            if let (Some(fr), Some(m)) = (
+                it.next().and_then(parse_dec),
+                it.next().and_then(parse_num),
+            ) {
+                events.push((fr, m as u16));
+            }
+        }
+        if let Some(r) = rtc {
+            self.sat.set_rtc_unix(r);
+            println!("replay: re-seeded RTC {r}");
+        } else {
+            println!("replay: WARNING no `rtc` header — emulation may diverge from the recording");
+        }
+        let last = events.last().map(|&(f, _)| f).unwrap_or(0);
+        let total = last + extra;
+        println!(
+            "replay: {} pad events, last input @ frame {last}; running {total} frames",
+            events.len()
+        );
+        self.sat.set_master_bps(self.mbps.clone());
+        self.sat.set_slave_bps(self.sbps.clone());
+        self.sat.set_master_bp_probe(self.bp_probe);
+        self.sat.set_slave_bp_probe(self.bp_probe);
+        let mut ev = 0usize;
+        let mut pad = 0u16;
+        for fr in 0..total {
+            while ev < events.len() && events[ev].0 == fr {
+                pad = events[ev].1;
+                ev += 1;
+            }
+            self.sat.set_pad1(pad);
+            self.sat.run_for(CYCLES_PER_FRAME);
+            let _ = self.sat.take_audio(); // match jupiter's per-frame drain
+            if let Some(h) = self.sat.take_master_bp_hit() {
+                self.report_bp_hit("master", fr, &h, true);
+                return;
+            }
+            if let Some(h) = self.sat.take_slave_bp_hit() {
+                self.report_bp_hit("slave", fr, &h, false);
+                return;
+            }
+        }
+        println!(
+            "replay done @ frame {total}; pad={pad:04X}; master @ {} slave @ {} disp={}",
+            self.fmt_addr(self.sat.master().regs.pc),
+            self.fmt_addr(self.sat.slave().regs.pc),
+            self.sat.bus.vdp2.regs.display_enabled(),
+        );
+    }
+
     /// Print a captured SH-2 breakpoint hit: the PC (with symbol label), the
     /// probe value, R0..R15, a code preview, and — for the master — the
     /// best-effort stack call-chain (return-address-shaped stack words). No
@@ -1517,6 +1598,13 @@ impl Dbg {
                     Err(e) => println!("render write failed: {e}"),
                 }
             }
+            // Replay a jupiter input movie (SAT_INPUT_REC) to drive an
+            // input-gated boot path headlessly + deterministically. Run first,
+            // on a fresh sdbg with the same bios/disc/region the recording used.
+            "replay" => match a1 {
+                Some(path) => self.replay(path, a2.and_then(parse_dec).unwrap_or(300)),
+                None => println!("usage: replay <file> [extra-frames-after-last-input=300]"),
+            },
             other => println!("unknown command {other:?}; try `help`"),
         }
         true
@@ -1569,6 +1657,7 @@ sdbg commands:
   pad <mask>      hold port-1 pad buttons (A=400 START=800 B=100; 0=release)
   poke <a> <v> [sz]  write value to a bus address (debug poke)
   render [file]   composite CURRENT VDP state to PPM (no frame advance)
+  replay <f> [n]  replay a jupiter input movie (SAT_INPUT_REC); n frames past last input
   help            this help                                        [alias h ?]
   quit            exit                                             [alias q]"
     );
