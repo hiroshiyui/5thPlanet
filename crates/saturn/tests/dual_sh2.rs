@@ -230,6 +230,27 @@ fn word_write_to_fti_region_pulses_target_frt_input_capture() {
     assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "master ICF set");
 }
 
+/// The FTI pin is wired to the bus, so a write of *any* width triggers it — not
+/// only the 16-bit form. The byte/long paths originally dropped the FTI region
+/// (`_ => {}`), a latent lost-wakeup for a game that pulses via `MOV.B`/`MOV.L`.
+/// Verifies both widths set the target FRT's ICF, same as the word write.
+#[test]
+fn byte_and_long_writes_to_fti_region_also_pulse_input_capture() {
+    use sh2::bus::{AccessKind, Bus};
+
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    sat.reset();
+    sat.bus.write8(0x0100_0000, 0x12, AccessKind::Data); // byte -> slave FTI
+    sat.run_for(512);
+    assert_eq!(sat.slave().onchip.frt.ftcsr & 0x80, 0x80, "byte write set slave ICF");
+
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    sat.reset();
+    sat.bus.write32(0x0180_0000, 0x1234_5678, AccessKind::Data); // long -> master FTI
+    sat.run_for(512);
+    assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "long write set master ICF");
+}
+
 /// Regression guard for the `b65cd18` black-screen bug: a pending SMPC command
 /// must NOT shorten (break) the SH-2 batch to dispatch its side effect early.
 /// b65cd18 added `if smpc.has_pending() { break }` to `step_cpus`; inside

@@ -221,15 +221,14 @@ fn master_fti_write16_sets_master_capture_flag() {
 
 #[test]
 fn fti_regions_are_open_bus_on_read() {
-    // The FTI trigger regions only act on 16-bit writes; reads fall through to
-    // open bus (0). (8/32-bit writes there also do nothing observable.)
+    // The FTI trigger regions are write-only; reads fall through to open bus
+    // (0). Writes of any width pulse the target input-capture line.
     use saturn::bus::{MASTER_FTI_BASE, SLAVE_FTI_BASE};
     let mut bus = fresh();
     assert_eq!(bus.read32(SLAVE_FTI_BASE, AccessKind::Data).0, 0);
     assert_eq!(bus.read32(MASTER_FTI_BASE, AccessKind::Data).0, 0);
-    // An 8-bit write does not trigger the (16-bit-only) capture.
     bus.write8(SLAVE_FTI_BASE, 0xFF, AccessKind::Data);
-    assert!(!bus.slave_input_capture, "only 16-bit writes pulse FTI");
+    assert!(bus.slave_input_capture, "8-bit writes also pulse FTI");
 }
 
 #[test]

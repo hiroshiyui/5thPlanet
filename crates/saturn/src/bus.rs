@@ -704,6 +704,22 @@ impl Bus for SaturnBus {
             SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.ctrl.write8(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write8(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write8(addr - HIGH_WRAM_BASE, val),
+            // Inter-CPU FTI trigger. Hardware wires the cores' input-capture pin
+            // to the bus, so a write of *any* width pulses it — not just the
+            // 16-bit form (`write16`). Mirror that here so a `MOV.B` wake isn't
+            // silently dropped (a latent lost-wakeup).
+            SLAVE_FTI_BASE..=SLAVE_FTI_END => {
+                self.slave_input_capture = true;
+                if ftilog() {
+                    eprintln!("FTI->slave addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                }
+            }
+            MASTER_FTI_BASE..=MASTER_FTI_END => {
+                self.master_input_capture = true;
+                if ftilog() {
+                    eprintln!("FTI->master addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                }
+            }
             _ => {}
         }
         self.charge(addr, 1, true, k)
@@ -776,6 +792,19 @@ impl Bus for SaturnBus {
             SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.ctrl.write32(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write32(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
+            // Inter-CPU FTI trigger — any-width write pulses it (see `write8`).
+            SLAVE_FTI_BASE..=SLAVE_FTI_END => {
+                self.slave_input_capture = true;
+                if ftilog() {
+                    eprintln!("FTI->slave addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                }
+            }
+            MASTER_FTI_BASE..=MASTER_FTI_END => {
+                self.master_input_capture = true;
+                if ftilog() {
+                    eprintln!("FTI->master addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                }
+            }
             _ => {}
         }
         self.charge(addr, 4, true, k)
