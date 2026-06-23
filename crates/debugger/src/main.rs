@@ -1312,6 +1312,26 @@ impl Dbg {
                 self.sat.bus.vdp2.regs.display_enabled(),
                 self.sat.bus.vdp1.is_drawing(),
             ),
+            "fbdump" => {
+                // Render the current VDP state to a PPM (one run_frame; a stable
+                // hang leaves the screen unchanged) + report dims and non-black px.
+                let mut fb = std::mem::take(&mut self.fb);
+                let (w, h) = self.sat.run_frame(&mut fb);
+                self.fb = fb;
+                let px = w * h;
+                let nb = (0..px)
+                    .filter(|&i| (self.fb[i * 4] | self.fb[i * 4 + 1] | self.fb[i * 4 + 2]) != 0)
+                    .count();
+                let path = a1.unwrap_or("tmp/fb.ppm");
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for i in 0..px {
+                    out.extend_from_slice(&self.fb[i * 4..i * 4 + 3]);
+                }
+                match std::fs::write(path, &out) {
+                    Ok(()) => println!("fbdump: {w}x{h}  {nb}/{px} non-black px  -> {path}"),
+                    Err(e) => println!("fbdump write failed: {e}"),
+                }
+            }
             "scsp" => {
                 // a6 = sound-driver work-area base. The driver's command ring
                 // lives at a6+0x1840 (write ptr) / a6+0x1842 (read ptr): the main
