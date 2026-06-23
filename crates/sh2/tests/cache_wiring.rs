@@ -211,3 +211,38 @@ fn instruction_fetch_also_uses_cache() {
     }
     assert_eq!(bus.reads32, after_fill, "subsequent fetches all hit cache");
 }
+
+#[test]
+fn reset_purges_and_disables_the_cache_so_the_core_refetches() {
+    // A reset must drop pre-reset cache lines AND disable the cache (SH7604
+    // CCR.CE=0). Load-bearing for the Saturn slave, which is re-reset via SMPC
+    // SSHON to relocate it (SAN5's FMV->menu transition): without the purge the
+    // rebooted core fetch-hits its stale pre-reset lines and never picks up the
+    // new code. Disabling alone is NOT enough — the lines return when the boot
+    // re-enables the cache, so the reset must invalidate them.
+    let mut cpu;
+    let mut bus;
+    (cpu, bus) = make_cpu(&[0x6212]); // MOV.L @R1,R2
+    cpu.regs.r[1] = 0x4000;
+    bus.inner.write_u32(0x4000, 0x1111_1111);
+    cpu.cache.set_ccr(0x01);
+    cpu.step(&mut bus); // caches the data line = 0x11111111
+    assert_eq!(cpu.regs.r[2], 0x1111_1111);
+
+    // Another bus master overwrites memory directly (bypassing this cache).
+    bus.inner.write_u32(0x4000, 0x2222_2222);
+
+    cpu.reset(&mut bus);
+    assert!(!cpu.cache.enabled(), "reset clears CCR → cache disabled");
+
+    // Re-enable and re-run the load: it must MISS the purged line and read the
+    // fresh value, not the stale 0x11111111 that a disable-only reset leaves.
+    cpu.regs.pc = PC0;
+    cpu.regs.r[1] = 0x4000;
+    cpu.cache.set_ccr(0x01);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs.r[2], 0x2222_2222,
+        "reset purged the stale line; the re-fetch reads current memory"
+    );
+}

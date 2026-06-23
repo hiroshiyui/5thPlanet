@@ -272,6 +272,18 @@ impl Cpu {
         self.pending_branch = None;
         self.in_delay_slot = false;
         self.load_dest_pending = None;
+        // A reset must leave the core fetching *current* code, not its pre-reset
+        // cache. The SH7604 disables the cache on reset (CCR.CE=0) and clears the
+        // address array, so we invalidate the lines and clear CCR. This is
+        // load-bearing on a *re-*reset: the Saturn slave is (re)started via SMPC
+        // SSHON, and SAN5 SSHOFF/SSHON-resets it at the FMV->menu transition to
+        // relocate it to a new dispatch. Without invalidating, the rebooted slave
+        // fetch-hits its stale FMV-dispatch lines once the cache is re-enabled and
+        // never relocates — the blank-menu deadlock. (Disabling alone is NOT
+        // enough; the lines return when the boot re-enables the cache.) Matches
+        // Mednafen's reset leaving the core with a clean cache.
+        self.cache.purge();
+        self.cache.set_ccr(0);
         let (pc, _) = self.mem_read32(0x0000_0000, AccessKind::Data, bus);
         let (sp, _) = self.mem_read32(0x0000_0004, AccessKind::Data, bus);
         self.regs.pc = pc;
