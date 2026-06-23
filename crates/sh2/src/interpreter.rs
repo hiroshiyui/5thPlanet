@@ -53,6 +53,11 @@ const fn is_divu_reg(addr: u32) -> bool {
 /// `OnChip::owns` dispatch swallow it. (*SH7604 Hardware Manual* §8, CCR.)
 const CCR_ADDR: u32 = 0xFFFF_FE92;
 
+/// FRT free-running-timer control/status register (*SH7604 HW Manual* §11). Bit 7
+/// (ICF) is the inter-CPU input-capture flag a sibling SH-2's FTI pulse sets and
+/// the other polls/clears; [`Cpu::dbg_ftcsr`] traces accesses to it.
+const FTCSR_ADDR: u32 = 0xFFFF_FE11;
+
 /// Debug-only tally of `Data` reads whose **physical** address lands in
 /// `[lo, hi)`, bucketed by how the cache treated them. Used to test whether a
 /// shared region (e.g. SCSP sound RAM, written by the 68k) is read by this
@@ -154,6 +159,26 @@ pub struct Cpu {
     /// `(executing_pc, cycle)`. Capped to avoid unbounded growth. Not serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub dbg_regwatch_log: alloc::vec::Vec<(u32, u64)>,
+    /// Debug only: when set, record every byte access to FTCSR ([`FTCSR_ADDR`]) —
+    /// the FRT status reg whose ICF bit carries the inter-CPU FTI done-flag. For
+    /// hunting where the master detects/clears the slave's "decode done" pulse
+    /// (the FILM-player ping-pong re-arm). Off by default; not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_ftcsr: bool,
+    /// Debug only: FTCSR byte accesses captured while [`Self::dbg_ftcsr`], as
+    /// `(pc, value, is_write, cycle)` (pc is the post-fetch PC, ≈ access instr
+    /// + 2). Capped to avoid unbounded growth. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_ftcsr_log: alloc::vec::Vec<(u32, u8, bool, u64)>,
+    /// Debug only: when >0, push the executing PC into [`Self::dbg_pc_log`] each
+    /// step and decrement. Armed (once) by the first FTCSR *write* while
+    /// [`Self::dbg_ftcsr`] — captures the path right after the master clears the
+    /// inter-CPU done-flag (the streaming round-2 decision). Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_pc_capture: usize,
+    /// Debug only: PCs captured under [`Self::dbg_pc_capture`]. Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_pc_log: alloc::vec::Vec<u32>,
     /// Pre-decoded instruction table: `decode(w)` for every 16-bit word `w`.
     /// Turns the per-instruction decode (a match + operand-field extraction +
     /// `Op` construction, ~7% of run time) into one indexed load. Pure function
@@ -201,6 +226,10 @@ impl Cpu {
             dbg_regwatch_after: 0,
             dbg_regwatch_armed: false,
             dbg_regwatch_log: alloc::vec::Vec::new(),
+            dbg_ftcsr: false,
+            dbg_ftcsr_log: alloc::vec::Vec::new(),
+            dbg_pc_capture: 0,
+            dbg_pc_log: alloc::vec::Vec::new(),
             decode_lut: build_decode_lut(),
         }
     }
@@ -289,6 +318,10 @@ impl Cpu {
         // value within the cycle window, log the executing PC. Off-path when
         // disabled (one `is_some` check); `instr_pc` is captured only when armed.
         let instr_pc = if self.dbg_regwatch.is_some() { self.regs.pc } else { 0 };
+        if self.dbg_pc_capture > 0 {
+            self.dbg_pc_log.push(self.regs.pc);
+            self.dbg_pc_capture -= 1;
+        }
         let cost = self.step_instruction(bus);
         if let Some((idx, val)) = self.dbg_regwatch
             && self.pipeline.cycles >= self.dbg_regwatch_after
@@ -1335,6 +1368,9 @@ impl Cpu {
             self.timer_sync_pre(addr);
             let v = self.onchip.read8(addr);
             self.timer_sync_post(addr);
+            if self.dbg_ftcsr && addr == FTCSR_ADDR && self.dbg_ftcsr_log.len() < 16384 {
+                self.dbg_ftcsr_log.push((self.regs.pc, v, false, self.pipeline.cycles));
+            }
             return (v, stall);
         }
         if is_assoc_purge(addr) {
@@ -1498,6 +1534,17 @@ impl Cpu {
             self.onchip.refresh_interrupts();
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
+            }
+            if self.dbg_ftcsr && addr == FTCSR_ADDR {
+                if self.dbg_ftcsr_log.len() < 16384 {
+                    self.dbg_ftcsr_log.push((self.regs.pc, val, true, self.pipeline.cycles));
+                }
+                // Arm the post-clear PC trace once: the first FTCSR write is the
+                // master ack/clear of the slave's round-1 done — capture what it
+                // does next (the round-2 streaming decision).
+                if self.dbg_pc_log.is_empty() {
+                    self.dbg_pc_capture = 4000;
+                }
             }
             return 0;
         }

@@ -1270,6 +1270,38 @@ impl Dbg {
                     println!("  pc={} cyc={cyc}", self.fmt_addr(*pc));
                 }
             }
+            "ftcsr" => {
+                // Trace master FTCSR (FRT status; bit7 ICF = inter-CPU FTI flag)
+                // byte accesses — to see where/when the master polls & clears the
+                // slave's "done" pulse. `ftcsrdump` to print + drain.
+                let m = self.sat.master_mut();
+                m.dbg_ftcsr = true;
+                m.dbg_ftcsr_log.clear();
+                println!("master FTCSR-access trace armed");
+            }
+            "ftcsrdump" => {
+                let log = core::mem::take(&mut self.sat.master_mut().dbg_ftcsr_log);
+                println!("FTCSR: {} byte access(es) [pc ~= access instr + 2]:", log.len());
+                for (pc, val, is_w, cyc) in &log {
+                    let icf = if val & 0x80 != 0 { "ICF=1" } else { "ICF=0" };
+                    println!(
+                        "  {} FTCSR={val:02X} {icf} pc={} cyc={cyc}",
+                        if *is_w { "WR" } else { "RD" },
+                        self.fmt_addr(*pc)
+                    );
+                }
+            }
+            "pctail" => {
+                // Raw post-clear PC trace (armed by the first FTCSR write under
+                // `ftcsr`): the master's path right after acking the slave's
+                // round-1 done — the streaming round-2 decision. One PC per line.
+                let log = core::mem::take(&mut self.sat.master_mut().dbg_pc_log);
+                let n = a1.and_then(parse_dec).map(|v| v as usize).unwrap_or(log.len());
+                println!("post-clear PC trace: {} PCs (showing {})", log.len(), n.min(log.len()));
+                for pc in log.iter().take(n) {
+                    println!("{pc:08X}");
+                }
+            }
             "cache" => self.dump_cache(),
             "caudit" => self.cache_audit(),
             "stale" => self.detect_stale(a1.and_then(parse_dec).unwrap_or(2000)),
@@ -1443,6 +1475,7 @@ sdbg commands:
   cd              CD-block state (status/hirq/curfad/partitions)
   cdlog [n]       last n CD host commands
   hirqlog [n]     last n HIRQ-edge changes (old->new +set -clr, cause) [CD-timing]
+  ftcsr           arm master FTCSR (FRT status/ICF) byte-access trace; ftcsrdump prints+drains
   vdp             VDP display state
   scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)
