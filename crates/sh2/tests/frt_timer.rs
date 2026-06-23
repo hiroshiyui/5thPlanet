@@ -109,10 +109,13 @@ fn cclra_single_large_delta_does_not_skip_the_match() {
 
 #[test]
 fn ftcsr_write_zero_clears_an_individual_flag_and_keeps_the_others() {
-    // Status flags are write-0-to-clear (after read-1), not W1C. Writing a
-    // byte with OCFA=1 (kept) and OCFB=0 (cleared) leaves only OCFA.
+    // Status flags are write-0-to-clear *after a read-1*, not W1C: a flag only
+    // clears if it was read as 1 since the last clear (SH7604 FTCSR latch,
+    // modeled by `ftcsr_read_ones`). Read FTCSR first to latch all four, then
+    // write a byte with OCFA=1 (kept) and OCFB=0 (cleared) leaving only OCFA.
     let mut o = OnChip::new();
     o.frt.ftcsr = 0b1000_1110; // ICF | OCFA | OCFB | OVF all set
+    let _ = o.read8(FTCSR); // read-1 latches the status bits for the clear
     // Write 1 to ICF and OCFA, 0 to OCFB and OVF.
     o.write8(FTCSR, 0b1000_1000);
     assert_eq!(
@@ -156,7 +159,9 @@ fn overflow_arms_the_ovi_interrupt_only_when_tier_ovie_set() {
         Some((InterruptSource::FrtOvi, 7)),
         "OVI armed at the IPRB priority"
     );
-    // Clearing OVF (FTCSR write-0) drops the request next refresh.
+    // Clearing OVF drops the request next refresh — but only after a read-1
+    // (SH7604 FTCSR latch): read FTCSR to latch the flags, then write 0.
+    let _ = o.read8(0xFFFF_FE11);
     o.write8(0xFFFF_FE11, 0x00);
     o.refresh_interrupts();
     assert_eq!(o.intc.next_pending(0), None, "OVF cleared → request dropped");
