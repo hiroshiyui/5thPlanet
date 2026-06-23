@@ -16,8 +16,9 @@ gap**, not a bad dump or a game that needs a quirk flag. Both pass authenticatio
 and run real game code, then **stall in the CD-driven Sega FILM/Cinepak movie
 player** (PDZ's intro movie; SAN5's KOEI-logo FMV) — a shared fragile subsystem,
 though by different proximate mechanisms (PDZ = the CD read pump freezes mid-Play
-with status stuck at `PLAY`; SAN5 = the master stalls between movie chunks on a
-timing-dependent gate). The FILM-player ↔ CD/timing interaction is the common
+with status stuck at `PLAY`; SAN5 = the master fills one FILM ring then never
+re-enters the consume loop — a producer/consumer pacing lock, now fully diagnosed
+and savestate-validated). The FILM-player ↔ CD/timing interaction is the common
 suspect.
 
 **Crucially, no fully-working title exercises the Cinepak FILM player, so it is
@@ -110,8 +111,11 @@ mode-bit mapping / reset defaults / connector chain.
 
 ## Sangokushi V (SAN5 / 三國志V, KOEI, serial T-7623G) — OPEN
 
-- **Status:** open (investigated 2026-06-22). Localized to a **timing-dependent
-  control-flow divergence** in the master's main loop; exact root not yet found.
+- **Status:** **diagnosis COMPLETE + savestate-validated (2026-06-23); the FIX is the
+  open hard part.** Root = FILM **producer/consumer pacing**: ours fills one ring (177
+  sectors) before running the consume loop, which then locks; Mednafen interleaves
+  fill+consume and streams. The earlier "timing-dependent control-flow divergence"
+  (2026-06-22) was correct and is now fully resolved to the pacing mechanism below.
 - **Image:** `roms/SANGOKUSHI_V.cue` (redumper multi-`FILE` CUE-BIN; the disc is
   fine — the cdrdao→redumper re-dump changed nothing). **JP BIOS v1.01.**
 
@@ -202,6 +206,36 @@ Fully deterministic (same PC/cycle each run).
   that limit's origin (and the timing value it derives from — the CD reads are
   byte-identical to Mednafen up to here) is the final layer.
 
+- **★★★ RESOLVED to root (2026-06-23): producer/consumer PACING — savestate-validated.**
+  The 362496 clamp above is `limit = ring_size(364544) + mem[0x0601AF54] − used` (read fn
+  `060E89CE`), then `read = min(full_movie, limit)`. **`mem[0x0601AF54]` ("+88") is the single
+  divergent field — 0 in ours, large (≈ movie size) in Mednafen.** With +88=0 the limit is
+  just ring-free, so the read clamps to one ring (177). It traces to an ordering divergence:
+  - **Two-sided trace proof.** The FILM streaming/**consume loop** is the ring-manager
+    `060E900A`–`060E918C` (advances read-ptr `@0x0601AF60`, grows +88, re-issues Play).
+    mednaref `SS_PCTRACE` (`tmp/med_ring.txt`): **Mednafen runs it (`060E900A` 39×,
+    `060E918C` 2×); ours runs it 0×.** Mednafen consumes/streams; ours never enters the loop.
+  - **Mechanism (ORDERING).** Ours' master runs **job-1 (CD fill, verified paced 2×) to read
+    the whole 177-sector range FIRST** (~77 frames in the `060178xx` SCDQ-poll loop) **before**
+    the consume gate `060E8FE6` (which needs `used<8`). By then `used`=FULL → the gate skips
+    forever → no consume → +88 stays 0 → no further reads → starved FMV (first `060E8FE6` runs
+    at frame ~1065, `used` already FULL). Mednafen's whole-movie read (803) **overflows** the
+    ~178-sector ring, *forcing* the consume to **interleave** with the fill → it streams.
+    **Fill-then-check (ours) vs interleave fill-and-consume (Mednafen)** = the m13
+    cycle-accuracy / producer-consumer pacing class — exactly the clock-steadiness / 2×-CD-speed
+    intuition.
+  - **★ Validated on the user's REAL interactive hang.** A jupiter savestate of the hang, loaded
+    in sdbg (`load`), confirms every predicted field: `mem[0x0601AF54]`=**0**, ring `used`=FULL
+    (`0x59000`), **read-ptr stuck at base (0% drained)**, CD `curfad`=5411=5234+**177** (the
+    clamp), status PAUSE + **PEND**, `free_blocks`=200 (CD HW buffer drained), slave parked at
+    `060E4E08`, FMV state `=2`. (It's the *terminal* state, past the read decision, so it can't
+    test a +88 fix directly — a *pre-decision* snapshot is the harness.)
+  - **Tooling note.** Mednafen `SS_WWATCH` (per-write hook) drops headless Mednafen to <1 fps and
+    **cannot reach the FILM init (frame ~985) even in 880s**, so the precise +88-writer code
+    stayed unpinned — but it's unnecessary (the consume-loop asymmetry proves it). *Ymir*
+    (StrikerX3, GPL-3.0) has a GUI watchpoint debugger that could read it in one session — a
+    user-driven 4th oracle (`ymiref/`, observe-only per ADR-0017).
+
 ### Ruled out (with evidence)
 | Hypothesis | Verdict / evidence |
 |---|---|
@@ -212,6 +246,8 @@ Fully deterministic (same PC/cycle each run).
 | FRT interrupts | **No** — TIER ICIE=0 on both cores. |
 | VDP1 draw-end | **No** — VDP1 `drawing=false` at the hang. |
 | Broken FTI handshake | **No** — round 1 is fully correct (above). |
+| Missing/wrong CD 2× speed-limiter | **No** — `sector_cyc(cd_speed)` paces reads; measured `curfad` advances 2.4–2.6 sectors/frame = **2×**, gradual (not bursty). The CD *rate* is correct; the divergence is fill/consume **ordering**, not speed. |
+| CD-block buffer over/under-flow | **No** — at the hang the 200-block HW buffer is fully drained (`free_blocks`=200); the *game's* software ring (`0x0601F078`) is what fills. |
 | Wrong scene variable | **No** — `SS_MEMDUMP` of the command mailbox (`060ED5F0..060ED650`) is **byte-identical** between ours (stuck) and Mednafen FULL (progressed to the logo). The init state matches; only the *execution path* diverges. |
 
 Mednafen plays SAN5 in **both** its cache modes (`-ss.dbg_cem` default *and*
@@ -229,13 +265,13 @@ Mednafen plays SAN5 in **both** its cache modes (`-ss.dbg_cem` default *and*
   each inter-CPU FTI pulse — commit `f1fc8c7`.
 - `SAT_SLOW_FETCH=N` headless timing-probe knob — commit `d257a22`.
 
-### Next phase (sustained, separate effort)
-Find the control-flow divergence: (a) make the **PC-stream tdiff vs Mednafen
-`SS_PCTRACE` work** — the blocker is the loop-collapse + delay-slot/`+4`
-alignment of `run_for_traced`'s trace, not the bug; a clean diff yields the first
-divergent master PC directly. Or (b) keep tracing `060E4672` → … with `pctrace`
-register capture to the conditional branch and what it reads. Or (c) extend the
-cross-emulator **signal scope** (`Scsp::enable_scope`, today SCSP-only) to sample
-the master's branch input on both emulators and overlay. The fix (matching the
-underlying master/peripheral rate the branch depends on) is itself a hard
-cycle-accuracy problem — see [`roadmap.md`](roadmap.md) M12/M13.
+### Next phase (the FIX — sustained, separate effort)
+Diagnosis is complete; the open work is the **pacing fix**: make ours' master run the consume
+(`060E900A`/`060E918C`) *during* the fill so `used`<8 when the gate `060E8FE6` checks — i.e.
+match Mednafen's fill/consume interleaving (equivalently, take the whole-movie read that
+overflows the ring). The lever is the master's loop pacing — *when* it yields from job-1
+(`060178xx` CD-fill) to the FMV state machine; pin the exact timing quantity it keys on and
+align it to the reference. **Test harness:** a **pre-decision** savestate (run to ~frame 985,
+save) — the terminal-hang savestate is past the read decision so it can't validate a +88 fix
+directly. This is the hard cycle-accuracy class — see [`roadmap.md`](roadmap.md) M12/M13 and
+the `m13-cycle-accuracy` / `threading-performance-model` memories.
