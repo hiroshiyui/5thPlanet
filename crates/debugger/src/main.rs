@@ -1675,6 +1675,22 @@ fn load_disc(cue_path: &Path) -> Option<Disc> {
     }
 }
 
+/// Build a cartridge from a `--cart` spec, mirroring the jupiter frontend so a
+/// recorded input movie replays against the same machine config (the SAN5 menu
+/// reads a backup-RAM cart in its storage check).
+fn parse_cart(spec: &str) -> Option<saturn::cartridge::Cartridge> {
+    use saturn::cartridge::Cartridge;
+    match spec {
+        "ram1m" => Some(Cartridge::ext_ram_1mb()),
+        "ram4m" => Some(Cartridge::ext_ram_4mb()),
+        "bram" | "bram32" => Some(Cartridge::backup_ram(0x0040_0000)),
+        "bram4" => Some(Cartridge::backup_ram(0x0008_0000)),
+        "bram8" => Some(Cartridge::backup_ram(0x0010_0000)),
+        "bram16" => Some(Cartridge::backup_ram(0x0020_0000)),
+        _ => None,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut bios_path = None;
@@ -1682,6 +1698,7 @@ fn main() {
     let mut region = saturn::smpc::region::JAPAN;
     let mut rtc: u64 = 1_700_000_000;
     let mut syms_path: Option<String> = None;
+    let mut cart_spec: Option<String> = None;
     for a in &args {
         if let Some(r) = a.strip_prefix("--region=") {
             region = match r {
@@ -1693,6 +1710,8 @@ fn main() {
             rtc = t.parse().unwrap_or(rtc);
         } else if let Some(t) = a.strip_prefix("--syms=") {
             syms_path = Some(t.to_string());
+        } else if let Some(c) = a.strip_prefix("--cart=") {
+            cart_spec = Some(c.to_string());
         } else if bios_path.is_none() {
             bios_path = Some(a.clone());
         } else if disc_path.is_none() {
@@ -1701,7 +1720,7 @@ fn main() {
     }
     let Some(bios_path) = bios_path else {
         eprintln!(
-            "usage: sdbg <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>] [--syms=<file>]"
+            "usage: sdbg <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>] [--syms=<file>] [--cart=bram|ram4m|...]"
         );
         std::process::exit(2);
     };
@@ -1716,6 +1735,18 @@ fn main() {
     sat.reset();
     sat.set_region(region);
     sat.set_rtc_unix(rtc);
+    // Plug in a cartridge if requested — matches the frontend's `--cart`/config
+    // so a movie recorded with a backup-RAM cart (the SAN5 menu's storage check
+    // reads it) replays against the same machine. Determinism depends on this.
+    if let Some(spec) = &cart_spec {
+        match parse_cart(spec) {
+            Some(cart) => {
+                sat.insert_cartridge(cart);
+                println!("cartridge inserted: {spec}");
+            }
+            None => eprintln!("unknown --cart spec '{spec}' (bram|bram4|bram8|bram16|ram1m|ram4m)"),
+        }
+    }
     // Battery file next to the BIOS, if present (matches the frontend/tests).
     if let Ok(bup) = std::fs::read(format!("{bios_path}.bup")) {
         sat.load_internal_backup(&bup);
