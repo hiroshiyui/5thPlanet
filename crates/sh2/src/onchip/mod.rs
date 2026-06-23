@@ -553,6 +553,7 @@ mod tests {
         );
         // SH7604 FRT: software clears OCFA by writing 0 to it (after reading 1),
         // not W1C; the pending bit drops next refresh.
+        assert_eq!(o.read8(0xFFFF_FE11) & 0x08, 0x08, "OCFA observed before clear");
         o.write8(0xFFFF_FE11, 0x00); // FTCSR: write 0 to the status flags → clear
         o.refresh_interrupts();
         assert_eq!(o.intc.next_pending(0), None, "cleared after write-0");

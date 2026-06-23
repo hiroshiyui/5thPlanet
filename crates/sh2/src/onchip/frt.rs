@@ -34,9 +34,16 @@ pub struct Frt {
     pub tcr: u8,
     pub tocr: u8,
     pub ficr: u16,
+    /// SH7604 status flags clear only when software writes 0 after reading that
+    /// same flag as 1. Do not serialize: it is only a tiny read/modify/write
+    /// latch, and older save states must keep decoding with the same layout.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    ftcsr_read_ones: u8,
 }
 
 impl Frt {
+    const FTCSR_STATUS: u8 = 0b1000_1110; // ICF|OCFA|OCFB|OVF
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -94,10 +101,13 @@ impl Frt {
         self.tier & 0x80 != 0
     }
 
-    pub fn read8(&self, offset: u32) -> u8 {
+    pub fn read8(&mut self, offset: u32) -> u8 {
         match offset & 0x0F {
             0x00 => self.tier,
-            0x01 => self.ftcsr,
+            0x01 => {
+                self.ftcsr_read_ones |= self.ftcsr & Self::FTCSR_STATUS;
+                self.ftcsr
+            }
             0x02 => (self.frc >> 8) as u8,
             0x03 => self.frc as u8,
             0x04 => (self.ocr_active() >> 8) as u8,
@@ -116,10 +126,9 @@ impl Frt {
             0x01 => {
                 // SH7604 FRT FTCSR status flags (ICF bit7, OCFA bit3, OCFB bit2,
                 // OVF bit1) are **write-0-to-clear after a read-1**, NOT W1C: the
-                // hardware clears a flag when software writes 0 to it after
-                // having read it as 1. Model the common, sufficient form
-                // (write-0-clears: `new = old & written` for the status bits) —
-                // a flag is kept when 1 is written, cleared when 0 is written.
+                // hardware clears a flag when software writes 0 to it only after
+                // having read that same flag as 1. A flag set by an FTI edge after
+                // the read but before this write must survive the write.
                 // CCLRA (bit 0) is an ordinary read/write control bit.
                 //
                 // The previous W1C was wrong and load-bearing: software (e.g. the
@@ -128,8 +137,9 @@ impl Frt {
                 // stayed stuck set and an ICF-polling wait loop never actually
                 // waited — it spun through, reading shared state at the wrong
                 // time (the Doukyuusei intro slave crash).
-                const STATUS: u8 = 0b1000_1110; // ICF|OCFA|OCFB|OVF
-                self.ftcsr = (self.ftcsr & val & STATUS) | (val & 0x01);
+                let clear = (!val) & self.ftcsr_read_ones & Self::FTCSR_STATUS;
+                self.ftcsr = (self.ftcsr & Self::FTCSR_STATUS & !clear) | (val & 0x01);
+                self.ftcsr_read_ones &= self.ftcsr & Self::FTCSR_STATUS;
             }
             0x02 => self.frc = ((val as u16) << 8) | (self.frc & 0x00FF),
             0x03 => self.frc = (self.frc & 0xFF00) | val as u16,
@@ -141,7 +151,7 @@ impl Frt {
         }
     }
 
-    pub fn read16(&self, offset: u32) -> u16 {
+    pub fn read16(&mut self, offset: u32) -> u16 {
         let hi = self.read8(offset) as u16;
         let lo = self.read8(offset + 1) as u16;
         (hi << 8) | lo
@@ -227,18 +237,33 @@ mod tests {
     }
 
     #[test]
-    fn write_zero_clears_status_flags_write_one_keeps() {
+    fn write_zero_clears_only_status_flags_previously_read_as_one() {
         // SH7604 FRT FTCSR: status flags (ICF/OCFA/OCFB/OVF) are cleared by
         // writing 0 after reading 1 — NOT W1C. Writing 1 keeps the flag.
         let mut f = Frt::new();
         f.ftcsr = 0x0E; // OCFA | OCFB | OVF set
+        assert_eq!(f.read8(0x01), 0x0E);
         f.write8(0x01, 0x01); // status bits = 0 → clear all; CCLRA (bit 0) = 1
         assert_eq!(f.ftcsr, 0x01, "write-0 clears the status flags; CCLRA set");
 
         // Writing 1 to a status flag does NOT clear it (cannot set either).
         f.ftcsr = 0x0E;
+        assert_eq!(f.read8(0x01), 0x0E);
         f.write8(0x01, 0x0E); // status bits = 1 → kept
         assert_eq!(f.ftcsr, 0x0E, "write-1 keeps the status flags (not W1C)");
+
+        // A flag raised after a read that did not observe that flag must not be
+        // lost by the write half of a read/modify/write status clear.
+        let mut g = Frt::new();
+        g.ftcsr = 0x0E; // no ICF yet
+        assert_eq!(g.read8(0x01), 0x0E);
+        g.input_capture();
+        g.write8(0x01, 0x00);
+        assert_eq!(
+            g.ftcsr & 0x80,
+            0x80,
+            "new ICF pulse survives a zero write when ICF was not read as one"
+        );
     }
 
     #[test]
