@@ -1455,6 +1455,68 @@ impl Dbg {
                 },
                 None => println!("usage: load <file>"),
             },
+            // Inject a port-1 digital-pad state (held until changed), so an
+            // input-gated boot path (dialogs, title "PRESS START") can be
+            // driven headlessly. A button is a *tap*: `pad 400` (press A),
+            // run a few frames, `pad 0` (release). Bits: A=400 B=100 C=200
+            // START=800 UP=1000 DOWN=2000 LEFT=4000 RIGHT=8000 (saturn::smpc::pad).
+            "pad" => match a1.and_then(parse_num) {
+                Some(mask) => {
+                    self.sat.set_pad1(mask as u16);
+                    println!("pad1 = {:04X}", mask as u16);
+                }
+                None => println!(
+                    "usage: pad <mask-hex>  (A=400 B=100 C=200 START=800 UP=1000 DOWN=2000 LEFT=4000 RIGHT=8000; 0=release)"
+                ),
+            },
+            // Write a value to a bus address (debug poke) — e.g. to neutralize a
+            // VDP2 register and re-`render` it, isolating a render bug from the
+            // CPU state that produced it. Goes through the same bus path as a CPU
+            // store (AccessKind::Data).
+            "poke" => match (a1.and_then(|t| self.resolve(t)), a2.and_then(parse_num)) {
+                (Some(addr), Some(val)) => {
+                    let sz = a3.and_then(parse_num).unwrap_or(2) as u8;
+                    match sz {
+                        1 => {
+                            self.sat.bus.write8(addr, val as u8, AccessKind::Data);
+                        }
+                        4 => {
+                            self.sat.bus.write32(addr, val, AccessKind::Data);
+                        }
+                        _ => {
+                            self.sat.bus.write16(addr, val as u16, AccessKind::Data);
+                        }
+                    }
+                    println!("poke {addr:08X} = {val:08X} ({sz}B)");
+                }
+                _ => println!("usage: poke <addr|sym> <val-hex> [size=1|2|4]"),
+            },
+            // Composite the CURRENT VDP state to a PPM WITHOUT advancing the
+            // machine (unlike `fbdump`, which runs a frame first). Lets a `poke`
+            // to a VDP register be seen in isolation — a frame of CPU execution
+            // can't overwrite it before the render. Read-only.
+            "render" => {
+                let mut fb = std::mem::take(&mut self.fb);
+                let (w, h) = saturn::vdp2::render_frame(
+                    &self.sat.bus.vdp2,
+                    Some(self.sat.bus.vdp1.display_fb()),
+                    &mut fb,
+                );
+                self.fb = fb;
+                let px = w * h;
+                let nb = (0..px)
+                    .filter(|&i| (self.fb[i * 4] | self.fb[i * 4 + 1] | self.fb[i * 4 + 2]) != 0)
+                    .count();
+                let path = a1.unwrap_or("tmp/fb.ppm");
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for i in 0..px {
+                    out.extend_from_slice(&self.fb[i * 4..i * 4 + 3]);
+                }
+                match std::fs::write(path, &out) {
+                    Ok(()) => println!("render: {w}x{h}  {nb}/{px} non-black px  -> {path}"),
+                    Err(e) => println!("render write failed: {e}"),
+                }
+            }
             other => println!("unknown command {other:?}; try `help`"),
         }
         true
@@ -1504,6 +1566,9 @@ sdbg commands:
   scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)
   load <file>     restore a save state (rewind; re-enables cdlog)
+  pad <mask>      hold port-1 pad buttons (A=400 START=800 B=100; 0=release)
+  poke <a> <v> [sz]  write value to a bus address (debug poke)
+  render [file]   composite CURRENT VDP state to PPM (no frame advance)
   help            this help                                        [alias h ?]
   quit            exit                                             [alias q]"
     );
