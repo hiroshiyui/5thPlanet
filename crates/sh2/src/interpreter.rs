@@ -272,16 +272,6 @@ impl Cpu {
         self.pending_branch = None;
         self.in_delay_slot = false;
         self.load_dest_pending = None;
-        // A reset disables the cache: CCR <- 0 (SH7604 hardware manual section 8;
-        // Mednafen `SH7095::Reset` does `SetCCR(0)` on every reset, power-on or
-        // manual). This matters for a *manual* reset of a CPU whose cache holds
-        // lines: SMPC `SSHON` re-resets the slave to restart it after a code
-        // overlay swap, and the slave must NOT keep hitting its now-stale
-        // pre-reset lines — with the cache disabled it re-fetches fresh, and its
-        // re-init re-enables the cache (with a CP purge). The lines are retained,
-        // like the hardware's manual reset; a power-on starts from an empty
-        // `Cache::new` (CCR already 0), so this is a no-op there and golden-safe.
-        self.cache.set_ccr(0);
         let (pc, _) = self.mem_read32(0x0000_0000, AccessKind::Data, bus);
         let (sp, _) = self.mem_read32(0x0000_0004, AccessKind::Data, bus);
         self.regs.pc = pc;

@@ -211,27 +211,3 @@ fn instruction_fetch_also_uses_cache() {
     }
     assert_eq!(bus.reads32, after_fill, "subsequent fetches all hit cache");
 }
-
-#[test]
-fn reset_disables_the_cache_for_stale_line_coherency() {
-    // Regression for the Sangokushi V blank-menu fix. SMPC `SSHON` re-resets the
-    // slave to restart it after a code-overlay swap; a reset must set CCR=0
-    // (SH7604 hardware manual section 8 / Mednafen `SetCCR(0)`) so the reset CPU
-    // does NOT keep hitting its now-stale pre-reset I-cache lines — with the
-    // cache disabled it re-fetches fresh from external memory.
-    let mut cpu;
-    let mut bus;
-    (cpu, bus) = make_cpu(&[0x6212]); // MOV.L @R1,R2
-    cpu.regs.r[1] = 0x4000;
-    bus.inner.write_u32(0x4000, 0x1111_1111);
-    cpu.cache.set_ccr(0x01);
-    cpu.step(&mut bus); // miss-fill: 0x4000 now resident = 0x11111111
-    assert_eq!(cpu.regs.r[2], 0x1111_1111);
-    assert_eq!(cpu.cache.ccr() & 0x01, 0x01, "cache enabled before reset");
-
-    // Another bus master overwrites the cached location directly.
-    bus.inner.write_u32(0x4000, 0x2222_2222);
-
-    cpu.reset(&mut bus);
-    assert_eq!(cpu.cache.ccr() & 0x01, 0, "reset disables the cache (CCR=0)");
-}
