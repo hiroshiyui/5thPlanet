@@ -284,15 +284,31 @@ fn scu_transfer(
     cost: &mut u64,
 ) -> (u32, u32) {
     let mut src_shift = ((src & 2) >> 1) ^ 1;
+    // A 32-bit source read feeds two 16-bit bus writes; side-effecting sources
+    // like the CD data port must not be re-read for the low half.
+    let mut src_word: Option<(u32, u32)> = None;
     let mut i = 0u32;
     while i < bytes {
-        let (word, sr) = bus.read32(src & 0x07FF_FFFC, AccessKind::Dma);
+        let src_addr = src & 0x07FF_FFFC;
+        let word = match src_word {
+            Some((addr, word)) if addr == src_addr => word,
+            _ => {
+                let (word, sr) = bus.read32(src_addr, AccessKind::Dma);
+                *cost += sr as u64;
+                src_word = Some((src_addr, word));
+                word
+            }
+        };
         let half = (word >> (src_shift * 16)) as u16;
         let sw = bus.write16(dst & 0x07FF_FFFE, half, AccessKind::Dma);
-        *cost += (sr + sw) as u64;
+        *cost += sw as u64;
+        let consumed_low_half = src_shift == 0;
         src_shift ^= 1;
         if src_shift != 0 {
             src = src.wrapping_add(src_add);
+        }
+        if consumed_low_half {
+            src_word = None;
         }
         // Work RAM H (0x0600_0000) forces a fixed 2-byte destination step.
         let step = if dst & 0x0700_0000 == 0x0600_0000 {
@@ -1806,7 +1822,7 @@ impl Saturn {
 mod tests {
     use super::{
         CYCLES_PER_FRAME, CYCLES_PER_LINE, LINES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count,
-        hblank_active, intback_busy_us, scu_dma_bus, scu_dma_illegal, us_to_cycles,
+        drain_dma, hblank_active, intback_busy_us, scu_dma_bus, scu_dma_illegal, us_to_cycles,
     };
 
     #[test]
@@ -1863,6 +1879,37 @@ mod tests {
         // model treats it as ordinary RAM and must not skip the transfer.
         assert!(!scu_dma_illegal(0x0020_0000, 0x0600_0000)); // LWRAM → HWRAM
         assert!(!scu_dma_illegal(0x0020_0000, 0x0020_1000)); // LWRAM → LWRAM
+    }
+
+    #[test]
+    fn scu_dma_from_cd_data_port_preserves_longword_halves() {
+        fn cd_cmd(cd: &mut crate::CdBlock, cr1: u16, cr2: u16, cr3: u16, cr4: u16) {
+            cd.write16(0x0018, cr1);
+            cd.write16(0x001C, cr2);
+            cd.write16(0x0020, cr3);
+            cd.write16(0x0024, cr4);
+        }
+
+        let mut sat = Saturn::with_blank_bios();
+        let mut img = vec![0u8; 2048 * 2];
+        img[0..8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78]);
+        sat.insert_disc(crate::disc::Disc::from_iso(img));
+
+        let cd = &mut sat.bus.cd_block;
+        cd_cmd(cd, 0x3000, 0x0000, 0x0000, 0x0000); // drive -> filter/partition 0
+        cd_cmd(cd, 0x1080, 150, 0x0080, 0x0001); // Play one sector from FAD 150.
+        cd.tick(12_000_000);
+        cd_cmd(cd, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data.
+
+        sat.bus.scu.write32(0x00, 0x0581_8000); // D0R: fixed CD data port.
+        sat.bus.scu.write32(0x04, 0x0600_1000); // D0W: HWRAM destination.
+        sat.bus.scu.write32(0x08, 0x0000_0004); // D0C: one longword.
+        sat.bus.scu.write32(0x0C, 0x0000_0001); // D0AD: fixed source, +2 dest.
+        sat.bus.scu.write32(0x14, 0x0000_0007); // D0MD: manual start factor.
+        sat.bus.scu.write32(0x10, 1 << 8); // D0EN: DGO.
+        let _ = drain_dma(&mut sat.bus);
+
+        assert_eq!(sat.bus.high_wram.read32(0x1000), 0xDEAD_BEEF);
     }
 
     #[test]
