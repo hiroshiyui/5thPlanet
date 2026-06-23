@@ -3332,6 +3332,8 @@ fn menu_savestate_probe() {
         .unwrap_or(0x01_1798);
     let seq_reg: usize = std::env::var("SEQ_REG").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let start_at: u32 = std::env::var("START_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let start_period: Option<u32> = std::env::var("START_PERIOD").ok().and_then(|s| s.parse().ok());
+    let start_len: u32 = std::env::var("START_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
     let probe_frames: u32 =
         std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(340);
     sat.enable_seqlog(seq_pc, seq_reg);
@@ -3408,7 +3410,15 @@ fn menu_savestate_probe() {
     let mut vdp1_last = (0u32, 0u32, 0u32); // last frame's counts
     let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
     for f in 0..probe_frames {
-        let held = if f >= start_at && f < start_at + 6 { 0x0800u16 } else { 0 };
+        let held = if f >= start_at {
+            match start_period {
+                Some(period) if period > 0 && (f - start_at) % period < start_len => 0x0800u16,
+                None if f < start_at + start_len => 0x0800u16,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         sat.set_pad1(held);
         if dump_vdp {
             // run_frame to drive the full VDP1 plot + VDP2 composite path
