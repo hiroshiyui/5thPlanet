@@ -749,6 +749,21 @@ fn cram_cc(vdp2: &Vdp2, index: usize) -> ((u8, u8, u8), bool) {
     )
 }
 
+/// Decode a VDP2 16M-colour direct RGB dot. The 32-bit storage convention
+/// matches RGB888 CRAM entries: `0xT0BBGGRR`, with bit 31 as the colour-calc
+/// MSB and the low 24 bits carrying the visible colour.
+#[inline]
+fn direct_rgb888(entry: u32) -> ((u8, u8, u8), bool) {
+    (
+        (
+            (entry & 0xFF) as u8,
+            ((entry >> 8) & 0xFF) as u8,
+            ((entry >> 16) & 0xFF) as u8,
+        ),
+        entry & 0x8000_0000 != 0,
+    )
+}
+
 /// The back-screen (backdrop) colour for scanline `y`: RGB555 read from VRAM at
 /// the BKTA table. In per-line-colour mode the table advances one word per
 /// scanline; otherwise every line reads the same word. (VDP2 manual §back
@@ -1265,6 +1280,15 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
     // Bitmap special-function bits are whole-layer constants (BMSPR/BMSCC).
     let (spr, scc) = (nc.bm_spr, nc.bm_scc);
     match nc.depth {
+        // 32bpp RGB888 direct colour (16M-colour bitmap).
+        4 => {
+            let off = base + (py * w + px) * 4;
+            let entry = vdp2.vram.read32(off);
+            (entry & 0x00FF_FFFF != 0).then(|| {
+                let (rgb, msb) = direct_rgb888(entry);
+                Sample { rgb, code: 0, spr, scc, is_rgb: true, msb }
+            })
+        }
         // 16bpp RGB555 direct colour.
         3 => {
             let off = base + (py * w + px) * 2;
@@ -1670,6 +1694,13 @@ fn sample_rot_bitmap(
         vdp2.regs.rbg_bitmap_special_calc(),
     );
     match depth {
+        4 => {
+            let entry = vdp2.vram.read32(base + (py * w + px) * 4);
+            (entry & 0x00FF_FFFF != 0).then(|| {
+                let (rgb, msb) = direct_rgb888(entry);
+                Sample { rgb, code: 0, spr, scc, is_rgb: true, msb }
+            })
+        }
         3 => {
             let entry = vdp2.vram.read16(base + (py * w + px) * 2);
             (entry & 0x7FFF != 0).then(|| Sample {
@@ -1873,6 +1904,18 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 10, 5), [0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn bitmap_32bpp_direct_colour() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        // N0BMEN + N0CHCN = 4 (16M colour): 32-bit RGB888 bitmap.
+        v.regs.write16(0x028, 0x0042);
+        v.vram.write32((5u32 * 512 + 10) * 4, 0x0056_3412); // R=0x12, G=0x34, B=0x56
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 10, 5), [0x12, 0x34, 0x56, 0xFF]);
     }
 
     #[test]
@@ -2947,6 +2990,21 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 40, 200), [0, 0, 0, 0xFF], "h=256 wraps → no dot");
+    }
+
+    #[test]
+    fn rbg_bitmap_32bpp_direct_colour() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x4200); // R0BMEN + R0CHCN=4 (16M colour)
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x03E, 0x0001); // base 0x20000
+        setup_rot_identity(&mut v, 0);
+        v.vram.write32(0x20000 + (30 * 512 + 40) * 4, 0x00CC_8844);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 40, 30), [0x44, 0x88, 0xCC, 0xFF]);
     }
 
     /// Rotation bitmap screen-over mode 2: transparent outside the 512×(256|512)
