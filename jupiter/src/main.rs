@@ -389,8 +389,11 @@ fn run(
         apply_mouse_port(&mut saturn, mouse_port);
     }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
-    // time, like a console with a charged backup battery.
-    saturn.set_rtc_unix(host_unix_secs());
+    // time, like a console with a charged backup battery. Capture the seed so
+    // an input recording (SAT_INPUT_REC) can store it in its header — a
+    // deterministic replay (sdbg `replay`) must re-seed the same RTC.
+    let rtc_seed = host_unix_secs();
+    saturn.set_rtc_unix(rtc_seed);
     // Insert the launched disc (image or live drive); keep its spec so the OSD
     // "Insert Disc" can re-insert it after an eject.
     if let Some(spec) = &disc_spec
@@ -666,6 +669,25 @@ fn run(
             let mut pl_bursts = [0u32; 3];
             let mut pl_last = std::time::Instant::now();
 
+            // Optional input recording (SAT_INPUT_REC=<path>): an "input movie"
+            // for deterministic headless replay (sdbg `replay`). Writes the RTC
+            // seed as a header, then one `<frame> <pad-hex>` line per port-1
+            // pad-state change, where `frame` counts emulated frames
+            // (advance_frame calls) from reset. The replay must match this
+            // cadence (one frame + audio-drain per step) and re-seed the same
+            // RTC. Caveat: record a clean play-through — opening the OSD or
+            // quicksave/load desyncs the frame count from a fresh-boot replay.
+            let mut rec = std::env::var("SAT_INPUT_REC").ok().and_then(|p| {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&p).ok()?;
+                let _ = writeln!(f, "# 5thplanet input movie (frame pad-hex; A=400 START=800)");
+                let _ = writeln!(f, "rtc {rtc_seed}");
+                eprintln!("input recording -> {p}");
+                Some(f)
+            });
+            let mut rec_frame = 0u64;
+            let mut rec_last = 0u16;
+
             'emu: loop {
                 if emu_quit.load(Ordering::Relaxed) {
                     break;
@@ -804,6 +826,16 @@ fn run(
                 }
 
                 saturn.set_pad1(held);
+                // Record a pad-state change at the frame it takes effect (the
+                // burst below holds `held` constant for its whole span).
+                if let Some(f) = rec.as_mut()
+                    && held != rec_last
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{rec_frame} {held:04X}");
+                    let _ = f.flush();
+                    rec_last = held;
+                }
                 // Audio-paced burst: run frames until the (mirrored) SDL queue
                 // depth plus what this burst just produced reaches the target.
                 // `burst_cap` renders every game-frame in normal play and only
@@ -833,6 +865,7 @@ fn run(
                 }
                 pl_frames += burst;
                 pl_bursts[(burst as usize).min(2)] += 1;
+                rec_frame += burst as u64;
 
                 // Collect the frame the worker rendered while we computed,
                 // overlay any toast, and hand it to the main thread; then
