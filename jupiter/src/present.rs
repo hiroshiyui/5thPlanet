@@ -117,24 +117,28 @@ fn candidates(pref: RenderBackend, available: &[&str]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Build the SDL2 window + canvas, selecting the render driver per `pref` with a
-/// fallback chain. Returns the canvas and the SDL2 driver name actually in use,
-/// queried from the created renderer via `Canvas::info` so `auto` (which sets no
-/// hint) resolves to a real name like `opengl`, and a fallback shows what truly
-/// loaded rather than what was asked for. The `SDL_RENDER_DRIVER` hint
-/// is set before each `into_canvas`, and the window is rebuilt per attempt
-/// because `into_canvas` consumes it. Panics only if even SDL2's default canvas
-/// cannot be created — an unrecoverable video state.
+/// Build the SDL3 window + canvas, selecting the render driver per `pref` with a
+/// fallback chain. Returns the canvas and the driver name actually in use (the
+/// canvas's `renderer_name` field, so `auto` — which sets no hint — resolves to
+/// a real name like `opengl`). The `SDL_RENDER_DRIVER` hint is set before
+/// `into_canvas`. Candidates are pre-filtered to drivers SDL3 reports available,
+/// so the chosen one should create successfully; `into_canvas` is **infallible**
+/// in sdl3-rs (it panics on a renderer it cannot make), so unlike the SDL2 path
+/// there is no per-candidate renderer-creation retry — only a failed window
+/// build falls through to the next candidate. Vsync is intentionally not
+/// requested: this frontend is audio-paced (see `main.rs`), not vsync-paced.
 #[cfg(feature = "sdl2-frontend")]
 pub fn build_canvas(
-    video: &sdl2::VideoSubsystem,
+    video: &sdl3::VideoSubsystem,
     title: &str,
     width: u32,
     height: u32,
     pref: RenderBackend,
-) -> (sdl2::render::WindowCanvas, &'static str) {
-    let available: Vec<&str> = sdl2::render::drivers().map(|d| d.name).collect();
-    // Each available driver from the preference chain, then SDL2's default (no
+) -> (sdl3::render::WindowCanvas, String) {
+    // sdl3-rs `drivers()` yields the driver name strings directly.
+    let names: Vec<String> = sdl3::render::drivers().collect();
+    let available: Vec<&str> = names.iter().map(String::as_str).collect();
+    // Each available driver from the preference chain, then SDL3's default (no
     // hint) as the ultimate fallback.
     let attempts = candidates(pref, &available)
         .into_iter()
@@ -142,20 +146,17 @@ pub fn build_canvas(
         .chain(std::iter::once(None));
     for cand in attempts {
         if let Some(driver) = cand {
-            sdl2::hint::set("SDL_RENDER_DRIVER", driver);
+            sdl3::hint::set("SDL_RENDER_DRIVER", driver);
         }
         let Ok(window) = video.window(title, width, height).position_centered().build() else {
             continue;
         };
-        if let Ok(canvas) = window.into_canvas().present_vsync().build() {
-            // Ask the created renderer which driver it actually is — for `auto`
-            // (no hint) this is the only way to learn the resolved backend, and
-            // after a fallback it confirms what truly loaded, not just the ask.
-            let used = canvas.info().name;
-            return (canvas, used);
-        }
+        let canvas = window.into_canvas();
+        // The driver the renderer actually created (a public field on the canvas).
+        let used = canvas.renderer_name.clone();
+        return (canvas, used);
     }
-    panic!("could not create any SDL2 renderer (no working video driver)");
+    panic!("could not create any SDL3 renderer (no working video driver)");
 }
 
 #[cfg(test)]

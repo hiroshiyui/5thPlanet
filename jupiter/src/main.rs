@@ -377,7 +377,7 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
 /// cosmetic — any decode failure is silently ignored so a broken icon never
 /// stops the emulator from opening.
 #[cfg(feature = "sdl2-frontend")]
-fn set_window_icon(window: &mut sdl2::video::Window) {
+fn set_window_icon(window: &mut sdl3::video::Window) {
     const ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
     let decoder = png::Decoder::new(ICON_PNG);
     let Ok(mut reader) = decoder.read_info() else { return };
@@ -390,12 +390,12 @@ fn set_window_icon(window: &mut sdl2::video::Window) {
     }
     buf.truncate(info.buffer_size());
     let pitch = info.width * 4;
-    let Ok(surface) = sdl2::surface::Surface::from_data(
+    let Ok(surface) = sdl3::surface::Surface::from_data(
         &mut buf,
         info.width,
         info.height,
         pitch,
-        sdl2::pixels::PixelFormatEnum::ABGR8888,
+        sdl3::pixels::PixelFormat::ABGR8888,
     ) else {
         return;
     };
@@ -412,10 +412,10 @@ fn run(
     mut mouse_port: Option<u8>,
     cfg: config::Config,
 ) -> ExitCode {
-    use sdl2::audio::AudioSpecDesired;
-    use sdl2::event::Event;
-    use sdl2::keyboard::{Keycode, Scancode};
-    use sdl2::pixels::PixelFormatEnum;
+    use sdl3::audio::{AudioFormat, AudioSpec};
+    use sdl3::event::Event;
+    use sdl3::keyboard::{Keycode, Scancode};
+    use sdl3::pixels::PixelFormat;
 
     use osd::{Nav, Osd, OsdCtx};
 
@@ -468,60 +468,33 @@ fn run(
         eprintln!("loaded backup RAM from {}", battery_path.display());
     }
 
-    let sdl = sdl2::init().expect("SDL2 init");
-    let video = sdl.video().expect("SDL2 video subsystem");
-    // Host game controllers (the SDL GameController API normalizes every
-    // recognized pad — XInput on Windows, evdev on Linux — to one Xbox-style
-    // layout). Devices are opened on hot-plug events; SDL also delivers an
-    // Added event for each pad already attached at init.
-    let controller_subsystem = sdl
-        .game_controller()
-        .expect("SDL2 game-controller subsystem");
-    let mut controllers: Vec<sdl2::controller::GameController> = Vec::new();
+    let sdl = sdl3::init().expect("SDL3 init");
+    let video = sdl.video().expect("SDL3 video subsystem");
+    // Host game controllers (the SDL gamepad API normalizes every recognized pad
+    // — XInput on Windows, evdev on Linux — to one Xbox-style layout). Devices
+    // are opened on hot-plug events; SDL also delivers an Added event for each
+    // pad already attached at init.
+    let controller_subsystem = sdl.gamepad().expect("SDL3 gamepad subsystem");
+    let mut controllers: Vec<sdl3::gamepad::Gamepad> = Vec::new();
 
-    // SCSP audio: a 44.1 kHz stereo S16 queue the SCSP fills each frame.
-    let audio = sdl.audio().expect("SDL2 audio subsystem");
-    let audio_queue = audio
-        .open_queue::<i16, _>(
-            None,
-            &AudioSpecDesired {
-                freq: Some(44_100),
-                channels: Some(2),
-                samples: None,
-            },
-        )
-        .expect("open audio queue");
-    // Report what SDL actually opened. If you hear nothing, check this line: a
-    // dummy/empty driver or a spec far from 44100/2/S16 means SDL didn't get a
-    // working backend — try `SDL_AUDIODRIVER=pulseaudio` (or `pipewire`/`alsa`)
-    // and confirm the app shows up in your system mixer.
-    eprintln!(
-        "SDL audio: driver={:?}, obtained spec={:?}",
-        audio.current_audio_driver(),
-        audio_queue.spec()
-    );
-    // The device may have opened at a different rate (PipeWire/Pulse commonly
-    // force 48 kHz). A 48 kHz device consumes our 44.1 kHz stream ~9% fast:
-    // the BGM pitches up and — worse — the pacing reserve never fills, so the
-    // queue rides near 0 ms and every compute dip becomes an audible underrun
-    // and a felt slowdown. Convert each chunk to the device rate before
-    // queueing, and keep all pacing math in source (44.1 kHz) units by
-    // scaling the mirror back.
-    let dev_freq = audio_queue.spec().freq as u32;
-    let resample: Option<sdl2::audio::AudioCVT> = if dev_freq != 44_100 {
-        eprintln!("SDL audio: device at {dev_freq} Hz — resampling 44100 -> {dev_freq}");
-        sdl2::audio::AudioCVT::new(
-            sdl2::audio::AudioFormat::S16LSB,
-            2,
-            44_100,
-            sdl2::audio::AudioFormat::S16LSB,
-            2,
-            dev_freq as i32,
-        )
-        .ok()
-    } else {
-        None
+    // SCSP audio: a 44.1 kHz stereo S16 stream the SCSP fills each frame. SDL3's
+    // AudioStream auto-resamples to whatever rate the device opens at, so (unlike
+    // the SDL2 path) there is no manual AudioCVT and no device-rate pacing math —
+    // `queued_bytes()` is already in source (44.1 kHz) units.
+    let audio = sdl.audio().expect("SDL3 audio subsystem");
+    let audio_spec = AudioSpec {
+        freq: Some(44_100),
+        channels: Some(2),
+        format: Some(AudioFormat::S16LE),
     };
+    let audio_stream = audio
+        .open_playback_device(&audio_spec)
+        .and_then(|dev| dev.open_device_stream(Some(&audio_spec)))
+        .expect("open audio stream");
+    // If you hear nothing, check the audio driver: a dummy/empty driver means SDL
+    // didn't get a working backend — try `SDL_AUDIODRIVER=pipewire` (or
+    // `pulseaudio`/`alsa`) and confirm the app shows up in your system mixer.
+    eprintln!("SDL audio: driver={:?}", audio.current_audio_driver());
     // Leave the device PAUSED (SDL opens queues paused) until the reserve has
     // filled once — see the prebuffer gate in the main loop. Resuming here would
     // let the device drain from t=0 while the queue is still empty during boot,
@@ -541,9 +514,7 @@ fn run(
     eprintln!("render backend: {active_driver} (requested {})", backend_pref.to_token());
     set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
-        let _ = canvas
-            .window_mut()
-            .set_fullscreen(sdl2::video::FullscreenType::Desktop);
+        let _ = canvas.window_mut().set_fullscreen(true);
     }
     let creator = canvas.texture_creator();
     // ABGR8888 is the SDL packed format whose in-memory byte order on
@@ -553,7 +524,7 @@ fn run(
     // every pixel for no benefit.
     let mut texture = creator
         .create_texture_streaming(
-            PixelFormatEnum::ABGR8888,
+            PixelFormat::ABGR8888,
             FRAME_WIDTH as u32,
             FRAME_HEIGHT as u32,
         )
@@ -1055,8 +1026,10 @@ fn run(
                         let _ = emu_tx.send(EmuIn::PlayCdda);
                     }
                     Event::MouseMotion { xrel, yrel, .. } if mouse_port.is_some() => {
-                        mouse_dx += xrel;
-                        mouse_dy += yrel;
+                        // SDL3 mouse coordinates are floats; we accumulate integer
+                        // deltas for the Shuttle Mouse.
+                        mouse_dx += xrel as i32;
+                        mouse_dy += yrel as i32;
                     }
                     Event::KeyDown {
                         keycode: Some(Keycode::F10),
@@ -1069,11 +1042,15 @@ fn run(
                     // dedupe guard makes a startup enumeration + the init-time
                     // Added events idempotent.
                     Event::ControllerDeviceAdded { which, .. } => {
-                        match controller_subsystem.open(which) {
+                        // SDL3's JoystickId is a newtype around the u32 the event carries.
+                        let jid = sdl3::sys::joystick::SDL_JoystickID(which);
+                        match controller_subsystem.open(jid) {
                             Ok(c) => {
-                                if !controllers.iter().any(|o| o.instance_id() == c.instance_id())
-                                {
-                                    eprintln!("controller connected: {}", c.name());
+                                if !controllers.iter().any(|o| o.id().ok() == c.id().ok()) {
+                                    eprintln!(
+                                        "controller connected: {}",
+                                        c.name().unwrap_or_default()
+                                    );
                                     controllers.push(c);
                                 }
                             }
@@ -1081,7 +1058,7 @@ fn run(
                         }
                     }
                     Event::ControllerDeviceRemoved { which, .. } => {
-                        controllers.retain(|c| c.instance_id() != which);
+                        controllers.retain(|c| c.id().ok().map(|j| j.0) != Some(which));
                     }
                     // Controller navigation of the open menu: D-pad moves, A
                     // selects, B backs out, Start toggles. Suppressed while a
@@ -1089,12 +1066,12 @@ fn run(
                     Event::ControllerButtonDown { button, .. }
                         if osd_open.load(Ordering::Relaxed) && rebind_target.is_none() =>
                     {
-                        use sdl2::controller::Button;
+                        use sdl3::gamepad::Button;
                         let msg = match button {
                             Button::DPadUp => Some(EmuIn::Nav(Nav::Up)),
                             Button::DPadDown => Some(EmuIn::Nav(Nav::Down)),
-                            Button::A => Some(EmuIn::Nav(Nav::Select)),
-                            Button::B => Some(EmuIn::Nav(Nav::Back)),
+                            Button::South => Some(EmuIn::Nav(Nav::Select)),
+                            Button::East => Some(EmuIn::Nav(Nav::Back)),
                             Button::Start => Some(EmuIn::Toggle),
                             _ => None,
                         };
@@ -1122,18 +1099,20 @@ fn run(
             // or left stick = D-pad. Per-button gamepad rebind arrives with
             // the M13 E2 analog-peripheral work.
             {
-                use sdl2::controller::{Axis, Button};
+                use sdl3::gamepad::{Axis, Button};
                 const TH: i16 = 16384; // half of full deflection
                 for c in &controllers {
+                    // SDL3 renamed the face buttons: South/East/West/North are
+                    // the physical bottom/right/left/top (Xbox A/B/X/Y).
                     for (btn, bit) in [
                         (Button::DPadUp, pad::UP),
                         (Button::DPadDown, pad::DOWN),
                         (Button::DPadLeft, pad::LEFT),
                         (Button::DPadRight, pad::RIGHT),
-                        (Button::X, pad::A),
-                        (Button::A, pad::B),
-                        (Button::B, pad::C),
-                        (Button::Y, pad::X),
+                        (Button::West, pad::A),
+                        (Button::South, pad::B),
+                        (Button::East, pad::C),
+                        (Button::North, pad::X),
                         (Button::LeftShoulder, pad::Y),
                         (Button::RightShoulder, pad::Z),
                         (Button::Start, pad::START),
@@ -1174,7 +1153,7 @@ fn run(
                     mouse_capture_enabled && !osd_open.load(Ordering::Relaxed);
                 if want_grab != mouse_grabbed {
                     mouse_grabbed = want_grab;
-                    sdl.mouse().set_relative_mouse_mode(mouse_grabbed);
+                    sdl.mouse().set_relative_mouse_mode(canvas.window(), mouse_grabbed);
                 }
                 let ms = events.mouse_state();
                 let mut buttons = 0u8;
@@ -1195,34 +1174,18 @@ fn run(
                 mouse_dy = 0;
             }
 
-            // Queue the emu thread's audio (resampled to the device rate when
-            // it differs) and refresh the depth mirror it paces on — in
-            // SOURCE-rate units, so the 44.1 kHz pacing math holds on a
-            // 48 kHz device. Start playback once the reserve has first
-            // filled, so a cold start never drains an empty queue.
+            // Push the emu thread's audio into the SDL3 stream (which auto-
+            // resamples to the device rate) and refresh the depth mirror it paces
+            // on. `queued_bytes()` is already in source (44.1 kHz) units, so no
+            // device-rate scaling is needed. Start playback once the reserve has
+            // first filled, so a cold start never drains an empty stream.
             while let Ok(chunk) = audio_rx.try_recv() {
-                match &resample {
-                    Some(cvt) => {
-                        let mut bytes = Vec::with_capacity(chunk.len() * 2);
-                        for s in &chunk {
-                            bytes.extend_from_slice(&s.to_le_bytes());
-                        }
-                        let out = cvt.convert(bytes);
-                        let samples: Vec<i16> = out
-                            .chunks_exact(2)
-                            .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                            .collect();
-                        let _ = audio_queue.queue_audio(&samples);
-                    }
-                    None => {
-                        let _ = audio_queue.queue_audio(&chunk);
-                    }
-                }
+                let _ = audio_stream.put_data_i16(&chunk);
             }
-            let src_size = (audio_queue.size() as u64 * 44_100 / dev_freq as u64) as u32;
+            let src_size = audio_stream.queued_bytes().unwrap_or(0) as u32;
             audio_mirror.store(src_size, Ordering::Relaxed);
             if !audio_started && src_size >= audio_target_bytes {
-                audio_queue.resume();
+                let _ = audio_stream.resume();
                 audio_started = true;
             }
 
@@ -1238,13 +1201,7 @@ fn run(
                         );
                     }
                     UiMsg::Fullscreen(on) => {
-                        use sdl2::video::FullscreenType;
-                        let mode = if on {
-                            FullscreenType::Desktop
-                        } else {
-                            FullscreenType::Off
-                        };
-                        let _ = canvas.window_mut().set_fullscreen(mode);
+                        let _ = canvas.window_mut().set_fullscreen(on);
                     }
                     UiMsg::ArmRebind(b) => rebind_target = Some(b),
                     UiMsg::ResetKeymap => {
@@ -1279,7 +1236,7 @@ fn run(
                 if dims != cur_dims {
                     texture = creator
                         .create_texture_streaming(
-                            PixelFormatEnum::ABGR8888,
+                            PixelFormat::ABGR8888,
                             dims.0 as u32,
                             dims.1 as u32,
                         )
@@ -1294,14 +1251,14 @@ fn run(
                 .expect("upload framebuffer");
             canvas.clear();
             canvas.copy(&texture, None, None).expect("blit to canvas");
-            canvas.present(); // present_vsync caps us at the display rate
+            canvas.present(); // audio-paced (see the burst loop / idle sleep)
             pl_present += t.elapsed();
             pl_iters += 1;
             if perflog && pl_last.elapsed().as_secs() >= 1 && pl_iters > 0 {
                 eprintln!(
                     "MAIN iters/s={pl_iters} | present avg {:.2} ms | queue={}ms",
                     pl_present.as_secs_f64() * 1e3 / pl_iters as f64,
-                    (audio_queue.size() as u64 * 44_100 / dev_freq as u64 / 176) as u32,
+                    (audio_stream.queued_bytes().unwrap_or(0) as u64 / 176) as u32,
                 );
                 pl_present = std::time::Duration::ZERO;
                 pl_iters = 0;
