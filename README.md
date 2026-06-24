@@ -1,5 +1,9 @@
 # 5thPlanet
 
+<p align="center">
+  <img src="doc/app_icon_256.png" alt="5thPlanet application icon" width="256" height="256">
+</p>
+
 An accuracy-first SEGA Saturn emulator in Rust.
 
 *The Saturn is one of the hardest 5th-gen consoles to emulate* — eight
