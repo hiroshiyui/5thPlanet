@@ -37,6 +37,19 @@ graphics, looping CD-DA BGM, and SFX (tag `vf2-good-emulation`).
 | [`vf2-player-select.png`](vf2-player-select.png) | The PLAYER SELECT screen with the character roster and Akira's profile card. |
 | [`vf2-fight.png`](vf2-fight.png) | An in-match 3D fight — Akira (left) in Round 1, with the textured stage, health bars, and timer. |
 
+## Sangokushi V (三國志V)
+
+Koei's Three Kingdoms strategy game (serial T-7623G, JP) — playable from its
+opening movie through to the in-game strategy screen, on the JP v1.01 BIOS.
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`sangokushi-fmv.png`](sangokushi-fmv.png) | The opening movie — the 「歴史シミュレーションゲーム」 (history-simulation game) tagline. The first title to drive the emulator's Sega FILM / Cinepak movie player through to gameplay. |
+| [`sangokushi-title.png`](sangokushi-title.png) | The 「三國志V」 title logo, © 1985 / 1995 KOEI. |
+| [`sangokushi-menu.png`](sangokushi-menu.png) | The main menu — 新しくゲームを始める / データをロードする / 武将データを登録する / サウンドウェアを聞く — over the dragon-tile background. (The blank-menu and missing-button blockers are fixed; see [`doc/wip-compatibility-titles.md`](../wip-compatibility-titles.md).) |
+| [`sangokushi-opening.png`](sangokushi-opening.png) | The opening — Sun Jian (孫堅) and his advisor, 「184年 1月 春」. |
+| [`sangokushi-strategy.png`](sangokushi-strategy.png) | The in-game strategy screen — the 孫堅軍 command menu (君主 / 家臣 / 移動 / 戦争 / 機能), gold / rice, and the provincial map. |
+
 ## Frontend (in-window OSD)
 
 | Image | What it shows |
@@ -51,6 +64,7 @@ capabilities**, with **no intent to infringe** any copyright or trademark.
 - *SEGA*, *SEGA Saturn*, the Saturn logos, and *Virtua Fighter 2* are
   trademarks and/or registered trademarks of **SEGA Corporation**. © SEGA.
 - *Doukyuusei ~if~* (同級生 if) is © **NEC InterChannel, Ltd.** / élf.
+- *Sangokushi V* (三國志V / *Romance of the Three Kingdoms V*) is © **KOEI Co., Ltd.** (now Koei Tecmo Games).
 - All other game titles, logos, characters, and artwork shown are the property
   of their respective owners.
 
