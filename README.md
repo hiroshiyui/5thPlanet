@@ -44,7 +44,9 @@ states, the console's battery-backed save memory, expansion cartridges, and an
 in-window menu (Esc — save slots, controller rebinding, region/cartridge/BIOS
 switching, all persisted to a config file) are all in place.
 
-Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md).
+Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md), and
+the per-title compatibility list in
+[`doc/compatible-game-titles.md`](doc/compatible-game-titles.md).
 
 | USA BIOS | Japanese BIOS (v1.01) |
 | --- | --- |
