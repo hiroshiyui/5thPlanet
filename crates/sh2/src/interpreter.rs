@@ -1429,6 +1429,15 @@ impl Cpu {
         kind: AccessKind,
         bus: &mut impl Bus,
     ) -> (u16, u32) {
+        if addr == CCR_ADDR {
+            // Some Saturn code uses MOV.W @CCR,R0; OR #CP,R0; MOV.W R0,@CCR.
+            // The SH7604 mirrors the 8-bit CCR into both halves of a 16-bit read
+            // (Mednafen sh7095.inc: `CCR | (CCR << 8)`); the low byte carries CE so
+            // the pattern preserves it and `OR #CP` sets the write-only CP bit that
+            // the following word write consumes.
+            let ccr = self.cache.ccr() as u16;
+            return (ccr | (ccr << 8), 0);
+        }
         if OnChip::owns(addr) {
             let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
             self.timer_sync_pre(addr);
@@ -1581,6 +1590,10 @@ impl Cpu {
         kind: AccessKind,
         bus: &mut impl Bus,
     ) -> u32 {
+        if addr == CCR_ADDR {
+            self.cache.set_ccr(val as u8);
+            return 0;
+        }
         if OnChip::owns(addr) {
             self.timer_sync_pre(addr);
             self.onchip.write16(addr, val);

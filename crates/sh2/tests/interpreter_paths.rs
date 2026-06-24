@@ -6,7 +6,7 @@
 //! is a concrete value derived from the SH-2 software / SH7604 hardware
 //! manual semantics the code cites.
 
-use sh2::Cpu;
+use sh2::{Cpu, Lookup};
 use sh2::harness::MemBus;
 use sh2::regs::Sr;
 
@@ -223,6 +223,31 @@ fn ccr_is_reachable_through_the_cpu_memory_path() {
     assert_eq!(cpu.cache.ccr() & 0x01, 0x01, "CE bit set in the cache");
     cpu.step(&mut bus); // read CCR back
     assert_eq!(cpu.regs.r[3] & 0x01, 0x01, "CCR read back through mem path");
+}
+
+#[test]
+fn ccr_word_access_sets_cp_and_preserves_ce() {
+    // Sangokushi V's menu transition uses this word sequence to purge SH-2
+    // cache lines before publishing VDP1 display-list work:
+    //   MOV.W @CCR,R0 ; OR #0x10,R0 ; MOV.W R0,@CCR
+    let (mut cpu, mut bus) = make(&[0x6011, 0xCB10, 0x2101]);
+    cpu.regs.r[1] = 0xFFFF_FE92; // CCR
+    cpu.cache.set_ccr(0x01); // CE
+
+    let cached_addr = 0x0000_4000;
+    cpu.cache.install(cached_addr, [0xA5; 16]);
+    assert!(matches!(cpu.cache.lookup_data(cached_addr), Lookup::Hit(_)));
+    let purges_before = cpu.cache.dbg_purges();
+
+    cpu.step(&mut bus); // MOV.W @CCR,R0
+    assert_eq!(cpu.regs.r[0], 0x0101, "word read mirrors CCR into both bytes (SH7604 / Mednafen CCR|CCR<<8)");
+    cpu.step(&mut bus); // OR #0x10,R0
+    assert_eq!(cpu.regs.r[0] & 0xFF, 0x11, "CP bit requested");
+    cpu.step(&mut bus); // MOV.W R0,@CCR
+
+    assert_eq!(cpu.cache.ccr(), 0x01, "CP is write-only; CE remains enabled");
+    assert_eq!(cpu.cache.dbg_purges(), purges_before + 1, "word write triggered CP purge");
+    assert_eq!(cpu.cache.lookup_data(cached_addr), Lookup::Miss, "resident line was purged");
 }
 
 #[test]
