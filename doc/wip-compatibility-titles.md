@@ -4,41 +4,26 @@ A working tracker for commercial titles that **do not yet boot/run correctly**
 in 5thPlanet, with the symptoms, findings, evidence, and ruled-out hypotheses
 gathered so far. Each entry is a resume point, not a closed case.
 
-For the titles that **do** work, see the milestone notes in
-[`roadmap.md`](roadmap.md): *Virtua Fighter 2* and *Doukyuusei ~if~* are both
-fully playable (M11). The references this work is checked against (Mednafen,
+For the titles that **do** work, see
+[`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2*,
+*Doukyuusei ~if~*, and *Sangokushi V* are all playable. The references this work is checked against (Mednafen,
 MAME, Yabause) are the never-committed local oracles described in
 [`adr/0017-reference-oracle-policy.md`](adr/0017-reference-oracle-policy.md).
 
-Both titles below share a profile: **Mednafen boots them with no per-game hack**
-(checked against `mednaref/src/ss/db.cpp`), so each is an **our-side fidelity
-gap**, not a bad dump or a game that needs a quirk flag. Both pass authentication
-and run real game code, then **stall in the CD-driven Sega FILM/Cinepak movie
-player** (PDZ's intro movie; SAN5's KOEI-logo FMV) — a shared fragile subsystem,
-though by different proximate mechanisms (PDZ = the CD read pump freezes mid-Play
-with status stuck at `PLAY`; SAN5 = the master fills one FILM ring then never
-re-enters the consume loop — a producer/consumer pacing lock, now fully diagnosed
-and savestate-validated). The FILM-player ↔ CD/timing interaction is the common
-suspect.
+Panzer Dragoon Zwei (below) **boots with no per-game hack in Mednafen** (checked
+against `mednaref/src/ss/db.cpp`), so it's an **our-side fidelity gap**, not a
+bad dump or a game that needs a quirk flag. It passes authentication and runs
+real game code, then **stalls in the CD-driven Sega FILM / Cinepak movie player**
+during its intro movie — the CD read pump freezes mid-`Play` with status stuck at
+`PLAY`.
 
-**Crucially, no fully-working title exercises the Cinepak FILM player, so it is
-effectively unvalidated.** A disc scan for the Sega FILM / Cinepak markers
-(`FDSC` description chunk, `cvid` Cinepak fourCC, `STAB` sample table) — and for
-other movie codecs — shows:
-- *VF2* = 0/0/0 Cinepak, but its opening **does** include a movie (scene 1):
-  it's **Duck TrueMotion** (three `DUCK`-headed files; scenes 2–3 are real-time
-  3D). A *different* codec and player from Cinepak FILM.
-- *Doukyuusei ~if~* = 1/0/3 — at most one non-Cinepak FILM.
-- *SAN5* = 18/18/21 — eighteen genuine Cinepak FILM files; *PDZ* uses Cinepak too.
-
-So SAN5 and PDZ are the **first real users of the Cinepak FILM path**, which is
-why both fail there while VF2/Doukyuusei don't. And VF2's TrueMotion movie
-playing flawlessly is the *opposite* of a counterexample — it proves our
-**CD-streaming + a software movie player work end-to-end**, so the defect is
-specifically in the **Cinepak FILM player's timing-sensitive read/pacing logic**,
-not in the CD block or movie streaming in general. (Both the Cinepak and
-TrueMotion decoders are the games' own SH-2 software, run by LLE — no decoder to
-implement either way; see the FMV note below.)
+The Cinepak FILM path is **no longer unvalidated**: *Sangokushi V* (now fully
+playable — see [`compatible-game-titles.md`](compatible-game-titles.md)) was the
+first title to drive it through to gameplay, its eighteen Cinepak FILM files
+playing. So PDZ's stall is a **PDZ-specific FILM/timing issue**, not a general gap
+in the player. (VF2's opening movie is **Duck TrueMotion**, a different codec; all
+of these decoders are the games' own SH-2 software run by LLE — no decoder to
+implement either way. See the FMV note below.)
 
 ---
 
@@ -106,184 +91,3 @@ mode-bit mapping / reset defaults / connector chain.
 - `mednaref/src/ss/db.cpp`: **no hack for PDZ** (boots on generic CDB fidelity).
 - Mednafen's PROBLEMATIC-GAMES list notes PD2 "relies on illegal/questionable
   VDP2 window settings" — an **in-game rendering quirk for later**, not the boot.
-
----
-
-## Sangokushi V (SAN5 / 三國志V, KOEI, serial T-7623G) — ✅ RESOLVED (fully playable)
-
-- **Status: FULLY PLAYABLE (2026-06-24)** — the title menu, opening, and in-game
-  strategy screen all render. Resolved by three SH-2 cache/bus fidelity gaps the
-  emulator wasn't honoring (NOT the FILM "producer/consumer pacing" the log below
-  first chased — that thread was a misdiagnosis, superseded):
-  1. **FMV** — an SCU-DMA-from-CD-FIFO halfword skip corrupted the `FILM` chunk
-     signature (`scu_transfer` popped the 16-bit FIFO once per halfword write); fixed
-     by caching the 32-bit word across both halves.
-  2. **Blank menu / deadlock (`35ce7e8`)** — `Cpu::reset` didn't purge the I-cache, so
-     the SSHON-re-reset slave fetch-hit stale FMV-dispatch lines, never relocated to
-     the menu dispatch, and the master deadlocked on the FTI handshake.
-  3. **Blank menu buttons (`6215aab`)** — a 16-bit `MOV.W @CCR` cache-purge fell
-     through (only byte-CCR access reached the cache), so stale display-list data left
-     the menu's display-object commands empty.
-  Full chain + methodology in the `sangokushi-v-boot-blocker` memory and the commits.
-- **Image:** `roms/SANGOKUSHI_V.cue` (redumper multi-`FILE` CUE-BIN). **JP BIOS v1.01.**
-
-> _The detailed investigation log below is historical (kept for methodology); several
-> threads — notably the FILM "producer/consumer pacing" root — were superseded by the
-> fixes above._
-
-### Symptom
-Boots the BIOS, then soft-hangs before the KOEI logo: **both SH-2s spin in
-`0x060E_xxxx`, the framebuffer stays 100% black** (display + NBG0 are enabled).
-Fully deterministic (same PC/cycle each run).
-
-### Findings
-- **Inter-CPU producer-consumer is correct for round 1.** The master wakes the
-  slave (writes `0xFFFF` → `0x01000000` at master PC `060E4E40`) and posts a
-  command in a shared mailbox (`060ED6xx`). The slave (released ~frame 850 via
-  SMPC `SSHON`) reads a **non-zero** command (`R0=0x060DFC46` at slave PC
-  `060E4E16`), takes the work path, processes it, acks (`0x01800000` at
-  `060E4E2C`), and parks polling `FTCSR.ICF`. The init script (mailbox commands
-  4→5) completes normally.
-- **The master then stalls in its main game loop** (`0601_99xx` — a sequence of
-  per-frame update-fn `JSR`s: `060E179C / 060E46E8 / 060E4672 / 060E4A2C`,
-  pointers in the literal pool at `06019A30`). The loop runs every frame but the
-  **scene state machine never advances** to the logo. The stall is inside the
-  call graph rooted at **`060E4672`**.
-- **Master *speed* changes the PATH** (fast → no-logo → deadlock; slow → logo →
-  deadlock), so a **timing-dependent branch** several call-levels deep drives the
-  divergence.
-- **★ The blocker is the FILM/Cinepak movie player — the KOEI logo is an FMV
-  (same subsystem PDZ dies in).** At the main-loop scene gate `060199B2` the
-  registers show **R2 = `0x46494C4D` = "FILM"**, and the gate fn (`060E4A2C`,
-  called at `060199AE`) returns **R0 ≠ 1** ("scene not done") *every iteration*
-  → the scene-advance block at `060199B6` is always skipped. (`060E4A2C` loops
-  over up to 32 display objects and reports "done" only when every object's
-  state field `== 1`; one object — the FILM/movie — never reaches `1` because
-  playback stalled.) The main loop keeps
-  running (PC sequence at the hang cycles `060199AC → …4A2C… → …49D6… → 06019A5E
-  → 060EA3xx`, confirmed by a raw 180-PC `SAT_INLOOP` capture — an earlier
-  "`060199AC` hit once" reading was the `fc`-then-`c` debugger-stall artifact,
-  not reality), but the FILM player never advances the movie.
-- **The movie read stalls.** The CD command ring (`@0601411A`) shows the master
-  reading movie sectors via the buffer/partition dance (`CalcActualSize →
-  GetSectorData → EndDataXfer → DeleteSectorData → GetBufStat`); `SAT_CDSEEKLOG`
-  shows the movie read in **count-limited chunks** (…, `fad=5092 count=141`,
-  `fad=5234 count=177 → end_fad=5411`), then **no further chunk reads** (drive
-  PAUSEd at FAD 5411, partitions drained, `GetBufStat → 0`). So the FILM player's
-  per-chunk advance is gated off by a **timing-dependent condition** our fast
-  master never satisfies; `SAT_SLOW_FETCH` lets it pass (logo renders briefly)
-  then fails a later chunk. The exact gate (likely a movie-frame pacing /
-  decode-done / per-chunk slave-dispatch condition — note the slave was
-  dispatched only once, frame 877) is in the `060E46xx–060E4Axx` FILM-player
-  code and `060E4A2C` — not yet pinned.
-- **★ It is an upstream divergence, NOT a CD Play-count parse bug (Mednafen
-  cross-check).** From the *same* movie start FAD 5234 (`0x1472`), Mednafen FULL
-  (`SS_CDTRACE`) issues `Play count=0x323`(803) then `0x3deb`(15851) — it reads
-  the **whole movie**; ours (`SAT_CDSEEKLOG`) issues a read ending at FAD 5411
-  (**count 177**) then stops. The commands genuinely differ (ours' end-CR
-  `0x1523` vs Mednafen's `0x0323`), so the CD-block's count/Play handling is
-  *correct* — the **game itself computes a different, truncated movie read** in
-  our run, i.e. the FILM player's read-size (which depends on diverged
-  master/frame-timing state) is wrong because of the upstream timing
-  divergence. So the root is still the timing-dependent control flow, now seen
-  to corrupt the FILM player's read-length calculation.
-- **★ Quantitative clue (the magnitude lines up).** Ours reads **177** sectors
-  where Mednafen reads **803** from the same FAD — a **~4.5× ratio**, closely
-  matching the **~5× slowdown** (`SAT_SLOW_FETCH` 5 fails, 7 renders) needed to
-  make ours progress. So the FILM player's read-length is ~linearly tied to a
-  timing metric that's **~5× off** in our run — i.e. it is *not* the diffuse
-  ~1% master drift (which couldn't move a 4.5× gap), but a **specific ~5×
-  error** in whatever frame/pacing quantity the player uses to size each read
-  (e.g. main-loop iterations per movie-frame period, or a per-frame work
-  budget). The CD-command primitive `060140FA` merely writes the 4 CRs from a
-  caller-built struct (`@R4`); the read-length (CR4) is computed up the FILM
-  player's caller chain — that computation + the ~5×-off timing input it reads
-  is the precise unpinned target. VF2's TrueMotion movie proves the CD block,
-  read pump, and a software movie player all work end-to-end, so the defect is
-  contained to this Cinepak-FILM read-sizing/pacing path.
-- **★★ The read-count is a pinned bytes→sectors divide; the bug is one number
-  (2026-06-23).** A new register-write trace (`SAT_REGWATCH` / sdbg `rwatch` —
-  the `dbg_regwatch` core instrument, cycle-gated + golden-safe, commit
-  `7697467`) pinned it: at FILM-player `060E4412` → `JSR 0x06010300` (the SH-2
-  software divide), **read-count = 177 sectors = bytes-to-read (362496) ÷ 2048
-  (bytes/sector)**. The ÷2048 is a correct units conversion (2048 is a hardcoded
-  literal); **the bug is the dividend — bytes-to-read = 362496, ~4.5× too
-  small.** Mednafen reads ~804 sectors ≈ 1646592 bytes ≈ the *whole* movie;
-  ours' full-movie size is known-correct (`0x191878`=1644152 in the descriptor)
-  yet it reads only ~22% of it, then underflows and stalls. So the blocker now
-  reduces to **why the FILM player computes 362496 bytes-to-read instead of
-  ~1.64 M.** 362496 lives in stack local `@[R15+8]` and is **clamped** inside
-  `060E4412` (`CMP/GT @R15`, sub-calls) — likely `min(remaining, per-read_limit)`
-  where the limit (~362496 = 177 sectors) is the ~5×-too-small quantity. Pinning
-  that limit's origin (and the timing value it derives from — the CD reads are
-  byte-identical to Mednafen up to here) is the final layer.
-
-- **★★★ RESOLVED to root (2026-06-23): producer/consumer PACING — savestate-validated.**
-  The 362496 clamp above is `limit = ring_size(364544) + mem[0x0601AF54] − used` (read fn
-  `060E89CE`), then `read = min(full_movie, limit)`. **`mem[0x0601AF54]` ("+88") is the single
-  divergent field — 0 in ours, large (≈ movie size) in Mednafen.** With +88=0 the limit is
-  just ring-free, so the read clamps to one ring (177). It traces to an ordering divergence:
-  - **Two-sided trace proof.** The FILM streaming/**consume loop** is the ring-manager
-    `060E900A`–`060E918C` (advances read-ptr `@0x0601AF60`, grows +88, re-issues Play).
-    mednaref `SS_PCTRACE` (`tmp/med_ring.txt`): **Mednafen runs it (`060E900A` 39×,
-    `060E918C` 2×); ours runs it 0×.** Mednafen consumes/streams; ours never enters the loop.
-  - **Mechanism (ORDERING).** Ours' master runs **job-1 (CD fill, verified paced 2×) to read
-    the whole 177-sector range FIRST** (~77 frames in the `060178xx` SCDQ-poll loop) **before**
-    the consume gate `060E8FE6` (which needs `used<8`). By then `used`=FULL → the gate skips
-    forever → no consume → +88 stays 0 → no further reads → starved FMV (first `060E8FE6` runs
-    at frame ~1065, `used` already FULL). Mednafen's whole-movie read (803) **overflows** the
-    ~178-sector ring, *forcing* the consume to **interleave** with the fill → it streams.
-    **Fill-then-check (ours) vs interleave fill-and-consume (Mednafen)** = the m13
-    cycle-accuracy / producer-consumer pacing class — exactly the clock-steadiness / 2×-CD-speed
-    intuition.
-  - **★ Validated on the user's REAL interactive hang.** A jupiter savestate of the hang, loaded
-    in sdbg (`load`), confirms every predicted field: `mem[0x0601AF54]`=**0**, ring `used`=FULL
-    (`0x59000`), **read-ptr stuck at base (0% drained)**, CD `curfad`=5411=5234+**177** (the
-    clamp), status PAUSE + **PEND**, `free_blocks`=200 (CD HW buffer drained), slave parked at
-    `060E4E08`, FMV state `=2`. (It's the *terminal* state, past the read decision, so it can't
-    test a +88 fix directly — a *pre-decision* snapshot is the harness.)
-  - **Tooling note.** Mednafen `SS_WWATCH` (per-write hook) drops headless Mednafen to <1 fps and
-    **cannot reach the FILM init (frame ~985) even in 880s**, so the precise +88-writer code
-    stayed unpinned — but it's unnecessary (the consume-loop asymmetry proves it). *Ymir*
-    (StrikerX3, GPL-3.0) has a GUI watchpoint debugger that could read it in one session — a
-    user-driven 4th oracle (`ymiref/`, observe-only per ADR-0017).
-
-### Ruled out (with evidence)
-| Hypothesis | Verdict / evidence |
-|---|---|
-| SH-2 cache coherency | **No** — the `sdbg stale` detector found **0 stale of 486M (master) + 249M (slave) cache reads**; the cache is always coherent. |
-| SH7604 cache LRU | Was a true LRU vs the hardware 6-bit pseudo-LRU; **ported (a real accuracy fix) but it does NOT fix SAN5.** |
-| Timing magnitude ("master too fast") | **No** — `SAT_SLOW_FETCH` slowdown renders the logo *transiently* (N=7, frame 1800) but the SAME deadlock returns by frame 3000. Slowing only **delays** it. |
-| Watchdog timer | **No** — WTCSR=00 (TME=0) on both cores; SAN5 leaves the WDT disabled. |
-| FRT interrupts | **No** — TIER ICIE=0 on both cores. |
-| VDP1 draw-end | **No** — VDP1 `drawing=false` at the hang. |
-| Broken FTI handshake | **No** — round 1 is fully correct (above). |
-| Missing/wrong CD 2× speed-limiter | **No** — `sector_cyc(cd_speed)` paces reads; measured `curfad` advances 2.4–2.6 sectors/frame = **2×**, gradual (not bursty). The CD *rate* is correct; the divergence is fill/consume **ordering**, not speed. |
-| CD-block buffer over/under-flow | **No** — at the hang the 200-block HW buffer is fully drained (`free_blocks`=200); the *game's* software ring (`0x0601F078`) is what fills. |
-| Wrong scene variable | **No** — `SS_MEMDUMP` of the command mailbox (`060ED5F0..060ED650`) is **byte-identical** between ours (stuck) and Mednafen FULL (progressed to the logo). The init state matches; only the *execution path* diverges. |
-
-Mednafen plays SAN5 in **both** its cache modes (`-ss.dbg_cem` default *and*
-`full`), so it isn't cache-mode-fragile there — our timing model has the gap.
-
-### Landed (accuracy, not the SAN5 fix)
-- **SH7604 6-bit pseudo-LRU** (`13454b6`, savestate v10→v11, golden-invariant;
-  VF2 + Doukyuusei still render).
-
-### Debug instruments built (reusable, golden-safe)
-- sdbg `cache` (CCR + hit/miss + purge counts), `frt` (FTI/FTCSR + WDT state),
-  `caudit` (cache-vs-memory line audit), `stale` (per-access stale-read
-  detector via `Bus::peek16`) — commits `bd2f78b`, `0ee6553`, `f1fc8c7`.
-- CPU-tagged `SAT_FTILOG` (`SaturnBus::cur_is_slave`) — names the core issuing
-  each inter-CPU FTI pulse — commit `f1fc8c7`.
-- `SAT_SLOW_FETCH=N` headless timing-probe knob — commit `d257a22`.
-
-### Next phase (the FIX — sustained, separate effort)
-Diagnosis is complete; the open work is the **pacing fix**: make ours' master run the consume
-(`060E900A`/`060E918C`) *during* the fill so `used`<8 when the gate `060E8FE6` checks — i.e.
-match Mednafen's fill/consume interleaving (equivalently, take the whole-movie read that
-overflows the ring). The lever is the master's loop pacing — *when* it yields from job-1
-(`060178xx` CD-fill) to the FMV state machine; pin the exact timing quantity it keys on and
-align it to the reference. **Test harness:** a **pre-decision** savestate (run to ~frame 985,
-save) — the terminal-hang savestate is past the read decision so it can't validate a +88 fix
-directly. This is the hard cycle-accuracy class — see [`roadmap.md`](roadmap.md) M12/M13 and
-the `m13-cycle-accuracy` / `threading-performance-model` memories.
