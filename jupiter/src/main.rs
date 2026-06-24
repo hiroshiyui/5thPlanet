@@ -357,6 +357,36 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
     if depth < catchup_floor { max.max(1) } else { 1 }
 }
 
+/// Decode the bundled PNG icon (`jupiter/assets/app_icon.png`, embedded at build time)
+/// into a raw RGBA surface and apply it as the window/taskbar icon. Purely
+/// cosmetic — any decode failure is silently ignored so a broken icon never
+/// stops the emulator from opening.
+#[cfg(feature = "sdl2-frontend")]
+fn set_window_icon(window: &mut sdl2::video::Window) {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
+    let decoder = png::Decoder::new(ICON_PNG);
+    let Ok(mut reader) = decoder.read_info() else { return };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let Ok(info) = reader.next_frame(&mut buf) else { return };
+    // SDL's ABGR8888 byte order on little-endian hosts is [R,G,B,A] in memory,
+    // matching the `png` crate's RGBA8 output — so no per-pixel swap is needed.
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return;
+    }
+    buf.truncate(info.buffer_size());
+    let pitch = info.width * 4;
+    let Ok(surface) = sdl2::surface::Surface::from_data(
+        &mut buf,
+        info.width,
+        info.height,
+        pitch,
+        sdl2::pixels::PixelFormatEnum::ABGR8888,
+    ) else {
+        return;
+    };
+    window.set_icon(surface);
+}
+
 #[cfg(feature = "sdl2-frontend")]
 fn run(
     bios: Vec<u8>,
@@ -494,6 +524,7 @@ fn run(
         .present_vsync()
         .build()
         .expect("canvas");
+    set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
         let _ = canvas
             .window_mut()

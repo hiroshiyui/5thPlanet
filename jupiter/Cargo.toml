@@ -10,6 +10,9 @@ saturn = { path = "../crates/saturn" }
 sh2 = { path = "../crates/sh2" }
 physdisc = { path = "../crates/physdisc" }
 sdl2 = { version = "0.37", optional = true }
+# Pure-Rust PNG decoder, used only by the SDL2 frontend to decode the
+# bundled window icon (`doc/app_icon.png`) into a raw RGBA surface.
+png = { version = "0.17", optional = true }
 
 [features]
 default = ["sdl2-frontend"]
@@ -18,7 +21,7 @@ default = ["sdl2-frontend"]
 # off, `cargo run -p jupiter -- BIOS` still loads the BIOS,
 # runs a fixed number of frames, and dumps a one-line status report —
 # useful for the BIOS-boot regression in M3 task #8.
-sdl2-frontend = ["dep:sdl2"]
+sdl2-frontend = ["dep:sdl2", "dep:png"]
 # Enable live physical-disc support via libcdio (`--disc=cdrom:<device>`).
 # Off by default so the standard build needs no libcdio; enabling it links
 # the system library through the `physdisc` crate.
