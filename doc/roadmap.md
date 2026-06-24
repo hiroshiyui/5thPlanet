@@ -10,7 +10,7 @@ yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
 Current test count: **1135 workspace-wide, 0 failures**, ~85% line coverage
-(`cargo llvm-cov`; excludes the SDL2 frontend and the FFI `physdisc` crate).
+(`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
 checks** (`run_all`, 16 so far across cpu / branch / memory / onchip DIVU·FRT·DMAC
@@ -42,7 +42,7 @@ set as chips/games surface needs.
 | SCSP | ✅ 32-slot PCM+FM engine, ADSR, LFO, mixer/DAC, MVOL, slot monitor (0x408), 128-step effect DSP, CD-DA via EXTS, 44.1 kHz output |
 | CD-block | 🟡 HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
 | Cartridge slot | ✅ Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
-| SDL2 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config |
+| SDL3 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config (migrated SDL2→SDL3) |
 | Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v9); media referenced not embedded, fingerprint-validated |
 | Backup RAM (battery) | ✅ Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
 | On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert + image browser, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
@@ -373,11 +373,11 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
 - **Precompiled binary packages (download-and-run distribution).** Ship
   self-contained `jupiter` frontend binaries on GitHub Releases so users don't
   need a Rust toolchain.
-  - **Crux — SDL2 linking:** currently dynamic (`sdl2 = "0.37"`), so a bare
-    binary needs the host's `libSDL2`. Add a `bundled-sdl2` feature
-    (`sdl2 = ["bundled","static-link"]`) so *release* artifacts statically link
-    SDL2 (self-contained, no system SDL2) while local dev keeps the fast dynamic
-    build. Cost: a C toolchain/CMake in the build env, +~2–4 MB.
+  - **Crux — SDL3 linking:** currently dynamic (`sdl3` via system pkg-config),
+    so a bare binary needs the host's `libSDL3`. Use `sdl3-sys`'s `static-link`
+    (with a vendored/CMake SDL3 build) so *release* artifacts statically link
+    SDL3 (self-contained, no system SDL3) while local dev keeps the fast dynamic
+    pkg-config build. Cost: a C toolchain/CMake in the build env, +~2–4 MB.
   - **Automation:** no CI exists yet → use **cargo-dist (`dist`)**: one
     `[workspace.metadata.dist]` block generates a GitHub Actions workflow that
     builds the per-platform matrix on the `v*` tag push (which the
@@ -393,8 +393,22 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
     — libcdio is GPL and the project is MIT, so default-feature builds stay
     MIT-clean (a release build must not enable it).
   - Archive contents: the `jupiter` binary (optionally `sdbg`), README,
-    LICENSE (MIT) + bundled SDL2 zlib licence, the BIOS-not-included note,
+    LICENSE (MIT) + bundled SDL3 zlib licence, the BIOS-not-included note,
     SHA256SUMS.
+- **CRT-shader presentation via SDL_GPU.** SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
+  multi-pass render targets, SPIR-V shaders — exposed by `sdl3::gpu`, *no new
+  dependency* now that the frontend is on SDL3) makes a high-quality CRT filter
+  feasible: Sony Trinitron-style aperture grille + scanline beam + bloom/halation
+  + gamma. Plan: a `Presenter` trait keeping the current `SDL_Renderer` blit as
+  the default/fallback (and the only path where Vulkan/Metal/D3D12 or a GPU is
+  unavailable), plus an opt-in SDL_GPU CRT presenter (framebuffer → texture →
+  1–3-pass shader → swapchain) selected via config. Presentation-only — the
+  framebuffer stays bit-identical, so accuracy is untouched. Shaders authored
+  GLSL → SPIR-V (precompiled, or `SDL_shadercross`; DXIL/MSL for non-Vulkan
+  hosts). De-risk with a passthrough-shader spike first; the `--backend`
+  render-driver selector is the groundwork. (Alternative: `librashader` to run
+  RetroArch crt-royale presets verbatim — but it's a heavy parallel GPU stack;
+  SDL_GPU is the in-dependency path.)
 - MPEG card + CD move/copy sector ops (deferred from M7).
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the
   project's design axis).
