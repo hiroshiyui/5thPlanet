@@ -118,8 +118,10 @@ fn candidates(pref: RenderBackend, available: &[&str]) -> Vec<&'static str> {
 }
 
 /// Build the SDL2 window + canvas, selecting the render driver per `pref` with a
-/// fallback chain. Returns the canvas and the driver name actually used (for the
-/// startup log; `"default"` means SDL2's own pick). The `SDL_RENDER_DRIVER` hint
+/// fallback chain. Returns the canvas and the SDL2 driver name actually in use,
+/// queried from the created renderer via `Canvas::info` so `auto` (which sets no
+/// hint) resolves to a real name like `opengl`, and a fallback shows what truly
+/// loaded rather than what was asked for. The `SDL_RENDER_DRIVER` hint
 /// is set before each `into_canvas`, and the window is rebuilt per attempt
 /// because `into_canvas` consumes it. Panics only if even SDL2's default canvas
 /// cannot be created — an unrecoverable video state.
@@ -146,7 +148,11 @@ pub fn build_canvas(
             continue;
         };
         if let Ok(canvas) = window.into_canvas().present_vsync().build() {
-            return (canvas, cand.unwrap_or("default"));
+            // Ask the created renderer which driver it actually is — for `auto`
+            // (no hint) this is the only way to learn the resolved backend, and
+            // after a fallback it confirms what truly loaded, not just the ask.
+            let used = canvas.info().name;
+            return (canvas, used);
         }
     }
     panic!("could not create any SDL2 renderer (no working video driver)");
