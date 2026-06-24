@@ -36,7 +36,9 @@ foundation stays solid.
 commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
 3D fights with CD music and sound effects), and ***Doukyuusei ~if~* is fully
 playable** (graphics, sound effects, and voices), including Shuttle Mouse
-support. Games load from disc images (CUE/BIN, ISO, CloneCD) or straight from
+support. **Koei's strategy title *Sangokushi V* (三國志V) is playable** too — from
+its opening movie through to the in-game strategy map. Games load from disc images
+(CUE/BIN, ISO, CloneCD) or straight from
 an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
 in-window menu (Esc — save slots, controller rebinding, region/cartridge/BIOS

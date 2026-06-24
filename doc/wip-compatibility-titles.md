@@ -109,15 +109,27 @@ mode-bit mapping / reset defaults / connector chain.
 
 ---
 
-## Sangokushi V (SAN5 / 三國志V, KOEI, serial T-7623G) — OPEN
+## Sangokushi V (SAN5 / 三國志V, KOEI, serial T-7623G) — ✅ RESOLVED (fully playable)
 
-- **Status:** **diagnosis COMPLETE + savestate-validated (2026-06-23); the FIX is the
-  open hard part.** Root = FILM **producer/consumer pacing**: ours fills one ring (177
-  sectors) before running the consume loop, which then locks; Mednafen interleaves
-  fill+consume and streams. The earlier "timing-dependent control-flow divergence"
-  (2026-06-22) was correct and is now fully resolved to the pacing mechanism below.
-- **Image:** `roms/SANGOKUSHI_V.cue` (redumper multi-`FILE` CUE-BIN; the disc is
-  fine — the cdrdao→redumper re-dump changed nothing). **JP BIOS v1.01.**
+- **Status: FULLY PLAYABLE (2026-06-24)** — the title menu, opening, and in-game
+  strategy screen all render. Resolved by three SH-2 cache/bus fidelity gaps the
+  emulator wasn't honoring (NOT the FILM "producer/consumer pacing" the log below
+  first chased — that thread was a misdiagnosis, superseded):
+  1. **FMV** — an SCU-DMA-from-CD-FIFO halfword skip corrupted the `FILM` chunk
+     signature (`scu_transfer` popped the 16-bit FIFO once per halfword write); fixed
+     by caching the 32-bit word across both halves.
+  2. **Blank menu / deadlock (`35ce7e8`)** — `Cpu::reset` didn't purge the I-cache, so
+     the SSHON-re-reset slave fetch-hit stale FMV-dispatch lines, never relocated to
+     the menu dispatch, and the master deadlocked on the FTI handshake.
+  3. **Blank menu buttons (`6215aab`)** — a 16-bit `MOV.W @CCR` cache-purge fell
+     through (only byte-CCR access reached the cache), so stale display-list data left
+     the menu's display-object commands empty.
+  Full chain + methodology in the `sangokushi-v-boot-blocker` memory and the commits.
+- **Image:** `roms/SANGOKUSHI_V.cue` (redumper multi-`FILE` CUE-BIN). **JP BIOS v1.01.**
+
+> _The detailed investigation log below is historical (kept for methodology); several
+> threads — notably the FILM "producer/consumer pacing" root — were superseded by the
+> fixes above._
 
 ### Symptom
 Boots the BIOS, then soft-hangs before the KOEI logo: **both SH-2s spin in
