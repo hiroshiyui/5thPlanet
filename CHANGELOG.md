@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-24
+
+Migrates the `jupiter` frontend from **SDL2 to SDL3** and adds a user-selectable
+graphics-presentation backend. **Building jupiter now requires SDL3** (`libsdl3`
+dev libs + pkg-config), not SDL2 — update your build environment / CI. The
+emulation core is untouched (frontend-only; save-state format unchanged; all
+three playable games — VF2, Doukyuusei ~if~, Sangokushi V — verified working).
+
+### Added
+
+- **Selectable graphics-presentation backend.** Choose how the framebuffer is
+  presented — `--backend=opengl|opengles|direct3d11|direct3d12|metal|software`
+  (default `auto`), the `backend` config key, or the OSD Settings → Graphics
+  **Renderer** row — with a fallback chain (preferred → opengl → software); the
+  resolved driver is logged at startup. The picture is still rendered in software
+  (accuracy-first); this only selects the present path.
+
+### Changed
+
+- **Frontend migrated SDL2 → SDL3** (sdl3 0.18.4 + sdl3-sys, system SDL 3.x via
+  pkg-config), unlocking SDL3's modern APIs (SDL_GPU, stream-based auto-resampling
+  audio, the unified gamepad API). The `sdl2-frontend` Cargo feature is renamed
+  `sdl-frontend`. **Build dependency: SDL3 is now required** (the headless
+  `--no-default-features` build still needs no SDL). See ADR-0019/0020.
+
+### Fixed
+
+- The startup "render backend" line reports the **actual** driver in use (queried
+  from the renderer), not a useless "default" for `auto`.
+
 ## [0.10.0] - 2026-06-24
 
 Brings **Sangokushi V** to fully playable — the third playable commercial title
