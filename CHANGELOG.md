@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-24
+
+Brings **Sangokushi V** to fully playable — the third playable commercial title
+— adds VDP2 16M-colour bitmap rendering, and lands a batch of SH-2/SCU
+cache-and-bus accuracy fixes plus a large headless-debugging toolkit. Save-state
+format unchanged (v10); the prior playable games (Virtua Fighter 2, Doukyuusei
+~if~) are unaffected — their render goldens still pass.
+
+### Added
+
+- **Sangokushi V (三國志V) is playable** — the third playable commercial title,
+  from its intro movie through the title, main menu, opening, and the in-game
+  strategy screen; the first title to drive the Sega FILM / Cinepak movie player
+  through to gameplay. See [`doc/compatible-game-titles.md`](doc/compatible-game-titles.md).
+- **VDP2 16M-colour (RGB888) bitmap mode** for NBG/RBG.
+- **`sdbg` headless toolkit** — `pad` / `poke` / `render` (drive input-gated
+  paths + composite a frame without advancing), `replay` (deterministic playback
+  of recorded input movies) with `--cart`, `caudit` (audit both SH-2 caches),
+  `fbdump` (render the loaded state to a PPM), cache/FRT inspection, and a cache
+  stale-read detector.
+- **jupiter** — `SAT_INPUT_REC` (record input movies for headless replay), an
+  SDL2 window icon, and the `SAT_SLOW_FETCH` timing probe.
+- **Docs** — a [debugging playbook](doc/debugging-playbook.md), a
+  [compatible-game-titles list](doc/compatible-game-titles.md), a WIP
+  compatibility tracker, Sangokushi V screenshots, and an LLE-debugging
+  methodology section in CLAUDE.md.
+
+### Fixed
+
+- **SH-2 cache coherency** — the two Sangokushi V menu blockers: `Cpu::reset`
+  now purges and disables the cache (an SSHON-re-reset slave refetches instead of
+  running stale code), and 16-bit `MOV.W @CCR` access routes to the cache so a
+  word cache-purge is not silently dropped. Also: FTCSR status flags clear only
+  after a read-1 (SH7604 latch), and the SH7604 6-bit pseudo-LRU cache
+  replacement.
+- **Saturn** — inter-CPU FTI triggers on a write of any width; the
+  SCU-DMA-from-CD-FIFO source longword is read once per two 16-bit writes (fixes
+  the Sangokushi V FMV "FILM" signature corruption).
+
+### Changed
+
+- `dump_game_disc.sh` is driven by **redumper** (with cdrdao as a fallback).
+
+### Removed
+
+- CHD disc-image support — the loader reads `.cue` / `.iso` / `.ccd` only; use
+  `chdman extractcd` to convert a CHD.
+
 ## [0.9.0] - 2026-06-22
 
 Expands the built-in self-diagnostics into a broad accuracy/boot tool and adds
