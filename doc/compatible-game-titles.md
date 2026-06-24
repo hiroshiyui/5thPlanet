@@ -39,8 +39,8 @@ titles keep rendering. Sangokushi V has no render golden yet.
   Cinepak** movie player through to gameplay. Three SH-2 cache/bus fidelity
   fixes carried it: the SCU-DMA-from-CD-FIFO halfword skip (FMV), the reset
   cache-purge (`35ce7e8`, blank menu), and the 16-bit `MOV.W @CCR` cache-purge
-  (`6215aab`, blank menu buttons). Full chain in
-  [`wip-compatibility-titles.md`](wip-compatibility-titles.md).
+  (`6215aab`, blank menu buttons). Full chain in the commit messages and the
+  [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study.
 
 ## Also runs
 

@@ -46,7 +46,7 @@ opening movie through to the in-game strategy screen, on the JP v1.01 BIOS.
 | ----- | ------------- |
 | [`sangokushi-fmv.png`](sangokushi-fmv.png) | The opening movie — the 「歴史シミュレーションゲーム」 (history-simulation game) tagline. The first title to drive the emulator's Sega FILM / Cinepak movie player through to gameplay. |
 | [`sangokushi-title.png`](sangokushi-title.png) | The 「三國志V」 title logo, © 1985 / 1995 KOEI. |
-| [`sangokushi-menu.png`](sangokushi-menu.png) | The main menu — 新しくゲームを始める / データをロードする / 武将データを登録する / サウンドウェアを聞く — over the dragon-tile background. (The blank-menu and missing-button blockers are fixed; see [`doc/wip-compatibility-titles.md`](../wip-compatibility-titles.md).) |
+| [`sangokushi-menu.png`](sangokushi-menu.png) | The main menu — 新しくゲームを始める / データをロードする / 武将データを登録する / サウンドウェアを聞く — over the dragon-tile background. (The blank-menu and missing-button blockers are fixed; see the [`debugging-playbook.md`](../debugging-playbook.md) SAN5 case study.) |
 | [`sangokushi-opening.png`](sangokushi-opening.png) | The opening — Sun Jian (孫堅) and his advisor, 「184年 1月 春」. |
 | [`sangokushi-strategy.png`](sangokushi-strategy.png) | The in-game strategy screen — the 孫堅軍 command menu (君主 / 家臣 / 移動 / 戦争 / 機能), gold / rice, and the provincial map. |
 
