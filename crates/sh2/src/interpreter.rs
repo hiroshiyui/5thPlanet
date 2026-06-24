@@ -1591,6 +1591,9 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> u32 {
         if addr == CCR_ADDR {
+            // Counterpart to the mem_read16 mirror: the 8-bit CCR occupies the low
+            // byte of the word, so a word write feeds the low byte to set_ccr (CP
+            // purges, CE/etc. stored) — matching Mednafen sh7095.inc's SetCCR.
             self.cache.set_ccr(val as u8);
             return 0;
         }
