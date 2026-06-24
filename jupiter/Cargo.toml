@@ -12,19 +12,18 @@ physdisc = { path = "../crates/physdisc" }
 # Pure-Rust PNG decoder, used only by the SDL frontend to decode the
 # bundled window icon (`doc/app_icon.png`) into a raw RGBA surface.
 png = { version = "0.17", optional = true }
-# SDL3 via the system library (pkg-config finds SDL 3.4.10). EXPERIMENTAL:
-# the `sdl2-frontend` feature name is kept to minimise churn on this branch;
-# it now pulls SDL3. Rename to `sdl-frontend` if/when this lands on main.
+# SDL3 via the system library (pkg-config finds SDL 3.x). Gated by the
+# `sdl-frontend` feature (the frontend was migrated from SDL2 to SDL3).
 sdl3 = { version = "0.18.4", optional = true, features = ["use-pkg-config"] }
 
 [features]
-default = ["sdl2-frontend"]
-# Toggle the SDL2 window off if the host doesn't have libsdl2-dev
+default = ["sdl-frontend"]
+# Toggle the SDL3 window off if the host doesn't have libsdl3
 # installed or if you want a headless build for CI. With the feature
 # off, `cargo run -p jupiter -- BIOS` still loads the BIOS,
 # runs a fixed number of frames, and dumps a one-line status report —
 # useful for the BIOS-boot regression in M3 task #8.
-sdl2-frontend = ["dep:sdl3", "dep:png"]
+sdl-frontend = ["dep:sdl3", "dep:png"]
 # Enable live physical-disc support via libcdio (`--disc=cdrom:<device>`).
 # Off by default so the standard build needs no libcdio; enabling it links
 # the system library through the `physdisc` crate.

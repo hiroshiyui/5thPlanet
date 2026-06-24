@@ -1,14 +1,14 @@
-//! Graphics-presentation backend selection for the SDL2 frontend.
+//! Graphics-presentation backend selection for the SDL3 frontend.
 //!
 //! `jupiter` does **not** render the Saturn picture — the VDP1/VDP2 compositor
 //! in `saturn` produces the finished RGBA framebuffer *in software* (the
 //! accuracy-first core; the GPU is for presentation only). This module only
-//! chooses *how that 2D frame is blitted to the window*. SDL2's 2D renderer
+//! chooses *how that 2D frame is blitted to the window*. SDL3's 2D renderer
 //! already abstracts the GPU backend — OpenGL, Direct3D, Metal, and software are
-//! all SDL2 render *drivers* — so "selecting a backend" here means picking the
-//! `SDL_RENDER_DRIVER` SDL2 uses, with a fallback chain.
+//! all SDL3 render *drivers* — so "selecting a backend" here means picking the
+//! `SDL_RENDER_DRIVER` SDL3 uses, with a fallback chain.
 //!
-//! Note: SDL2's 2D renderer has **no Vulkan driver** (the `vulkan` token is
+//! Note: SDL3's 2D renderer has **no Vulkan driver** (the `vulkan` token is
 //! accepted but maps to [`RenderBackend::Auto`]); Vulkan would need a separate
 //! `wgpu` backend, which is out of scope for this strategy.
 //!
@@ -17,10 +17,10 @@
 //! builds the canvas together, retrying the next candidate if creation fails.
 
 /// A requested presentation backend, parsed from the `backend` config key /
-/// `--backend` flag and mapped to an SDL2 render-driver name.
+/// `--backend` flag and mapped to an SDL3 render-driver name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderBackend {
-    /// Let SDL2 use its own platform-default driver order (no hint set).
+    /// Let SDL3 use its own platform-default driver order (no hint set).
     Auto,
     OpenGl,
     OpenGlEs,
@@ -32,7 +32,7 @@ pub enum RenderBackend {
 
 impl RenderBackend {
     /// Parse a config/CLI token (case-insensitive). Unknown tokens — including
-    /// `vulkan`, which the SDL2 2D renderer cannot provide — fall back to
+    /// `vulkan`, which the SDL3 2D renderer cannot provide — fall back to
     /// [`RenderBackend::Auto`] with a warning, so a stale or wishful config never
     /// blocks startup.
     pub fn from_token(tok: &str) -> Self {
@@ -47,7 +47,7 @@ impl RenderBackend {
             other => {
                 eprintln!(
                     "render backend: unknown/unsupported backend {other:?} \
-                     (the SDL2 2D renderer has no Vulkan driver); using auto"
+                     (the SDL3 2D renderer has no Vulkan driver); using auto"
                 );
                 RenderBackend::Auto
             }
@@ -69,8 +69,8 @@ impl RenderBackend {
         }
     }
 
-    /// The SDL2 `SDL_RENDER_DRIVER` name this backend requests, or `None` for
-    /// [`Auto`](RenderBackend::Auto) (no hint — SDL2 uses its own order).
+    /// The SDL3 `SDL_RENDER_DRIVER` name this backend requests, or `None` for
+    /// [`Auto`](RenderBackend::Auto) (no hint — SDL3 uses its own order).
     fn driver_name(self) -> Option<&'static str> {
         Some(match self {
             RenderBackend::Auto => return None,
@@ -83,10 +83,10 @@ impl RenderBackend {
         })
     }
 
-    /// The ordered SDL2 driver names to try for this preference: the requested
+    /// The ordered SDL3 driver names to try for this preference: the requested
     /// driver first, then OpenGL, then software — so a host missing the preferred
     /// GPU API still gets a working window. [`Auto`](RenderBackend::Auto) yields
-    /// an empty chain (let SDL2 pick its default).
+    /// an empty chain (let SDL3 pick its default).
     fn preference_chain(self) -> Vec<&'static str> {
         match self.driver_name() {
             None => Vec::new(),
@@ -104,9 +104,9 @@ impl RenderBackend {
 }
 
 /// The ordered driver candidates to attempt for `pref`, given the drivers
-/// `available` in this SDL2 build: the preference chain filtered to what's
+/// `available` in this SDL3 build: the preference chain filtered to what's
 /// available. **Pure** (no SDL), so the fallback policy is unit-testable. An
-/// empty result means "let SDL2 choose its default" (the [`Auto`] case, or a
+/// empty result means "let SDL3 choose its default" (the [`Auto`] case, or a
 /// preference whose whole chain is unavailable).
 ///
 /// [`Auto`]: RenderBackend::Auto
@@ -123,11 +123,11 @@ fn candidates(pref: RenderBackend, available: &[&str]) -> Vec<&'static str> {
 /// a real name like `opengl`). The `SDL_RENDER_DRIVER` hint is set before
 /// `into_canvas`. Candidates are pre-filtered to drivers SDL3 reports available,
 /// so the chosen one should create successfully; `into_canvas` is **infallible**
-/// in sdl3-rs (it panics on a renderer it cannot make), so unlike the SDL2 path
-/// there is no per-candidate renderer-creation retry — only a failed window
-/// build falls through to the next candidate. Vsync is intentionally not
+/// in sdl3-rs (it panics on a renderer it cannot make), so there is no
+/// per-candidate renderer-creation retry — only a failed window build falls
+/// through to the next candidate. Vsync is intentionally not
 /// requested: this frontend is audio-paced (see `main.rs`), not vsync-paced.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 pub fn build_canvas(
     video: &sdl3::VideoSubsystem,
     title: &str,
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn auto_yields_no_candidates() {
-        // Auto sets no hint regardless of what's available — SDL2 picks.
+        // Auto sets no hint regardless of what's available — SDL3 picks.
         assert!(candidates(RenderBackend::Auto, &["opengl", "metal", "software"]).is_empty());
     }
 
@@ -210,7 +210,7 @@ mod tests {
         let avail = ["opengl", "software"];
         assert_eq!(candidates(RenderBackend::Metal, &avail), vec!["opengl", "software"]);
         assert_eq!(candidates(RenderBackend::Direct3D11, &avail), vec!["opengl", "software"]);
-        // Nothing in the chain available -> empty -> caller uses SDL2 default.
+        // Nothing in the chain available -> empty -> caller uses SDL3 default.
         assert!(candidates(RenderBackend::OpenGl, &["direct3d11"]).is_empty());
     }
 }

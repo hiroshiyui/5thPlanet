@@ -15,7 +15,7 @@
 //! shown changes — so accuracy and the `bios_boot` golden are unaffected (the
 //! core's `run_frame` is untouched; this path is frontend-only).
 //!
-//! The module is `sdl2`-free (operates on `Saturn` + `Vec<u8>` + channels), so
+//! The module is `sdl`-free (operates on `Saturn` + `Vec<u8>` + channels), so
 //! the buffer/handshake logic is unit-tested without a window.
 
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -126,8 +126,8 @@ impl RenderPipe {
     /// buffer into it. Skipping a submit for lack of a spare must not become
     /// permanent: `wait` only returns buffers for submitted jobs, so the
     /// caller has to check this *outside* the wait path.
-    // Only the SDL2 main loop drives the spare-feed path.
-    #[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
+    // Only the SDL3 main loop drives the spare-feed path.
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
     pub fn needs_spare(&self) -> bool {
         self.spare.is_none() && !self.in_flight
     }

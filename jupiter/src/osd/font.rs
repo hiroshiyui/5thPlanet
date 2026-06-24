@@ -1,6 +1,6 @@
 //! 8×8 bitmap font + framebuffer drawing primitives for the OSD.
 //!
-//! No dependencies and no `sdl2`: everything here writes directly into the
+//! No dependencies and no `sdl3`: everything here writes directly into the
 //! emulator's RGBA framebuffer (`[R, G, B, A]` bytes, the `ABGR8888` layout
 //! the SDL texture consumes), so the whole OSD is unit-testable without a
 //! window. The font is the public-domain **font8x8 "basic"** table (Daniel

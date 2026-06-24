@@ -3,13 +3,13 @@
 //! Two builds:
 //!
 //! * `cargo run -p jupiter -- BIOS.bin`
-//!   (default features) — opens an SDL2 window, runs the Saturn at
+//!   (default features) — opens an SDL3 window, runs the Saturn at
 //!   60 Hz, uploads each frame to a streaming texture. Quit with
 //!   Esc or the window's close button.
 //!
 //! * `cargo run -p jupiter --no-default-features -- BIOS.bin`
 //!   — headless. Runs a fixed number of frames and prints a short
-//!   status report. Useful when libsdl2-dev isn't available, or
+//!   status report. Useful when libsdl3-dev isn't available, or
 //!   for the BIOS-boot regression test that doesn't need a window.
 
 use std::env;
@@ -19,15 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use saturn::cartridge::Cartridge;
 
-// The OSD menu is pure logic (no sdl2): compile it for the SDL2 frontend and
+// The OSD menu is pure logic (no sdl3): compile it for the SDL3 frontend and
 // for tests (so its unit tests run even with `--no-default-features`), but not
 // in a headless non-test build where nothing uses it.
 mod config;
-#[cfg(any(feature = "sdl2-frontend", test))]
+#[cfg(any(feature = "sdl-frontend", test))]
 mod osd;
-#[cfg(any(feature = "sdl2-frontend", test))]
+#[cfg(any(feature = "sdl-frontend", test))]
 mod render_pipe;
-#[cfg(any(feature = "sdl2-frontend", test))]
+#[cfg(any(feature = "sdl-frontend", test))]
 mod present;
 
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
@@ -41,7 +41,7 @@ fn host_unix_secs() -> u64 {
 
 /// Classify a master-SH-2 PC into a coarse memory region for the OSD's live
 /// status readout (cache-through `0x2…` aliases fold onto the same regions).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn classify_pc(pc: u32) -> &'static str {
     match pc & 0x0FFF_FFFF {
         0x0000_0000..=0x000F_FFFF => "BIOS",
@@ -286,7 +286,7 @@ fn parse_cart(spec: &str) -> Result<Cartridge, String> {
 /// `.bin` of exactly 512 KiB in the launched image's directory, sorted.
 /// Returns the list and the launched image's index in it (the launched path
 /// is prepended if the scan somehow misses it, e.g. a non-`.bin` extension).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn scan_bios_images(launched: &std::path::Path) -> (Vec<std::path::PathBuf>, usize) {
     let dir = launched
         .parent()
@@ -376,7 +376,7 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
 /// into a raw RGBA surface and apply it as the window/taskbar icon. Purely
 /// cosmetic — any decode failure is silently ignored so a broken icon never
 /// stops the emulator from opening.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn set_window_icon(window: &mut sdl3::video::Window) {
     const ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
     let decoder = png::Decoder::new(ICON_PNG);
@@ -402,7 +402,7 @@ fn set_window_icon(window: &mut sdl3::video::Window) {
     window.set_icon(surface);
 }
 
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn run(
     bios: Vec<u8>,
     disc_spec: Option<String>,
@@ -478,9 +478,9 @@ fn run(
     let mut controllers: Vec<sdl3::gamepad::Gamepad> = Vec::new();
 
     // SCSP audio: a 44.1 kHz stereo S16 stream the SCSP fills each frame. SDL3's
-    // AudioStream auto-resamples to whatever rate the device opens at, so (unlike
-    // the SDL2 path) there is no manual AudioCVT and no device-rate pacing math —
-    // `queued_bytes()` is already in source (44.1 kHz) units.
+    // AudioStream auto-resamples to whatever rate the device opens at, so there
+    // is no manual AudioCVT and no device-rate pacing math — `queued_bytes()`
+    // is already in source (44.1 kHz) units.
     let audio = sdl.audio().expect("SDL3 audio subsystem");
     let audio_spec = AudioSpec {
         freq: Some(44_100),
@@ -500,9 +500,9 @@ fn run(
     // let the device drain from t=0 while the queue is still empty during boot,
     // which under-runs exactly once on a cold start (the "first-play buzz").
     // Presentation backend: the framebuffer is rendered in software (for
-    // accuracy); this only selects which SDL2 render driver blits it, with a
+    // accuracy); this only selects which SDL3 render driver blits it, with a
     // fallback chain (see the `present` module). `--backend=` / `cfg.backend`
-    // choose; the default lets SDL2 pick.
+    // choose; the default lets SDL3 pick.
     let backend_pref = present::RenderBackend::from_token(&cfg.backend);
     let (mut canvas, active_driver) = present::build_canvas(
         &video,
@@ -1283,7 +1283,7 @@ fn run(
 }
 
 /// Messages from the SDL main thread to the emulation thread.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 enum EmuIn {
     /// Current held pad-1 bits (sampled from the keyboard each iteration).
     Pad(u16),
@@ -1308,7 +1308,7 @@ enum EmuIn {
 
 /// Messages from the emulation thread back to the SDL main thread —
 /// window-affecting OSD actions (the canvas is not Send) and quit.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 enum UiMsg {
     Scale(u8),
     Fullscreen(bool),
@@ -1324,7 +1324,7 @@ enum UiMsg {
 
 /// Mutable frontend display/config state the Settings screens read (for their
 /// active-item marks) and write (when the user changes a setting).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 struct UiState {
     scale: u8,
     fullscreen: bool,
@@ -1336,7 +1336,7 @@ struct UiState {
 /// Everything the emu thread's OSD dispatcher owns besides the machine: the
 /// Settings mirrors, the persisted config, the launch disc spec, and the
 /// save-file base path (`<bios>` → `.state` / `.<n>.state` / `.bup` siblings).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 struct Session {
     save_base: std::path::PathBuf,
     launched_spec: Option<String>,
@@ -1359,10 +1359,10 @@ struct Session {
 }
 
 /// Disc-image extensions the browser offers (lower-cased compare).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 const DISC_EXTS: &[&str] = &["cue", "iso", "ccd"];
 
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 impl Session {
     fn slot_path(&self, n: u8) -> std::path::PathBuf {
         self.save_base.with_extension(format!("{n}.state"))
@@ -1414,7 +1414,7 @@ impl Session {
     }
 }
 
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn region_code_to_osd(code: u8) -> osd::OsdRegion {
     use saturn::smpc::region;
     match code {
@@ -1426,7 +1426,7 @@ fn region_code_to_osd(code: u8) -> osd::OsdRegion {
 }
 
 /// The config-file token for a region (the OSD Region screen persists it).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_region_to_token(r: osd::OsdRegion) -> &'static str {
     match r {
         osd::OsdRegion::Japan => "japan",
@@ -1437,7 +1437,7 @@ fn osd_region_to_token(r: osd::OsdRegion) -> &'static str {
 }
 
 /// The config-file token for a menu cartridge (same vocabulary as `--cart=`).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_cart_to_token(c: osd::OsdCart) -> &'static str {
     match c {
         osd::OsdCart::None => "none",
@@ -1449,7 +1449,7 @@ fn osd_cart_to_token(c: osd::OsdCart) -> &'static str {
 
 /// The config token for a menu backend (a subset of the `--backend` vocabulary;
 /// `Direct3D` persists as `direct3d11`). Inverse of [`token_to_osd_backend`].
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_backend_to_token(b: osd::OsdBackend) -> &'static str {
     match b {
         osd::OsdBackend::Auto => "auto",
@@ -1463,7 +1463,7 @@ fn osd_backend_to_token(b: osd::OsdBackend) -> &'static str {
 /// Map a config/CLI backend token to the menu's backend enum, folding the full
 /// [`present::RenderBackend`] vocabulary (OpenGL ES, D3D11/12) onto the OSD's
 /// subset so the Graphics screen always has a row to show.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn token_to_osd_backend(tok: &str) -> osd::OsdBackend {
     use present::RenderBackend as Rb;
     match Rb::from_token(tok) {
@@ -1475,7 +1475,7 @@ fn token_to_osd_backend(tok: &str) -> osd::OsdBackend {
     }
 }
 
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_region_to_code(r: osd::OsdRegion) -> u8 {
     use saturn::smpc::region;
     match r {
@@ -1489,7 +1489,7 @@ fn osd_region_to_code(r: osd::OsdRegion) -> u8 {
 /// Best-effort identification of an inserted cartridge for the Settings mark.
 /// A ROM cart has no Settings equivalent (you can't re-create it from the menu),
 /// so it reads as `None` — selecting a menu cart would replace it.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn cartridge_to_osd(c: &Cartridge) -> osd::OsdCart {
     match c {
         Cartridge::Dram { id, .. } if *id == 0x5C => osd::OsdCart::ExtRam4M,
@@ -1499,7 +1499,7 @@ fn cartridge_to_osd(c: &Cartridge) -> osd::OsdCart {
     }
 }
 
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_cart_to_cartridge(c: osd::OsdCart) -> Cartridge {
     match c {
         osd::OsdCart::None => Cartridge::None,
@@ -1511,7 +1511,7 @@ fn osd_cart_to_cartridge(c: osd::OsdCart) -> Cartridge {
 }
 
 /// The Shuttle Mouse port as the OSD names it (`None`/`1`/`2` ↔ Off/Port1/Port2).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn mouse_port_to_osd(port: Option<u8>) -> osd::OsdMouse {
     match port {
         Some(1) => osd::OsdMouse::Port1,
@@ -1522,7 +1522,7 @@ fn mouse_port_to_osd(port: Option<u8>) -> osd::OsdMouse {
 
 /// Inverse of [`mouse_port_to_osd`]: the port index the rest of the frontend
 /// tracks (the config token and the SDL capture gate use this).
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn osd_mouse_to_port(m: osd::OsdMouse) -> Option<u8> {
     match m {
         osd::OsdMouse::Off => None,
@@ -1545,7 +1545,7 @@ fn apply_mouse_port(saturn: &mut saturn::Saturn, port: Option<u8>) {
 
 /// Carry out a menu action against the running machine. Returns `true` if the
 /// emulator should quit. Save-state slots live at `<bios>.<n>.state`.
-#[cfg(feature = "sdl2-frontend")]
+#[cfg(feature = "sdl-frontend")]
 fn dispatch_osd(
     action: osd::OsdAction,
     osd: &mut osd::Osd,
@@ -1678,7 +1678,7 @@ fn dispatch_osd(
             osd.close();
         }
         OsdAction::SetBackend(b) => {
-            // The SDL2 render driver is chosen when the window/canvas is built,
+            // The SDL3 render driver is chosen when the window/canvas is built,
             // so a change can't take effect live — persist it and tell the user
             // it applies on the next launch.
             let tok = osd_backend_to_token(b);
@@ -1780,7 +1780,7 @@ fn dispatch_osd(
     false
 }
 
-#[cfg(not(feature = "sdl2-frontend"))]
+#[cfg(not(feature = "sdl-frontend"))]
 fn run(
     bios: Vec<u8>,
     disc_spec: Option<String>,

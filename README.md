@@ -20,7 +20,7 @@ foundation stays solid.
 | --------- | ----------------------------------------------------------- | ------------ |
 | M1        | Cycle-accurate SH-2 (SH7604) core                           | ✅ complete  |
 | M2        | Saturn bus, dual SH-2, event-driven scheduler               | ✅ complete  |
-| M3        | SCU, SMPC, VDP2 minimal, SCU-DSP, SDL2 window (scaffolding)  | ✅ complete  |
+| M3        | SCU, SMPC, VDP2 minimal, SCU-DSP, SDL window (scaffolding)  | ✅ complete  |
 | M4        | BIOS splash on screen                                       | ✅ complete  |
 | M5        | Chip-coverage build-out — VDP1, MC68EC000, full VDP2        | ✅ complete  |
 | M6        | SCSP audio — slot/FM engine + SCSP-DSP                      | ✅ complete  |
@@ -62,13 +62,13 @@ cargo test --workspace
 # by hand; don't run `cargo fmt --all`, it reformats the whole tree)
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Coverage (~85% line, excluding the SDL2 frontend + FFI crate)
+# Coverage (~85% line, excluding the SDL3 frontend + FFI crate)
 cargo llvm-cov --workspace --summary-only
 
 # Run a single test
 cargo test -p sh2 -- decoder::tests::decodes_branches
 
-# SDL2 frontend (default-on `sdl2-frontend` feature): opens a window and
+# SDL3 frontend (default-on `sdl-frontend` feature): opens a window and
 # runs the supplied BIOS. Use --no-default-features for a headless run.
 # --backend=opengl|metal|direct3d11|software (default: auto) picks how the
 # frame is presented; the picture itself is always rendered in software.
@@ -81,7 +81,7 @@ cargo run -p jupiter -- doctor
 
 ## Controls
 
-The SDL2 frontend maps the host keyboard — and any attached **game
+The SDL3 frontend maps the host keyboard — and any attached **game
 controller** — to **port&nbsp;1** (a standard Saturn digital control pad) plus
 a few emulator hotkeys. Every pad button can be rebound from the menu
 (**Esc → Settings → Controller**, press-to-bind); the bindings persist in the
@@ -157,7 +157,7 @@ map to the mouse buttons and **Enter** doubles as the mouse's Start button.
   register-guarded), single-step, SH-2 **and** SCSP-68k disassembly + PC-trace,
   read/write watchpoints, memory search, CD-block + SCSP/68k state, command
   history, and save-state rewind. `cargo run -p sdbg -- <bios.bin> [disc.cue]`.
-- [`jupiter`](jupiter) — SDL2 frontend binary (window +
+- [`jupiter`](jupiter) — SDL3 frontend binary (window +
   framebuffer upload + audio, or headless), behind a default-on feature.
   Includes the hand-rolled in-window OSD menu (`src/osd/`, Esc to open) and
   the persisted config file (`src/config.rs`) — a `jupiter.toml` beside the

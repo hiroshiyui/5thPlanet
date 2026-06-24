@@ -1,7 +1,7 @@
 //! Hand-rolled on-screen menu (ZSNES/fwNES-style), software-composited into
 //! the emulator's RGBA framebuffer.
 //!
-//! This module is deliberately **`sdl2`-free and core-free**: it operates on a
+//! This module is deliberately **`sdl3`-free and core-free**: it operates on a
 //! `&mut [u8]` RGBA buffer ([`font::Canvas`]) and an abstract [`Nav`] input,
 //! and emits [`OsdAction`]s the frontend executes against the `Saturn` API. So
 //! the whole menu — navigation and rendering — is unit-testable without a
@@ -105,7 +105,7 @@ impl OsdMouse {
 /// `present::RenderBackend` config tokens). A convenience subset of the full
 /// `--backend` vocabulary: `Direct3D` stands in for the D3D11/12 tokens and
 /// OpenGL ES folds into `OpenGl`. Selecting one writes the config; it applies on
-/// the next launch (the SDL2 render driver is fixed when the window is created).
+/// the next launch (the SDL3 render driver is fixed when the window is created).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsdBackend {
     Auto,
@@ -177,7 +177,7 @@ pub enum OsdAction {
     /// Move the Shuttle Mouse (frontend re-points the SMPC ports live, no reset).
     SetMouse(OsdMouse),
     /// Change the graphics-presentation backend. The frontend writes the config;
-    /// the SDL2 render driver is fixed at window creation, so it applies on the
+    /// the SDL3 render driver is fixed at window creation, so it applies on the
     /// next launch.
     SetBackend(OsdBackend),
     /// Rebind a pad button ([`crate::config::BUTTON_NAMES`] index): the
@@ -299,7 +299,7 @@ enum Select {
 
 /// The in-window OSD menu state (ADR-0008): whether it's open, the
 /// screen/selection stack, a transient toast line, and any pending key-capture.
-/// A pure, sdl2-free, core-free state machine — driven by navigation input and
+/// A pure, sdl3-free, core-free state machine — driven by navigation input and
 /// rendered into an RGBA buffer, so it unit-tests without a window.
 pub struct Osd {
     open: bool,
@@ -450,7 +450,7 @@ impl Osd {
                         &format!("Fullscreen: {}", if ctx.fullscreen { "On" } else { "Off" }),
                         Select::Emit(OsdAction::ToggleFullscreen),
                     ),
-                    // The SDL2 render driver is fixed when the window is created,
+                    // The SDL3 render driver is fixed when the window is created,
                     // so this writes the config and takes effect on next launch.
                     mk(
                         &format!("Renderer: {}", ctx.backend.label()),

@@ -6,7 +6,7 @@
 //! self-contained-archive location), falling back to
 //! `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` (then `~/.config/…`). The portable
 //! file wins so a bundled archive overrides any global config — see
-//! [`Config::path`]. Like the OSD this module is **`sdl2`-free**: key bindings
+//! [`Config::path`]. Like the OSD this module is **`sdl3`-free**: key bindings
 //! are stored as SDL scancode *names* (strings); the frontend resolves them via
 //! `Scancode::from_name` at the edge.
 //!
@@ -22,7 +22,7 @@ pub const PAD_BUTTONS: usize = 13;
 /// Pad-button display names, in the fixed binding order used everywhere
 /// (config keys, OSD rows, the frontend's pad-bit table).
 // Headless builds read the config but have no keyboard to name buttons for.
-#[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
 pub const BUTTON_NAMES: [&str; PAD_BUTTONS] = [
     "Up", "Down", "Left", "Right", "A", "B", "C", "X", "Y", "Z", "L", "R", "Start",
 ];
@@ -58,8 +58,8 @@ pub struct Config {
     /// on port 2, keyboard pad stays on port 1). The CLI flag overrides this.
     pub mouse: String,
     /// Graphics-presentation backend token, same vocabulary as `--backend`:
-    /// `auto` (default — SDL2 picks its platform default), `opengl`, `opengles`,
-    /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL2
+    /// `auto` (default — SDL3 picks its platform default), `opengl`, `opengles`,
+    /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL3
     /// render driver presents the framebuffer; the CLI flag overrides this.
     pub backend: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
@@ -122,8 +122,8 @@ impl Config {
     }
 
     /// Serialize back to the flat TOML-subset text.
-    // Only the SDL2 frontend writes the config (the OSD); headless reads it.
-    #[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
+    // Only the SDL3 frontend writes the config (the OSD); headless reads it.
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
     pub fn to_text(&self) -> String {
         let mut out = String::from("# 5thPlanet frontend configuration\n");
         out.push_str(&format!("scale = {}\n", self.scale));
@@ -202,7 +202,7 @@ impl Config {
 
     /// Persist to [`Config::path`], creating the directory. Errors are
     /// reported, not fatal — a read-only config dir shouldn't kill the session.
-    #[cfg_attr(not(feature = "sdl2-frontend"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
     pub fn save(&self) {
         let Some(path) = Self::path() else {
             return;
