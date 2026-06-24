@@ -137,6 +137,15 @@ jupiter/           — SDL2 frontend binary (window + framebuffer upload +
                      reserve — the reserve rides out per-stage compute dips. The
                      device stays **paused until that reserve first fills**
                      (prebuffer-before-play) so a cold start can't under-run.
+                     The `present` module (`present.rs`) is the
+                     **graphics-presentation backend seam** (sdl2-free pure
+                     parts, unit-tested): SDL2's 2D renderer already abstracts
+                     OpenGL / Direct3D / Metal / software, so `RenderBackend`
+                     (from the `backend` config key / `--backend` flag) picks
+                     the `SDL_RENDER_DRIVER` with a fallback chain
+                     (preferred → opengl → software) and `build_canvas` sets the
+                     hint + builds the canvas. The VDP stays software — this is
+                     presentation only; no Vulkan (SDL2's 2D renderer has none).
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```

@@ -70,6 +70,8 @@ cargo test -p sh2 -- decoder::tests::decodes_branches
 
 # SDL2 frontend (default-on `sdl2-frontend` feature): opens a window and
 # runs the supplied BIOS. Use --no-default-features for a headless run.
+# --backend=opengl|metal|direct3d11|software (default: auto) picks how the
+# frame is presented; the picture itself is always rendered in software.
 cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
 
 # Built-in self-diagnostics (no window): exits 0 if all checks pass.
