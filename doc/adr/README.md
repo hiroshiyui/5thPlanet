@@ -59,18 +59,15 @@ We use Michael Nygard's lightweight format — see
 | [0018](0018-save-state-design.md) | Whole-machine bincode save states; external media referenced, not embedded | Accepted |
 | [0019](0019-gpu-is-presentation-only.md) | Frontend graphics are software-composited; the GPU is for presentation only | Accepted |
 | [0020](0020-migrate-sdl2-to-sdl3.md) | Migrate the SDL frontend from SDL2 to SDL3 | Accepted |
+| [0021](0021-per-access-bsc-bus-timing.md) | Per-access BSC bus-timing model (faithful Mednafen port) | Accepted |
+| [0022](0022-event-driven-onchip-timers.md) | Event-driven SH-2 on-chip FRT/WDT timers + INTC (lazy materialize) | Accepted |
 
 ### Decisions worth recording (backlog)
 
 Significant choices already made in code/`CLAUDE.md` that are good
 candidates for retroactive ADRs:
 
-- The **per-access BSC bus-timing model** (M12 task #8 — the Mednafen
-  `BSC_BusRead/Write` port: CS0/CS3 transaction costs, the SH-2 write buffer,
-  B-bus deferred-write serialization, SCU-DMA arbitration). A substantial,
-  load-bearing timing decision, documented in `CLAUDE.md` + `doc/roadmap.md` but
-  not yet an ADR.
-- The **event-driven SH-2 on-chip FRT/WDT timers + INTC** (M13 task A1 —
-  Mednafen's lazy materialize + recalc-on-change, replacing the per-instruction
-  `advance_timers`/`refresh_interrupts`). A deliberate, golden-invariant
-  departure from the old model, worth recording.
+- _(none currently — the M12 per-access bus-timing model and the M13
+  event-driven on-chip timers were recorded as
+  [0021](0021-per-access-bsc-bus-timing.md) and
+  [0022](0022-event-driven-onchip-timers.md).)_
