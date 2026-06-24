@@ -27,6 +27,8 @@ mod config;
 mod osd;
 #[cfg(any(feature = "sdl2-frontend", test))]
 mod render_pipe;
+#[cfg(any(feature = "sdl2-frontend", test))]
+mod present;
 
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
 /// somehow before the epoch). Used to seed the Saturn RTC.
@@ -104,6 +106,7 @@ fn main() -> ExitCode {
     let mut positionals: Vec<String> = Vec::new();
     let mut cart_spec: Option<String> = None;
     let mut mouse_port: Option<u8> = None;
+    let mut backend_override: Option<String> = None;
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
@@ -111,6 +114,8 @@ fn main() -> ExitCode {
             mouse_port = Some(2);
         } else if arg == "--mouse=1" {
             mouse_port = Some(1);
+        } else if let Some(tok) = arg.strip_prefix("--backend=") {
+            backend_override = Some(tok.to_string());
         } else {
             positionals.push(arg);
         }
@@ -139,6 +144,12 @@ fn main() -> ExitCode {
             eprintln!("  --mouse[=1|2]          Shuttle Mouse on port 2 (default) or 1;");
             eprintln!("                         host mouse + clicks, Return = mouse Start,");
             eprintln!("                         F10 = toggle pointer capture (Esc/OSD also releases)");
+            eprintln!(
+                "  --backend=<api>        presentation backend: auto (default) | opengl |"
+            );
+            eprintln!(
+                "                         opengles | direct3d11 | direct3d12 | metal | software"
+            );
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -167,7 +178,11 @@ fn main() -> ExitCode {
     let disc_spec = positionals.get(1).cloned();
 
     // Persisted frontend settings (M9). A command-line flag beats the file.
-    let cfg = config::Config::load();
+    let mut cfg = config::Config::load();
+    // `--backend=` overrides the config's graphics backend (CLI > file).
+    if let Some(b) = backend_override {
+        cfg.backend = b;
+    }
 
     // Optional expansion cartridge: `--cart=` wins, else the config file.
     let cart = match cart_spec {
@@ -440,6 +455,7 @@ fn run(
         fullscreen: cfg.fullscreen,
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
+        backend: token_to_osd_backend(&cfg.backend),
     };
     saturn.insert_cartridge(cart);
 
@@ -510,20 +526,19 @@ fn run(
     // filled once — see the prebuffer gate in the main loop. Resuming here would
     // let the device drain from t=0 while the queue is still empty during boot,
     // which under-runs exactly once on a cold start (the "first-play buzz").
-    let window = video
-        .window(
-            "5thPlanet",
-            FRAME_WIDTH as u32 * cfg.scale as u32,
-            FRAME_HEIGHT as u32 * cfg.scale as u32,
-        )
-        .position_centered()
-        .build()
-        .expect("create window");
-    let mut canvas = window
-        .into_canvas()
-        .present_vsync()
-        .build()
-        .expect("canvas");
+    // Presentation backend: the framebuffer is rendered in software (for
+    // accuracy); this only selects which SDL2 render driver blits it, with a
+    // fallback chain (see the `present` module). `--backend=` / `cfg.backend`
+    // choose; the default lets SDL2 pick.
+    let backend_pref = present::RenderBackend::from_token(&cfg.backend);
+    let (mut canvas, active_driver) = present::build_canvas(
+        &video,
+        "5thPlanet",
+        FRAME_WIDTH as u32 * cfg.scale as u32,
+        FRAME_HEIGHT as u32 * cfg.scale as u32,
+        backend_pref,
+    );
+    eprintln!("render backend: {active_driver} (requested {})", backend_pref.to_token());
     set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
         let _ = canvas
@@ -734,6 +749,7 @@ fn run(
                     region: sess.ui.region,
                     cart: sess.ui.cart,
                     mouse: mouse_port_to_osd(sess.mouse_port),
+                    backend: sess.ui.backend,
                     // pad_keys/bios_names are read only by the Controller/BIOS
                     // settings sub-screens (via `items()`, gated on the menu
                     // being open), so skip cloning them on the gameplay hot path
@@ -1357,6 +1373,7 @@ struct UiState {
     fullscreen: bool,
     region: osd::OsdRegion,
     cart: osd::OsdCart,
+    backend: osd::OsdBackend,
 }
 
 /// Everything the emu thread's OSD dispatcher owns besides the machine: the
@@ -1470,6 +1487,34 @@ fn osd_cart_to_token(c: osd::OsdCart) -> &'static str {
         osd::OsdCart::ExtRam1M => "ram1m",
         osd::OsdCart::ExtRam4M => "ram4m",
         osd::OsdCart::BackupRam => "bram",
+    }
+}
+
+/// The config token for a menu backend (a subset of the `--backend` vocabulary;
+/// `Direct3D` persists as `direct3d11`). Inverse of [`token_to_osd_backend`].
+#[cfg(feature = "sdl2-frontend")]
+fn osd_backend_to_token(b: osd::OsdBackend) -> &'static str {
+    match b {
+        osd::OsdBackend::Auto => "auto",
+        osd::OsdBackend::OpenGl => "opengl",
+        osd::OsdBackend::Direct3D => "direct3d11",
+        osd::OsdBackend::Metal => "metal",
+        osd::OsdBackend::Software => "software",
+    }
+}
+
+/// Map a config/CLI backend token to the menu's backend enum, folding the full
+/// [`present::RenderBackend`] vocabulary (OpenGL ES, D3D11/12) onto the OSD's
+/// subset so the Graphics screen always has a row to show.
+#[cfg(feature = "sdl2-frontend")]
+fn token_to_osd_backend(tok: &str) -> osd::OsdBackend {
+    use present::RenderBackend as Rb;
+    match Rb::from_token(tok) {
+        Rb::Auto => osd::OsdBackend::Auto,
+        Rb::OpenGl | Rb::OpenGlEs => osd::OsdBackend::OpenGl,
+        Rb::Direct3D11 | Rb::Direct3D12 => osd::OsdBackend::Direct3D,
+        Rb::Metal => osd::OsdBackend::Metal,
+        Rb::Software => osd::OsdBackend::Software,
     }
 }
 
@@ -1674,6 +1719,16 @@ fn dispatch_osd(
             };
             osd.set_toast(format!("Region: {name} (reset)"), 150);
             osd.close();
+        }
+        OsdAction::SetBackend(b) => {
+            // The SDL2 render driver is chosen when the window/canvas is built,
+            // so a change can't take effect live — persist it and tell the user
+            // it applies on the next launch.
+            let tok = osd_backend_to_token(b);
+            sess.ui.backend = b;
+            sess.cfg.backend = tok.to_string();
+            sess.cfg.save();
+            osd.set_toast(format!("Renderer: {tok} (restart to apply)"), 180);
         }
         OsdAction::SetBios(i) => {
             let i = i as usize;

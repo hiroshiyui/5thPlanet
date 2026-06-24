@@ -57,6 +57,11 @@ pub struct Config {
     /// mouse, default), `1` (mouse on port 1, replacing the pad) or `2` (mouse
     /// on port 2, keyboard pad stays on port 1). The CLI flag overrides this.
     pub mouse: String,
+    /// Graphics-presentation backend token, same vocabulary as `--backend`:
+    /// `auto` (default — SDL2 picks its platform default), `opengl`, `opengles`,
+    /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL2
+    /// render driver presents the framebuffer; the CLI flag overrides this.
+    pub backend: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -69,6 +74,7 @@ impl Default for Config {
             region: None,
             cartridge: "none".into(),
             mouse: "off".into(),
+            backend: "auto".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -101,6 +107,7 @@ impl Config {
                 "region" => cfg.region = Some(unquote(v)).filter(|s| !s.is_empty()),
                 "cartridge" => cfg.cartridge = unquote(v),
                 "mouse" => cfg.mouse = unquote(v),
+                "backend" => cfg.backend = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -126,6 +133,7 @@ impl Config {
         }
         out.push_str(&format!("cartridge = \"{}\"\n", self.cartridge));
         out.push_str(&format!("mouse = \"{}\"\n", self.mouse));
+        out.push_str(&format!("backend = \"{}\"\n", self.backend));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -223,6 +231,7 @@ mod tests {
             region: Some("europe-pal".into()),
             cartridge: "ram4m".into(),
             mouse: "2".into(),
+            backend: "software".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -258,6 +267,15 @@ mod tests {
         assert_eq!(Config::parse("mouse = \"1\"\n").mouse, "1");
         // A missing key keeps the default; main.rs treats unknown tokens as off.
         assert_eq!(Config::parse("scale = 2\n").mouse, "off");
+    }
+
+    #[test]
+    fn backend_token_parses_and_defaults_to_auto() {
+        assert_eq!(Config::default().backend, "auto");
+        assert_eq!(Config::parse("backend = \"opengl\"\n").backend, "opengl");
+        assert_eq!(Config::parse("backend = \"software\"\n").backend, "software");
+        // A missing key keeps the default; present.rs maps unknown tokens to auto.
+        assert_eq!(Config::parse("scale = 2\n").backend, "auto");
     }
 
     #[test]

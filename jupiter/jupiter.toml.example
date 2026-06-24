@@ -33,6 +33,17 @@ scale = 2
 # Start in fullscreen. Default: false.
 fullscreen = false
 
+# Graphics-presentation backend = which SDL2 render driver blits the frame.
+# Same vocabulary as the `--backend=` CLI flag. The emulator's picture is always
+# rendered in software (for accuracy); this only selects how that finished 2D
+# frame is presented, with an automatic fallback chain (preferred -> opengl ->
+# software). Valid values:
+#   "auto"        let SDL2 pick its platform default (default)
+#   "opengl"   "opengles"   "metal"
+#   "direct3d11"  "direct3d12"  "software"
+# Note: "vulkan" is NOT available in SDL2's 2D renderer; it maps to "auto".
+backend = "auto"
+
 # --- System -----------------------------------------------------------------
 
 # SMPC region token. Omit this key entirely to autodetect from the BIOS

@@ -101,6 +101,45 @@ impl OsdMouse {
     }
 }
 
+/// Graphics-presentation backend as the OSD names it (the frontend maps these to
+/// `present::RenderBackend` config tokens). A convenience subset of the full
+/// `--backend` vocabulary: `Direct3D` stands in for the D3D11/12 tokens and
+/// OpenGL ES folds into `OpenGl`. Selecting one writes the config; it applies on
+/// the next launch (the SDL2 render driver is fixed when the window is created).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsdBackend {
+    Auto,
+    OpenGl,
+    Direct3D,
+    Metal,
+    Software,
+}
+
+impl OsdBackend {
+    /// The next backend in the Auto → OpenGL → Direct3D → Metal → Software → Auto
+    /// cycle (the Graphics screen advances through these on each activation).
+    fn next(self) -> Self {
+        match self {
+            OsdBackend::Auto => OsdBackend::OpenGl,
+            OsdBackend::OpenGl => OsdBackend::Direct3D,
+            OsdBackend::Direct3D => OsdBackend::Metal,
+            OsdBackend::Metal => OsdBackend::Software,
+            OsdBackend::Software => OsdBackend::Auto,
+        }
+    }
+
+    /// Short label for the cycling Graphics-screen row.
+    fn label(self) -> &'static str {
+        match self {
+            OsdBackend::Auto => "Auto",
+            OsdBackend::OpenGl => "OpenGL",
+            OsdBackend::Direct3D => "Direct3D",
+            OsdBackend::Metal => "Metal",
+            OsdBackend::Software => "Software",
+        }
+    }
+}
+
 /// One row in the disc-image browser ([`Screen::DiscBrowser`]). The frontend
 /// builds the list from the current directory (`..` first when not at the
 /// filesystem root, then sub-directories, then disc-image files); the OSD only
@@ -137,6 +176,10 @@ pub enum OsdAction {
     SetCartridge(OsdCart),
     /// Move the Shuttle Mouse (frontend re-points the SMPC ports live, no reset).
     SetMouse(OsdMouse),
+    /// Change the graphics-presentation backend. The frontend writes the config;
+    /// the SDL2 render driver is fixed at window creation, so it applies on the
+    /// next launch.
+    SetBackend(OsdBackend),
     /// Rebind a pad button ([`crate::config::BUTTON_NAMES`] index): the
     /// frontend captures the next host key and reports back via
     /// [`Osd::end_capture`].
@@ -184,6 +227,8 @@ pub struct OsdCtx {
     pub cart: OsdCart,
     /// Current Shuttle Mouse port — the Controller screen shows it.
     pub mouse: OsdMouse,
+    /// Current graphics-presentation backend — the Graphics screen cycles it.
+    pub backend: OsdBackend,
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
     pub pad_keys: [String; PAD_BUTTONS],
@@ -404,6 +449,12 @@ impl Osd {
                     mk(
                         &format!("Fullscreen: {}", if ctx.fullscreen { "On" } else { "Off" }),
                         Select::Emit(OsdAction::ToggleFullscreen),
+                    ),
+                    // The SDL2 render driver is fixed when the window is created,
+                    // so this writes the config and takes effect on next launch.
+                    mk(
+                        &format!("Renderer: {}", ctx.backend.label()),
+                        Select::Emit(OsdAction::SetBackend(ctx.backend.next())),
                     ),
                     mk("Back", Select::Close),
                 ]
@@ -781,6 +832,7 @@ mod tests {
             region: OsdRegion::Japan,
             cart: OsdCart::None,
             mouse: OsdMouse::Off,
+            backend: OsdBackend::Auto,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
             bios_active: 0,
@@ -978,6 +1030,32 @@ mod tests {
         assert_eq!(OsdMouse::Off.label(), "Off");
         assert_eq!(OsdMouse::Port1.label(), "Port 1");
         assert_eq!(OsdMouse::Port2.label(), "Port 2");
+    }
+
+    #[test]
+    fn osd_backend_cycles_and_labels() {
+        let mut b = OsdBackend::Auto;
+        let mut seen = vec![b.label()];
+        for _ in 0..4 {
+            b = b.next();
+            seen.push(b.label());
+        }
+        assert_eq!(seen, ["Auto", "OpenGL", "Direct3D", "Metal", "Software"]);
+        assert_eq!(b.next(), OsdBackend::Auto); // wraps back to Auto
+    }
+
+    #[test]
+    fn graphics_renderer_row_cycles_backend() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // backend = Auto
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Graphics");
+        // The row reads "Renderer: Auto"; activating it advances to OpenGL.
+        assert_eq!(
+            select_main(&mut osd, &c, "Renderer: Auto"),
+            Some(OsdAction::SetBackend(OsdBackend::OpenGl))
+        );
     }
 
     #[test]
