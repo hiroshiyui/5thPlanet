@@ -4,10 +4,12 @@ A working tracker for commercial titles that **do not yet boot/run correctly**
 in 5thPlanet, with the symptoms, findings, evidence, and ruled-out hypotheses
 gathered so far. Each entry is a resume point, not a closed case.
 
-For the titles that **do** work, see
-[`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2*,
-*Doukyuusei ~if~*, and *Sangokushi V* are all playable. The references this work is checked against (Mednafen,
-MAME, Yabause) are the never-committed local oracles described in
+For the fully-working titles see
+[`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2* and
+*Doukyuusei ~if~* are fully playable. *Sangokushi V* is **playable but not yet
+fully** — it has one open intermittent blocker (the per-scenario opening movie
+stall) tracked in its section below. The references this work is checked against
+(Mednafen, MAME, Yabause) are the never-committed local oracles described in
 [`adr/0017-reference-oracle-policy.md`](adr/0017-reference-oracle-policy.md).
 
 Panzer Dragoon Zwei (below) **boots with no per-game hack in Mednafen** (checked
@@ -94,3 +96,42 @@ mode-bit mapping / reset defaults / connector chain.
 - `mednaref/src/ss/db.cpp`: **no hack for PDZ** (boots on generic CDB fidelity).
 - Mednafen's PROBLEMATIC-GAMES list notes PD2 "relies on illegal/questionable
   VDP2 window settings" — an **in-game rendering quirk for later**, not the boot.
+
+---
+
+## Sangokushi V (三國志V) — playable, scenario-opening movie stall
+
+- **Status:** **playable** (intro FMV → title → menus → in-game strategy map; see
+  [`compatible-game-titles.md`](compatible-game-titles.md)) but **not yet fully
+  playable** — one open, intermittent blocker. Active (not paused).
+- **Image:** `roms/SANGOKUSHI_V.cue` (+ 8 tracks), KOEI, JP, serial **T-7623G**,
+  BIOS v1.01. **No per-game hack in Mednafen** → our-side fidelity gap.
+
+### Symptom
+The **per-scenario opening introduction movie** sometimes fails to play and
+**stalls the emulation**. It is **intermittent** — **resetting the emulator
+usually bypasses it** and the game proceeds. The startup intro FMV, the title,
+and the menus all run; this is the per-scenario opening movie specifically.
+
+### Likely class
+Another **CD-driven Sega FILM / Cinepak movie-player** stall — the same family as
+the Panzer Dragoon Zwei blocker above. SAN5 already drives its eighteen Cinepak
+FILM files to gameplay, so the player works for most movies; this is a
+robustness / timing gap, not a missing feature. The intermittency points at a
+timing or ordering race rather than a deterministic content bug.
+
+### Next steps (resume point)
+1. **Reproduce deterministically** — capture the stall as an input movie
+   (`SAT_INPUT_REC`) and replay it headless (`sdbg replay --cart`); a fixed RTC
+   seed + pad stream is essential given the intermittency.
+2. **Trace to the divergence** — at the freeze, dump the CD read-pump / FILM
+   player state (drive status, FAD, partition/FIFO occupancy, `cmd_log`) and diff
+   against the Mednafen oracle at the same point (the LLE trace-to-divergence
+   workflow). Compare with the PDZ findings above — status-stuck-`PLAY` + a
+   read-pump freeze — which may share a root.
+
+### History
+Reached playable 2026-06-24 via two SH-2 cache-purge fixes (the FMV→menu deadlock
+`35ce7e8` and the word-`CCR` menu-button purge `6215aab`) — cache coherency is
+SAN5's signature failure class. Full chain in the commit messages and the
+[`debugging-playbook.md`](debugging-playbook.md) SAN5 case study.
