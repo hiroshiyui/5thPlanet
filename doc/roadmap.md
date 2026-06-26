@@ -428,9 +428,13 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   multi-GPU host is **OS/driver-level**, not an SDL flag: Linux `DRI_PRIME=1` /
   NVIDIA `__NV_PRIME_RENDER_OFFLOAD=1` / `MESA_VK_DEVICE_SELECT`; Windows per-app
   Graphics settings or the `NvOptimusEnablement` / `AMD PowerXpressRequestHighPerformance`
-  export convention; macOS via Metal. (Alternative: `librashader` to run
-  RetroArch crt-royale presets verbatim — but it's a heavy parallel GPU stack;
-  SDL_GPU is the in-dependency path.)
+  export convention; macOS via Metal. (Alternative: `librashader` — a pure-Rust,
+  Cargo-native, verbatim `.slangp` runtime that would run the whole `slang-shaders`
+  corpus as-is; reconsidered 2026-06-27 and **not** chosen — the real trade is its
+  MPL/GPL copyleft + a heavier dep tree (`ash`/`wgpu` + `glslang`/`naga`/
+  `spirv-cross2`) + a separate GPU context vs SDL_GPU's in-dependency, permissive,
+  in-SDL3 path. SDL_GPU's cost: reimplement the slang multi-pass runtime. See
+  ADR-0019 "Revisited 2026-06-27".)
 - MPEG card + CD move/copy sector ops (deferred from M7).
 - **Explicitly never** — JIT / dynarec (accuracy over performance is the
   project's design axis).

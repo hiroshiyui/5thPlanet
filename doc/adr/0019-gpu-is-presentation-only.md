@@ -38,7 +38,8 @@ presentation**. Concretely:
   the in-dependency, multi-pass, shader-capable API made available by the SDL3
   migration ([0020](0020-migrate-sdl2-to-sdl3.md)) — behind a `Presenter` trait
   with the `SDL_Renderer` blit as the default and fallback. Not a separate GPU
-  stack.
+  stack. This route reimplements the slang multi-pass pipeline itself rather than
+  embedding librashader — the trade is weighed under "Alternatives" + Revisited.
 
 ### Capability detection (added 2026-06-27)
 
@@ -61,6 +62,25 @@ software Vulkan (llvmpipe/lavapipe). Reading the driver back (to label the backe
 and reject software rasterizers) waits on a newer sdl3-rs with a safe accessor, or
 a justified, narrowly-scoped `#![allow(unsafe_code)]` shim.
 
+### Revisited 2026-06-27 — librashader weighed again, SDL_GPU reaffirmed
+
+Prompted by assembling the RetroArch `slang-shaders` corpus (the presets we'd
+actually want to run), the librashader-vs-SDL_GPU route was reconsidered with
+current facts. The earlier "heavy parallel GPU stack" framing was wrong:
+librashader is pure-Rust, Cargo-native, mature, and runs the whole `.slangp`
+pipeline verbatim — strictly *less* implementation work than the SDL_GPU route.
+**SDL_GPU is nonetheless reaffirmed**, trading that convenience for three things
+the project values more here: a permissive license (vs librashader's MPL/GPL
+copyleft), an SDL-only dependency tree (vs `ash`/`wgpu` + `glslang`/`naga`/
+`spirv-cross2`), and staying inside SDL3's presentation surface (librashader has
+no SDL_GPU backend and would need its own GL/Vulkan/wgpu context). **Accepted
+cost:** the route reimplements the slang multi-pass runtime + Slang-preprocess
+itself, so realistically only a few simple presets get hand-ported (e.g. 1-pass
+`crt-geom`), not the 12-pass `crt-guest-advanced`. librashader remains the
+documented escape hatch if running the full corpus verbatim ever outweighs the
+copyleft + dep-weight costs. The full research backing this is in the
+`shaders/README.md` route discussion. (See the updated "Alternatives" bullet.)
+
 ## Consequences
 
 - **Easier:** cross-platform presentation comes for free (SDL's backends); the
@@ -78,10 +98,24 @@ a justified, narrowly-scoped `#![allow(unsafe_code)]` shim.
 - **GPU-accelerate the VDP.** Rejected: output would no longer be bit-exact
   against hardware/Mednafen, killing the diff methodology — the opposite of the
   project's axis.
-- **Add wgpu (or librashader) for the GPU/shader needs.** Rejected once on SDL3:
-  `SDL_GPU` provides a cross-platform shader pipeline inside the dependency we
-  already link, so a second heavy GPU stack isn't warranted (librashader remains
-  a possible *future* route only if running RetroArch presets verbatim becomes a
-  goal). See [0020](0020-migrate-sdl2-to-sdl3.md).
+- **Use librashader (or wgpu) for the GPU/shader needs.** Not chosen, but on an
+  *accurate* weighing (see Revisited 2026-06-27): librashader is **pure-Rust,
+  Cargo-native, mature, modular**, and a **complete verbatim runtime of the
+  RetroArch `.slangp` slang pipeline** (multi-pass, feedback/history, LUTs,
+  parameters, the libretro semantic uniforms) that plugs in exactly as a
+  presentation post-process (input texture → caller output target → caller
+  presents) — *not* the "heavy parallel stack" an earlier draft called it. It is
+  still not chosen for three concrete reasons: (1) **license** — it is
+  MPL-2.0/GPL-3.0 copyleft (link-friendly + file-level, but a posture change for
+  an otherwise-permissive tree); (2) **dependency weight** — it pulls a backend
+  (`ash`/`wgpu`) plus the reflection stack (`glslang`/`naga`/`spirv-cross2`),
+  much heavier than SDL-only; (3) **no SDL_GPU backend** — it targets
+  GL/Vulkan/D3D/Metal/wgpu and can't ride SDL3's 2D renderer, so adopting it means
+  standing up a separate GPU device/context. `SDL_GPU` instead provides a
+  shader pipeline *inside the dependency we already link*, permissively. The
+  accepted cost is that the SDL_GPU route must reimplement the slang multi-pass
+  runtime + the Slang-preprocess front-end itself; librashader stays the
+  documented escape hatch if running the full preset corpus verbatim ever
+  outweighs those costs. See [0020](0020-migrate-sdl2-to-sdl3.md).
 - **Leave the render driver to SDL's default (no selection).** Rejected: not
   user-selectable, and the `auto` case couldn't even report what it resolved to.
