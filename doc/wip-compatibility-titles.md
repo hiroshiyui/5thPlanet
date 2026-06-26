@@ -17,11 +17,14 @@ real game code, then **stalls in the CD-driven Sega FILM / Cinepak movie player*
 during its intro movie — the CD read pump freezes mid-`Play` with status stuck at
 `PLAY`.
 
-The Cinepak FILM path is **no longer unvalidated**: *Sangokushi V* (now fully
-playable — see [`compatible-game-titles.md`](compatible-game-titles.md)) was the
+The Cinepak FILM path is **no longer unvalidated**: *Sangokushi V* (playable —
+see [`compatible-game-titles.md`](compatible-game-titles.md)) was the
 first title to drive it through to gameplay, its eighteen Cinepak FILM files
-playing. So PDZ's stall is a **PDZ-specific FILM/timing issue**, not a general gap
-in the player. (VF2's opening movie is **Duck TrueMotion**, a different codec; all
+playing. PDZ's stall is therefore *likely* a **PDZ-specific FILM/timing issue**
+rather than a wholesale gap in the player — but note SAN5 is **not yet fully
+playable**: its per-scenario opening introduction movie also intermittently
+stalls (a reset usually bypasses it), so the FILM path is not yet fully robust.
+(VF2's opening movie is **Duck TrueMotion**, a different codec; all
 of these decoders are the games' own SH-2 software run by LLE — no decoder to
 implement either way. See the FMV note below.)
 
