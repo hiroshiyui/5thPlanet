@@ -421,6 +421,10 @@ impl ScspCtrl {
         (self.dbg_keyon_execs, self.dbg_slot_starts)
     }
 
+    pub fn dbg_sample_counter(&self) -> u64 {
+        self.sample_counter
+    }
+
     /// Debug: ([Timer A,B,C overflow counts], tick_timers calls, samples ticked).
     pub fn dbg_timer_counts(&self) -> ([u32; 3], u32, u32) {
         (self.dbg_timer_of, self.dbg_tt_calls, self.dbg_tt_samples)
@@ -517,6 +521,10 @@ impl ScspCtrl {
         self.write16(aligned, nv);
     }
     pub fn write16(&mut self, o: u32, v: u16) {
+        self.write16_inner(o, v, true);
+    }
+
+    fn write16_inner(&mut self, o: u32, v: u16, run_keyon: bool) {
         self.store16(o, v);
         // DSP program / coefficients / delay-address tables live at
         // 0x700..0xC00; route them into the DSP and recompute its length.
@@ -531,7 +539,8 @@ impl ScspCtrl {
         }
         // A write touching a slot's first word (data[0]) with KYONEX set
         // executes key-on/off across all slots.
-        if o < NUM_SLOTS as u32 * SLOT_STRIDE
+        if run_keyon
+            && o < NUM_SLOTS as u32 * SLOT_STRIDE
             && (o & (SLOT_STRIDE - 1)) <= 1
             && self.read16(o & !(SLOT_STRIDE - 1)) & 0x1000 != 0
         {
@@ -560,8 +569,20 @@ impl ScspCtrl {
         }
     }
     pub fn write32(&mut self, o: u32, v: u32) {
-        self.write16(o, (v >> 16) as u16);
-        self.write16(o + 2, v as u16);
+        let keyon_base = if o < NUM_SLOTS as u32 * SLOT_STRIDE && (o & (SLOT_STRIDE - 1)) <= 1 {
+            Some(o & !(SLOT_STRIDE - 1))
+        } else if o + 2 < NUM_SLOTS as u32 * SLOT_STRIDE && ((o + 2) & (SLOT_STRIDE - 1)) <= 1 {
+            Some((o + 2) & !(SLOT_STRIDE - 1))
+        } else {
+            None
+        };
+        self.write16_inner(o, (v >> 16) as u16, keyon_base.is_none());
+        self.write16_inner(o + 2, v as u16, keyon_base.is_none());
+        if let Some(base) = keyon_base
+            && self.read16(base) & 0x1000 != 0
+        {
+            self.key_on_execute();
+        }
     }
 
     /// Advance the three timers by `samples`, pending interrupts on overflow.
@@ -821,6 +842,13 @@ impl ScspCtrl {
                 d.isel,
                 d.efsdl,
                 d.efpan,
+            );
+        }
+        if stream_probe_slot(i) {
+            let d = self.slot_debug(i);
+            eprintln!(
+                "SCSP_STREAM_KEYON slot={i:02} sample={} sa={:05X} lsa={:04X} lea={:04X} step={} tl={:02X}",
+                self.sample_counter, d.sa, d.lsa, d.lea, d.step, d.tl
             );
         }
     }
@@ -1145,6 +1173,14 @@ impl ScspCtrl {
             }
             1 => {
                 if addr >= lea {
+                    if stream_probe_slot(i) {
+                        eprintln!(
+                            "SCSP_STREAM_WRAP slot={i:02} sample={} sa={:05X} addr={addr:04X} lsa={lsa:04X} lea={lea:04X} cur_before={} step={step}",
+                            self.sample_counter,
+                            sa,
+                            slot.cur >> PHASE_SHIFT,
+                        );
+                    }
                     slot.cur = (lsa << PHASE_SHIFT) + (slot.cur - (lea << PHASE_SHIFT));
                     slot.nxt = slot.cur + (1 << PHASE_SHIFT);
                 }
@@ -1181,6 +1217,7 @@ impl ScspCtrl {
         let (lp, rp) = &*PAN_TABLES;
         let (mut l, mut r) = (0i32, 0i32);
         let dsp_on = self.dsp.running();
+        let trace_slot = mix_trace_slot();
         // Latch this sample's EXTS (CD-DA) inputs before the slot loop, exactly
         // as Mednafen calls `CDB_GetCDDA(GetEXTSPtr())` before `RunSample`: the
         // pair is consumed by slots 16/17's effect-return below and by DSP
@@ -1232,12 +1269,39 @@ impl ScspCtrl {
             // attenuation, consumed by `slot_sample`/`eg_advance`).
             self.run_lfo(i);
             let pcm = self.slot_sample(i, ram) as i32;
-            let voice = (pcm * self.eg_advance(i)) >> PHASE_SHIFT;
+            let eg_mul = self.eg_advance(i);
+            let voice = (pcm * eg_mul) >> PHASE_SHIFT;
             let reg_b = self.slot_reg(i, 0xB);
             // Direct output: DISDL send level (bits 15-13) + DIPAN (12-8).
             let didx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
-            l += (voice * lp[didx]) >> PHASE_SHIFT;
-            r += (voice * rp[didx]) >> PHASE_SHIFT;
+            let direct_l = (voice * lp[didx]) >> PHASE_SHIFT;
+            let direct_r = (voice * rp[didx]) >> PHASE_SHIFT;
+            l += direct_l;
+            r += direct_r;
+            if trace_slot == Some(i) && self.sample_counter & 0x1FF == 0 {
+                let d = self.slot_debug(i);
+                let eidx = ((((reg_b >> 5) & 7) << 5) | (reg_b & 0x1F)) as usize;
+                let eff_l = (eff * lp[eidx]) >> PHASE_SHIFT;
+                let eff_r = (eff * rp[eidx]) >> PHASE_SHIFT;
+                eprintln!(
+                    "SCSP_MIX slot={i:02} sample={} sa={:05X} cur={} pcm={} egmul={} voice={} dl={} dr={} eff={} el={} er={} tl={:02X} disdl={} efsdl={} eg={}",
+                    self.sample_counter,
+                    d.sa,
+                    d.cur,
+                    pcm,
+                    eg_mul,
+                    voice,
+                    direct_l,
+                    direct_r,
+                    eff,
+                    eff_l,
+                    eff_r,
+                    d.tl,
+                    d.disdl,
+                    d.efsdl,
+                    d.eg_state,
+                );
+            }
             // Effect send: route the voice into the DSP input mix MIXS[ISEL] at
             // the IMXL level (reg 0xA).
             if dsp_on {
@@ -1260,7 +1324,7 @@ impl ScspCtrl {
             // effect program; its EFREG outputs are read by the next sample's
             // per-slot effect-return above.
             let rbc = self.read16(0x402);
-            self.dsp.rbp = (rbc & 0x3F) as u32;
+            self.dsp.rbp = (rbc & 0x7F) as u32;
             self.dsp.rbl = 0x2000u32 << ((rbc >> 7) & 3);
             self.dsp.step(ram);
         }
@@ -1326,6 +1390,41 @@ type Wwatch68 = (u32, u8, Vec<Wwatch68Entry>);
 fn effect_send_level(voice: i32, imxl: u32) -> i32 {
     let s = voice.clamp(i16::MIN as i32, i16::MAX as i32);
     (s << 4) >> (7 - imxl)
+}
+
+#[cfg(not(test))]
+fn mix_trace_slot() -> Option<usize> {
+    use std::sync::OnceLock;
+    static SLOT: OnceLock<Option<usize>> = OnceLock::new();
+    *SLOT.get_or_init(|| {
+        std::env::var("SAT_SCSP_MIX_TRACE_SLOT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&s| s < NUM_SLOTS)
+    })
+}
+
+#[cfg(test)]
+fn mix_trace_slot() -> Option<usize> {
+    None
+}
+
+#[cfg(not(test))]
+fn stream_probe_slot(i: usize) -> bool {
+    use std::sync::OnceLock;
+    static SLOT: OnceLock<Option<usize>> = OnceLock::new();
+    SLOT.get_or_init(|| {
+        std::env::var("SAT_SCSP_STREAM_SLOT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .or_else(|| std::env::var_os("SAT_SCSP_STREAM_PROBE").map(|_| 0))
+            .filter(|&s| s < NUM_SLOTS)
+    }) == &Some(i)
+}
+
+#[cfg(test)]
+fn stream_probe_slot(_: usize) -> bool {
+    false
 }
 
 /// The Sound Processor (SCSP): 512 KiB sound RAM, the 32-slot FM/PCM engine +
@@ -2759,6 +2858,31 @@ mod tests {
             EgState::Release,
             "key-off releases the playing slot"
         );
+    }
+
+    #[test]
+    fn longword_keyon_uses_the_updated_sample_address_low_word() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(0x02, 0x8C04); // stale SA low from the previous voice
+
+        s.ctrl.write32(0x00, 0x1802_8000); // KYONEX|KYONB|SAhi=2, SAlo=0x8000
+
+        let d = s.ctrl.slot_debug(0);
+        assert_eq!(d.sa, 0x28000, "key-on sees the complete longword write");
+        let (_, starts) = s.ctrl.dbg_keyon_counts();
+        assert_eq!(starts, 1, "no stale intermediate start at the old SA low");
+    }
+
+    #[test]
+    fn dsp_ring_base_pointer_keeps_bit_six() {
+        let mut s = Scsp::new();
+        s.ctrl.write16(0x402, 0x0040); // RBP bit 6 set, RBL = 0
+        s.ctrl.dsp.mpro[0] = 1;
+        s.ctrl.dsp.start();
+
+        let _ = s.next_sample();
+
+        assert_eq!(s.ctrl.dsp.rbp, 0x40, "RBP is a 7-bit field");
     }
 
     #[test]
