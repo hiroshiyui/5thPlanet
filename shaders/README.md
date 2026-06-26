@@ -29,6 +29,26 @@ see the README Acknowledgements); and the compiled outputs (`.spv` / `.dxil` /
 > "Capability detection" for why, and for the known limitation (no backend-name
 > readback, so no software-rasterizer rejection yet).
 
+## The bundled collection: `slang-shaders/`
+
+A full copy of the RetroArch [**`slang-shaders`**](https://github.com/libretro/slang-shaders)
+collection lives at [`slang-shaders/`](slang-shaders/) (gitignored, like everything
+else here — it's GPL/CC third-party material, bring your own). It's **self-contained**:
+~100 ready-to-use CRT presets at `slang-shaders/crt/*.slangp`, each referencing only
+its own internal `shaders/…slang` passes (no external dependency tree to resolve).
+Trinitron-style looks are already in the box — e.g.
+`crt/crt-gdv-mini-ultra-trinitron.slangp`, and `crt/crt-guest-advanced.slangp`
+(which uses a bundled `trinitron-lut.png`).
+
+⚠️ **Format note:** these are **`.slangp` / `.slang`** (RetroArch's Slang preset
+chain — Vulkan-GLSL dialect + a preprocessor), which is **librashader's native
+format, not raw `SDL_GPU`**. SDL_GPU consumes compiled SPIR-V/DXIL/MSL (see
+[Shader formats](#shader-formats) below), so two routes to actually run them:
+take the **librashader** path (roadmap alternative) to load these presets verbatim,
+or **hand-port** a chosen preset's GLSL passes to SPIR-V via `SDL_shadercross` for
+the in-dependency SDL_GPU presenter. Until the presenter lands, this collection is
+reference/source material — nothing in the build loads it yet.
+
 ## The accuracy contract (what a shader must NOT touch)
 
 Per [ADR-0019](../doc/adr/0019-gpu-is-presentation-only.md), **the GPU is for
@@ -56,13 +76,17 @@ also fine — they just stay gitignored here.
 
 ## Expected layout (to be finalized when the presenter lands)
 
-One sub-directory per preset, e.g.:
+The dropped-in RetroArch collection keeps its own tree (`slang-shaders/crt/…`);
+any hand-authored or precompiled presets for the SDL_GPU path sit alongside it,
+one sub-directory per preset, e.g.:
 
 ```
 shaders/
-  crt-royale/
-    crt-royale.glsl          # or a small manifest + per-pass shaders
-    *.spv / *.dxil / *.msl   # precompiled outputs (optional)
+  slang-shaders/             # the RetroArch collection (gitignored) — see above
+    crt/*.slangp             #   ~100 ready CRT presets (.slangp / .slang)
+  crt-royale/                # a hand-ported / precompiled SDL_GPU preset, e.g.
+    crt-royale.glsl          #   or a small manifest + per-pass shaders
+    *.spv / *.dxil / *.msl   #   precompiled outputs (optional)
   scanline-simple/
     scanline.frag
 ```
@@ -72,9 +96,11 @@ The active preset will be chosen via the frontend config (a shader key in
 
 ## Getting shaders
 
-- **RetroArch / libretro shaders** (crt-royale, crt-guest, …) — widely available,
-  GPL/CC-licensed. If the `librashader` alternative (roadmap) is taken, these run
-  closer to verbatim.
+- **The bundled `slang-shaders/` collection** (above) — ~100 CRT presets already
+  here. Native to **librashader** (`.slangp` runs verbatim); for the SDL_GPU path,
+  hand-port a preset's GLSL passes via `SDL_shadercross`.
+- **More RetroArch / libretro shaders** (crt-royale, crt-guest, …) — widely
+  available, GPL/CC-licensed; drop them here too (gitignored).
 - **Hand-authored GLSL** — start from the de-risking **passthrough** shader (a 1:1
   copy of the input texture) the roadmap calls for, confirm the SDL_GPU swapchain
   path works, then add CRT passes.
