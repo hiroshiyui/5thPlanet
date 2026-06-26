@@ -61,6 +61,7 @@ We use Michael Nygard's lightweight format — see
 | [0020](0020-migrate-sdl2-to-sdl3.md) | Migrate the SDL frontend from SDL2 to SDL3 | Accepted |
 | [0021](0021-per-access-bsc-bus-timing.md) | Per-access BSC bus-timing model (faithful Mednafen port) | Accepted |
 | [0022](0022-event-driven-onchip-timers.md) | Event-driven SH-2 on-chip FRT/WDT timers + INTC (lazy materialize) | Accepted |
+| [0023](0023-save-file-keying.md) | Save-file keying: save states per game disc, internal backup RAM per BIOS | Accepted |
 
 ### Decisions worth recording (backlog)
 
