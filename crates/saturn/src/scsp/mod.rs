@@ -437,7 +437,11 @@ impl ScspCtrl {
         // monitor — a computed value, not the backing byte.
         if idx & !1 == 0x408 {
             let m = self.slot_monitor();
-            return if idx & 1 == 0 { (m >> 8) as u8 } else { m as u8 };
+            return if idx & 1 == 0 {
+                (m >> 8) as u8
+            } else {
+                m as u8
+            };
         }
         // Register 0x404 (MIDI input + status flags, read) — no MIDI device is
         // attached, so the input stays empty and the output ready: high byte =
@@ -461,8 +465,7 @@ impl ScspCtrl {
     /// (written there with bits 11-15); the slot's live phase/envelope come from
     /// the per-sample playback state.
     fn slot_monitor(&self) -> u16 {
-        let r408 =
-            u16::from_be_bytes([self.raw[Self::idx(0x408)], self.raw[Self::idx(0x409)]]);
+        let r408 = u16::from_be_bytes([self.raw[Self::idx(0x408)], self.raw[Self::idx(0x409)]]);
         let s = &self.slots[((r408 >> 11) & 0x1F) as usize];
         // CA = top nibble of the 16-bit loop-relative current address.
         let ca = (((s.cur >> PHASE_SHIFT) & 0xFFFF) >> 12) as u16;
@@ -472,6 +475,13 @@ impl ScspCtrl {
         let env_level = 0x3FF - (s.eg.volume >> EG_SHIFT).clamp(0, 0x3FF) as u16;
         (ca << 7) | (sgc << 5) | (env_level >> 5)
     }
+
+    /// Debug: selected MSLC slot and computed slot-monitor value.
+    pub fn dbg_slot_monitor(&self) -> (usize, u16) {
+        let r408 = u16::from_be_bytes([self.raw[Self::idx(0x408)], self.raw[Self::idx(0x409)]]);
+        (((r408 >> 11) & 0x1F) as usize, self.slot_monitor())
+    }
+
     pub fn read16(&self, o: u32) -> u16 {
         u16::from_be_bytes([self.read8(o), self.read8(o + 1)])
     }
@@ -754,6 +764,14 @@ impl ScspCtrl {
             } else if !off {
                 // Key-off a playing slot: enter the release phase (the slot keeps
                 // playing until the release envelope decays to silence).
+                #[cfg(not(test))]
+                if std::env::var_os("SAT_SCSP_KEYON_LOG").is_some() {
+                    let d = self.slot_debug(i);
+                    eprintln!(
+                        "SCSP_KEYOFF slot={i:02} sample={} sa={:05X} cur={} lsa={:04X} lea={:04X} eg={}",
+                        self.sample_counter, d.sa, d.cur, d.lsa, d.lea, d.eg_state
+                    );
+                }
                 self.slots[i].eg.state = EgState::Release;
             }
             // Clear KYONEX (bit 12) so the strobe is one-shot.
@@ -781,6 +799,30 @@ impl ScspCtrl {
             step_mod: 0,
             alfo: 0,
         };
+        #[cfg(not(test))]
+        if std::env::var_os("SAT_SCSP_KEYON_LOG").is_some() {
+            let d = self.slot_debug(i);
+            eprintln!(
+                "SCSP_KEYON slot={i:02} start={} sample={} sa={:05X} lsa={:04X} lea={:04X} pcm8={} lpctl={} oct={} fns={:03X} step={} disdl={} dipan={:02X} tl={:02X} imxl={} isel={} efsdl={} efpan={:02X}",
+                self.dbg_slot_starts,
+                self.sample_counter,
+                d.sa,
+                d.lsa,
+                d.lea,
+                d.pcm8,
+                d.lpctl,
+                d.oct,
+                d.fns,
+                d.step,
+                d.disdl,
+                d.dipan,
+                d.tl,
+                d.imxl,
+                d.isel,
+                d.efsdl,
+                d.efpan,
+            );
+        }
     }
 
     /// Build the envelope state at key-on: cache the AR/D1R/D2R/RR step sizes
@@ -1565,13 +1607,18 @@ impl Scsp {
         core::mem::take(&mut self.out)
     }
 
+    /// Drop already-generated presentation samples without touching emulated
+    /// sound RAM, registers, timers, or CPU state.
+    pub fn clear_output_buffer(&mut self) {
+        self.out.clear();
+    }
+
     /// How many CD-DA (EXTS) input values — interleaved L,R `i16`s — the next
     /// `run(sh2_cycles)` will consume, given the current sample-clock phase.
     /// Pure preview of `run`'s quota math; lets the aggregate pull exactly that
     /// much from the CD-block before stepping (the per-batch EXTS feed).
     pub fn cd_need(&self, sh2_cycles: u64) -> usize {
-        let samples = (self.sample_frac + sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ))
-            / SH2_CLOCK_HZ;
+        let samples = (self.sample_frac + sh2_cycles.saturating_mul(SCSP_SAMPLE_HZ)) / SH2_CLOCK_HZ;
         (samples as usize) * 2
     }
 
@@ -1609,6 +1656,11 @@ impl Scsp {
     /// Snapshot slot `i`'s playback parameters for debugging (see [`SlotDebug`]).
     pub fn slot_debug(&self, i: usize) -> SlotDebug {
         self.ctrl.slot_debug(i)
+    }
+
+    /// Debug: selected MSLC slot and computed slot-monitor value.
+    pub fn dbg_slot_monitor(&self) -> (usize, u16) {
+        self.ctrl.dbg_slot_monitor()
     }
 
     /// Debug: effect-DSP running flag + its EFREG output registers + per-index
@@ -1675,8 +1727,8 @@ impl Scsp {
             let Scsp { ram, ctrl, out, .. } = &mut *self;
             for _ in 0..samples {
                 ctrl.tick_timers(1);
+                let (l, r) = ctrl.mix(ram);
                 if out.len() < MAX_AUDIO_SAMPLES {
-                    let (l, r) = ctrl.mix(ram);
                     out.push(l);
                     out.push(r);
                 }
@@ -1864,8 +1916,8 @@ impl Scsp {
                 sample_acc -= CYCLES_PER_SAMPLE_68K;
                 samples_left -= 1;
                 ctrl.tick_timers(1);
+                let (l, r) = ctrl.mix(ram);
                 if out.len() < MAX_AUDIO_SAMPLES {
-                    let (l, r) = ctrl.mix(ram);
                     out.push(l);
                     out.push(r);
                 }
@@ -1877,8 +1929,8 @@ impl Scsp {
         while samples_left > 0 {
             samples_left -= 1;
             ctrl.tick_timers(1);
+            let (l, r) = ctrl.mix(ram);
             if out.len() < MAX_AUDIO_SAMPLES {
-                let (l, r) = ctrl.mix(ram);
                 out.push(l);
                 out.push(r);
             }
@@ -1908,6 +1960,47 @@ struct M68kView<'a> {
 /// fires early and the per-voice divider lands at the wrong phase). Found by a
 /// cycle-exact 68k lockstep vs Mednafen (`take_68k_itrace`).
 const SCSP_ACCESS_WAIT: u32 = 2;
+
+#[inline]
+fn sound_ram_write_watch(addr: u32, size: u32, val: u32, sample_counter: u64) {
+    use std::sync::OnceLock;
+    static W: OnceLock<Option<u32>> = OnceLock::new();
+    let Some(t) = *W.get_or_init(|| {
+        std::env::var("SAT_68K_SRAM_WWATCH")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+    }) else {
+        return;
+    };
+    static WIN: OnceLock<u32> = OnceLock::new();
+    let win = *WIN.get_or_init(|| {
+        std::env::var("SAT_68K_SRAM_WWATCH_WIN")
+            .ok()
+            .and_then(|s| match s.trim().strip_prefix("0x") {
+                Some(h) => u32::from_str_radix(h, 16).ok(),
+                None => s.trim().parse().ok(),
+            })
+            .unwrap_or(0)
+    });
+    if addr.wrapping_add(size) > t.saturating_sub(win) && addr < t.wrapping_add(win.max(1)) {
+        eprintln!(
+            "S68WWATCH {t:05X}: w{}@{addr:05X} val={val:08X} sample={sample_counter}",
+            size * 8
+        );
+    }
+}
+
+#[inline]
+fn sound_reg_write_log(addr: u32, size: u32, val: u32, sample_counter: u64) {
+    if std::env::var_os("SAT_68K_REG_LOG").is_none() {
+        return;
+    }
+    eprintln!(
+        "S68REG w{}@{:03X} val={val:08X} sample={sample_counter}",
+        size * 8,
+        addr
+    );
+}
 
 impl M68kView<'_> {
     #[inline]
@@ -1968,8 +2061,10 @@ impl Bus for M68kView<'_> {
     }
     fn write8(&mut self, addr: u32, val: u8, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
+            sound_reg_write_log(addr - 0x10_0000, 1, val as u32, self.ctrl.sample_counter);
             self.ctrl.write8(addr - 0x10_0000, val);
         } else if addr < 0x10_0000 {
+            sound_ram_write_watch(addr, 1, val as u32, self.ctrl.sample_counter);
             self.ram.write8(addr, val);
         }
         if Self::is_scsp(addr) {
@@ -1980,8 +2075,10 @@ impl Bus for M68kView<'_> {
     }
     fn write16(&mut self, addr: u32, val: u16, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
+            sound_reg_write_log(addr - 0x10_0000, 2, val as u32, self.ctrl.sample_counter);
             self.ctrl.write16(addr - 0x10_0000, val);
         } else if addr < 0x10_0000 {
+            sound_ram_write_watch(addr, 2, val as u32, self.ctrl.sample_counter);
             self.ram.write16(addr, val);
         }
         if Self::is_scsp(addr) {
@@ -1992,8 +2089,10 @@ impl Bus for M68kView<'_> {
     }
     fn write32(&mut self, addr: u32, val: u32, _: AccessKind) -> u32 {
         if Self::is_reg(addr) {
+            sound_reg_write_log(addr - 0x10_0000, 4, val, self.ctrl.sample_counter);
             self.ctrl.write32(addr - 0x10_0000, val);
         } else if addr < 0x10_0000 {
+            sound_ram_write_watch(addr, 4, val, self.ctrl.sample_counter);
             self.ram.write32(addr, val);
         }
         if Self::is_scsp(addr) {
@@ -2378,7 +2477,10 @@ mod tests {
         s.feed_cd(vec![8000, -8000]);
         let (l, r) = s.ctrl.mix(&mut s.ram);
         assert!(l > 1000, "left CD sample reaches the left output (l={l})");
-        assert!(r < -1000, "right CD sample reaches the right output (r={r})");
+        assert!(
+            r < -1000,
+            "right CD sample reaches the right output (r={r})"
+        );
         // EFSDL=0 (the reset value) mutes the CD input entirely.
         s.ctrl.write16(16 * 0x20 + 0x16, 0x0000);
         s.ctrl.write16(17 * 0x20 + 0x16, 0x0000);
@@ -2417,7 +2519,10 @@ mod tests {
         // A stray strobe (e.g. another slot keying) with KYONB still set must
         // NOT replay the dead sample.
         s.ctrl.write16(0x20, 0x1000); // slot 1: KYONEX, KYONB=0 (pure strobe)
-        assert!(!s.slot_active(0), "stale KYONB does not re-key a sample-ended slot");
+        assert!(
+            !s.slot_active(0),
+            "stale KYONB does not re-key a sample-ended slot"
+        );
         // Key-off moves it to Release; a fresh key-on then restarts it.
         s.ctrl.write16(0x00, 0x1000); // KYONEX, KYONB=0 -> key off
         s.ctrl.write16(0x00, 0x1800); // KYONEX|KYONB -> key on again
@@ -2510,8 +2615,15 @@ mod tests {
         assert_eq!(sample_at(0x0000), 0, "MVOL 0 silences the DAC");
         // MVOL 0xE → mv 0xC0 (0.75); MVOL 0xF → mv 0x100. So 0xE attenuates.
         let attenuated = sample_at(0x000E);
-        assert!(attenuated > 0 && attenuated < unity, "even MVOL attenuates ({attenuated} < {unity})");
-        assert_eq!(attenuated, (unity * 0xC0) >> 8, "MVOL 0xE = unity × 0xC0/0x100");
+        assert!(
+            attenuated > 0 && attenuated < unity,
+            "even MVOL attenuates ({attenuated} < {unity})"
+        );
+        assert_eq!(
+            attenuated,
+            (unity * 0xC0) >> 8,
+            "MVOL 0xE = unity × 0xC0/0x100"
+        );
     }
 
     #[test]
@@ -2540,6 +2652,38 @@ mod tests {
         assert!(!audio.is_empty(), "audio was generated");
         assert!(audio.iter().any(|&x| x != 0), "output is non-silent");
         assert!(s.take_audio().is_empty(), "buffer drained");
+    }
+
+    #[test]
+    fn clear_output_buffer_drops_generated_samples_only() {
+        let mut s = Scsp::new();
+        s.ram.write32(4, 0x2000); // 68k reset PC
+        s.ram.write16(0x2000, 0x60FE); // BRA self
+        keyon_panned(&mut s, 0, 0x2000, 7, 0x00);
+        s.start();
+        s.run(2_000_000);
+
+        s.clear_output_buffer();
+
+        assert!(s.take_audio().is_empty(), "presentation output was dropped");
+        assert!(s.running, "emulated sound CPU state is untouched");
+        assert_eq!(s.ram.read16(0x2000), 0x60FE, "sound RAM is untouched");
+    }
+
+    #[test]
+    fn full_output_buffer_does_not_freeze_slot_playback_position() {
+        let mut s = Scsp::new();
+        keyon_slot0(&mut s, 0x0020, 0x100, 0, 0x100, 0); // looping slot
+        s.out = vec![0; MAX_AUDIO_SAMPLES];
+        let before = s.ctrl.slots[0].cur;
+
+        s.run(2_000_000);
+
+        assert_eq!(s.out.len(), MAX_AUDIO_SAMPLES, "host queue stays capped");
+        assert_ne!(
+            s.ctrl.slots[0].cur, before,
+            "emulated slot phase advances even while host queue is full"
+        );
     }
 
     #[test]
@@ -2793,7 +2937,10 @@ mod tests {
             idxs.push(s.ctrl.slots[0].cur >> PHASE_SHIFT);
         }
         // The slot must turn backwards at some point (the `backwards` flag set).
-        assert!(s.ctrl.slots[0].backwards, "reverse loop set the backwards flag");
+        assert!(
+            s.ctrl.slots[0].backwards,
+            "reverse loop set the backwards flag"
+        );
         // And the index must have decreased on at least one step.
         assert!(
             idxs.windows(2).any(|w| w[1] < w[0]),
@@ -2807,7 +2954,8 @@ mod tests {
         // bounces between LSA and LEA.
         let mut s = Scsp::new();
         for k in 0..8u32 {
-            s.ram.write16(0x100 + k * 2, (k as u16).wrapping_mul(0x1111));
+            s.ram
+                .write16(0x100 + k * 2, (k as u16).wrapping_mul(0x1111));
         }
         keyon_slot0(&mut s, 0x0060, 0x100, 1, 4, 0); // LPCTL=3 (bits 6:5 = 11)
         let mut turned_back = false;
@@ -2855,7 +3003,10 @@ mod tests {
                 break;
             }
         }
-        assert!(reached_d2, "Decay1 falls to the decay level then enters Decay2");
+        assert!(
+            reached_d2,
+            "Decay1 falls to the decay level then enters Decay2"
+        );
     }
 
     #[test]
@@ -2947,7 +3098,10 @@ mod tests {
         s.ctrl.write16(0x10, 0); // OCT/FNS
         s.ctrl.write16(0x00, 0x1800); // key on
         let (l, r) = s.next_sample();
-        assert!(l != 0 && r != 0, "effect return reached the DAC (l={l} r={r})");
+        assert!(
+            l != 0 && r != 0,
+            "effect return reached the DAC (l={l} r={r})"
+        );
         assert_eq!(l, r, "centre EFPAN is symmetric");
     }
 
