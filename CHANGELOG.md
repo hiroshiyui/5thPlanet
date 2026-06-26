@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-26
+
+Keys **save states to the loaded game disc** instead of the BIOS, so each game has
+its own save-state slots. **Breaking (saves): existing `<bios>.*.state` files are
+orphaned** — games now look for `<disc>.*.state`. The internal backup RAM (`.bup`)
+is unchanged (it stays keyed to the BIOS, modelling the console's single shared
+memory card).
+
+### Changed
+
+- **Save states key to the game disc image, not the BIOS** ([ADR-0023](doc/adr/0023-save-file-keying.md)).
+  Each game gets its own quicksave (F5/F9) and OSD save slots, written beside its
+  disc image (`<disc>.state` / `<disc>.<n>.state`). This fixes a latent bug where
+  every game on one BIOS shared `<bios>.0.state` — saving one game's slot 0
+  clobbered another's, and a cross-game load failed the save-state's
+  disc-fingerprint check. A live `cdrom:` drive or a no-disc boot falls back to the
+  BIOS base. The internal backup RAM (`.bup`) is unchanged — it stays keyed to the
+  BIOS. **Breaking for saves:** pre-existing `<bios>.*.state` files are orphaned;
+  no automatic migration (copy an old state next to the disc image to keep it).
+
 ## [0.12.0] - 2026-06-26
 
 Makes **Sangokushi V fully playable** — the third fully-playable commercial game
