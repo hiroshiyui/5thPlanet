@@ -583,6 +583,7 @@ fn run(
             eprintln!("load save state {path} failed: {e:?}");
             return ExitCode::from(1);
         }
+        apply_mouse_port(&mut saturn, mouse_port);
         let m = saturn.master();
         let s = saturn.slave();
         eprintln!(
@@ -856,7 +857,6 @@ fn run(
             let mut pl_frames = 0u32;
             let mut pl_bursts = [0u32; 3];
             let mut pl_last = std::time::Instant::now();
-            let mut input_suppress_frames = 0u32;
             let mut audio_pacing_idle_since: Option<std::time::Instant> = None;
             let mut next_movie_probe = movie_probe.filter(|&period| period != 0);
 
@@ -950,26 +950,18 @@ fn run(
                             let _ = osd.toggle();
                         }
                         EmuIn::Nav(nav) => {
-                            if let Some(action) = osd.handle(nav, &ctx) {
-                                let suppress_input = matches!(
-                                    action,
-                                    osd::OsdAction::Reset | osd::OsdAction::Load(_)
-                                );
-                                if dispatch_osd(
+                            if let Some(action) = osd.handle(nav, &ctx)
+                                && dispatch_osd(
                                     action,
                                     &mut osd,
                                     &mut saturn,
                                     &mut sess,
                                     &ui_tx,
                                     &audio_tx,
-                                ) {
-                                    let _ = ui_tx.send(UiMsg::Quit);
-                                    break 'emu;
-                                }
-                                if suppress_input {
-                                    held = 0;
-                                    input_suppress_frames = 3;
-                                }
+                                )
+                            {
+                                let _ = ui_tx.send(UiMsg::Quit);
+                                break 'emu;
                             }
                         }
                         EmuIn::Quicksave => match fs::write(sess.state_path(), saturn.save_state())
@@ -982,11 +974,10 @@ fn run(
                             match fs::read(&path) {
                             Ok(bytes) => match saturn.load_state(&bytes) {
                                 Ok(()) => {
+                                    apply_mouse_port(&mut saturn, sess.mouse_port);
                                     let _ = audio_tx.send(AudioMsg::Reset);
                                     eprintln!("quickload: {}", path.display());
                                     osd.set_toast("Quickload", 90);
-                                    held = 0;
-                                    input_suppress_frames = 3;
                                 }
                                 Err(e) => {
                                     let _ = audio_tx.send(AudioMsg::Reset);
@@ -1047,19 +1038,18 @@ fn run(
                     continue;
                 }
 
-                let game_held = if input_suppress_frames != 0 { 0 } else { held };
                 if scripted_pad.is_none() {
-                    saturn.set_pad1(game_held);
+                    saturn.set_pad1(held);
                 }
                 // Record a pad-state change at the frame it takes effect (the
                 // burst below holds `held` constant for its whole span).
                 if let Some(f) = rec.as_mut()
-                    && game_held != rec_last
+                    && held != rec_last
                 {
                     use std::io::Write;
-                    let _ = writeln!(f, "{rec_frame} {game_held:04X}");
+                    let _ = writeln!(f, "{rec_frame} {held:04X}");
                     let _ = f.flush();
-                    rec_last = game_held;
+                    rec_last = held;
                 }
                 // Audio-paced burst: run frames until the (mirrored) SDL queue
                 // depth plus what this burst just produced reaches the target.
@@ -1096,7 +1086,6 @@ fn run(
                 pl_frames += burst;
                 pl_bursts[(burst as usize).min(2)] += 1;
                 rec_frame += burst as u64;
-                input_suppress_frames = input_suppress_frames.saturating_sub(burst);
                 if burst > 0
                     && let Some(period) = movie_probe
                     && (period == 0 || {
@@ -1941,6 +1930,7 @@ fn dispatch_osd(
             match fs::read(&path) {
                 Ok(bytes) => match saturn.load_state(&bytes) {
                     Ok(()) => {
+                        apply_mouse_port(saturn, sess.mouse_port);
                         let _ = audio_tx.send(AudioMsg::Reset);
                         eprintln!("loaded slot {n}: {}", path.display());
                         osd.set_toast(format!("Loaded slot {n}"), 120);
