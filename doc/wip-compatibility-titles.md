@@ -129,13 +129,23 @@ still the same CD-driven **Sega FILM / Cinepak** family as the PDZ blocker above
 ### Deterministic repro
 The core is deterministic given (RTC seed + pad stream), both captured by the
 jupiter `SAT_INPUT_REC` movie — so a recording of a *stalling* session reproduces
-the stall on every headless replay; the interactive "intermittency" is just
-RTC-seed / pad-timing variation between sessions (a recording of a *good* session
-always plays).
+the stall on every headless replay. The interactive "intermittency" is **not**
+non-determinism in the core: it is purely **between-session** variation in the RTC
+seed (host wall-clock at boot) and human pad timing — the only entropy the core
+sees (single-threaded; no `rand`; the SMPC RTC is seeded then cycle-driven). A
+savestate from a *good* timeline always plays; one from a *stalling* timeline
+always stalls (it freezes one of the unlucky seed/timing combinations).
 - **`sdbg replay <stall.rec>`** parks at `master 002D6B04, CD status=01 fad=52005
   free_blocks=0 parts=[0:200]` — bit-identical to the interactive freeze.
 - **Fast repro:** a savestate taken ~frame 4300 (just before the read) + ~140
   frames forward with **no input** develops the stall.
+- **Verified 100% reproducible:** loading the pre-stall savestate and running 400
+  frames forward **4/4 times** produced bit-identical results — same master PC
+  (`002DF042`), slave PC (`002D8E3E`), and CD state (`status=01 fad=52005 free=0
+  hirq=0FCD`). So a fix can be developed and verified deterministically against it;
+  the fix must target the **root** (the missing CD-block behaviour, which is
+  timing-independent and so covers the whole random class), not just this one
+  savestate.
 
 ### Ruled out (each with evidence)
 | Hypothesis | Verdict | Evidence |
