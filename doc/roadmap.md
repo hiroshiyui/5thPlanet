@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1146 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1149 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
