@@ -81,7 +81,8 @@ fn bios_boots_to_stable_framebuffer_hash() {
         Ok(s) => {
             let golden = parse_hex_u64(s.trim()).expect("golden file must hold a hex u64");
             assert_eq!(
-                hash, golden,
+                hash,
+                golden,
                 "BIOS-boot framebuffer hash drifted: actual 0x{hash:016X}, \
                  expected 0x{golden:016X}. If the change was intentional, \
                  update {} with the new value.",

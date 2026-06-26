@@ -128,7 +128,10 @@ mod tests {
     #[test]
     fn counting_gate_and_shift_decode() {
         let mut w = Wdt::new();
-        assert!(!w.counting(), "TME clear → not counting (OnChip gates clock_wtcnt on this)");
+        assert!(
+            !w.counting(),
+            "TME clear → not counting (OnChip gates clock_wtcnt on this)"
+        );
         enable(&mut w, true, 0);
         assert!(w.counting(), "TME set → counting");
         assert_eq!(Wdt::shift(0), 1, "φ/2");

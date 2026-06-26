@@ -148,7 +148,11 @@ pub fn build_canvas(
         if let Some(driver) = cand {
             sdl3::hint::set("SDL_RENDER_DRIVER", driver);
         }
-        let Ok(window) = video.window(title, width, height).position_centered().build() else {
+        let Ok(window) = video
+            .window(title, width, height)
+            .position_centered()
+            .build()
+        else {
             continue;
         };
         let canvas = window.into_canvas();
@@ -197,10 +201,19 @@ mod tests {
     #[test]
     fn preference_is_tried_first_then_opengl_then_software() {
         let avail = ["metal", "opengl", "software"];
-        assert_eq!(candidates(RenderBackend::Metal, &avail), vec!["metal", "opengl", "software"]);
-        assert_eq!(candidates(RenderBackend::OpenGl, &avail), vec!["opengl", "software"]);
+        assert_eq!(
+            candidates(RenderBackend::Metal, &avail),
+            vec!["metal", "opengl", "software"]
+        );
+        assert_eq!(
+            candidates(RenderBackend::OpenGl, &avail),
+            vec!["opengl", "software"]
+        );
         // Software-first when explicitly requested.
-        assert_eq!(candidates(RenderBackend::Software, &avail), vec!["software", "opengl"]);
+        assert_eq!(
+            candidates(RenderBackend::Software, &avail),
+            vec!["software", "opengl"]
+        );
     }
 
     #[test]
@@ -208,8 +221,14 @@ mod tests {
         // Metal requested on a host that only has opengl/software (e.g. Linux):
         // the preferred driver is dropped, the fallbacks remain in order.
         let avail = ["opengl", "software"];
-        assert_eq!(candidates(RenderBackend::Metal, &avail), vec!["opengl", "software"]);
-        assert_eq!(candidates(RenderBackend::Direct3D11, &avail), vec!["opengl", "software"]);
+        assert_eq!(
+            candidates(RenderBackend::Metal, &avail),
+            vec!["opengl", "software"]
+        );
+        assert_eq!(
+            candidates(RenderBackend::Direct3D11, &avail),
+            vec!["opengl", "software"]
+        );
         // Nothing in the chain available -> empty -> caller uses SDL3 default.
         assert!(candidates(RenderBackend::OpenGl, &["direct3d11"]).is_empty());
     }

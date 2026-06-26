@@ -61,9 +61,9 @@ fn rom_arith_loop_sums_n_minus_1_down_to_zero() {
     //   NOP
     let prog = [
         0xE305_u16, 0xE405, // MOV #5,R3 ; MOV #5,R4
-        0x334C,             // ADD R4, R3 (n=3, m=4)
-        0x4410,             // DT R4
-        0x8BFC,             // BF -4 (back to ADD)
+        0x334C, // ADD R4, R3 (n=3, m=4)
+        0x4410, // DT R4
+        0x8BFC, // BF -4 (back to ADD)
         0x0009, 0x0009,
     ];
     let (mut cpu, mut bus) = fresh(&prog);
@@ -91,8 +91,7 @@ fn rom_load_store_round_trip_via_pre_dec_post_inc() {
         // Pop into R13, R12, R11, R10 in that order via MOV.L @R15+,Rn.
         // (Popping into R15 first would clobber SP and break the chain —
         // hardware-correct behaviour on SH-2 when Rn == Rm, but useless.)
-        0x6DF6, 0x6CF6, 0x6BF6, 0x6AF6,
-        0x0009,
+        0x6DF6, 0x6CF6, 0x6BF6, 0x6AF6, 0x0009,
     ];
     let (mut cpu, mut bus) = fresh(&prog);
     run(&mut cpu, &mut bus, prog.len());
@@ -125,12 +124,12 @@ fn rom_branch_taken_and_not_taken_paths() {
     //   NOP
     let prog = [
         0xE101, 0xE201, // MOV #1,R1 ; MOV #1,R2
-        0x3210,        // CMP/EQ R1,R2 → T=1
-        0x8D00,        // BT/S +0 → taken, slot runs, lands at next CMP
-        0x321C,        // ADD R1,R2 (slot)
-        0x3210,        // CMP/EQ R1,R2 → T=0 (1 vs 2)
-        0x8900,        // BT +0 → not taken, falls through
-        0xE509,        // MOV #9,R5
+        0x3210, // CMP/EQ R1,R2 → T=1
+        0x8D00, // BT/S +0 → taken, slot runs, lands at next CMP
+        0x321C, // ADD R1,R2 (slot)
+        0x3210, // CMP/EQ R1,R2 → T=0 (1 vs 2)
+        0x8900, // BT +0 → not taken, falls through
+        0xE509, // MOV #9,R5
         0x0009,
     ];
     let (mut cpu, mut bus) = fresh(&prog);
@@ -193,11 +192,9 @@ fn rom_multiply_accumulate_chain() {
     //   .literal B_ptr
     let prog = [
         0xD104, 0xD204, // (disps 4 and 4 — alignment masks resolve later)
-        0x0028,        // CLRMAC
-        0x021F,        // MAC.L @R1+, @R2+ (n=2, m=1)
-        0x021F,
-        0x0009,
-        0x0009,        // padding so literals are 4-aligned
+        0x0028, // CLRMAC
+        0x021F, // MAC.L @R1+, @R2+ (n=2, m=1)
+        0x021F, 0x0009, 0x0009, // padding so literals are 4-aligned
         0x0009,
     ];
     let (mut cpu, mut bus) = fresh(&prog);

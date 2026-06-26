@@ -10,7 +10,8 @@ use sh2::bus::{AccessKind, Bus};
 #[test]
 fn vram_writes_and_reads_through_the_bus() {
     let mut sat = Saturn::with_blank_bios();
-    sat.bus.write32(VRAM_BASE + 0x100, 0xDEAD_BEEF, AccessKind::Data);
+    sat.bus
+        .write32(VRAM_BASE + 0x100, 0xDEAD_BEEF, AccessKind::Data);
     let (v, _) = sat.bus.read32(VRAM_BASE + 0x100, AccessKind::Data);
     assert_eq!(v, 0xDEAD_BEEF);
     assert_eq!(sat.bus.vdp2.vram.read32(0x100), 0xDEAD_BEEF);
@@ -60,7 +61,8 @@ fn cache_through_alias_works_for_vdp2() {
     // bits, so the bus sees 0x05E0_0000 either way.
     let mut sat = Saturn::with_blank_bios();
     // Direct write to cache-through-aliased physical addr.
-    sat.bus.write32(VRAM_BASE + 0x10, 0xCAFE_F00D, AccessKind::Data);
+    sat.bus
+        .write32(VRAM_BASE + 0x10, 0xCAFE_F00D, AccessKind::Data);
     // Read back via the same physical addr.
     let (v, _) = sat.bus.read32(VRAM_BASE + 0x10, AccessKind::Data);
     assert_eq!(v, 0xCAFE_F00D);

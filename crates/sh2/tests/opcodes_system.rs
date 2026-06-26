@@ -59,10 +59,7 @@ fn stsl_predec_storage_of_macl() {
     c.regs.r[1] = 0x4004;
     c.step(&mut bus);
     assert_eq!(c.regs.r[1], 0x4000);
-    assert_eq!(
-        &bus.as_slice()[0x4000..0x4004],
-        &[0xAA, 0xBB, 0xCC, 0xDD]
-    );
+    assert_eq!(&bus.as_slice()[0x4000..0x4004], &[0xAA, 0xBB, 0xCC, 0xDD]);
 }
 
 #[test]

@@ -94,8 +94,7 @@ fn cpu_drives_divu_via_normal_mov_l_instructions() {
     }
     assert_eq!(cpu.regs.r[5] as i32, 7, "quotient = 50 / 7 = 7");
     assert_eq!(
-        cpu.onchip.divu.dvdnth as i32,
-        1,
+        cpu.onchip.divu.dvdnth as i32, 1,
         "remainder visible in DVDNTH"
     );
 }
@@ -149,5 +148,9 @@ fn frc_read_materializes_the_lazy_counter() {
     }
     // 80 φ cycles at φ/8 → FRC ≈ 10. The point is it's non-zero: without the
     // read-path materialization the field would still read its event-time value.
-    assert_eq!(cpu.regs.r[3], 80 / 8, "FRC read reflects elapsed cycles (materialized)");
+    assert_eq!(
+        cpu.regs.r[3],
+        80 / 8,
+        "FRC read reflects elapsed cycles (materialized)"
+    );
 }

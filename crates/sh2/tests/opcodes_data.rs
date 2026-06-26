@@ -87,10 +87,7 @@ fn mov_l_r0_indexed() {
     c.regs.r[1] = 0xABCD_1234;
     c.regs.r[2] = 0x3000;
     c.step(&mut bus);
-    assert_eq!(
-        &bus.as_slice()[0x3010..0x3014],
-        &[0xAB, 0xCD, 0x12, 0x34]
-    );
+    assert_eq!(&bus.as_slice()[0x3010..0x3014], &[0xAB, 0xCD, 0x12, 0x34]);
     c.step(&mut bus);
     assert_eq!(c.regs.r[3], 0xABCD_1234);
 }
@@ -103,10 +100,7 @@ fn mov_gbr_disp() {
     c.regs.gbr = 0x5000;
     c.regs.r[0] = 0xDEAD_BEEF;
     c.step(&mut bus); // store at GBR + 8
-    assert_eq!(
-        &bus.as_slice()[0x5008..0x500C],
-        &[0xDE, 0xAD, 0xBE, 0xEF]
-    );
+    assert_eq!(&bus.as_slice()[0x5008..0x500C], &[0xDE, 0xAD, 0xBE, 0xEF]);
     c.regs.r[0] = 0;
     c.step(&mut bus);
     assert_eq!(c.regs.r[0], 0xDEAD_BEEF);

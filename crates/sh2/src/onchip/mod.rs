@@ -492,7 +492,11 @@ mod tests {
         // Clearing OVF (write DVCR back without bit 0) drops the request.
         o.write32(0xFFFF_FF08, 0b10); // OVFIE stays, OVF cleared
         o.refresh_interrupts();
-        assert_eq!(o.intc.next_pending(0), None, "cleared OVF → request dropped");
+        assert_eq!(
+            o.intc.next_pending(0),
+            None,
+            "cleared OVF → request dropped"
+        );
     }
 
     #[test]
@@ -502,7 +506,11 @@ mod tests {
         o.write8(0xFFFF_FE16, 0x01);
         // Advance 32 cycles → one φ/32 FRC tick (the lazy timer materializes it).
         o.advance_timers(32);
-        assert_eq!(o.read16(0xFFFF_FE12), 1, "FRC at FFFFFE12 after one φ/32 tick");
+        assert_eq!(
+            o.read16(0xFFFF_FE12),
+            1,
+            "FRC at FFFFFE12 after one φ/32 tick"
+        );
     }
 
     #[test]
@@ -553,7 +561,11 @@ mod tests {
         );
         // SH7604 FRT: software clears OCFA by writing 0 to it (after reading 1),
         // not W1C; the pending bit drops next refresh.
-        assert_eq!(o.read8(0xFFFF_FE11) & 0x08, 0x08, "OCFA observed before clear");
+        assert_eq!(
+            o.read8(0xFFFF_FE11) & 0x08,
+            0x08,
+            "OCFA observed before clear"
+        );
         o.write8(0xFFFF_FE11, 0x00); // FTCSR: write 0 to the status flags → clear
         o.refresh_interrupts();
         assert_eq!(o.intc.next_pending(0), None, "cleared after write-0");

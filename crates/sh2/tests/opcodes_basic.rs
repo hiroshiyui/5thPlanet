@@ -153,7 +153,10 @@ fn bra_with_delay_slot_executes_slot_before_jump() {
     cpu.regs.r[2] = 5;
 
     cpu.step(&mut bus); // BRA — sets pending_branch
-    assert_eq!(cpu.regs.r[2], 5, "BRA itself must not yet have executed slot");
+    assert_eq!(
+        cpu.regs.r[2], 5,
+        "BRA itself must not yet have executed slot"
+    );
 
     cpu.step(&mut bus); // ADD R1,R2 in delay slot
     assert_eq!(cpu.regs.r[2], 15);

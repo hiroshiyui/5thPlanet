@@ -67,28 +67,28 @@ fn build_sine_program() -> Vec<u8> {
     // Code words (offsets relative to CODE_PC, computed below for the pool refs).
     // Pool: longword 0x05B0_0000 at 0x50, then words 0x4000/0xE000/0x1820.
     let code: [u16; 22] = [
-        movl_pcrel(1, 11),       // 0x20  R1 = 0x05B00000 (pool@0x50)
-        movw_pcrel(0, 23),       // 0x22  R0 = 0x4000     (pool@0x54)
-        movw_store_r0(1, 1),     // 0x24  reg1 SA-low = R0
-        mov_imm(0, 0),           // 0x26  R0 = 0
-        movw_store_r0(1, 2),     // 0x28  reg2 LSA = 0
-        mov_imm(0, REG_LEA),     // 0x2A  R0 = 63
-        movw_store_r0(1, 3),     // 0x2C  reg3 LEA = 63
-        mov_imm(0, REG_AR),      // 0x2E  R0 = 0x1F
-        movw_store_r0(1, 4),     // 0x30  reg4 AR = max
-        mov_imm(0, 0),           // 0x32  R0 = 0
-        movw_store_r0(1, 5),     // 0x34  reg5 = 0
-        mov_imm(0, 0),           // 0x36  R0 = 0
-        movw_store_r0(1, 6),     // 0x38  reg6 TL = 0 (max volume)
-        mov_imm(0, 0),           // 0x3A  R0 = 0
-        movw_store_r0(1, 8),     // 0x3C  reg8 OCT/FNS = 0 (base pitch, 1:1)
-        mov_imm(0, 0),           // 0x3E  R0 = 0
-        movw_store_r0(1, 10),    // 0x40  reg0xA ISEL/IMXL = 0 (no DSP)
-        movw_pcrel(0, 8),        // 0x42  R0 = 0xE000     (pool@0x56)
-        movw_store_r0(1, 11),    // 0x44  reg0xB DISDL = 7
-        movw_pcrel(0, 7),        // 0x46  R0 = 0x1820     (pool@0x58)
-        movw_store_r0(1, 0),     // 0x48  reg0 = KEY ON (last)
-        BRA_SELF,                // 0x4A  spin forever
+        movl_pcrel(1, 11),    // 0x20  R1 = 0x05B00000 (pool@0x50)
+        movw_pcrel(0, 23),    // 0x22  R0 = 0x4000     (pool@0x54)
+        movw_store_r0(1, 1),  // 0x24  reg1 SA-low = R0
+        mov_imm(0, 0),        // 0x26  R0 = 0
+        movw_store_r0(1, 2),  // 0x28  reg2 LSA = 0
+        mov_imm(0, REG_LEA),  // 0x2A  R0 = 63
+        movw_store_r0(1, 3),  // 0x2C  reg3 LEA = 63
+        mov_imm(0, REG_AR),   // 0x2E  R0 = 0x1F
+        movw_store_r0(1, 4),  // 0x30  reg4 AR = max
+        mov_imm(0, 0),        // 0x32  R0 = 0
+        movw_store_r0(1, 5),  // 0x34  reg5 = 0
+        mov_imm(0, 0),        // 0x36  R0 = 0
+        movw_store_r0(1, 6),  // 0x38  reg6 TL = 0 (max volume)
+        mov_imm(0, 0),        // 0x3A  R0 = 0
+        movw_store_r0(1, 8),  // 0x3C  reg8 OCT/FNS = 0 (base pitch, 1:1)
+        mov_imm(0, 0),        // 0x3E  R0 = 0
+        movw_store_r0(1, 10), // 0x40  reg0xA ISEL/IMXL = 0 (no DSP)
+        movw_pcrel(0, 8),     // 0x42  R0 = 0xE000     (pool@0x56)
+        movw_store_r0(1, 11), // 0x44  reg0xB DISDL = 7
+        movw_pcrel(0, 7),     // 0x46  R0 = 0x1820     (pool@0x58)
+        movw_store_r0(1, 0),  // 0x48  reg0 = KEY ON (last)
+        BRA_SELF,             // 0x4A  spin forever
     ];
 
     let mut prog = vec![0u8; 0x60];
@@ -127,12 +127,21 @@ fn program_disassembles_as_expected() {
     assert_eq!(u32::from_be_bytes(prog[0..4].try_into().unwrap()), CODE_PC);
     assert_eq!(u32::from_be_bytes(prog[4..8].try_into().unwrap()), STACK);
     // The pool holds exactly the SCSP base + the three 16-bit register values.
-    assert_eq!(u32::from_be_bytes(prog[0x50..0x54].try_into().unwrap()), SCSP_REGS);
+    assert_eq!(
+        u32::from_be_bytes(prog[0x50..0x54].try_into().unwrap()),
+        SCSP_REGS
+    );
     assert_eq!(at(0x54), SA_LOW);
     assert_eq!(at(0x58), KEY_ON);
     // Spot-check a couple of instructions decode to the intended ops.
-    assert!(matches!(decode(at(0x20)), sh2::isa::Op::MovLPcRel { rn: 1, .. }));
-    assert!(matches!(decode(at(0x48)), sh2::isa::Op::MovWS0 { rn: 1, disp: 0 }));
+    assert!(matches!(
+        decode(at(0x20)),
+        sh2::isa::Op::MovLPcRel { rn: 1, .. }
+    ));
+    assert!(matches!(
+        decode(at(0x48)),
+        sh2::isa::Op::MovWS0 { rn: 1, disp: 0 }
+    ));
 }
 
 #[test]
@@ -148,7 +157,10 @@ fn audio_pipeline_sine() {
     // (SNDON releases it) on a harmless BRA-self so it can't touch the SCSP.
     let sine = sine_period(N, AMP);
     for (i, &s) in sine.iter().enumerate() {
-        sat.bus.scsp.ram.write16(SA_LOW as u32 + i as u32 * 2, s as u16);
+        sat.bus
+            .scsp
+            .ram
+            .write16(SA_LOW as u32 + i as u32 * 2, s as u16);
     }
     sat.bus.scsp.ram.write32(0, 0x0000_1000); // 68k SSP
     sat.bus.scsp.ram.write32(4, 0x0000_0100); // 68k PC
@@ -189,8 +201,14 @@ fn audio_pipeline_sine() {
     }
 
     assert!(nonzero > 0, "slot produced audio (the sine plays)");
-    assert!(peak >= AMP as u16 / 4, "sine reaches a meaningful level (peak={peak})");
-    assert!(peak < 30000, "steady single voice must not clip (peak={peak})");
+    assert!(
+        peak >= AMP as u16 / 4,
+        "sine reaches a meaningful level (peak={peak})"
+    );
+    assert!(
+        peak < 30000,
+        "steady single voice must not clip (peak={peak})"
+    );
 }
 
 // ===========================================================================
@@ -257,7 +275,10 @@ fn audio_pipeline_sine_68k() {
     // reloads SSP/PC from sound RAM [0]/[4] and runs the driver.
     let sine = sine_period(N, AMP);
     for (i, &s) in sine.iter().enumerate() {
-        sat.bus.scsp.ram.write16(SA_LOW as u32 + i as u32 * 2, s as u16);
+        sat.bus
+            .scsp
+            .ram
+            .write16(SA_LOW as u32 + i as u32 * 2, s as u16);
     }
     sat.bus.scsp.ram.write32(0, M68K_SSP);
     sat.bus.scsp.ram.write32(4, M68K_PC);
@@ -286,14 +307,23 @@ fn audio_pipeline_sine_68k() {
 
     let peak = pcm.iter().map(|&x| x.unsigned_abs()).max().unwrap_or(0);
     let nonzero = pcm.iter().filter(|&&x| x != 0).count();
-    println!("68k-driven output: {} samples, {nonzero} non-zero, peak={peak}", pcm.len());
+    println!(
+        "68k-driven output: {} samples, {nonzero} non-zero, peak={peak}",
+        pcm.len()
+    );
     if let Ok(p) = std::env::var("AUDIO_OUT") {
         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
         std::fs::write(&p, &bytes).unwrap();
         println!("wrote {} bytes to {p}", bytes.len());
     }
 
-    assert!(nonzero > 0, "the 68k-keyed slot produces audio (the sine plays)");
-    assert!(peak >= AMP as u16 / 4, "sine reaches a meaningful level (peak={peak})");
+    assert!(
+        nonzero > 0,
+        "the 68k-keyed slot produces audio (the sine plays)"
+    );
+    assert!(
+        peak >= AMP as u16 / 4,
+        "sine reaches a meaningful level (peak={peak})"
+    );
     assert!(peak < 30000, "single voice must not clip (peak={peak})");
 }

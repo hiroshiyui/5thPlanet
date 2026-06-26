@@ -46,5 +46,9 @@ fn run_system_reports_bios_video() {
         .iter()
         .find(|o| o.name == "bios_video")
         .expect("bios_video outcome present");
-    assert!(video.passed, "bios_video should pass for a real BIOS: {}", video.detail);
+    assert!(
+        video.passed,
+        "bios_video should pass for a real BIOS: {}",
+        video.detail
+    );
 }

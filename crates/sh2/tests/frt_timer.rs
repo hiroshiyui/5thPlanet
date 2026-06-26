@@ -28,7 +28,11 @@ fn ocrb_compare_match_sets_ocfb() {
     o.advance_timers(0x20 * 8); // φ/8 (default TCR): 0x20 ticks → FRC = 0x20
     assert_eq!(o.frt.frc, 0x0020);
     assert_eq!(o.frt.ftcsr & 0x04, 0x04, "OCFB set on the OCRB match");
-    assert_eq!(o.frt.ftcsr & 0x08, 0x00, "OCFA not set (OCRA still 0, never reached)");
+    assert_eq!(
+        o.frt.ftcsr & 0x08,
+        0x00,
+        "OCFA not set (OCRA still 0, never reached)"
+    );
 }
 
 #[test]
@@ -130,7 +134,10 @@ fn input_capture_latches_and_icie_gates_the_interrupt_return() {
     o.write16(OCR, 0xFFFF); // keep OCRA out of the way
     o.advance_timers(0x55 * 8); // φ/8 (default TCR): advance FRC to 0x55
     assert_eq!(o.frt.frc, 0x55);
-    assert!(!o.frt.input_capture(), "ICIE clear → no interrupt requested");
+    assert!(
+        !o.frt.input_capture(),
+        "ICIE clear → no interrupt requested"
+    );
     assert_eq!(o.frt.ficr, 0x55, "FRC latched into FICR");
     assert_eq!(o.frt.ftcsr & 0x80, 0x80, "ICF set");
     // FICR is read-only — a write to its offsets is dropped.
@@ -164,7 +171,11 @@ fn overflow_arms_the_ovi_interrupt_only_when_tier_ovie_set() {
     let _ = o.read8(0xFFFF_FE11);
     o.write8(0xFFFF_FE11, 0x00);
     o.refresh_interrupts();
-    assert_eq!(o.intc.next_pending(0), None, "OVF cleared → request dropped");
+    assert_eq!(
+        o.intc.next_pending(0),
+        None,
+        "OVF cleared → request dropped"
+    );
 }
 
 #[test]
@@ -193,7 +204,11 @@ fn next_ts_schedules_the_nearest_ocra_match() {
     let mut o = OnChip::new();
     o.write16(OCR, 0x0010); // OCRA = 0x10 (TOCR.OCRS clear → OCRA)
     o.advance_timers(0); // force a recalc at cycle 0
-    assert_eq!(o.timer_next_ts(), 0x10 * 8, "next_ts at the OCRA match cycle");
+    assert_eq!(
+        o.timer_next_ts(),
+        0x10 * 8,
+        "next_ts at the OCRA match cycle"
+    );
 }
 
 #[test]

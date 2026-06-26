@@ -127,7 +127,10 @@ fn internal_backup_round_trips_through_the_bus_and_load() {
     let mut next = Saturn::with_blank_bios();
     next.reset();
     next.load_internal_backup(&image);
-    assert_eq!(next.bus.read8(0x0018_0000 + 0x101, AccessKind::Data).0, 0x5A);
+    assert_eq!(
+        next.bus.read8(0x0018_0000 + 0x101, AccessKind::Data).0,
+        0x5A
+    );
 }
 
 // ---- save / load edge cases -----------------------------------------------
@@ -159,7 +162,8 @@ fn save_load_with_a_disc_inserted_regrafts_the_disc() {
     let snapshot = sat.save_state();
     // Run forward, then restore: the disc fingerprint matches → accepted.
     sat.run_for(100_000);
-    sat.load_state(&snapshot).expect("reload onto the same disc");
+    sat.load_state(&snapshot)
+        .expect("reload onto the same disc");
     assert!(sat.has_disc(), "disc re-grafted across load");
 }
 
@@ -231,7 +235,10 @@ fn run_frame_raises_vblank_and_advances_the_clock_by_one_frame() {
     let start = sat.now();
     let (w, h) = sat.run_frame(&mut out);
     // Default NTSC low-res.
-    assert_eq!((w, h), (saturn::vdp2::FRAME_WIDTH, saturn::vdp2::FRAME_HEIGHT));
+    assert_eq!(
+        (w, h),
+        (saturn::vdp2::FRAME_WIDTH, saturn::vdp2::FRAME_HEIGHT)
+    );
     // One NTSC frame is ~479_151 cycles; the clock advanced about that much.
     let advanced = sat.now() - start;
     assert!(
@@ -251,7 +258,11 @@ fn fti_word_write_wakes_the_target_cpu_via_the_drain() {
     // wake signal. drain_input_capture is reached through run_for's batch end.
     let mut sat = Saturn::with_blank_bios();
     sat.reset();
-    assert_eq!(sat.slave().onchip.frt.ftcsr & 0x80, 0, "ICF clear initially");
+    assert_eq!(
+        sat.slave().onchip.frt.ftcsr & 0x80,
+        0,
+        "ICF clear initially"
+    );
     sat.bus.write16(0x0100_0000, 0xBEEF, AccessKind::Data); // slave FTI region
     sat.run_for(512);
     assert_eq!(

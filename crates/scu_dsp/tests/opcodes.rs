@@ -577,7 +577,10 @@ fn d1_dest_undefined_is_ignored() {
     d.load_program(0, &[op_alu(0) | d1_mov_imm(0x8, 0x99), END]);
     d.start(0);
     d.run_until_stopped(16);
-    assert_eq!(d.regs.rx, 0x4242, "undefined dest leaves registers untouched");
+    assert_eq!(
+        d.regs.rx, 0x4242,
+        "undefined dest leaves registers untouched"
+    );
 }
 
 // ---- MVI: conditional + MVI to PC ----
@@ -610,11 +613,11 @@ fn mvi_to_pc_jumps_with_delay_slot_and_sets_top() {
     // MVI dest 0xC = PC: a jump. The next word is the delay slot; TOP latches
     // the return address (the PC after the MVI).
     let d = run(&[
-        mvi(0xC, 4),                            // jump to 4
-        op_alu(0) | d1_mov_imm(DEST_RX, 0x77),  // delay slot, runs once
+        mvi(0xC, 4),                           // jump to 4
+        op_alu(0) | d1_mov_imm(DEST_RX, 0x77), // delay slot, runs once
         NOP,
         NOP,
-        END,                                    // halts here (index 4)
+        END, // halts here (index 4)
     ]);
     assert_eq!(d.regs.rx, 0x77, "MVI-to-PC delay slot executed");
     assert_eq!(d.regs.top, 1, "TOP latched the post-MVI PC");

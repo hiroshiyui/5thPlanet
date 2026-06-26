@@ -178,8 +178,15 @@ fn dmac_address_mode_3_decrements_like_mode_2() {
 
     assert_eq!(bus.as_slice()[0x6004], 0xCA, "first word at start dest");
     assert_eq!(bus.as_slice()[0x6002], 0xBE, "second word one word lower");
-    assert_eq!(cpu.onchip.dmac.channels[0].dar, 0x6000, "mode 3 decremented twice");
-    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 0b10, 0b10, "completed → TE set");
+    assert_eq!(
+        cpu.onchip.dmac.channels[0].dar, 0x6000,
+        "mode 3 decremented twice"
+    );
+    assert_eq!(
+        cpu.onchip.dmac.channels[0].chcr & 0b10,
+        0b10,
+        "completed → TE set"
+    );
 }
 
 #[test]
@@ -198,7 +205,11 @@ fn dmac_misaligned_word_address_sets_ae_and_aborts() {
     cpu.step(&mut bus);
 
     assert_eq!(cpu.onchip.dmac.dmaor & 0b100, 0b100, "AE fault bit latched");
-    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 0b10, 0, "TE not set (aborted)");
+    assert_eq!(
+        cpu.onchip.dmac.channels[0].chcr & 0b10,
+        0,
+        "TE not set (aborted)"
+    );
     assert_eq!(cpu.onchip.dmac.channels[0].tcr, 3, "aborted after one unit");
 }
 
@@ -220,8 +231,14 @@ fn dmac_block_mode_fixed_destination_overwrites() {
     cpu.step(&mut bus);
 
     let (v, _) = sh2::bus::Bus::read32(&mut bus, 0x4000, sh2::bus::AccessKind::Data);
-    assert_eq!(v, 0x4000_0003, "only the last longword survives at the fixed dest");
-    assert_eq!(cpu.onchip.dmac.channels[0].sar, 0x3010, "source advanced by 16");
+    assert_eq!(
+        v, 0x4000_0003,
+        "only the last longword survives at the fixed dest"
+    );
+    assert_eq!(
+        cpu.onchip.dmac.channels[0].sar, 0x3010,
+        "source advanced by 16"
+    );
     assert_eq!(cpu.onchip.dmac.channels[0].dar, 0x4000, "dest fixed");
     assert_eq!(cpu.onchip.dmac.channels[0].tcr, 0, "block consumed");
     assert_eq!(cpu.onchip.dmac.channels[0].chcr & 0b10, 0b10, "TE set");

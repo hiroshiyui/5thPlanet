@@ -38,8 +38,14 @@ fn gameplay_cpu_vs_render_split() {
             .unwrap();
         sat.insert_disc(d);
     }
-    let warm: u32 = std::env::var("WARM").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
-    let n: u32 = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let warm: u32 = std::env::var("WARM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    let n: u32 = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
     let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
 
     for _ in 0..warm {

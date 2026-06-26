@@ -1074,7 +1074,11 @@ fn cmpi_l_to_memory_does_not_modify() {
     let (mut cpu, mut bus) = boot(&[0x0C90, 0x0000, 0x0005], |c| c.regs.a[0] = 0x3000);
     bus.write_long(0x3000, 0x0000_0005);
     cpu.step(&mut bus);
-    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0x0000_0005, "no write");
+    assert_eq!(
+        bus.read32(0x3000, AccessKind::Data).0,
+        0x0000_0005,
+        "no write"
+    );
     assert!(cpu.regs.sr.z, "equal → Z");
 }
 
@@ -1470,7 +1474,11 @@ fn memory_asr_preserves_sign() {
     let (mut cpu, mut bus) = boot(&[0xE0D0], |c| c.regs.a[0] = 0x3000);
     bus.write_word(0x3000, 0x8000);
     cpu.step(&mut bus);
-    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0xC000, "sign preserved");
+    assert_eq!(
+        bus.read16(0x3000, AccessKind::Data).0,
+        0xC000,
+        "sign preserved"
+    );
     assert!(cpu.regs.sr.n);
 }
 
@@ -1493,7 +1501,11 @@ fn memory_roxl_rotates_word_through_extend() {
     });
     bus.write_word(0x3000, 0x0000);
     cpu.step(&mut bus);
-    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x0001, "X into bit 0");
+    assert_eq!(
+        bus.read16(0x3000, AccessKind::Data).0,
+        0x0001,
+        "X into bit 0"
+    );
     assert!(!cpu.regs.sr.c, "old MSB was 0");
 }
 
@@ -1506,7 +1518,11 @@ fn memory_roxr_rotates_word_through_extend() {
     });
     bus.write_word(0x3000, 0x0000);
     cpu.step(&mut bus);
-    assert_eq!(bus.read16(0x3000, AccessKind::Data).0, 0x8000, "X into bit 15");
+    assert_eq!(
+        bus.read16(0x3000, AccessKind::Data).0,
+        0x8000,
+        "X into bit 15"
+    );
     assert!(!cpu.regs.sr.c, "old LSB was 0");
 }
 
@@ -1531,8 +1547,16 @@ fn movem_store_to_control_mode_walks_ascending() {
         c.regs.a[1] = 0x3000;
     });
     cpu.step(&mut bus);
-    assert_eq!(bus.read32(0x3000, AccessKind::Data).0, 0x1111_1111, "D0 first");
-    assert_eq!(bus.read32(0x3004, AccessKind::Data).0, 0x2222_2222, "A0 next");
+    assert_eq!(
+        bus.read32(0x3000, AccessKind::Data).0,
+        0x1111_1111,
+        "D0 first"
+    );
+    assert_eq!(
+        bus.read32(0x3004, AccessKind::Data).0,
+        0x2222_2222,
+        "A0 next"
+    );
 }
 
 #[test]
@@ -1566,7 +1590,11 @@ fn bchg_on_memory_toggles_byte_bit() {
     let (mut cpu, mut bus) = boot(&[0x0850, 0x0000], |c| c.regs.a[0] = 0x3000);
     bus.write8(0x3000, 0x00, AccessKind::Data);
     cpu.step(&mut bus);
-    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x01, "bit toggled set");
+    assert_eq!(
+        bus.read8(0x3000, AccessKind::Data).0,
+        0x01,
+        "bit toggled set"
+    );
     assert!(cpu.regs.sr.z, "old bit was 0");
 }
 
@@ -1580,7 +1608,11 @@ fn btst_on_memory_dynamic_does_not_write() {
     bus.write8(0x3000, 0x01, AccessKind::Data);
     cpu.step(&mut bus);
     assert!(!cpu.regs.sr.z, "bit 0 set");
-    assert_eq!(bus.read8(0x3000, AccessKind::Data).0, 0x01, "BTST never writes");
+    assert_eq!(
+        bus.read8(0x3000, AccessKind::Data).0,
+        0x01,
+        "BTST never writes"
+    );
 }
 
 #[test]
@@ -1651,7 +1683,11 @@ fn dbcc_condition_true_terminates_without_decrement() {
         c.regs.d[0] = 5;
     });
     cpu.step(&mut bus);
-    assert_eq!(cpu.regs.d[0] & 0xFFFF, 5, "condition true → counter untouched");
+    assert_eq!(
+        cpu.regs.d[0] & 0xFFFF,
+        5,
+        "condition true → counter untouched"
+    );
     assert_eq!(cpu.regs.pc, 0x1004, "fell through past the displacement");
 }
 
@@ -1774,6 +1810,10 @@ fn andi_to_sr_masks_system_byte_then_traces() {
     // interrupt mask cleared.
     let stacked_sr = Bus::read16(&mut bus, cpu.regs.a[7], AccessKind::Data).0;
     assert_eq!(stacked_sr & 0x8000, 0x8000, "ANDI kept T (bit 15 in mask)");
-    assert_eq!(stacked_sr & 0x2000, 0, "ANDI cleared S (bit 13 not in mask)");
+    assert_eq!(
+        stacked_sr & 0x2000,
+        0,
+        "ANDI cleared S (bit 13 not in mask)"
+    );
     assert_eq!(stacked_sr & 0x0700, 0, "ANDI cleared the interrupt mask");
 }

@@ -4,8 +4,8 @@
 
 use saturn::SaturnBus;
 use saturn::bus::{
-    ABUS_BBUS_BASE, BACKUP_BASE, BIOS_BASE, HIGH_WRAM_BASE, LOW_WRAM_BASE, SCSP_RAM_BASE, SMPC_BASE,
-    SOUND_BASE,
+    ABUS_BBUS_BASE, BACKUP_BASE, BIOS_BASE, HIGH_WRAM_BASE, LOW_WRAM_BASE, SCSP_RAM_BASE,
+    SMPC_BASE, SOUND_BASE,
 };
 use sh2::bus::{AccessKind, Bus};
 
@@ -140,7 +140,10 @@ fn high_wram_round_trip_8_and_16_bit() {
     bus.write8(HIGH_WRAM_BASE + 0x10, 0xA5, AccessKind::Data);
     bus.write16(HIGH_WRAM_BASE + 0x20, 0xBEEF, AccessKind::Data);
     assert_eq!(bus.read8(HIGH_WRAM_BASE + 0x10, AccessKind::Data).0, 0xA5);
-    assert_eq!(bus.read16(HIGH_WRAM_BASE + 0x20, AccessKind::Data).0, 0xBEEF);
+    assert_eq!(
+        bus.read16(HIGH_WRAM_BASE + 0x20, AccessKind::Data).0,
+        0xBEEF
+    );
 }
 
 #[test]
@@ -239,7 +242,10 @@ fn backup_ram_round_trip_via_16_and_32_bit_bus() {
     bus.write16(BACKUP_BASE + 0x20, 0x00CD, AccessKind::Data); // odd lane <- 0xCD
     assert_eq!(bus.read16(BACKUP_BASE + 0x20, AccessKind::Data).0, 0x00CD);
     bus.write32(BACKUP_BASE + 0x40, 0x00AB_00CD, AccessKind::Data);
-    assert_eq!(bus.read32(BACKUP_BASE + 0x40, AccessKind::Data).0, 0x00AB_00CD);
+    assert_eq!(
+        bus.read32(BACKUP_BASE + 0x40, AccessKind::Data).0,
+        0x00AB_00CD
+    );
 }
 
 #[test]
@@ -283,7 +289,10 @@ fn scsp_region_charges_bbus_wait_states() {
     // The 32-bit store handed off at 2021 and completes at 2021 + 17 + 13 =
     // 2051; a read right after waits that out, then pays its own two halves.
     bus.cycle = 2002;
-    assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, (2051 - 2002) + 48);
+    assert_eq!(
+        bus.read16(SCSP_RAM_BASE, AccessKind::Data).1,
+        (2051 - 2002) + 48
+    );
 }
 
 #[test]
@@ -301,7 +310,10 @@ fn bbus_write_completion_does_not_block_cs3_traffic() {
     assert_eq!(bus.read32(HIGH_WRAM_BASE, AccessKind::Data).1, 9);
     // The SCSP completion (3019) still gates the next B-bus access.
     bus.cycle = 3011;
-    assert_eq!(bus.read16(SCSP_RAM_BASE, AccessKind::Data).1, (3019 - 3011) + 48);
+    assert_eq!(
+        bus.read16(SCSP_RAM_BASE, AccessKind::Data).1,
+        (3019 - 3011) + 48
+    );
 }
 
 // ---- M12 task #8: the per-access BSC bus-timing model ----------------------

@@ -59,10 +59,10 @@ const LRU_UPDATE: [(u8, u8); WAYS] = [
 /// reset value `0` via [`LRU_UPDATE`] (so never indexed in practice). Ported
 /// verbatim from Mednafen `sh7095.inc` `LRU_Replace_Tab`.
 const LRU_REPLACE: [i8; 0x40] = [
-    0x03, 0x02, -1, 0x02, 0x03, -1, 0x01, 0x01, -1, 0x02, -1, 0x02, -1, -1, 0x01, 0x01,
-    0x03, -1, -1, -1, 0x03, -1, 0x01, 0x01, -1, -1, -1, -1, -1, -1, 0x01, 0x01,
-    0x03, 0x02, -1, 0x02, 0x03, -1, -1, -1, -1, 0x02, -1, 0x02, -1, -1, -1, -1,
-    0x03, -1, -1, -1, 0x03, -1, -1, -1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x02, -1, 0x02, 0x03, -1, 0x01, 0x01, -1, 0x02, -1, 0x02, -1, -1, 0x01, 0x01, 0x03, -1,
+    -1, -1, 0x03, -1, 0x01, 0x01, -1, -1, -1, -1, -1, -1, 0x01, 0x01, 0x03, 0x02, -1, 0x02, 0x03,
+    -1, -1, -1, -1, 0x02, -1, 0x02, -1, -1, -1, -1, 0x03, -1, -1, -1, 0x03, -1, -1, -1, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -298,7 +298,11 @@ impl Cache {
     /// refreshed on a hit, exactly as [`Cache::lookup`] does.
     #[inline]
     pub fn probe(&mut self, addr: u32, fetch: bool) -> Probe {
-        let masked = if fetch { self.inst_disabled() } else { self.data_disabled() };
+        let masked = if fetch {
+            self.inst_disabled()
+        } else {
+            self.data_disabled()
+        };
         if !self.enabled() || masked {
             return Probe::Bypass;
         }
@@ -321,7 +325,10 @@ impl Cache {
     /// `debug_assert!` catches any other caller in debug builds.
     #[inline]
     pub fn line_at(&self, set: usize, way: usize) -> &[u8; LINE_BYTES] {
-        debug_assert!(set < SETS && way < WAYS, "line_at({set}, {way}) out of range — pass Probe::Hit indices");
+        debug_assert!(
+            set < SETS && way < WAYS,
+            "line_at({set}, {way}) out of range — pass Probe::Hit indices"
+        );
         &self.sets[set][way].data
     }
 
@@ -545,7 +552,10 @@ mod tests {
         c.lookup_data(evict_addr); // miss
         c.install(evict_addr, line_with(0xC0));
         assert_eq!(c.lookup_data(base), Lookup::Miss, "tag 0 (LRU) evicted");
-        assert!(matches!(c.lookup_data(base | (3 << 10)), Lookup::Hit(_)), "tag 3 resident");
+        assert!(
+            matches!(c.lookup_data(base | (3 << 10)), Lookup::Hit(_)),
+            "tag 3 resident"
+        );
     }
 
     #[test]
@@ -589,7 +599,11 @@ mod tests {
         let a2 = base | (2 << 10);
         c.lookup_data(a2);
         c.install(a2, line_with(2));
-        assert_eq!(c.lookup_data(base), Lookup::Miss, "tag 0 evicted in TW mode");
+        assert_eq!(
+            c.lookup_data(base),
+            Lookup::Miss,
+            "tag 0 evicted in TW mode"
+        );
     }
 
     #[test]
@@ -677,8 +691,15 @@ mod tests {
         // Touch tag 0 via probe → tag 1 becomes LRU; installing tag 4 evicts it.
         assert!(matches!(c.probe(base, false), Probe::Hit(_, _)));
         c.install(base | (4 << 10), line_with(0xC0));
-        assert_eq!(c.probe(base | (1 << 10), false), Probe::Miss, "tag 1 evicted");
-        assert!(matches!(c.probe(base, false), Probe::Hit(_, _)), "tag 0 kept");
+        assert_eq!(
+            c.probe(base | (1 << 10), false),
+            Probe::Miss,
+            "tag 1 evicted"
+        );
+        assert!(
+            matches!(c.probe(base, false), Probe::Hit(_, _)),
+            "tag 0 kept"
+        );
     }
 
     #[test]

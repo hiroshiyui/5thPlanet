@@ -28,7 +28,8 @@ fn empty_slot_floats_high() {
     let (dram, _) = s.bus.read32(CART_DRAM0_BASE, AccessKind::Data);
     assert_eq!(dram, 0xFFFF_FFFF, "empty DRAM window floats high");
     // Writes into an empty slot are dropped (don't panic, stay floating).
-    s.bus.write32(CART_DRAM0_BASE, 0x1234_5678, AccessKind::Data);
+    s.bus
+        .write32(CART_DRAM0_BASE, 0x1234_5678, AccessKind::Data);
     let (after, _) = s.bus.read32(CART_DRAM0_BASE, AccessKind::Data);
     assert_eq!(after, 0xFFFF_FFFF);
 }
@@ -41,8 +42,10 @@ fn ext_ram_1mb_two_banks_and_id() {
     assert_eq!(id, 0x5A, "1 MiB DRAM cart reports 0x5A (8 Mbit)");
 
     // Both banks are independent, writable RAM.
-    s.bus.write32(CART_DRAM0_BASE, 0xDEAD_BEEF, AccessKind::Data);
-    s.bus.write32(CART_DRAM1_BASE, 0xCAFE_F00D, AccessKind::Data);
+    s.bus
+        .write32(CART_DRAM0_BASE, 0xDEAD_BEEF, AccessKind::Data);
+    s.bus
+        .write32(CART_DRAM1_BASE, 0xCAFE_F00D, AccessKind::Data);
     let (b0, _) = s.bus.read32(CART_DRAM0_BASE, AccessKind::Data);
     let (b1, _) = s.bus.read32(CART_DRAM1_BASE, AccessKind::Data);
     assert_eq!(b0, 0xDEAD_BEEF);
@@ -55,7 +58,8 @@ fn ext_ram_1mb_two_banks_and_id() {
     assert_eq!(mirror, 0xDEAD_BEEF, "512 KiB bank mirrors at +0x80000");
 
     // Byte and halfword granularity work too (big-endian).
-    s.bus.write16(CART_DRAM0_BASE + 0x10, 0xABCD, AccessKind::Data);
+    s.bus
+        .write16(CART_DRAM0_BASE + 0x10, 0xABCD, AccessKind::Data);
     let (hw, _) = s.bus.read16(CART_DRAM0_BASE + 0x10, AccessKind::Data);
     assert_eq!(hw, 0xABCD);
     let (hi, _) = s.bus.read8(CART_DRAM0_BASE + 0x10, AccessKind::Data);
@@ -71,7 +75,8 @@ fn ext_ram_4mb_reports_32mbit_and_holds_2mb_banks() {
 
     // A 2 MiB bank does not mirror until its full window; the very top of
     // bank 0 is distinct from its base.
-    s.bus.write32(CART_DRAM0_BASE, 0x1111_1111, AccessKind::Data);
+    s.bus
+        .write32(CART_DRAM0_BASE, 0x1111_1111, AccessKind::Data);
     s.bus
         .write32(CART_DRAM0_BASE + 0x0010_0000, 0x2222_2222, AccessKind::Data);
     let (a, _) = s.bus.read32(CART_DRAM0_BASE, AccessKind::Data);

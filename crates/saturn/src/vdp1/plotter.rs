@@ -628,7 +628,8 @@ impl<'a> Plotter<'a> {
                 // half transparent: blend with destination if its MSB set.
                 let d = self.fb.pixel(x, fy);
                 if d & 0x8000 != 0 {
-                    self.fb.set_pixel(x, fy, alpha_blend_rgb555(d, pix) | 0x8000);
+                    self.fb
+                        .set_pixel(x, fy, alpha_blend_rgb555(d, pix) | 0x8000);
                 } else {
                     self.fb.set_pixel(x, fy, pix);
                 }

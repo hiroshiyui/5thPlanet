@@ -153,13 +153,16 @@ fn movl_pcrel_in_taken_slot_is_legal_and_uses_branch_target_plus_2() {
     // 0x1000 BRA +12 (target 0x1010); slot: MOV.L @(1,PC),R1.
     // Slot base = 0x1010 + 2 → ea = (0x1012 & !3) + 4 = 0x1014.
     let (mut cpu, mut bus) = make(&[
-        0xA006, 0xD101, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009,
-        0x0009, 0x0009, 0xCAFE, 0xBABE,
+        0xA006, 0xD101, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0xCAFE,
+        0xBABE,
     ]);
     cpu.step(&mut bus); // BRA (pending)
     cpu.step(&mut bus); // slot MOV.L — legal, target+2 base
     assert_eq!(cpu.last_fault, None, "PC-relative MOV in a slot is legal");
-    assert_eq!(cpu.regs.r[1], 0xCAFE_BABE, "literal read from target+2 base");
+    assert_eq!(
+        cpu.regs.r[1], 0xCAFE_BABE,
+        "literal read from target+2 base"
+    );
     assert_eq!(cpu.regs.pc, 0x1010, "branch retired after the slot");
 }
 

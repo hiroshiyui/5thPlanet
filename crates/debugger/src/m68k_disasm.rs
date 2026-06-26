@@ -184,7 +184,12 @@ fn decode_immediate(op: u16, r: &mut Reader) -> String {
     }
     let size = 1u32 << sz;
     let i = imm(size, r);
-    format!("{}.{} #{i:#x},{}", names[kind], SZ_BWL[sz], ea(mode, reg, size, r))
+    format!(
+        "{}.{} #{i:#x},{}",
+        names[kind],
+        SZ_BWL[sz],
+        ea(mode, reg, size, r)
+    )
 }
 
 fn decode_move(op: u16, r: &mut Reader) -> String {
@@ -349,8 +354,16 @@ fn decode_addsub(op: u16, base: &str, r: &mut Reader) -> String {
     let to_ea = opmode & 4 != 0;
     // ADDX/SUBX share the to-ea column with mode 0/1 + bit pattern.
     if to_ea && (mode == 0 || mode == 1) {
-        let x = if mode == 0 { format!("d{reg}") } else { format!("-(a{reg})") };
-        let xd = if mode == 0 { format!("d{dn}") } else { format!("-(a{dn})") };
+        let x = if mode == 0 {
+            format!("d{reg}")
+        } else {
+            format!("-(a{reg})")
+        };
+        let xd = if mode == 0 {
+            format!("d{dn}")
+        } else {
+            format!("-(a{dn})")
+        };
         return format!("{base}x.{} {x},{xd}", SZ_BWL[sz]);
     }
     let operand = ea(mode, reg, 1 << sz, r);
@@ -475,7 +488,10 @@ mod tests {
     fn immediate_group_ori_andi_subi_addi_eori_cmpi() {
         assert_eq!(dis(&[0x0001, 0x0012]), ("ori.b #0x12,d1".into(), 4));
         assert_eq!(t(&[0x0440, 0x1234]), "subi.w #0x1234,d0");
-        assert_eq!(dis(&[0x0680, 0x1234, 0x5678]), ("addi.l #0x12345678,d0".into(), 6));
+        assert_eq!(
+            dis(&[0x0680, 0x1234, 0x5678]),
+            ("addi.l #0x12345678,d0".into(), 6)
+        );
         assert_eq!(t(&[0x0c00, 0x0042]), "cmpi.b #0x42,d0");
         assert_eq!(t(&[0x0a40, 0xbeef]), "eori.w #0xbeef,d0");
     }

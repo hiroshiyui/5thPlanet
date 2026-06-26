@@ -274,7 +274,11 @@ fn setsmem_writes_smem_echoed_by_intback_oreg12_15() {
     sat.bus.write8(0x0010_0007, 0xEF, AccessKind::Data); // IREG3
     sat.bus.write8(COMREG, 0x17, AccessKind::Data); // SETSMEM
     sat.run_for(512);
-    assert_eq!(sat.bus.smpc.smem, [0xDE, 0xAD, 0xBE, 0xEF], "SETSMEM stored SMEM");
+    assert_eq!(
+        sat.bus.smpc.smem,
+        [0xDE, 0xAD, 0xBE, 0xEF],
+        "SETSMEM stored SMEM"
+    );
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF drops after SETSMEM");
 
@@ -353,7 +357,10 @@ fn intback_break_ends_the_peripheral_sequence() {
     sat.run_for(40_000);
     let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
     assert_eq!(sr, 0x2F, "status SR signals peripheral data pending");
-    assert_ne!(sat.bus.smpc.intback_stage, 0, "a peripheral sequence is in progress");
+    assert_ne!(
+        sat.bus.smpc.intback_stage, 0,
+        "a peripheral sequence is in progress"
+    );
     // Host BREAKs (IREG0 bit 0x40) instead of CONTINUE — the sequence ends.
     sat.bus.write8(0x0010_0001, 0x40, AccessKind::Data);
     assert_eq!(sat.bus.smpc.intback_stage, 0, "BREAK ended the sequence");
@@ -415,14 +422,22 @@ fn intback_peripheral_reports_the_shuttle_mouse() {
         "flags<<4 | buttons"
     );
     assert_eq!(sat.bus.smpc.oreg[3], 5, "X delta low byte");
-    assert_eq!(sat.bus.smpc.oreg[4], (-3i32 & 0xFF) as u8, "Y delta (up-positive)");
+    assert_eq!(
+        sat.bus.smpc.oreg[4],
+        (-3i32 & 0xFF) as u8,
+        "Y delta (up-positive)"
+    );
     assert_eq!(sat.bus.smpc.oreg[5], 0xF0, "port 2: no peripheral");
 
     // The report consumed the deltas: a second phase reports zero motion
     // (buttons are level state, still held).
     sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // CONTINUE (last)
     sat.run_for(40_000);
-    assert_eq!(sat.bus.smpc.oreg[2], mouse::LEFT | mouse::START, "no motion flags");
+    assert_eq!(
+        sat.bus.smpc.oreg[2],
+        mouse::LEFT | mouse::START,
+        "no motion flags"
+    );
     assert_eq!(sat.bus.smpc.oreg[3], 0, "X accumulator reset");
     assert_eq!(sat.bus.smpc.oreg[4], 0, "Y accumulator reset");
 }
@@ -437,7 +452,11 @@ fn mouse_deltas_clamp_with_overflow_flags() {
     sat.feed_mouse(1000, 1000, 0); // host down 1000 → Saturn −1000
     let (b1, x, y) = sat.bus.smpc.take_mouse_report();
     // X: positive overflow → clamp 255. Y: negative overflow → clamp −256.
-    assert_eq!(b1 >> 4, 0x4 | 0x8 | 0x2, "X-overflow + Y-overflow + Y-negative");
+    assert_eq!(
+        b1 >> 4,
+        0x4 | 0x8 | 0x2,
+        "X-overflow + Y-overflow + Y-negative"
+    );
     assert_eq!(x, 255);
     assert_eq!(y, (-256i32 & 0xFF) as u8);
 }
@@ -459,5 +478,9 @@ fn pad_on_port1_and_mouse_on_port2_pack_sequentially() {
     sat.run_for(40_000);
     let o = &sat.bus.smpc.oreg;
     assert_eq!(&o[0..4], &[0xF1, 0x02, !0x08, 0xFF], "port 1: pad block");
-    assert_eq!(&o[4..9], &[0xF1, 0xE3, mouse::RIGHT, 7, 0], "port 2: mouse block");
+    assert_eq!(
+        &o[4..9],
+        &[0xF1, 0xE3, mouse::RIGHT, 7, 0],
+        "port 2: mouse block"
+    );
 }

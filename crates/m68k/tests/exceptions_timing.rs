@@ -93,7 +93,10 @@ fn divu_overflow_is_cheaper_than_a_full_divide() {
         });
         cpu.step(&mut bus)
     };
-    assert!(overflow < normal, "overflow ({overflow}) cheaper than divide ({normal})");
+    assert!(
+        overflow < normal,
+        "overflow ({overflow}) cheaper than divide ({normal})"
+    );
 }
 
 // ---- address-error exception (vector 3, group-0 frame) -------------------
@@ -113,12 +116,19 @@ fn word_write_to_odd_address_takes_an_address_error() {
     bus.write_word(0x000E, 0x5000);
     cpu.step(&mut bus);
 
-    assert_eq!(cpu.regs.pc, 0x5000, "vectored through the address-error handler");
+    assert_eq!(
+        cpu.regs.pc, 0x5000,
+        "vectored through the address-error handler"
+    );
     assert!(cpu.regs.sr.supervisor);
     assert_eq!(cpu.regs.a[7], 0x2000 - 14, "long group-0 frame is 14 bytes");
     assert_eq!(cpu.fault, None, "fault consumed");
     // The data write never reached the (odd) target cell.
-    assert_eq!(Bus::read16(&mut bus, 0x2000, AccessKind::Data).0, 0, "write aborted");
+    assert_eq!(
+        Bus::read16(&mut bus, 0x2000, AccessKind::Data).0,
+        0,
+        "write aborted"
+    );
 }
 
 #[test]
@@ -131,7 +141,11 @@ fn byte_access_to_odd_address_is_fine() {
     });
     cpu.step(&mut bus);
     assert_eq!(cpu.fault, None, "no address error on a byte access");
-    assert_eq!(Bus::read8(&mut bus, 0x2001, AccessKind::Data).0, 0xCA, "byte stored at the odd address");
+    assert_eq!(
+        Bus::read8(&mut bus, 0x2001, AccessKind::Data).0,
+        0xCA,
+        "byte stored at the odd address"
+    );
 }
 
 #[test]
@@ -164,7 +178,11 @@ fn trace_fires_after_an_instruction_executed_with_t_set() {
 
     assert_eq!(cpu.regs.pc, 0x3000, "vectored through the trace handler");
     assert!(!cpu.regs.sr.trace, "T cleared on trace-exception entry");
-    assert_eq!(cpu.regs.a[7], 0x2000 - 6, "normal 6-byte frame (not group-0)");
+    assert_eq!(
+        cpu.regs.a[7],
+        0x2000 - 6,
+        "normal 6-byte frame (not group-0)"
+    );
     // The stacked PC is the instruction *after* the traced NOP.
     assert_eq!(
         Bus::read32(&mut bus, cpu.regs.a[7] + 2, AccessKind::Data).0,
@@ -177,5 +195,8 @@ fn trace_fires_after_an_instruction_executed_with_t_set() {
 fn no_trace_when_t_is_clear() {
     let (mut cpu, mut bus) = boot(&[0x4E71], |c| c.regs.sr.supervisor = true);
     cpu.step(&mut bus);
-    assert_eq!(cpu.regs.pc, 0x1002, "ran straight through, no trace exception");
+    assert_eq!(
+        cpu.regs.pc, 0x1002,
+        "ran straight through, no trace exception"
+    );
 }

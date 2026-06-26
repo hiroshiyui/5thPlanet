@@ -36,8 +36,19 @@ pub const DEFAULT_KEYS: [&str; PAD_BUTTONS] = [
 
 /// The config-file keys for the bindings, index-matched to [`BUTTON_NAMES`].
 const KEY_KEYS: [&str; PAD_BUTTONS] = [
-    "key_up", "key_down", "key_left", "key_right", "key_a", "key_b", "key_c", "key_x", "key_y",
-    "key_z", "key_l", "key_r", "key_start",
+    "key_up",
+    "key_down",
+    "key_left",
+    "key_right",
+    "key_a",
+    "key_b",
+    "key_c",
+    "key_x",
+    "key_y",
+    "key_z",
+    "key_l",
+    "key_r",
+    "key_start",
 ];
 
 /// Persisted frontend settings. `region: None` means "autodetect from the
@@ -249,7 +260,13 @@ mod tests {
         let cfg = Config::parse("nonsense\nscale = banana\nunknown = 7\n# comment\nscale = 9\n");
         // 9 clamps to 4; everything else stays default.
         assert_eq!(cfg.scale, 4);
-        assert_eq!(cfg, Config { scale: 4, ..Config::default() });
+        assert_eq!(
+            cfg,
+            Config {
+                scale: 4,
+                ..Config::default()
+            }
+        );
     }
 
     #[test]
@@ -273,7 +290,10 @@ mod tests {
     fn backend_token_parses_and_defaults_to_auto() {
         assert_eq!(Config::default().backend, "auto");
         assert_eq!(Config::parse("backend = \"opengl\"\n").backend, "opengl");
-        assert_eq!(Config::parse("backend = \"software\"\n").backend, "software");
+        assert_eq!(
+            Config::parse("backend = \"software\"\n").backend,
+            "software"
+        );
         // A missing key keeps the default; present.rs maps unknown tokens to auto.
         assert_eq!(Config::parse("scale = 2\n").backend, "auto");
     }
@@ -290,7 +310,10 @@ mod tests {
         };
         // The portable file always wins when present, even alongside XDG —
         // a self-contained archive's bundled config overrides the global one.
-        assert_eq!(pick(&["/cfg/jupiter.toml", "/app/jupiter.toml"]), Some(local.clone()));
+        assert_eq!(
+            pick(&["/cfg/jupiter.toml", "/app/jupiter.toml"]),
+            Some(local.clone())
+        );
         assert_eq!(pick(&["/app/jupiter.toml"]), Some(local.clone()));
         // Only the XDG file exists -> use it.
         assert_eq!(pick(&["/cfg/jupiter.toml"]), Some(xdg.clone()));
@@ -302,8 +325,14 @@ mod tests {
     fn pick_path_falls_back_to_xdg_when_no_portable() {
         let xdg = PathBuf::from("/cfg/jupiter.toml");
         // No exe location at all -> XDG path, whether or not it exists yet.
-        assert_eq!(Config::pick_path(Some(xdg.clone()), None, |_| false), Some(xdg.clone()));
-        assert_eq!(Config::pick_path(Some(xdg.clone()), None, |_| true), Some(xdg));
+        assert_eq!(
+            Config::pick_path(Some(xdg.clone()), None, |_| false),
+            Some(xdg.clone())
+        );
+        assert_eq!(
+            Config::pick_path(Some(xdg.clone()), None, |_| true),
+            Some(xdg)
+        );
         // Nothing resolvable -> None.
         assert_eq!(Config::pick_path(None, None, |_| true), None);
     }

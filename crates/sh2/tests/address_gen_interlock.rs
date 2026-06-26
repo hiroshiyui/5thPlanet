@@ -75,5 +75,9 @@ fn unrelated_address_base_does_not_stall() {
     cpu.regs.r[1] = 0x2000;
     cpu.regs.r[7] = 0x3000;
     cpu.step(&mut bus);
-    assert_eq!(cpu.step(&mut bus), 1, "no interlock when the base wasn't just loaded");
+    assert_eq!(
+        cpu.step(&mut bus),
+        1,
+        "no interlock when the base wasn't just loaded"
+    );
 }
