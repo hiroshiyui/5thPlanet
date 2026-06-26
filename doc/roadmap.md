@@ -413,8 +413,11 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   `sdl3::gpu::Device::new` for its shader format (SPIR-V/DXIL/MSL) and logs the
   verdict (`GpuCapability`), falling back to the `SDL_Renderer` blit; `unsafe`-free
   because `Device::new` returns a `Result` (the cheap pre-probes aren't safe-wrapped
-  in sdl3-rs 0.18.4). Follow-up: read the chosen backend (`SDL_GetGPUDeviceDriver`,
-  also unwrapped) to label it + reject a software Vulkan. **Device entry point:**
+  in sdl3-rs 0.18.4). **Presenter DoD:** when the presenter ships and consumes the
+  verdict, flip the `gpu` config default `off`→`auto` (search `TODO(gpu-presenter)`
+  — also update its default-asserting test + `jupiter.toml.example`). Follow-up:
+  read the chosen backend (`SDL_GetGPUDeviceDriver`, also unwrapped) to label it +
+  reject a software Vulkan. **Device entry point:**
   `SDL_CreateGPUDevice(format_flags, debug_mode, name)` /
   `SDL_CreateGPUDeviceWithProperties` (safe-wrapped by `sdl3::gpu` — no `unsafe`
   despite the workspace `forbid`). The `name` picks the **backend**

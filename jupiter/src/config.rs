@@ -73,10 +73,10 @@ pub struct Config {
     /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL3
     /// render driver presents the framebuffer; the CLI flag overrides this.
     pub backend: String,
-    /// SDL_GPU capability-probe mode, same vocabulary as `--gpu`: `off` (default —
-    /// no probe, the only presentation path is the `SDL_Renderer` blit), `auto`,
-    /// or `on`. Groundwork for the planned CRT-shader presenter (ADR-0019); the
-    /// CLI flag overrides this.
+    /// SDL_GPU capability-probe mode, same vocabulary as `--gpu`: `off` (default
+    /// *until the CRT-shader presenter lands* — no probe, the only presentation
+    /// path is the `SDL_Renderer` blit), `auto`, or `on`. Groundwork for the
+    /// planned presenter (ADR-0019); the CLI flag overrides this.
     pub gpu: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
@@ -91,6 +91,10 @@ impl Default for Config {
             cartridge: "none".into(),
             mouse: "off".into(),
             backend: "auto".into(),
+            // TODO(gpu-presenter): flip to "auto" when the SDL_GPU CRT presenter
+            // consumes the probe verdict (ADR-0019). The flip also requires
+            // updating the `gpu_token_parses_and_defaults_to_off` test, the `gpu`
+            // field doc above, and `jupiter/jupiter.toml.example`.
             gpu: "off".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
