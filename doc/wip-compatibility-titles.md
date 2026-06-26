@@ -120,10 +120,47 @@ FILM files to gameplay, so the player works for most movies; this is a
 robustness / timing gap, not a missing feature. The intermittency points at a
 timing or ordering race rather than a deterministic content bug.
 
+### Hypotheses (prioritized — Codex, 2026-06-26)
+1. **Frontend pacing stall (most likely).** The SDL frontend advances emulation
+   from audio-queue depth; if the queue mirror / inflight counter sticks high,
+   the emu thread stops calling `advance_frame()` and movie + CD + SCSP + input
+   all freeze together. Fits "stops randomly, OSD Reset/load sometimes helps,"
+   and headless scripted `.1.state` runs are stable (so the issue is tied to
+   interactive SDL use). Pacing watchdogs were added in `8ac18cb` to target this,
+   but may not fully cover it.
+2. **Savestate restores stale SMPC port/device state.** Explains a "buttons don't
+   work after load" symptom: `load_state` restores the port-device layout, so
+   `set_pad1` writes bits the game ignores if port 1 isn't a pad. Load paths now
+   re-apply the frontend port config after load (`2a33f47`) — input-related, not
+   the movie decoder.
+3. **OSD/input timing shifts the transition frame.** Leaving Settings with C to
+   enter the movie is a game-state transition; if C is seen on a different
+   INTBACK frame the game can take a slightly different path — looks random
+   because manual timing varies.
+4. **Core CD-buffer-vs-SH-2/SCSP timing race.** The movie streams CD data + SCSP
+   ring audio; an occasional "not enough sectors" / missed buffer state can stall
+   it — would show as `SDLMOVIE` still advancing frames while `cd_st`/`fad`/
+   `parts`/PC get stuck.
+5. **Bad/stale savestate captured during an already-broken timeline.** Possible
+   but de-prioritized: the `.1.state` repeatedly reaches the movie in headless
+   probes.
+6. **Residual SCU/SH-2 timing approximation.** The narration-repeat was DMA
+   timing starvation (now fixed, `64237d7`), proving the movie path is
+   timing-sensitive — a narrower CD-block HIRQ/DMA/polling mismatch may remain,
+   visible only under real frontend pacing + manual input.
+
+### Best discriminator — when it stalls, watch whether `SDLMOVIE f=…` keeps printing
+- **`SDLMOVIE` also stops** → frontend pacing / thread / audio stall (#1).
+- **`SDLMOVIE` continues but `fad`/`parts`/PC are stuck** → core CD/game timing (#4/#6).
+- **Input dies only after a load** → SMPC port-restore (#2).
+- **Scripted `SAT_PAD` always works but manual C sometimes fails** → input transition timing (#3).
+
 ### Next steps (resume point)
 1. **Reproduce deterministically** — capture the stall as an input movie
    (`SAT_INPUT_REC`) and replay it headless (`sdbg replay --cart`); a fixed RTC
-   seed + pad stream is essential given the intermittency.
+   seed + pad stream is essential given the intermittency. If scripted input
+   never reproduces it, that itself points at frontend pacing (#1) or manual
+   input timing (#3).
 2. **Trace to the divergence** — at the freeze, dump the CD read-pump / FILM
    player state (drive status, FAD, partition/FIFO occupancy, `cmd_log`) and diff
    against the Mednafen oracle at the same point (the LLE trace-to-divergence
