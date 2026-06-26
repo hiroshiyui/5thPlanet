@@ -29,6 +29,8 @@ mod osd;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod present;
 #[cfg(any(feature = "sdl-frontend", test))]
+mod present_gpu;
+#[cfg(any(feature = "sdl-frontend", test))]
 mod render_pipe;
 
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
@@ -240,6 +242,7 @@ fn main() -> ExitCode {
     let mut cart_spec: Option<String> = None;
     let mut mouse_port: Option<u8> = None;
     let mut backend_override: Option<String> = None;
+    let mut gpu_override: Option<String> = None;
     for arg in env::args().skip(1) {
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
@@ -249,6 +252,10 @@ fn main() -> ExitCode {
             mouse_port = Some(1);
         } else if let Some(tok) = arg.strip_prefix("--backend=") {
             backend_override = Some(tok.to_string());
+        } else if arg == "--gpu" {
+            gpu_override = Some("auto".to_string());
+        } else if let Some(tok) = arg.strip_prefix("--gpu=") {
+            gpu_override = Some(tok.to_string());
         } else {
             positionals.push(arg);
         }
@@ -283,6 +290,8 @@ fn main() -> ExitCode {
             eprintln!(
                 "                         opengles | direct3d11 | direct3d12 | metal | software"
             );
+            eprintln!("  --gpu[=off|auto|on]    probe SDL_GPU support at startup (off = default;");
+            eprintln!("                         groundwork for the planned CRT-shader presenter)");
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -315,6 +324,10 @@ fn main() -> ExitCode {
     // `--backend=` overrides the config's graphics backend (CLI > file).
     if let Some(b) = backend_override {
         cfg.backend = b;
+    }
+    // `--gpu[=…]` overrides the config's SDL_GPU probe mode (CLI > file).
+    if let Some(g) = gpu_override {
+        cfg.gpu = g;
     }
 
     // Optional expansion cartridge: `--cart=` wins, else the config file.
@@ -712,6 +725,10 @@ fn run(
         "render backend: {active_driver} (requested {})",
         backend_pref.to_token()
     );
+    // SDL_GPU capability probe (off by default). Today this only logs whether the
+    // host could drive the planned CRT-shader presenter; `_gpu_cap` is the typed
+    // verdict the presenter will consume once it's wired (ADR-0019).
+    let _gpu_cap = present_gpu::probe(present_gpu::GpuMode::from_token(&cfg.gpu));
     set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
         let _ = canvas.window_mut().set_fullscreen(true);

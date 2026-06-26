@@ -73,6 +73,11 @@ pub struct Config {
     /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL3
     /// render driver presents the framebuffer; the CLI flag overrides this.
     pub backend: String,
+    /// SDL_GPU capability-probe mode, same vocabulary as `--gpu`: `off` (default —
+    /// no probe, the only presentation path is the `SDL_Renderer` blit), `auto`,
+    /// or `on`. Groundwork for the planned CRT-shader presenter (ADR-0019); the
+    /// CLI flag overrides this.
+    pub gpu: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -86,6 +91,7 @@ impl Default for Config {
             cartridge: "none".into(),
             mouse: "off".into(),
             backend: "auto".into(),
+            gpu: "off".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -119,6 +125,7 @@ impl Config {
                 "cartridge" => cfg.cartridge = unquote(v),
                 "mouse" => cfg.mouse = unquote(v),
                 "backend" => cfg.backend = unquote(v),
+                "gpu" => cfg.gpu = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -145,6 +152,7 @@ impl Config {
         out.push_str(&format!("cartridge = \"{}\"\n", self.cartridge));
         out.push_str(&format!("mouse = \"{}\"\n", self.mouse));
         out.push_str(&format!("backend = \"{}\"\n", self.backend));
+        out.push_str(&format!("gpu = \"{}\"\n", self.gpu));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -243,6 +251,7 @@ mod tests {
             cartridge: "ram4m".into(),
             mouse: "2".into(),
             backend: "software".into(),
+            gpu: "auto".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -296,6 +305,15 @@ mod tests {
         );
         // A missing key keeps the default; present.rs maps unknown tokens to auto.
         assert_eq!(Config::parse("scale = 2\n").backend, "auto");
+    }
+
+    #[test]
+    fn gpu_token_parses_and_defaults_to_off() {
+        assert_eq!(Config::default().gpu, "off");
+        assert_eq!(Config::parse("gpu = \"auto\"\n").gpu, "auto");
+        assert_eq!(Config::parse("gpu = \"on\"\n").gpu, "on");
+        // A missing key keeps the default; present_gpu maps unknown tokens to off.
+        assert_eq!(Config::parse("scale = 2\n").gpu, "off");
     }
 
     #[test]

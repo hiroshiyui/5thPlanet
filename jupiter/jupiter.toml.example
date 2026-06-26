@@ -44,6 +44,16 @@ fullscreen = false
 # Note: "vulkan" is NOT available in SDL2's 2D renderer; it maps to "auto".
 backend = "auto"
 
+# SDL_GPU capability probe, same vocabulary as the `--gpu` CLI flag. Groundwork
+# for the planned CRT-shader presenter (the GPU is presentation-only — ADR-0019);
+# the probe only logs whether this host could create an SDL_GPU device. Valid
+# values:
+#   "off"   never probe (default; the SDL_Renderer blit is the only path)
+#   "auto"  probe at startup and report
+#   "on"    probe and warn loudly if it fails
+# Default: "off".
+gpu = "off"
+
 # --- System -----------------------------------------------------------------
 
 # SMPC region token. Omit this key entirely to autodetect from the BIOS
