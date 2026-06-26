@@ -76,7 +76,8 @@ pub struct Config {
     /// SDL_GPU capability-probe mode, same vocabulary as `--gpu`: `off` (default
     /// *until the CRT-shader presenter lands* — no probe, the only presentation
     /// path is the `SDL_Renderer` blit), `auto`, or `on`. Groundwork for the
-    /// planned presenter (ADR-0019); the CLI flag overrides this.
+    /// planned presenter (ADR-0019); the CLI flag overrides this. **Only consumed
+    /// in `gpu-preview` builds** — inert (parsed/stored but unused) otherwise.
     pub gpu: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],

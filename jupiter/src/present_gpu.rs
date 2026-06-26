@@ -109,6 +109,7 @@ impl ShaderKind {
 /// for the host's shader format could be created. The fields are written by
 /// [`probe`] and read by the future CRT-shader presenter (ADR-0019); until that
 /// lands nothing consumes them, hence the `dead_code` allowance.
+#[cfg(feature = "gpu-preview")]
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuCapability {
@@ -119,7 +120,7 @@ pub struct GpuCapability {
 }
 
 /// The matching `sdl3::gpu::ShaderFormat` flag for this kind.
-#[cfg(feature = "sdl-frontend")]
+#[cfg(feature = "gpu-preview")]
 impl ShaderKind {
     fn to_sdl(self) -> sdl3::gpu::ShaderFormat {
         use sdl3::gpu::ShaderFormat;
@@ -139,7 +140,7 @@ impl ShaderKind {
 /// SDL error and reports "unavailable" so the caller keeps the `SDL_Renderer`
 /// path. The created device is dropped immediately — nothing consumes it until the
 /// presenter lands (see the module docs for why we must allocate to probe).
-#[cfg(feature = "sdl-frontend")]
+#[cfg(feature = "gpu-preview")]
 pub fn probe(mode: GpuMode) -> GpuCapability {
     let shader = ShaderKind::for_target();
     if !should_probe(mode) {

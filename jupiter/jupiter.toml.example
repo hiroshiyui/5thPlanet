@@ -46,8 +46,9 @@ backend = "auto"
 
 # SDL_GPU capability probe, same vocabulary as the `--gpu` CLI flag. Groundwork
 # for the planned CRT-shader presenter (the GPU is presentation-only — ADR-0019);
-# the probe only logs whether this host could create an SDL_GPU device. Valid
-# values:
+# the probe only logs whether this host could create an SDL_GPU device. **Only
+# active in `gpu-preview` builds** (`cargo build --features gpu-preview`); in a
+# normal build this key + the `--gpu` flag are inert. Valid values:
 #   "off"   never probe (default; the SDL_Renderer blit is the only path)
 #   "auto"  probe at startup and report
 #   "on"    probe and warn loudly if it fails

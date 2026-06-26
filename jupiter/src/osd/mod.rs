@@ -266,6 +266,8 @@ enum Screen {
     /// Stub chooser for the (planned) SDL_GPU CRT-shader presenter — see
     /// ADR-0019 + `shaders/README.md`. Currently a read-only placeholder; it
     /// will list the presets from `shaders/` once the presenter lands.
+    /// Preview-only groundwork (the `gpu-preview` feature; absent by default).
+    #[cfg(feature = "gpu-preview")]
     Shaders,
     Controller,
     Region,
@@ -445,7 +447,7 @@ impl Osd {
             Screen::Graphics => {
                 // Scale cycles 1→2→3→4→1 on each activation.
                 let next = ctx.scale % 4 + 1;
-                vec![
+                let mut v = vec![
                     mk(
                         &format!("Scale: {}x", ctx.scale),
                         Select::Emit(OsdAction::SetScale(next)),
@@ -460,10 +462,14 @@ impl Osd {
                         &format!("Renderer: {}", ctx.backend.label()),
                         Select::Emit(OsdAction::SetBackend(ctx.backend.next())),
                     ),
-                    mk("Shaders...", Select::Push(Screen::Shaders)),
-                    mk("Back", Select::Close),
-                ]
+                ];
+                // The Shaders chooser is preview-only groundwork (gpu-preview).
+                #[cfg(feature = "gpu-preview")]
+                v.push(mk("Shaders...", Select::Push(Screen::Shaders)));
+                v.push(mk("Back", Select::Close));
+                v
             }
+            #[cfg(feature = "gpu-preview")]
             Screen::Shaders => {
                 // Stub: the SDL_GPU CRT-shader presenter is a backlog item
                 // (ADR-0019; `shaders/README.md`). Read-only placeholder rows so
@@ -643,6 +649,7 @@ impl Osd {
             Screen::Slots { saving: false } => "Load State",
             Screen::Settings => "Settings",
             Screen::Graphics => "Graphics",
+            #[cfg(feature = "gpu-preview")]
             Screen::Shaders => "Shaders",
             Screen::Controller => "Controller",
             Screen::Region => "Region",
@@ -953,6 +960,7 @@ mod tests {
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Quit));
     }
 
+    #[cfg(feature = "gpu-preview")]
     #[test]
     fn graphics_opens_shaders_chooser_stub() {
         let mut osd = Osd::new();

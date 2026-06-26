@@ -28,7 +28,9 @@ mod config;
 mod osd;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod present;
-#[cfg(any(feature = "sdl-frontend", test))]
+// Preview-only groundwork (the `--gpu` SDL_GPU probe); compiled only with the
+// `gpu-preview` feature, or in tests for its pure unit tests.
+#[cfg(any(feature = "gpu-preview", test))]
 mod present_gpu;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod render_pipe;
@@ -242,8 +244,20 @@ fn main() -> ExitCode {
     let mut cart_spec: Option<String> = None;
     let mut mouse_port: Option<u8> = None;
     let mut backend_override: Option<String> = None;
+    #[cfg(feature = "gpu-preview")]
     let mut gpu_override: Option<String> = None;
     for arg in env::args().skip(1) {
+        // `--gpu[=off|auto|on]` is preview-only groundwork (off by default);
+        // recognised only in `gpu-preview` builds — otherwise it falls through as
+        // an unknown argument.
+        #[cfg(feature = "gpu-preview")]
+        if arg == "--gpu" || arg.starts_with("--gpu=") {
+            gpu_override = Some(
+                arg.strip_prefix("--gpu=")
+                    .map_or_else(|| "auto".to_string(), str::to_string),
+            );
+            continue;
+        }
         if let Some(spec) = arg.strip_prefix("--cart=") {
             cart_spec = Some(spec.to_string());
         } else if arg == "--mouse" || arg == "--mouse=2" {
@@ -252,10 +266,6 @@ fn main() -> ExitCode {
             mouse_port = Some(1);
         } else if let Some(tok) = arg.strip_prefix("--backend=") {
             backend_override = Some(tok.to_string());
-        } else if arg == "--gpu" {
-            gpu_override = Some("auto".to_string());
-        } else if let Some(tok) = arg.strip_prefix("--gpu=") {
-            gpu_override = Some(tok.to_string());
         } else {
             positionals.push(arg);
         }
@@ -290,8 +300,15 @@ fn main() -> ExitCode {
             eprintln!(
                 "                         opengles | direct3d11 | direct3d12 | metal | software"
             );
-            eprintln!("  --gpu[=off|auto|on]    probe SDL_GPU support at startup (off = default;");
-            eprintln!("                         groundwork for the planned CRT-shader presenter)");
+            #[cfg(feature = "gpu-preview")]
+            {
+                eprintln!(
+                    "  --gpu[=off|auto|on]    probe SDL_GPU support at startup (off = default;"
+                );
+                eprintln!(
+                    "                         groundwork for the planned CRT-shader presenter)"
+                );
+            }
             eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
@@ -325,7 +342,9 @@ fn main() -> ExitCode {
     if let Some(b) = backend_override {
         cfg.backend = b;
     }
-    // `--gpu[=…]` overrides the config's SDL_GPU probe mode (CLI > file).
+    // `--gpu[=…]` overrides the config's SDL_GPU probe mode (CLI > file);
+    // preview-only (the `gpu-preview` feature).
+    #[cfg(feature = "gpu-preview")]
     if let Some(g) = gpu_override {
         cfg.gpu = g;
     }
@@ -725,9 +744,11 @@ fn run(
         "render backend: {active_driver} (requested {})",
         backend_pref.to_token()
     );
-    // SDL_GPU capability probe (off by default). Today this only logs whether the
-    // host could drive the planned CRT-shader presenter; `_gpu_cap` is the typed
-    // verdict the presenter will consume once it's wired (ADR-0019).
+    // SDL_GPU capability probe — preview-only groundwork (the `gpu-preview`
+    // feature; absent from normal builds). Logs whether the host could drive the
+    // planned CRT-shader presenter; `_gpu_cap` is the verdict the presenter will
+    // consume once it's wired (ADR-0019).
+    #[cfg(feature = "gpu-preview")]
     let _gpu_cap = present_gpu::probe(present_gpu::GpuMode::from_token(&cfg.gpu));
     set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
