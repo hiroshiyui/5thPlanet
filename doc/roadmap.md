@@ -407,7 +407,18 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   framebuffer stays bit-identical, so accuracy is untouched. Shaders authored
   GLSL → SPIR-V (precompiled, or `SDL_shadercross`; DXIL/MSL for non-Vulkan
   hosts). De-risk with a passthrough-shader spike first; the `--backend`
-  render-driver selector is the groundwork. (Alternative: `librashader` to run
+  render-driver selector is the groundwork. **Device entry point:**
+  `SDL_CreateGPUDevice(format_flags, debug_mode, name)` /
+  `SDL_CreateGPUDeviceWithProperties` (safe-wrapped by `sdl3::gpu` — no `unsafe`
+  despite the workspace `forbid`). The `name` picks the **backend**
+  (`vulkan`/`direct3d12`/`metal`/null), **not** a physical GPU — SDL_GPU has no
+  integrated-vs-discrete device selector; the closest knob is the property
+  `SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN` (default **false** →
+  already prefers the performance/discrete GPU). Pinning the discrete GPU on a
+  multi-GPU host is **OS/driver-level**, not an SDL flag: Linux `DRI_PRIME=1` /
+  NVIDIA `__NV_PRIME_RENDER_OFFLOAD=1` / `MESA_VK_DEVICE_SELECT`; Windows per-app
+  Graphics settings or the `NvOptimusEnablement` / `AMD PowerXpressRequestHighPerformance`
+  export convention; macOS via Metal. (Alternative: `librashader` to run
   RetroArch crt-royale presets verbatim — but it's a heavy parallel GPU stack;
   SDL_GPU is the in-dependency path.)
 - MPEG card + CD move/copy sector ops (deferred from M7).
