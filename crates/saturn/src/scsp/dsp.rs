@@ -14,8 +14,6 @@
 use crate::memory::Ram;
 use serde_big_array::BigArray;
 
-const SOUND_RAM_MASK: u32 = (super::SOUND_RAM_BYTES as u32) - 1;
-
 /// Sign-extend the low `bits` of `v`.
 #[inline]
 fn sext(v: i32, bits: u32) -> i32 {
@@ -183,7 +181,6 @@ impl Dsp {
             self.mixs.fill(0);
             return;
         }
-        self.efreg.fill(0);
         let rbl_mask = self.rbl.wrapping_sub(1);
 
         for step in 0..128 {
@@ -289,7 +286,11 @@ impl Dsp {
             // Resolve the delay-RAM access latched on a previous step (the
             // access has latency — Mednafen's ReadPending/WritePending).
             if self.read_pending != 0 {
-                let w = ram.read16((self.rw_addr << 1) & SOUND_RAM_MASK);
+                let w = if self.rw_addr & 0x4_0000 != 0 {
+                    0
+                } else {
+                    ram.read16(self.rw_addr << 1)
+                };
                 self.read_value = if self.read_pending == 2 {
                     ((w as i32) << 8) & 0xFF_FFFF
                 } else {
@@ -297,7 +298,9 @@ impl Dsp {
                 };
                 self.read_pending = 0;
             } else if self.write_pending {
-                ram.write16((self.rw_addr << 1) & SOUND_RAM_MASK, self.write_value);
+                if self.rw_addr & 0x4_0000 == 0 {
+                    ram.write16(self.rw_addr << 1, self.write_value);
+                }
                 self.write_pending = false;
             }
 
@@ -539,6 +542,22 @@ mod tests {
     }
 
     #[test]
+    fn unwritten_effect_outputs_remain_latched() {
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.efreg[3] = 0x1234;
+        let prog = [[0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0]];
+
+        load(&mut dsp, &prog);
+        dsp.step(&mut ram);
+
+        assert_eq!(
+            dsp.efreg[3], 0x1234,
+            "EFREG entries without EWT are latched, not cleared per sample"
+        );
+    }
+
+    #[test]
     fn delay_ram_write_then_read_round_trips_via_madrs() {
         // MWT stores the shifter into delay RAM at MADRS[masa]; a later MRT reads
         // it back into read_value, and IWT latches read_value into MEMS. NOFL=1
@@ -602,6 +621,30 @@ mod tests {
             dsp.mems[2],
             ((stored as i32) << 8) & 0xFF_FFFF,
             "MRT(NOFL) read-back: raw 16-bit << 8, masked to 24 bits, into MEMS[2]"
+        );
+    }
+
+    #[test]
+    fn delay_ram_dummy_half_reads_zero_and_ignores_writes() {
+        let mut dsp = Dsp::new();
+        let mut ram = Ram::new(super::super::SOUND_RAM_BYTES);
+        dsp.stopped = false;
+        dsp.last_step = 1;
+
+        ram.write16(0, 0x5678);
+        dsp.rw_addr = 0x4_0000;
+        dsp.read_pending = 2; // raw 16-bit read path
+        dsp.step(&mut ram);
+        assert_eq!(dsp.read_value, 0, "dummy delay-RAM half reads as silence");
+
+        dsp.rw_addr = 0x4_0000;
+        dsp.write_pending = true;
+        dsp.write_value = 0x1234;
+        dsp.step(&mut ram);
+        assert_eq!(
+            ram.read16(0),
+            0x5678,
+            "dummy delay-RAM writes must not wrap into real sound RAM"
         );
     }
 
