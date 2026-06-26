@@ -421,6 +421,8 @@ impl ScspCtrl {
         (self.dbg_keyon_execs, self.dbg_slot_starts)
     }
 
+    /// Debug: the running 44.1 kHz output-sample counter (the bus write-watch
+    /// stamps sound-RAM writes with it to correlate 68k stores against playback).
     pub fn dbg_sample_counter(&self) -> u64 {
         self.sample_counter
     }
@@ -568,6 +570,12 @@ impl ScspCtrl {
             _ => {}
         }
     }
+    /// 32-bit register write. A longword touching a slot's first word must run
+    /// the KYONEX key-on scan **once against the complete word**, not twice via
+    /// two 16-bit halves — otherwise key-on can fire on the stale low half (old
+    /// sample-address) before the second halfword lands. So both halves are
+    /// stored with key-on suppressed, then the scan runs once if the write
+    /// covered a slot's first word with KYONEX set.
     pub fn write32(&mut self, o: u32, v: u32) {
         let keyon_base = if o < NUM_SLOTS as u32 * SLOT_STRIDE && (o & (SLOT_STRIDE - 1)) <= 1 {
             Some(o & !(SLOT_STRIDE - 1))
