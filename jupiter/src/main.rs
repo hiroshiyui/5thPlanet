@@ -508,6 +508,18 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
     if depth < catchup_floor { max.max(1) } else { 1 }
 }
 
+/// Base path for a game's save-state siblings: the loaded disc IMAGE so each game
+/// gets its own slots, falling back to `bios_base` for a live `cdrom:` drive (no
+/// image path) or a no-disc boot. The `.bup` battery keys to the BIOS separately
+/// (a shared console resource); only save states follow the disc.
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+fn state_base_for(launched_spec: Option<&str>, bios_base: &std::path::Path) -> std::path::PathBuf {
+    match launched_spec {
+        Some(spec) if !spec.starts_with("cdrom:") => std::path::PathBuf::from(spec),
+        _ => bios_base.to_path_buf(),
+    }
+}
+
 /// Subtract `n` from an atomic, clamping at 0. **Must saturate**: an
 /// `AudioMsg::Reset` zeroes `audio_inflight` (`store(0)`) and can race ahead of
 /// in-flight `Chunk` byte-count subtracts that were already queued, momentarily
@@ -1723,7 +1735,9 @@ struct UiState {
 
 /// Everything the emu thread's OSD dispatcher owns besides the machine: the
 /// Settings mirrors, the persisted config, the launch disc spec, and the
-/// save-file base path (`<bios>` → `.state` / `.<n>.state` / `.bup` siblings).
+/// save-file bases. The `.bup` battery keys to the BIOS (`save_base`, a shared
+/// console resource); save states key to the loaded disc image (`state_base`,
+/// per-game).
 #[cfg(feature = "sdl-frontend")]
 struct Session {
     save_base: std::path::PathBuf,
@@ -1732,7 +1746,8 @@ struct Session {
     cfg: config::Config,
     /// The swappable BIOS images beside the launched one (paths + display
     /// stems, index-matched) and which one is running. A swap re-keys
-    /// `save_base` to the new image.
+    /// `save_base` (and thus the `.bup`) to the new image; save states follow
+    /// the disc via `launched_spec`, not the BIOS.
     bios_paths: Vec<std::path::PathBuf>,
     bios_names: Vec<String>,
     bios_active: usize,
@@ -1752,11 +1767,19 @@ const DISC_EXTS: &[&str] = &["cue", "iso", "ccd"];
 
 #[cfg(feature = "sdl-frontend")]
 impl Session {
+    /// Base path for the per-game save-state siblings (`.state` / `.<n>.state`).
+    /// Unlike the `.bup` battery — a shared console resource keyed to the BIOS
+    /// (`save_base`) — a save state belongs to a specific game, so it keys to the
+    /// loaded disc IMAGE. A live `cdrom:` drive has no image path and a no-disc
+    /// boot has no game, so both fall back to the BIOS base.
+    fn state_base(&self) -> std::path::PathBuf {
+        state_base_for(self.launched_spec.as_deref(), &self.save_base)
+    }
     fn slot_path(&self, n: u8) -> std::path::PathBuf {
-        self.save_base.with_extension(format!("{n}.state"))
+        self.state_base().with_extension(format!("{n}.state"))
     }
     fn state_path(&self) -> std::path::PathBuf {
-        self.save_base.with_extension("state")
+        self.state_base().with_extension("state")
     }
 
     /// Rebuild `browse_entries` from `browse_dir`: `..` first (when not at the
@@ -2906,7 +2929,27 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::burst_cap;
+    use super::{burst_cap, state_base_for};
+    use std::path::Path;
+
+    // Save states key to the game disc (so each game has its own slots); a live
+    // `cdrom:` drive and a no-disc boot fall back to the BIOS base. (The `.bup`
+    // battery keys to the BIOS separately — not exercised here.)
+    #[test]
+    fn save_state_base_keys_to_disc_then_falls_back_to_bios() {
+        let bios = Path::new("/bios/saturn.bin");
+        assert_eq!(
+            state_base_for(Some("/roms/game.cue"), bios),
+            Path::new("/roms/game.cue"),
+            "a disc image keys the save states to itself"
+        );
+        assert_eq!(
+            state_base_for(Some("cdrom:/dev/sr0"), bios),
+            bios,
+            "a live optical drive has no image path → BIOS fallback"
+        );
+        assert_eq!(state_base_for(None, bios), bios, "no disc → BIOS fallback");
+    }
 
     // Healthy reserve (well above the floor) → render every frame, never
     // collapse — the VF2-steady-60 case (~77 ms vs a ~40 ms floor).
