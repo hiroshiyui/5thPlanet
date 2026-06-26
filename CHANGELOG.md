@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-26
+
+Makes **Sangokushi V fully playable** — the third fully-playable commercial game
+(with Virtua Fighter 2 and Doukyuusei ~if~) — by fixing the intermittent
+scenario-opening-movie stall, whose root cause was an SH-2 interrupt-timing bug.
+Also refines the SCU / SCSP / CD accuracy model, adds robust frontend audio
+pacing, and adopts standard `rustfmt` workspace-wide. **Save-state format → v12:
+save states from earlier versions are rejected** (presentation-only audio buffers
+are no longer serialized). The prior playable games' render goldens still pass
+(VF2 53440, Doukyuusei 143341 px) and the BIOS-boot golden is unchanged.
+
+### Added
+
+- **CD 16-bit sector data-port reads** — games that poll the buffered sector
+  stream from the CPU as 16-bit halfwords (not only through the 32-bit SCU-DMA
+  port) are now supported; the 32-bit port composes two halfword reads so both
+  paths see the same stream position.
+- **Robust frontend audio pacing** (jupiter) — in-flight-reserve accounting plus
+  two watchdogs keep the emulation thread from wedging across an OSD reset/load
+  edge, and audio is flushed on reset / state-load. Adds headless capture /
+  diagnostic tooling: `SAT_AUDIO_DUMP` (WAV capture), `SAT_LOADSTATE`, scripted
+  pad (`SAT_PAD`/`_FROM`/`_TO`), `SAT_FRAMES`, and movie / SCSP probes.
+
+### Changed
+
+- **Sangokushi V is now fully playable** (see Fixed) — three fully-playable
+  commercial games.
+- **SCU interrupt timing** — an interrupt is no longer accepted while the master
+  SH-2 is in a branch delay slot (hardware never does), and the SCU `IST` status
+  is write-0-clear and stays latched on vector acceptance until the guest clears
+  it (the ISR reads it to identify the source).
+- **SCU DMA model** — a DMA completes synchronously at its trigger point with no
+  SH-2 halt charge (superseding the M12 both-CPU-halt model), and the `D*EN`
+  enable now persists across completion so event-driven (VBlank / HBlank / Timer)
+  DMA re-arms correctly.
+- **SCSP** — playback advances every emulated sample regardless of the host audio
+  queue (decoupling emulation from presentation drain); a 32-bit key-on uses the
+  complete sample address; the DSP ring-base pointer is a full 7-bit field; and
+  EFREG is latched (not cleared per sample) with the delay-RAM "dummy half"
+  reading 0 / discarding writes instead of aliasing into real sound RAM.
+- The configured Shuttle Mouse port is re-applied after a state load.
+- **Adopted standard `rustfmt`** workspace-wide — a committed `rustfmt.toml` pins
+  `style_edition = "2024"`, and `cargo fmt --all -- --check` joins clippy as a
+  gate. The historical compact hand-style is retired.
+- **Save-state format → v12** — the presentation-only audio buffers (`Scsp::out`,
+  `CdBlock::cd_audio`) are no longer serialized (they are cleared on load), so
+  snapshots are smaller. **Save states from earlier versions are rejected.**
+
+### Fixed
+
+- **Sangokushi V scenario-opening movie stall** — the per-scenario opening movie
+  intermittently froze the emulation. Root cause: an SCU DMA-end interrupt was
+  forwarded into the `nop` delay slot after an `rte`, corrupting the game's
+  CD-DMA completion handshake so it never issued `EndDataXfer`, the CD buffer
+  filled, and the movie hung. Found via a deterministic record → replay →
+  snapshot repro (the interactive "randomness" was only between-session
+  RTC-seed / input-timing variation, not core non-determinism).
+- **Virtua Fighter 2 render** restored to its canonical output — a DMA
+  enable-clear regression had subtly corrupted one frame (53386 → 53440 px).
+- **CD 32-bit data-port over-read** returns a single `0xFFFF_FFFF` end-of-transfer
+  sentinel instead of spilling into (and popping) the staged TOC/file-info FIFO.
+- The jupiter audio watchdog honours `SAT_AUDIO_WATCHDOG_MS=0` (disable) and
+  clears the in-flight reserve symmetrically.
+
 ## [0.11.0] - 2026-06-24
 
 Migrates the `jupiter` frontend from **SDL2 to SDL3** and adds a user-selectable
