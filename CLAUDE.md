@@ -27,7 +27,7 @@ cargo llvm-cov --workspace --summary-only  # coverage (~85% line; re-report
                                            # from cache: cargo llvm-cov report …)
 ```
 
-**Formatting:** the codebase is a deliberate compact hand-style — **do NOT run `cargo fmt --all`** (under edition 2024 rustfmt explodes ~60 files; there is no `rustfmt.toml` and no CI fmt gate). Format only the lines you add/change, by hand, matching the surrounding code. `cargo clippy --workspace --all-targets -- -D warnings` *is* the enforceable gate and must stay clean. (See the `code-review` skill for the full rationale.)
+**Formatting:** code follows standard `rustfmt` — run `cargo fmt --all` and keep the tree fmt-clean. `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are both gates and must stay clean. (The codebase was historically a compact hand-style and `cargo fmt --all` was avoided; that restriction is **lifted** — formatting now follows the rustfmt ruleset across the workspace.)
 
 Run the binary with `cargo run -p jupiter -- <bios.bin>` — the SDL3 frontend (default-on `sdl-frontend` feature) opens a window and runs the BIOS; `--no-default-features` runs headless.
 

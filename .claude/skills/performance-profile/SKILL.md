@@ -60,7 +60,7 @@ Interpret against the architecture (see `render_pipe`/`main.rs` and the `threadi
 Before recommending (or, if asked, applying) an optimization, the bar is:
 - **Boot golden unchanged** — `cargo test -p saturn --test bios_boot` (the hash `0x0B1BA6E5180766F7`; a perf change that moves it is a behavior change, reject it).
 - **Savestate round-trip unchanged** — `cargo test -p saturn --test savestate`.
-- **Clippy clean** — `cargo clippy --workspace --all-targets -- -D warnings` (the enforceable gate; do NOT run `cargo fmt --all`, hand-format added lines).
+- **Clippy + fmt clean** — `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` (both gates; run `cargo fmt --all` to format).
 - For a render change, confirm bit-identical output across band counts (the parallel composite is bit-identical *by construction* — disjoint rows of a pure function of frozen state; verify the invariant still holds).
 - The core stays **single-threaded** — never propose per-chip threads/subprocesses (breaks determinism + the vs-Mednafen trace-diff methodology; the barrier problem serializes it anyway). Only the read-mostly frame-boundary edges (render; *carefully*, the SCSP mix) may parallelize.
 

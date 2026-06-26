@@ -51,7 +51,7 @@ When performing a project-wide code review, always follow these steps:
    - Non-obvious cycle-count or interlock decisions carry an inline comment citing the manual section that justifies them.
 
 8. **Code style** — Confirm:
-   - **Formatting: do NOT run `cargo fmt --all`.** The workspace is *not* globally rustfmt-clean and never has been — it uses a deliberate compact hand-style (e.g. `crates/sh2/src/isa.rs` keeps ~142 enum variants each on a single line). Under the pinned toolchain (edition 2024) `cargo fmt --all` reformats ~60 files (`isa.rs` alone explodes by +790 lines), and `style_edition = "2021"` is *worse*. There is no `rustfmt.toml` and no CI fmt gate, so any "fmt-clean" expectation is aspirational. **Format only the lines a change adds/modifies, by hand, matching the surrounding code.** Flag a hunk only when its style clearly diverges from its neighbors; never recommend a workspace-wide reformat as part of a review (it's a separate, deliberate decision needing explicit sign-off). No `#[rustfmt::skip]` without justification.
+   - **Formatting: the workspace follows standard `rustfmt`.** `cargo fmt --all -- --check` should be clean; flag a change that introduces unformatted code and ask for `cargo fmt --all`. (The codebase was historically a compact hand-style and `cargo fmt --all` was avoided; that restriction is now lifted.) No `#[rustfmt::skip]` without justification.
    - `cargo clippy --workspace --all-targets -- -D warnings` is clean (this *is* enforceable and should pass). Any `#[allow(clippy::...)]` suppression must have a comment explaining why the lint is a false positive here.
    - No `println!` / `eprintln!` in the `sh2` library crate (it's `no_std` + `alloc` only).
 
