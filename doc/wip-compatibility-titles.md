@@ -113,59 +113,58 @@ The **per-scenario opening introduction movie** sometimes fails to play and
 usually bypasses it** and the game proceeds. The startup intro FMV, the title,
 and the menus all run; this is the per-scenario opening movie specifically.
 
-### Likely class
-Another **CD-driven Sega FILM / Cinepak movie-player** stall — the same family as
-the Panzer Dragoon Zwei blocker above. SAN5 already drives its eighteen Cinepak
-FILM files to gameplay, so the player works for most movies; this is a
-robustness / timing gap, not a missing feature. The intermittency points at a
-timing or ordering race rather than a deterministic content bug.
+### Confirmed mechanism (investigated 2026-06-26)
+**It is a core CD buffer-transfer deadlock, NOT a frontend pacing stall** (the
+discriminator below was run). The movie player issues a large CD read (observed: a
+**5327-sector** play from FAD 51763); our **200-block buffer fills** (`free=0`)
+after ~242 sectors; the game queries **`GetBufStat (0x51)` → `CalcActualSize
+(0x52)`** and then **stops issuing CD commands** — it never issues the
+`GetSectorData` transfer that would drain the buffer. So FAD freezes (observed at
+52005), the partition stays full (`parts=[0:200]`), and the movie hangs while both
+SH-2s keep running. The inter-CPU **FRT (FTI) handshake stays alive** (master⇄slave
+ping-pong continues) and **both caches are coherent** — so the game is (correctly,
+from its own view) waiting on a CD-block state our HLE doesn't produce. This is
+still the same CD-driven **Sega FILM / Cinepak** family as the PDZ blocker above.
 
-### Hypotheses (prioritized — Codex, 2026-06-26)
-1. **Frontend pacing stall (most likely).** The SDL frontend advances emulation
-   from audio-queue depth; if the queue mirror / inflight counter sticks high,
-   the emu thread stops calling `advance_frame()` and movie + CD + SCSP + input
-   all freeze together. Fits "stops randomly, OSD Reset/load sometimes helps,"
-   and headless scripted `.1.state` runs are stable (so the issue is tied to
-   interactive SDL use). Pacing watchdogs were added in `8ac18cb` to target this,
-   but may not fully cover it.
-2. **Savestate restores stale SMPC port/device state.** Explains a "buttons don't
-   work after load" symptom: `load_state` restores the port-device layout, so
-   `set_pad1` writes bits the game ignores if port 1 isn't a pad. Load paths now
-   re-apply the frontend port config after load (`2a33f47`) — input-related, not
-   the movie decoder.
-3. **OSD/input timing shifts the transition frame.** Leaving Settings with C to
-   enter the movie is a game-state transition; if C is seen on a different
-   INTBACK frame the game can take a slightly different path — looks random
-   because manual timing varies.
-4. **Core CD-buffer-vs-SH-2/SCSP timing race.** The movie streams CD data + SCSP
-   ring audio; an occasional "not enough sectors" / missed buffer state can stall
-   it — would show as `SDLMOVIE` still advancing frames while `cd_st`/`fad`/
-   `parts`/PC get stuck.
-5. **Bad/stale savestate captured during an already-broken timeline.** Possible
-   but de-prioritized: the `.1.state` repeatedly reaches the movie in headless
-   probes.
-6. **Residual SCU/SH-2 timing approximation.** The narration-repeat was DMA
-   timing starvation (now fixed, `64237d7`), proving the movie path is
-   timing-sensitive — a narrower CD-block HIRQ/DMA/polling mismatch may remain,
-   visible only under real frontend pacing + manual input.
+### Deterministic repro
+The core is deterministic given (RTC seed + pad stream), both captured by the
+jupiter `SAT_INPUT_REC` movie — so a recording of a *stalling* session reproduces
+the stall on every headless replay; the interactive "intermittency" is just
+RTC-seed / pad-timing variation between sessions (a recording of a *good* session
+always plays).
+- **`sdbg replay <stall.rec>`** parks at `master 002D6B04, CD status=01 fad=52005
+  free_blocks=0 parts=[0:200]` — bit-identical to the interactive freeze.
+- **Fast repro:** a savestate taken ~frame 4300 (just before the read) + ~140
+  frames forward with **no input** develops the stall.
 
-### Best discriminator — when it stalls, watch whether `SDLMOVIE f=…` keeps printing
-- **`SDLMOVIE` also stops** → frontend pacing / thread / audio stall (#1).
-- **`SDLMOVIE` continues but `fad`/`parts`/PC are stuck** → core CD/game timing (#4/#6).
-- **Input dies only after a load** → SMPC port-restore (#2).
-- **Scripted `SAT_PAD` always works but manual C sometimes fails** → input transition timing (#3).
+### Ruled out (each with evidence)
+| Hypothesis | Verdict | Evidence |
+| --- | --- | --- |
+| Frontend pacing stall | ❌ | Audio watchdogs (`8ac18cb`) self-heal ≤1.5 s analytically; `SDLMOVIE` frames keep advancing *during* the stall |
+| CD read-pump deadlock | ❌ | Buffer-full pause re-arms `sec_prebuf_in` at `cd_block.rs:1648`; resumes once the game frees a block |
+| BFUL HIRQ latch (`a4df618`) | ❌ | `SAT_BFUL_READ_CLEAR=1` A/B — identical stall |
+| **Cache coherency** (SAN5's usual signature) | ❌ | `sdbg caudit`: **0 stale lines on both CPUs**; the game's 182,942 associative purges are all honored |
+| SCU DMA-halt removal (`64237d7`) | ❌ | Clean savestate bisection — the DMA-halt-restored build stalls identically |
+
+So the stall is **not** any of this session's CD/DMA/cache changes (no reason to
+revert them); current lean is a **pre-existing CD-protocol gap** in the
+buffer-full → transfer handshake. Caveat: a clean pre-session bisection is blocked
+because the input-movie replay **desyncs across code versions** (this session's
+timing changes shift the movie's cycle-exact path), so settling regression-vs-not
+needs a fresh recording made on the baseline build.
+
+### Discriminator (now run) — does `SDLMOVIE f=…` keep printing when it stalls?
+- **continues, but `fad`/`parts`/PC stuck** → core CD/game wedge ✅ (this is what happens)
+- `SDLMOVIE` also stops → frontend pacing / thread stall (ruled out)
+- input dies only after a load → SMPC port-restore (`2a33f47`, addressed)
 
 ### Next steps (resume point)
-1. **Reproduce deterministically** — capture the stall as an input movie
-   (`SAT_INPUT_REC`) and replay it headless (`sdbg replay --cart`); a fixed RTC
-   seed + pad stream is essential given the intermittency. If scripted input
-   never reproduces it, that itself points at frontend pacing (#1) or manual
-   input timing (#3).
-2. **Trace to the divergence** — at the freeze, dump the CD read-pump / FILM
-   player state (drive status, FAD, partition/FIFO occupancy, `cmd_log`) and diff
-   against the Mednafen oracle at the same point (the LLE trace-to-divergence
-   workflow). Compare with the PDZ findings above — status-stuck-`PLAY` + a
-   read-pump freeze — which may share a root.
+With the fast savestate repro, **trace the master/slave loop across the `free→0`
+transition** to find the exact gating condition before `GetSectorData` (which HIRQ
+bit / CD status / `CalcActualSize` result the player checks), then **diff vs the
+Mednafen oracle** at that point (the LLE trace-to-divergence workflow). Compare
+with the PDZ findings above (status-stuck + read-pump freeze) — possibly the same
+CD-FILM-player root.
 
 ### History
 Reached playable 2026-06-24 via two SH-2 cache-purge fixes (the FMV→menu deadlock
