@@ -382,12 +382,17 @@ pub struct CdBlock {
     /// Decoded CD-DA (Red Book) samples awaiting mix into the SCSP output —
     /// interleaved 16-bit stereo at 44.1 kHz. The read pump fills this while an
     /// **audio** track plays (M10); `Saturn::take_audio` drains and mixes it.
+    /// Presentation-only — `load_state` clears it (`clear_audio_buffer`) and it
+    /// re-primes from the restored timeline, so it is not serialized.
+    #[serde(skip)]
     cd_audio: VecDeque<i16>,
     /// CD-DA jitter-buffer priming flag: the read pump fills [`Self::cd_audio`]
     /// in sector bursts on the scheduler's batch cadence, but the host drains it
     /// smoothly per audio frame. Stay un-primed (mix silence, keep buffering)
     /// until a pre-roll cushion has built, then drain; re-arm on a dry buffer.
     /// Without this the steady drain outruns the bursty fill and CDDA stutters.
+    /// Reset by `clear_audio_buffer` on load, so it is not serialized.
+    #[serde(skip)]
     cd_audio_primed: bool,
 
     // ---- buffer/filter/partition engine (M7 phase 2) ----
@@ -812,7 +817,7 @@ impl CdBlock {
                 }
                 let hirq = self.hirq;
                 #[cfg(not(test))]
-                if std::env::var_os("SAT_BFUL_READ_CLEAR").is_some() {
+                if bful_read_clear() {
                     self.hirq &= !HIRQ_BFUL;
                 }
                 hirq
@@ -1820,8 +1825,18 @@ impl CdBlock {
 
     /// One 32-bit big-endian word from the data port. The hardware-facing port
     /// is 16-bit; compose two halfword reads so CPU word reads and SCU DMA see
-    /// the same stream position as explicit 16-bit polling code.
+    /// the same stream position as explicit 16-bit polling code. Real sectors
+    /// are a whole number of 32-bit words (2048/2336/2340/2352 bytes), so a word
+    /// never straddles a sector boundary on the live path.
     fn read_data_port32(&mut self) -> u32 {
+        // Over-read past the staged count: the direct 32-bit port returned a
+        // single `0xFFFF_FFFF` sentinel and freed/deleted once. Preserve that —
+        // a naive two-halfword compose would return `0xFFFF` then spill into
+        // (and pop) the staged TOC/file-info FIFO.
+        if matches!(&self.xfer32, Some(x) if x.sect >= x.num) {
+            let _ = self.read_data_port16(); // single drain (+ delete), returns 0xFFFF
+            return 0xFFFF_FFFF;
+        }
         ((self.read_data_port16() as u32) << 16) | self.read_data_port16() as u32
     }
 
@@ -3384,17 +3399,18 @@ mod tests {
     }
 
     #[test]
-    fn reading_hirq_does_not_clear_buffer_full() {
+    fn reading_hirq_does_not_clear_buffer_full_or_sector_complete() {
         let mut c = CdBlock::new();
         c.hirq = HIRQ_MPED | HIRQ_BFUL | HIRQ_CSCT;
-        assert_eq!(c.read16(0x0008) & HIRQ_BFUL, HIRQ_BFUL);
-        assert_eq!(
-            c.hirq & HIRQ_BFUL,
-            HIRQ_BFUL,
-            "BFUL is latched until the host writes HIRQ"
-        );
-        c.write16(0x0008, !HIRQ_BFUL);
-        assert_eq!(c.hirq & HIRQ_BFUL, 0, "W1C write clears BFUL");
+        let read = c.read16(0x0008);
+        assert_eq!(read & HIRQ_BFUL, HIRQ_BFUL);
+        assert_eq!(read & HIRQ_CSCT, HIRQ_CSCT);
+        // Both stay latched until the host write-AND-clears them — a status read
+        // must not drop the exact transition a streaming host is polling for.
+        assert_eq!(c.hirq & HIRQ_BFUL, HIRQ_BFUL, "BFUL latched across a read");
+        assert_eq!(c.hirq & HIRQ_CSCT, HIRQ_CSCT, "CSCT latched across a read");
+        c.write16(0x0008, !(HIRQ_BFUL | HIRQ_CSCT));
+        assert_eq!(c.hirq & (HIRQ_BFUL | HIRQ_CSCT), 0, "W0C write clears both");
     }
 
     #[test]
@@ -3511,9 +3527,44 @@ mod tests {
         for _ in 0..512 {
             let _ = c.read32(0x8000);
         }
-        let _ = c.read32(0x8000); // past end → frees the blocks
+        let over = c.read32(0x8000); // past end → single sentinel + frees the blocks
+        assert_eq!(
+            over, 0xFFFF_FFFF,
+            "over-read returns one full sentinel, not 0xFFFF spilled into the TOC FIFO"
+        );
         assert!(c.partitions[0].blocks.is_empty(), "partition emptied");
         assert_eq!(c.free_blocks, free_before + 1, "block returned to the pool");
+    }
+
+    #[test]
+    fn read32_equals_two_read16_halfwords_over_a_full_transfer() {
+        // The 32-bit data port composes two 16-bit halfword reads; the byte
+        // stream must be identical whichever width the host uses to drain it.
+        let stage = || {
+            let mut c = CdBlock::new();
+            c.insert_disc(data_disc());
+            play(&mut c, 150, 2);
+            pump(&mut c);
+            cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0002); // Get Sector Data: 2 sectors
+            c
+        };
+        let mut c32 = stage();
+        let mut c16 = stage();
+        let words = 2 * 2048 / 4; // two 2048-byte sectors as 32-bit words
+        let mut via32 = Vec::new();
+        for _ in 0..words {
+            via32.extend_from_slice(&c32.read32(0x8000).to_be_bytes());
+        }
+        let mut via16 = Vec::new();
+        for _ in 0..(words * 2) {
+            via16.extend_from_slice(&c16.read16(0x8000).to_be_bytes());
+        }
+        assert_eq!(
+            via32, via16,
+            "32-bit and 16-bit port reads stream identical bytes"
+        );
+        assert_eq!(&via32[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&via32[2048..2052], &[0x12, 0x34, 0x56, 0x78]);
     }
 
     #[test]
@@ -4463,4 +4514,13 @@ fn cd_rwatch() -> bool {
 fn cd_xfer_trace() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var_os("SAT_CD_XFER_TRACE").is_some())
+}
+
+/// Debug opt-in (`SAT_BFUL_READ_CLEAR`): restore the legacy auto-clear of BFUL
+/// on a HIRQ status read. Cached because the call site is the host's HIRQ poll
+/// loop (hit thousands of times per frame) — `env::var_os` takes a global lock.
+#[cfg(not(test))]
+fn bful_read_clear() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("SAT_BFUL_READ_CLEAR").is_some())
 }

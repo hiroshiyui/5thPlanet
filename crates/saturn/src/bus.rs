@@ -477,6 +477,10 @@ fn read_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32
     }
 }
 
+/// Debug (`SAT_SCSP_STREAM_PROBE` / `SAT_SCSP_STREAM_WIN`): log sound-RAM writes
+/// near a streamed-audio ring address, tagged with the SCSP sample counter — the
+/// "who-writes-the-ring" instrument for the CD/movie audio investigation. No-op
+/// (env cached) when unset.
 #[inline]
 fn scsp_stream_write_probe(
     addr: u32,
@@ -686,6 +690,8 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
             a if Cartridge::owns(a) => self.cartridge.read16(a),
+            // The sector data-transfer port is a 16-/32-bit port only (no `read8`
+            // arm — a byte read of it returns open bus, which no host does).
             CD_DATA_PORT..=CD_DATA_PORT_END => self.cd_block.read_data_port_halfword(),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read16(addr - CD_BLOCK_BASE),
             a if Vdp1::owns(a) => {
@@ -757,7 +763,7 @@ impl Bus for SaturnBus {
     fn write8(&mut self, addr: u32, val: u8, k: AccessKind) -> u32 {
         let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
             .contains(&addr)
-            .then_some(self.scsp.ctrl.dbg_sample_counter());
+            .then(|| self.scsp.ctrl.dbg_sample_counter());
         write_watch(
             addr,
             1,
@@ -821,7 +827,7 @@ impl Bus for SaturnBus {
     fn write16(&mut self, addr: u32, val: u16, k: AccessKind) -> u32 {
         let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
             .contains(&addr)
-            .then_some(self.scsp.ctrl.dbg_sample_counter());
+            .then(|| self.scsp.ctrl.dbg_sample_counter());
         write_watch(
             addr,
             2,
@@ -889,7 +895,7 @@ impl Bus for SaturnBus {
     fn write32(&mut self, addr: u32, val: u32, k: AccessKind) -> u32 {
         let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
             .contains(&addr)
-            .then_some(self.scsp.ctrl.dbg_sample_counter());
+            .then(|| self.scsp.ctrl.dbg_sample_counter());
         write_watch(addr, 4, val, k, self.cycle, self.step_pc, scsp_sample);
         scsp_stream_write_probe(addr, 4, val, self.cycle, self.step_pc, scsp_sample);
         self.note_write(addr, val);
