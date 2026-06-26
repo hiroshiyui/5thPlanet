@@ -25,13 +25,31 @@ instead of 0" — while the root was a dropped cache purge two layers up.)
 
 ## The workflow
 
-1. **Reproduce deterministically.** A bug you can't replay you can't bisect.
+1. **Reproduce deterministically.** A bug you can't replay you can't bisect — and
+   an "intermittent" one usually *can* be made deterministic.
+   - **"Random" across sessions ≠ non-deterministic.** The core is deterministic
+     given (RTC seed + pad stream): single-threaded, no `rand`, the SMPC RTC
+     seeded once then cycle-driven. So an interactively-random failure is just
+     between-session variation in the RTC seed + human input timing — capture one
+     *failing* session and it reproduces every time (a recording of a *good*
+     session always passes; you need a recording of a *bad* one).
    - Record/replay input movies (`jupiter` `SAT_INPUT_REC` → `sdbg replay`):
      they capture the RTC seed + per-frame pad so an input-gated screen
      reproduces frame-for-frame. Pass the same cartridge (`--cart`) — state must
      match exactly or determinism breaks.
-   - Save states pin a moment for repeated inspection.
-   - Sanity-check: same master PC / cycle every run.
+   - **Snapshot just before the failure** (`sdbg save`) for a fast
+     load-and-run-forward repro; sanity-check it re-runs identically N× (same
+     master PC / cycle / state). A fix must clear the *timing-independent root*
+     against this repro, not just make this one snapshot pass.
+   - **Classify before tracing** — is the symptom downstream of the bug? Separate
+     a frontend / pacing / render stall from a core / game-state stall (e.g.
+     `SAT_MOVIE_PROBE`: frames still advancing while CD state freezes ⇒ core, not
+     pacing) so you trace the right subsystem.
+   - **Timing-sensitive bisection: use the snapshot, not input-replay.** Replaying
+     one recording across code versions *desyncs* — a timing change navigates the
+     menus differently and never reaches the bug. Loading the same pre-failure
+     snapshot on each variant (revert the suspect commit + rebuild) pins the
+     identical state, so only the code difference shows.
 
 2. **Localize the divergence.** Find the first place *our* state differs from the
    oracle — do not start by reading game logic.
@@ -86,6 +104,14 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 - **Inter-CPU handshakes.** The master/slave SH-2s wake each other via the FRT
   input-capture pin and relocate each other via SMPC `SSHON` / `SSHOFF`. Timing
   and cache state around these handoffs are a recurring blocker source.
+- **Interrupt-acceptance timing.** The Saturn aggregate forwards SCU/CD interrupts
+  to the master once per instruction; that forward must honour the SH-2 rules the
+  core already enforces — above all, **never accept an interrupt inside a branch
+  delay slot** (`!cpu.next_is_delay_slot()`; leave the edge pending to the next
+  boundary). And acceptance consumes only the emulator's internal fresh-assertion
+  edge: the SCU `IST` latch is **guest-cleared, not auto-cleared on vector fetch**
+  (the ISR reads IST to identify the source). (Sangokushi V's movie stall lived
+  here — see below.)
 
 ## Case studies (scrubbed)
 
@@ -95,6 +121,20 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   `MOV.W @CCR` cache-purge fell through (only byte-CCR reached the cache) → stale
   display-list → blank menu buttons (`6215aab`). The second was found by
   *recognizing the cache-coherency class*, after a long symptom-trace did not.
+- **Sangokushi V — interrupt in a delay slot.** Its scenario-opening movie stalled
+  *intermittently* (interactively "random"). Made deterministic via
+  record→replay→snapshot; classified core-not-pacing (`SAT_MOVIE_PROBE` showed
+  frames advancing while the CD buffer froze full, `free=0 parts=[0:200]`);
+  snapshot-bisected to clear the cache / BFUL / DMA-halt suspects. Forward-tracing
+  `SAT_CD_XFER_TRACE` / `SAT_SCU_INT_TRACE` good-vs-bad sectors found a
+  `Level0DmaEnd` delivered at `0600094C` — the `nop` delay slot after an `rte`: the
+  aggregate was forwarding SCU interrupts before *every* instruction, including
+  delay slots, corrupting the CD-DMA completion (no `EndDataXfer` → buffer fills →
+  freeze). Fix: gate the forward on `!next_is_delay_slot()`. The full-CD-buffer
+  symptom was the downstream victim; the root was one interrupt landing one
+  instruction early. **Lesson: a "random" timing bug is still a fixed,
+  deterministic instance once captured — and the symptom subsystem is rarely the
+  buggy one.**
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
