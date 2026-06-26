@@ -713,10 +713,14 @@ impl Scu {
         }
     }
 
-    /// The highest-priority unmasked pending source as `(source, level)`,
-    /// clearing it from IST on this acknowledge cycle. Sampled once per master
-    /// instruction so an interrupt lands the exact cycle `SR.imask` drops below
-    /// its level; returns `None` when nothing qualifies.
+    /// The highest-priority unmasked pending source as `(source, level)`.
+    /// Sampled once per master instruction so an interrupt lands the exact
+    /// cycle `SR.imask` drops below its level; returns `None` when nothing
+    /// qualifies.
+    ///
+    /// Accepting the vector consumes only the fresh edge used by our interrupt
+    /// presenter. The software-visible IST latch remains set until the guest
+    /// clears it with the register's write-0-clear path.
     pub fn take_pending_interrupt(&mut self, sh2_imask: u8) -> Option<(Source, u8)> {
         // External interrupts (bits 16+, i.e. the CD-block) are masked by IMS
         // **bit 15**: Mednafen computes `IPending & ~(int16)IMask`, sign-
@@ -739,7 +743,6 @@ impl Scu {
                 continue;
             }
             self.fresh_assertions &= !bit;
-            self.ist &= !bit;
             return Some((source, lvl));
         }
         None
@@ -1024,15 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn taking_an_interrupt_acknowledges_and_clears_its_ist_bit() {
+    fn taking_an_interrupt_consumes_edge_but_keeps_ist_latched() {
         let mut s = Scu::new();
         s.ims = 0; // reset masks all sources; unmask to test acknowledge
         s.raise(Source::DspEnd);
         let _ = s.take_pending_interrupt(0).unwrap();
         assert_eq!(
             s.ist & (1 << Source::DspEnd.bit()),
-            0,
-            "vector acceptance clears the delivered IST bit"
+            1 << Source::DspEnd.bit(),
+            "vector acceptance leaves the software-visible IST bit latched"
         );
         // Re-draining without a fresh raise returns nothing.
         assert!(s.take_pending_interrupt(0).is_none());

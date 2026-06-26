@@ -807,7 +807,8 @@ impl Saturn {
         let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
         let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
         let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
-        if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+        let in_delay_slot = scheduler.entity(*master_id).sh2().cpu.next_is_delay_slot();
+        if !in_delay_slot && let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
             trace_scu_interrupt(
                 "step",
                 source,
@@ -1214,7 +1215,10 @@ impl Saturn {
                 let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
                 let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
                 let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
-                if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+                let in_delay_slot = scheduler.entity(*master_id).sh2().cpu.next_is_delay_slot();
+                if !in_delay_slot
+                    && let Some((source, level)) = bus.scu.take_pending_interrupt(imask)
+                {
                     trace_scu_interrupt(
                         "run",
                         source,
