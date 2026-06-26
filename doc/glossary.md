@@ -318,8 +318,9 @@ frontend re-creates its SDL texture when the mode changes (M11).
 
 **HIRQ** — Host Interrupt Request flags, the [CD-block]'s 16-bit status
 register at `0x0589_8008`. Each bit signals an event the host polls: `CMOK`
-(command complete, `0x01`), `DRDY` (data ready), `CSCT` (sector read), `PEND`
-(play end), [DCHG] (disc changed, `0x20`), `ESEL`/`EHST` (selector/host-command
+(command complete, `0x01`), `DRDY` (data ready), `CSCT` (sector read), `BFUL`
+(buffer full, `0x08` — the 200-block pool is full and the read pump pauses until
+the host drains a partition), `PEND` (play end), [DCHG] (disc changed, `0x20`), `ESEL`/`EHST` (selector/host-command
 end), `EFLS` (filesystem), `SCDQ` (subcode-Q), `MPED` (MPEG — held set since
 there is no MPEG card). Write-1-to-clear: the host writes a word and a written
 `0` clears that flag (`HIRQ &= val`). The BIOS polls HIRQ between CD commands to
@@ -333,12 +334,18 @@ and poll HIRQ instead.
 ## I
 
 **IMS / IST** — SCU Interrupt Mask / Status registers. Each bit is a
-specific source; IMS=1 suppresses, IST records pending (write-1-to-
-clear). The master SH-2 samples this as a level **every instruction** (in
+specific source; IMS=1 suppresses, IST records pending (**write-0-clear**:
+`IST &= val`, a written 0 clears the bit — like HIRQ, not write-1-to-clear).
+The master SH-2 samples this as a level **every instruction** (in
 `Saturn::step_cpus`, via `take_pending_interrupt`): the highest-priority
 pending source (`IST & !IMS`) whose level exceeds the master's `SR.imask`
 is delivered to the master [INTC] at the exact instruction it becomes
-unmasked (Phase 2B — was a once-per-batch drain).
+unmasked (Phase 2B — was a once-per-batch drain). Accepting the vector
+consumes only the emulator's internal fresh-assertion edge — **IST stays
+latched until the guest write-0-clears it** (the ISR reads it to identify
+the source) — and the master **never accepts an interrupt inside a branch
+delay slot** (`!next_is_delay_slot()`; forwarding a DMA-end into the `nop`
+after an `rte` was Sangokushi V's movie stall, `348aa04`).
 
 **IP.BIN** — Initial Program. A Saturn disc's boot header at the start of
 the first data track (FAD 150), beginning with the "SEGA SEGASATURN"

@@ -36,9 +36,8 @@ foundation stays solid.
 commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
 3D fights with CD music and sound effects), and ***Doukyuusei ~if~* is fully
 playable** (graphics, sound effects, and voices), including Shuttle Mouse
-support. **Koei's strategy title *Sangokushi V* (三國志V) is playable** too — title,
-menus, and the in-game strategy map (not yet *fully* playable: its per-scenario
-opening movie can intermittently stall, which a reset usually bypasses). Games load from disc images
+support. **Koei's strategy title *Sangokushi V* (三國志V) is fully playable** too —
+from its per-scenario opening movie through to the in-game strategy map. Games load from disc images
 (CUE/BIN, ISO, CloneCD) or straight from
 an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
@@ -59,8 +58,8 @@ the per-title compatibility list in
 # Build & test everything
 cargo test --workspace
 
-# Lint (the codebase is a hand-maintained compact style — format added lines
-# by hand; don't run `cargo fmt --all`, it reformats the whole tree)
+# Format + lint (both are gates; the workspace follows standard rustfmt)
+cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Coverage (~85% line, excluding the SDL3 frontend + FFI crate)
