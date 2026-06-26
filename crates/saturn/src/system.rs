@@ -46,6 +46,9 @@ fn smp_batch() -> u32 {
     })
 }
 
+// Debug-only tracer: the eight scalars are independent context fields logged
+// verbatim; bundling them into a struct purely to satisfy the lint adds noise.
+#[allow(clippy::too_many_arguments)]
 fn trace_scu_interrupt(
     site: &str,
     source: crate::scu::Source,
@@ -176,33 +179,26 @@ const CD_TICK_CYCLES: u64 = CYCLES_PER_LINE;
 // These were methods on `Saturn` (borrowing all of `self`); moving them onto
 // the bus lets them run both at the batch boundary (`run_for`) *and* from
 // inside the per-instruction `step_cpus` loop — the foundation for executing a
-// DMA at its trigger cycle and for the faithful cycle-stealing cost (M13 A1/A3).
+// DMA at its trigger cycle. Time-running cycle stealing is still a future
+// refinement; the current model completes queued DMA synchronously.
 // Behaviour is unchanged: still a synchronous block transfer at the drain point.
 
 /// Run every DMA the SCU queued. Direct or indirect (table-driven) mode; a
 /// transfer sourced from the BIOS A-bus is illegal and moves nothing.
 ///
-/// Returns the **CPU-halting cost** — the SCU A/B/C-bus arbitration (M12 #8
-/// residual, Mednafen `RecalcDMAHalt`): while a DMA with a **C-bus endpoint**
-/// (high Work RAM) runs, the SCU owns the CPU bus and **both** SH-2s halt
-/// (`CPU[0/1].SetExtHalt`), so such a transfer's paced duration (the
-/// `dma_time_thing` per-access costs) is charged to both CPUs by the caller.
-/// A pure A↔B transfer halts neither CPU — and since Mednafen force-finishes
-/// an active DMA the moment a CPU touches the A/B-bus (`CheckForceDMAFinish`,
-/// its own "kind of hacky" arbitration), our synchronous instant completion
-/// is equivalent for everything except the DMA-end interrupt's timestamp,
-/// which we raise at the trigger rather than the paced finish.
+/// Returns the CPU-halting cost. The current DMA model completes the transfer
+/// synchronously at the trigger point and raises DMA-end immediately, so it
+/// returns 0: charging the internal transfer cost as an SH-2 halt would double
+/// count a time-running DMA we do not actually keep active. Mednafen's timed DMA
+/// can halt C-bus transfers while active, but it also force-finishes an active
+/// DMA when a CPU touches the A/B bus; until this model becomes time-running,
+/// immediate copy + no extra CPU halt matches that observable behavior better
+/// than stalling both SH-2s for the whole transfer.
 fn drain_dma(bus: &mut SaturnBus) -> u64 {
-    let mut halt_cost = 0u64;
-    // A transfer halts the CPUs iff either endpoint is on the C-bus
-    // (Mednafen `d->WriteBus == 2 || d->ReadFunc == DMA_ReadCBus`).
-    let halting = |src: u32, dst: u32| scu_dma_bus(src) == Some(2) || scu_dma_bus(dst) == Some(2);
     // Cached: this runs per pending DMA on the per-instruction hot path, and
     // `env::var` takes a process-global lock + allocates on every call.
     static DMALOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let dmalog = *DMALOG.get_or_init(|| std::env::var_os("DMALOG").is_some());
-    static DMA_NO_HALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let dma_no_halt = *DMA_NO_HALT.get_or_init(|| std::env::var_os("SAT_DMA_NO_HALT").is_some());
     while let Some(req) = bus.scu.take_pending_dma() {
         if dmalog {
             eprintln!(
@@ -223,16 +219,11 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             let mut index = req.dst & 0x07FF_FFFF;
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
-            // Descriptor reads halt the CPUs when the table itself is in
-            // C-bus work RAM (the common case).
-            let table_halting = scu_dma_bus(req.dst) == Some(2);
             loop {
                 let (size, s0) = bus.read32(index, AccessKind::Dma);
                 let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
                 let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                if table_halting && !dma_no_halt {
-                    halt_cost += (s0 + s1 + s2) as u64;
-                }
+                let _ = (s0, s1, s2);
                 let last = isrc_raw & 0x8000_0000 != 0;
                 let isrc = isrc_raw & 0x07FF_FFFF;
                 let idst = idst & 0x07FF_FFFF;
@@ -240,9 +231,6 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 if !bios_src(isrc) {
                     let mut cost = 0u64;
                     scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
-                    if halting(isrc, idst) && !dma_no_halt {
-                        halt_cost += cost;
-                    }
                 }
                 index = index.wrapping_add(0xC);
                 walked += 1;
@@ -262,7 +250,7 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
         } else {
             let count = dma_count(req.channel, req.bytes);
             let mut cost = 0u64;
-            let ends = scu_transfer(
+            scu_transfer(
                 bus,
                 req.src,
                 req.dst,
@@ -270,15 +258,11 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 req.src_add,
                 req.dst_add,
                 &mut cost,
-            );
-            if halting(req.src, req.dst) && !dma_no_halt {
-                halt_cost += cost;
-            }
-            ends
+            )
         };
         bus.scu.finish_dma(req.channel, final_src, final_dst);
     }
-    halt_cost
+    0
 }
 
 /// Which of the three SCU DMA buses an address belongs to, or `None` if it maps
@@ -882,7 +866,7 @@ impl Saturn {
         self.catch_up_cd_block();
         self.update_video_timing();
         self.drain_smpc();
-        let _ = drain_dma(&mut self.bus); // backstop; step_cpus drains+charges per-instruction
+        let _ = drain_dma(&mut self.bus); // backstop; step_cpus drains DMA at the trigger point
         self.drain_scu_dsp();
         self.drain_vdp1();
         self.drain_scsp();
@@ -1285,11 +1269,9 @@ impl Saturn {
                 scheduler.entity_mut(*master_id).step(bus);
                 apply_fti!(); // master may have pulsed the slave's (or its own) FTI
                 record_raster!(); // log any raster read the master just did
-                // If the master's instruction triggered an SCU DMA, run it now.
-                // A C-bus-endpoint transfer halts BOTH SH-2s for its paced
-                // duration — the SCU owns the CPU bus (Mednafen
-                // `RecalcDMAHalt` → `SetExtHalt` on both cores); a pure A↔B
-                // transfer halts neither (see `drain_dma`).
+                // If the master's instruction triggered an SCU DMA, run its
+                // synchronous transfer now. `drain_dma` currently returns 0
+                // because the model does not keep a time-running DMA active.
                 let dma_cost = if bus.scu.dma_pending() {
                     drain_dma(bus)
                 } else {
@@ -1318,7 +1300,7 @@ impl Saturn {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
                 record_raster!(); // log any raster read the slave just did
-                // A slave-triggered C-bus DMA halts both CPUs the same way.
+                // A slave-triggered DMA is drained synchronously the same way.
                 let dma_cost = if bus.scu.dma_pending() {
                     drain_dma(bus)
                 } else {
@@ -1386,7 +1368,7 @@ impl Saturn {
             }
             self.update_video_timing();
             self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
+            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
@@ -1428,7 +1410,7 @@ impl Saturn {
             }
             self.update_video_timing();
             self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain+charge in step_cpus)
+            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
             self.drain_scu_dsp();
             self.drain_vdp1();
             self.drain_scsp();
@@ -2015,8 +1997,12 @@ mod tests {
         sat.bus.scu.write32(0x0C, 0x0000_0001); // D0AD: fixed source, +2 dest.
         sat.bus.scu.write32(0x14, 0x0000_0007); // D0MD: manual start factor.
         sat.bus.scu.write32(0x10, 1 << 8); // D0EN: DGO.
-        let _ = drain_dma(&mut sat.bus);
+        let halt = drain_dma(&mut sat.bus);
 
+        assert_eq!(
+            halt, 0,
+            "synchronous SCU DMA copies immediately without charging SH-2 halt time"
+        );
         assert_eq!(sat.bus.high_wram.read32(0x1000), 0xDEAD_BEEF);
     }
 
