@@ -12,6 +12,13 @@ bios/*
 roms/*
 !roms/README.md
 
+# Presentation shaders (CRT filters for the planned SDL_GPU presenter) live in
+# shaders/ — user-/third-party-supplied source + compiled SPIR-V/DXIL/MSL. Not
+# committed (often GPL/CC-licensed presets, plus build artifacts); keep the
+# directory documented via shaders/README.md (whitelisted below).
+shaders/*
+!shaders/README.md
+
 # Reference emulators, used only as behavioral oracles for trace-diffing —
 # local, never-committed source checkouts/builds. No emulator code is part of
 # this project (it is referenced, not incorporated — see README Acknowledgements).
