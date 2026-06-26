@@ -74,6 +74,22 @@ author GLSL → SPIR-V, then have it emit DXIL / MSL for non-Vulkan hosts.
 Precompiling and dropping the `.spv` / `.dxil` / `.metallib` beside the source is
 also fine — they just stay gitignored here.
 
+> ⚠️ **`.slang` is not plain GLSL — `glslc` can't eat it directly.** The
+> [`slang-shaders/`](slang-shaders/) sources are the **libretro Slang** dialect:
+> *both* shader stages live in one file split by `#pragma stage vertex` /
+> `#pragma stage fragment`, plus `#pragma name` / `#pragma parameter` /
+> `#pragma format` directives `glslc` doesn't understand. So a `.slang` needs a
+> **Slang-preprocess step first** — split the two stages and strip the pragmas
+> (parsing the parameters out for the runtime) — *then* `glslc` / `glslangValidator`
+> compiles each stage to SPIR-V (and `SDL_shadercross` on to DXIL/MSL). And that's
+> only the per-pass compile: a `.slangp` is a **multi-pass pipeline** (per-pass
+> scale/format/filter, LUT textures, feedback/history, parameters, and the libretro
+> semantic uniforms `MVP`/`SourceSize`/`OutputSize`/`FrameCount`) the presenter must
+> orchestrate itself. **librashader** does the whole preprocess + compile +
+> multi-pass run internally, which is why it's the verbatim route; the hand-port
+> route uses `glslc` for one sub-step of a longer chain. See ADR-0019 / the roadmap
+> for the route trade-off.
+
 ## Expected layout (to be finalized when the presenter lands)
 
 The dropped-in RetroArch collection keeps its own tree (`slang-shaders/crt/…`);
