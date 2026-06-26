@@ -40,6 +40,12 @@ fn host_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// SCSP output byte rate: 44.1 kHz × 2 channels × 2 bytes/sample.
+const AUDIO_BYTES_PER_SEC: u32 = 176_400;
+
+/// Write a 44-byte canonical WAV header for 44.1 kHz 16-bit stereo PCM. Called
+/// with `pcm_bytes = 0` up front (size unknown), then re-written in `Drop` once
+/// the final byte count is known (see [`WavDump`]).
 fn write_wav_header(mut w: impl Write, pcm_bytes: u32) -> std::io::Result<()> {
     let riff_bytes = 36u32.saturating_add(pcm_bytes);
     w.write_all(b"RIFF")?;
@@ -49,13 +55,16 @@ fn write_wav_header(mut w: impl Write, pcm_bytes: u32) -> std::io::Result<()> {
     w.write_all(&1u16.to_le_bytes())?; // PCM
     w.write_all(&2u16.to_le_bytes())?; // stereo
     w.write_all(&44_100u32.to_le_bytes())?;
-    w.write_all(&(44_100u32 * 2 * 2).to_le_bytes())?;
+    w.write_all(&AUDIO_BYTES_PER_SEC.to_le_bytes())?; // byte rate
     w.write_all(&4u16.to_le_bytes())?; // block align
     w.write_all(&16u16.to_le_bytes())?; // bits per sample
     w.write_all(b"data")?;
     w.write_all(&pcm_bytes.to_le_bytes())
 }
 
+/// Debug audio capture (`SAT_AUDIO_DUMP=<path>`): a raw WAV writer. The header
+/// is written with size 0 on open and **patched in `Drop`** with the final PCM
+/// byte count (`pcm_bytes`), so the size is only correct after the dump closes.
 struct WavDump {
     path: String,
     file: fs::File,
@@ -84,10 +93,15 @@ impl WavDump {
     }
 
     fn write_samples(&mut self, samples: &[i16]) {
-        for &sample in samples {
-            if self.file.write_all(&sample.to_le_bytes()).is_ok() {
-                self.pcm_bytes = self.pcm_bytes.saturating_add(2);
-            }
+        // Bulk-write the whole slice (one syscall, vs one per i16) and credit
+        // `pcm_bytes` only on success, so the size patched into the header in
+        // `Drop` stays consistent with the bytes actually on disk.
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        if self.file.write_all(&bytes).is_ok() {
+            self.pcm_bytes = self.pcm_bytes.saturating_add(bytes.len() as u32);
         }
     }
 
@@ -113,6 +127,37 @@ impl Drop for WavDump {
             );
         }
     }
+}
+
+/// Format the `SAT_SCSP_MOVIE_PROBE` slot summary: the selected MSLC monitor
+/// plus up to 8 active slots' SA / CA / loop / EG state. Empty when disabled.
+/// Shared by both the SDL and headless movie-probe paths.
+fn scsp_probe_string(scsp: &saturn::scsp::Scsp, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let (mslc, monitor) = scsp.dbg_slot_monitor();
+    let active = (0..32)
+        .filter(|&i| scsp.slot_active(i))
+        .take(8)
+        .map(|i| {
+            let d = scsp.slot_debug(i);
+            let ca = ((d.cur >> 12) & 0xFFFF) >> 12;
+            format!(
+                "{i}:sa={:05X} cur={} ca={ca:X} step={} lsa={} lea={} lp={} eg={} tl={:02X}",
+                d.sa,
+                d.cur >> 12,
+                d.step,
+                d.lsa,
+                d.lea,
+                d.lpctl,
+                d.eg_state,
+                d.tl
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" scsp_mslc={mslc} mon={monitor:04X} slots=[{active}]")
 }
 
 /// Classify a master-SH-2 PC into a coarse memory region for the OSD's live
@@ -463,6 +508,11 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
     if depth < catchup_floor { max.max(1) } else { 1 }
 }
 
+/// Subtract `n` from an atomic, clamping at 0. **Must saturate**: an
+/// `AudioMsg::Reset` zeroes `audio_inflight` (`store(0)`) and can race ahead of
+/// in-flight `Chunk` byte-count subtracts that were already queued, momentarily
+/// driving the counter below zero — saturation absorbs that window so the pacing
+/// reserve never underflows to a huge value (which would stall the emu thread).
 #[cfg(feature = "sdl-frontend")]
 fn atomic_saturating_sub(v: &std::sync::atomic::AtomicU32, n: u32) {
     use std::sync::atomic::Ordering;
@@ -704,7 +754,7 @@ fn run(
         .and_then(|s| s.parse().ok())
         .unwrap_or(120)
         .max(10);
-    let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
+    let audio_target_bytes = (AUDIO_BYTES_PER_SEC as u64 * audio_ms / 1000) as u32;
     let mut audio_started = false;
     let mut audio_drop_until_reset = false;
     let mut audio_dump = WavDump::from_env("SAT_AUDIO_DUMP");
@@ -786,6 +836,10 @@ fn run(
     let (emu_tx, emu_rx) = mpsc::channel::<EmuIn>();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, (usize, usize))>(2);
     let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
+    // Unbounded by design: the emu thread's `audio_tx.send` must never block (a
+    // bounded channel would reintroduce emu stalls). The main thread fully
+    // drains it every iteration, so it can't ratchet (and the watchdog backstops
+    // a genuinely stuck main thread).
     let (audio_tx, audio_rx) = mpsc::channel::<AudioMsg>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
     let audio_mirror = Arc::new(AtomicU32::new(0));
@@ -1106,32 +1160,7 @@ fn run(
                         .map(|(i, n)| format!("{i}:{n}"))
                         .collect::<Vec<_>>()
                         .join(",");
-                    let scsp_probe = if scsp_movie_probe {
-                        let (mslc, monitor) = saturn.bus.scsp.dbg_slot_monitor();
-                        let active = (0..32)
-                            .filter(|&i| saturn.bus.scsp.slot_active(i))
-                            .take(8)
-                            .map(|i| {
-                                let d = saturn.bus.scsp.slot_debug(i);
-                                let ca = ((d.cur >> 12) & 0xFFFF) >> 12;
-                                format!(
-                                    "{i}:sa={:05X} cur={} ca={ca:X} step={} lsa={} lea={} lp={} eg={} tl={:02X}",
-                                    d.sa,
-                                    d.cur >> 12,
-                                    d.step,
-                                    d.lsa,
-                                    d.lea,
-                                    d.lpctl,
-                                    d.eg_state,
-                                    d.tl
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        format!(" scsp_mslc={mslc} mon={monitor:04X} slots=[{active}]")
-                    } else {
-                        String::new()
-                    };
+                    let scsp_probe = scsp_probe_string(&saturn.bus.scsp, scsp_movie_probe);
                     eprintln!(
                         "SDLMOVIE f={rec_frame:04} pc={:08X} cd_st={cd_status:02X} fad={cd_fad} left={cd_left} free={cd_free} parts=[{part_summary}] depth={depth} mirror={} inflight={} burst={burst}{scsp_probe}",
                         saturn.master().regs.pc,
@@ -1184,8 +1213,12 @@ fn run(
                     // thread would otherwise stop producing frames forever.
                     let now = std::time::Instant::now();
                     let idle_since = audio_pacing_idle_since.get_or_insert(now);
-                    if now.duration_since(*idle_since)
-                        >= std::time::Duration::from_millis(audio_watchdog_ms.max(16))
+                    // `SAT_AUDIO_WATCHDOG_MS=0` disables the watchdog (matching
+                    // the main-thread one); `.max(16)` is only a floor for
+                    // nonzero values, so it can't fire every idle frame.
+                    if audio_watchdog_ms != 0
+                        && now.duration_since(*idle_since)
+                            >= std::time::Duration::from_millis(audio_watchdog_ms.max(16))
                     {
                         let mirror = emu_mirror.load(Ordering::Relaxed);
                         let inflight = emu_inflight.load(Ordering::Relaxed);
@@ -1512,6 +1545,7 @@ fn run(
                 let _ = audio_stream.clear();
                 audio_started = false;
                 audio_mirror.store(0, Ordering::Relaxed);
+                audio_inflight.store(0, Ordering::Relaxed); // symmetry with the emu-thread + reset paths
                 src_size = 0;
                 audio_last_queued = 0;
                 audio_last_change = audio_now;
@@ -1650,7 +1684,13 @@ enum EmuIn {
 /// must clear host-queued samples before later chunks from the new timeline play.
 #[cfg(feature = "sdl-frontend")]
 enum AudioMsg {
-    Chunk { samples: Vec<i16>, bytes: u32 },
+    /// `bytes` = `samples.len() * 2`, carried so the receiver subtracts the
+    /// `audio_inflight` reserve without recomputing and keeps the add/sub pairing
+    /// explicit (the emu thread `fetch_add`s the same value when it sends).
+    Chunk {
+        samples: Vec<i16>,
+        bytes: u32,
+    },
     Reset,
 }
 
@@ -2599,32 +2639,7 @@ fn run(
                 saturn.take_audio()
             };
             let audio_abs: i64 = audio.iter().map(|&x| (x as i64).abs()).sum();
-            let scsp_probe = if scsp_movie_probe {
-                let (mslc, monitor) = saturn.bus.scsp.dbg_slot_monitor();
-                let active = (0..32)
-                    .filter(|&i| saturn.bus.scsp.slot_active(i))
-                    .take(8)
-                    .map(|i| {
-                        let d = saturn.bus.scsp.slot_debug(i);
-                        let ca = ((d.cur >> 12) & 0xFFFF) >> 12;
-                        format!(
-                            "{i}:sa={:05X} cur={} ca={ca:X} step={} lsa={} lea={} lp={} eg={} tl={:02X}",
-                            d.sa,
-                            d.cur >> 12,
-                            d.step,
-                            d.lsa,
-                            d.lea,
-                            d.lpctl,
-                            d.eg_state,
-                            d.tl
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!(" scsp_mslc={mslc} mon={monitor:04X} slots=[{active}]")
-            } else {
-                String::new()
-            };
+            let scsp_probe = scsp_probe_string(&saturn.bus.scsp, scsp_movie_probe);
             eprintln!(
                 "MOVIE f={f:04} pc={:08X} cd_st={cd_status:02X} fad={cd_fad} left={cd_left} free={cd_free} parts=[{part_summary}] \
                  vdp2_disp={} tvmd={:04X} bgon={:04X} vdp1 plots={plots} cmds={cmds} px={px} dur={dur} front={vdp1_front} draw={vdp1_draw} out={out_nonblack} audio_abs={audio_abs}{scsp_probe}",
