@@ -5,10 +5,10 @@ in 5thPlanet, with the symptoms, findings, evidence, and ruled-out hypotheses
 gathered so far. Each entry is a resume point, not a closed case.
 
 For the fully-working titles see
-[`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2* and
-*Doukyuusei ~if~* are fully playable. *Sangokushi V* is **playable but not yet
-fully** — it has one open intermittent blocker (the per-scenario opening movie
-stall) tracked in its section below. The references this work is checked against
+[`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2*,
+*Doukyuusei ~if~*, and *Sangokushi V* are fully playable. SAN5's former
+intermittent per-scenario opening movie stall is tracked below as a closed
+regression case. The references this work is checked against
 (Mednafen, MAME, Yabause) are the never-committed local oracles described in
 [`adr/0017-reference-oracle-policy.md`](adr/0017-reference-oracle-policy.md).
 
@@ -23,12 +23,12 @@ The Cinepak FILM path is **no longer unvalidated**: *Sangokushi V* (playable —
 see [`compatible-game-titles.md`](compatible-game-titles.md)) was the
 first title to drive it through to gameplay, its eighteen Cinepak FILM files
 playing. PDZ's stall is therefore *likely* a **PDZ-specific FILM/timing issue**
-rather than a wholesale gap in the player — but note SAN5 is **not yet fully
-playable**: its per-scenario opening introduction movie also intermittently
-stalls (a reset usually bypasses it), so the FILM path is not yet fully robust.
-(VF2's opening movie is **Duck TrueMotion**, a different codec; all
-of these decoders are the games' own SH-2 software run by LLE — no decoder to
-implement either way. See the FMV note below.)
+rather than a wholesale gap in the player. SAN5's scenario-opening movie stall
+looked similar at the CD-buffer level, but its confirmed root cause was a SH-2
+interrupt-timing error: SCU DMA-end could be delivered in an `rte` delay slot.
+(VF2's opening movie is **Duck TrueMotion**, a different codec; all of these
+decoders are the games' own SH-2 software run by LLE — no decoder to implement
+either way. See the FMV note below.)
 
 ---
 
@@ -99,11 +99,14 @@ mode-bit mapping / reset defaults / connector chain.
 
 ---
 
-## Sangokushi V (三國志V) — playable, scenario-opening movie stall
+## Sangokushi V (三國志V) — playable, scenario-opening movie stall fixed
 
 - **Status:** **playable** (intro FMV → title → menus → in-game strategy map; see
-  [`compatible-game-titles.md`](compatible-game-titles.md)) but **not yet fully
-  playable** — one open, intermittent blocker. Active (not paused).
+  [`compatible-game-titles.md`](compatible-game-titles.md)). The former
+  intermittent per-scenario opening movie stall is fixed in the current tree
+  by the SCU/SH-2 interrupt timing correction below; user-side interactive
+  confirmation is still useful because the original symptom was timing- and
+  input-path sensitive.
 - **Image:** `roms/SANGOKUSHI_V.cue` (+ 8 tracks), KOEI, JP, serial **T-7623G**,
   BIOS v1.01. **No per-game hack in Mednafen** → our-side fidelity gap.
 
@@ -114,17 +117,27 @@ usually bypasses it** and the game proceeds. The startup intro FMV, the title,
 and the menus all run; this is the per-scenario opening movie specifically.
 
 ### Confirmed mechanism (investigated 2026-06-26)
-**It is a core CD buffer-transfer deadlock, NOT a frontend pacing stall** (the
-discriminator below was run). The movie player issues a large CD read (observed: a
-**5327-sector** play from FAD 51763); our **200-block buffer fills** (`free=0`)
-after ~242 sectors; the game queries **`GetBufStat (0x51)` → `CalcActualSize
-(0x52)`** and then **stops issuing CD commands** — it never issues the
-`GetSectorData` transfer that would drain the buffer. So FAD freezes (observed at
-52005), the partition stays full (`parts=[0:200]`), and the movie hangs while both
-SH-2s keep running. The inter-CPU **FRT (FTI) handshake stays alive** (master⇄slave
-ping-pong continues) and **both caches are coherent** — so the game is (correctly,
-from its own view) waiting on a CD-block state our HLE doesn't produce. This is
-still the same CD-driven **Sega FILM / Cinepak** family as the PDZ blocker above.
+**It is a core CD buffer-transfer deadlock, NOT a frontend pacing stall**, but
+the CD block was only the downstream victim. The root cause was that the Saturn
+aggregate sampled SCU interrupts before every master instruction, including
+branch delay slots. A `Level0DmaEnd` interrupt could therefore be forwarded while
+the SH-2 was executing the `nop` delay slot after an `rte` in the RAM interrupt
+dispatcher (`0600094A: rte`, `0600094C: nop`). Hardware does not accept
+interrupts inside delay slots.
+
+In the deterministic bad run, the DMA transfer for sector FAD 51805 completed,
+but the DMA-end interrupt was delivered at `PC=0600094C` instead of the next
+post-slot boundary. The game's CD DMA completion path then failed to issue
+`EndDataXfer`; the movie player kept reading until the 200-block CD buffer filled
+(`free=0`, `parts=[0:200]`, observed freeze at FAD 52005). Both SH-2s kept
+running, the FRT/FTI handshake stayed alive, and cache audit showed no stale
+lines, which is why the failure initially looked like a missing CD protocol
+transition.
+
+The fix is to leave the SCU edge pending while `next_is_delay_slot()` is true and
+forward it only at the first non-delay-slot instruction boundary. SCU `IST` also
+remains software-visible until the guest clears it via write-0-clear; accepting a
+vector consumes only the emulator's fresh edge.
 
 ### Deterministic repro
 The core is deterministic given (RTC seed + pad stream), both captured by the
@@ -142,39 +155,38 @@ always stalls (it freezes one of the unlucky seed/timing combinations).
 - **Verified 100% reproducible:** loading the pre-stall savestate and running 400
   frames forward **4/4 times** produced bit-identical results — same master PC
   (`002DF042`), slave PC (`002D8E3E`), and CD state (`status=01 fad=52005 free=0
-  hirq=0FCD`). So a fix can be developed and verified deterministically against it;
-  the fix must target the **root** (the missing CD-block behaviour, which is
-  timing-independent and so covers the whole random class), not just this one
-  savestate.
+  hirq=0FCD`).
+- **Post-fix validation:** loading the same pre-stall savestate now crosses the
+  old freeze point. A 420-frame headless probe reached `fad=52604` with the CD
+  buffer still draining (`free=175`, `parts=[0:25]`) and completed normally.
 
 ### Ruled out (each with evidence)
 | Hypothesis | Verdict | Evidence |
 | --- | --- | --- |
 | Frontend pacing stall | ❌ | Audio watchdogs (`8ac18cb`) self-heal ≤1.5 s analytically; `SDLMOVIE` frames keep advancing *during* the stall |
 | CD read-pump deadlock | ❌ | Buffer-full pause re-arms `sec_prebuf_in` at `cd_block.rs:1648`; resumes once the game frees a block |
+| CD protocol gap after `CalcActualSize` | ❌ | The game stopped issuing `EndDataXfer` only after the DMA-end interrupt landed in the `rte` delay slot; delaying SCU interrupt delivery past the slot fixes the same repro |
 | BFUL HIRQ latch (`a4df618`) | ❌ | `SAT_BFUL_READ_CLEAR=1` A/B — identical stall |
 | **Cache coherency** (SAN5's usual signature) | ❌ | `sdbg caudit`: **0 stale lines on both CPUs**; the game's 182,942 associative purges are all honored |
 | SCU DMA-halt removal (`64237d7`) | ❌ | Clean savestate bisection — the DMA-halt-restored build stalls identically |
 
-So the stall is **not** any of this session's CD/DMA/cache changes (no reason to
-revert them); current lean is a **pre-existing CD-protocol gap** in the
-buffer-full → transfer handshake. Caveat: a clean pre-session bisection is blocked
-because the input-movie replay **desyncs across code versions** (this session's
-timing changes shift the movie's cycle-exact path), so settling regression-vs-not
-needs a fresh recording made on the baseline build.
+So the stall was **not** a CD HLE command bug, a frontend queue problem, or a
+cache-coherency regression; it was a pre-existing SCU interrupt-delivery fidelity
+bug exposed by the CD DMA completion path.
 
 ### Discriminator (now run) — does `SDLMOVIE f=…` keep printing when it stalls?
 - **continues, but `fad`/`parts`/PC stuck** → core CD/game wedge ✅ (this is what happens)
 - `SDLMOVIE` also stops → frontend pacing / thread stall (ruled out)
 - input dies only after a load → SMPC port-restore (`2a33f47`, addressed)
 
-### Next steps (resume point)
-With the fast savestate repro, **trace the master/slave loop across the `free→0`
-transition** to find the exact gating condition before `GetSectorData` (which HIRQ
-bit / CD status / `CalcActualSize` result the player checks), then **diff vs the
-Mednafen oracle** at that point (the LLE trace-to-divergence workflow). Compare
-with the PDZ findings above (status-stuck + read-pump freeze) — possibly the same
-CD-FILM-player root.
+### Validation
+- `SAT_LOADSTATE=tmp/san5_pre.state SAT_FRAMES=420 SAT_MOVIE_PROBE=60 cargo run
+  --release -p jupiter --no-default-features -- ... SANGOKUSHI_V.cue` crosses
+  the old `fad=52005 parts=[0:200]` freeze and reaches `fad=52604`.
+- `cargo test -p saturn` passes. The SH-2 core already has
+  `interrupt_not_accepted_inside_delay_slot`; this fix extends that invariant to
+  the SCU forwarding layer.
+- `cargo test -p jupiter --no-default-features` passes.
 
 ### History
 Reached playable 2026-06-24 via two SH-2 cache-purge fixes (the FMV→menu deadlock

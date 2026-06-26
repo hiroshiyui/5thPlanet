@@ -17,7 +17,7 @@ project.
 | ----- | ------ | ------------- | ------ | ------------- |
 | **Virtua Fighter 2** | GS-9079 | JP / v1.01 | ✅ **Fully playable** — title, mode & character select with looping CD-DA BGM, full 3D fights to the K.O. screen at a steady 60 fps; balanced BGM/SFX. | 53440 px |
 | **Doukyuusei ~if~** (同級生 if) | — | JP / v1.01 | ✅ **Fully playable** — graphics, SFX, and voices; in-game record-select menu; native 640×224 hi-res; Shuttle Mouse supported. | 143341 px |
-| **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ⚠️ **Playable** (not *fully* playable) — intro FMV → title → main menu → in-game strategy screen. **Known issue:** the per-scenario opening introduction movie sometimes fails to play and stalls the emulation; a reset usually bypasses it. | — |
+| **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | — |
 
 The **render-golden** column is the headless non-black pixel count asserted by
 the `#[ignore]`d render-regression tests in `crates/saturn/tests/trace_boot.rs`
@@ -36,14 +36,13 @@ titles keep rendering. Sangokushi V has no render golden yet.
   read through an unfolded SH-2 cache-through alias, and VDP1 framebuffer dots
   not being horizontally doubled in the 640/704-dot modes.
 - **Sangokushi V** is the newest, and the first title to drive the **Sega FILM /
-  Cinepak** movie player through to gameplay. Three SH-2 cache/bus fidelity
-  fixes carried it: the SCU-DMA-from-CD-FIFO halfword skip (FMV), the reset
-  cache-purge (`35ce7e8`, blank menu), and the 16-bit `MOV.W @CCR` cache-purge
-  (`6215aab`, blank menu buttons). Full chain in the commit messages and the
-  [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study. **It is not
-  yet *fully* playable:** the per-scenario opening introduction movie
-  intermittently fails to play and stalls the emulation (a reset usually
-  bypasses it), so the FILM/Cinepak path is reliable for some movies but not all.
+  Cinepak** movie player through to gameplay. Its bring-up required SH-2
+  cache/bus fidelity fixes for the startup FMV and menus, plus an SCU
+  interrupt-timing fix for the former intermittent per-scenario movie stall:
+  DMA-end interrupts must not be forwarded while the master SH-2 is executing a
+  delay slot. Full chain in the commit messages, the
+  [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study, and the
+  closed SAN5 entry in [`wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
 ## Also runs
 
