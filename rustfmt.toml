@@ -1,0 +1,4 @@
+# Pin the rustfmt ruleset so `cargo fmt` is deterministic across toolchains.
+# `style_edition` matches the workspace edition (2024) — keep the two in sync.
+# See the Formatting note in CLAUDE.md.
+style_edition = "2024"
