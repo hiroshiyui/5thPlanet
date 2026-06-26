@@ -201,7 +201,11 @@ fn cs12_cost(addr: u32, width: u32, write: bool, asr0: u32) -> u64 {
         // (high half = CS0 below 0x0400_0000, low half = CS1 above):
         // 5 + inter-cycle waits (bits 7:4) + the read/write strobe wait.
         0x0200_0000..=0x04FF_FFFF => {
-            let cfg = if addr & 0x0400_0000 != 0 { asr0 & 0xFFFF } else { asr0 >> 16 };
+            let cfg = if addr & 0x0400_0000 != 0 {
+                asr0 & 0xFFFF
+            } else {
+                asr0 >> 16
+            };
             let strobe = (cfg >> (13 + write as u32)) & 1;
             u64::from(5 + ((cfg >> 4) & 0xF) + strobe) * halves(width)
         }
@@ -616,6 +620,7 @@ impl Bus for SaturnBus {
             LOW_WRAM_BASE..=LOW_WRAM_END => self.low_wram.read16(addr - LOW_WRAM_BASE),
             SOUND_BASE..=SOUND_END => self.sound.read16(addr - SOUND_BASE),
             a if Cartridge::owns(a) => self.cartridge.read16(a),
+            CD_DATA_PORT..=CD_DATA_PORT_END => self.cd_block.read_data_port_halfword(),
             CD_BLOCK_BASE..=CD_BLOCK_END => self.cd_block.read16(addr - CD_BLOCK_BASE),
             a if Vdp1::owns(a) => {
                 self.vdp1.tick(self.cycle);
@@ -711,13 +716,23 @@ impl Bus for SaturnBus {
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->slave addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->slave addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             MASTER_FTI_BASE..=MASTER_FTI_END => {
                 self.master_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->master addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->master addr={addr:08X} val={val:02X} by={} pc={:08X} cyc={} w8",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             _ => {}
@@ -757,13 +772,23 @@ impl Bus for SaturnBus {
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->slave addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->slave addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             MASTER_FTI_BASE..=MASTER_FTI_END => {
                 self.master_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->master addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->master addr={addr:08X} val={val:04X} by={} pc={:08X} cyc={}",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             _ => {}
@@ -796,13 +821,23 @@ impl Bus for SaturnBus {
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->slave addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->slave addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             MASTER_FTI_BASE..=MASTER_FTI_END => {
                 self.master_input_capture = true;
                 if ftilog() {
-                    eprintln!("FTI->master addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32", if self.cur_is_slave { "SLAVE" } else { "MASTER" }, self.step_pc, self.cycle);
+                    eprintln!(
+                        "FTI->master addr={addr:08X} val={val:08X} by={} pc={:08X} cyc={} w32",
+                        if self.cur_is_slave { "SLAVE" } else { "MASTER" },
+                        self.step_pc,
+                        self.cycle
+                    );
                 }
             }
             _ => {}

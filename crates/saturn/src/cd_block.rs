@@ -777,9 +777,9 @@ impl CdBlock {
 
     pub fn read16(&mut self, offset: u32) -> u16 {
         if offset & 0xFFFF >= DATA_FIFO {
-            // Data FIFO (16-bit): stream the staged TOC / file-info buffer.
-            // 32-bit sector-data transfers go through `read32` / the data port.
-            return self.read_fifo16();
+            // Data FIFO (16-bit): stream either an active sector-data transfer
+            // or the staged TOC/file-info buffer.
+            return self.read_data_port16();
         }
         match Self::slot(offset & 0xFFFF) {
             0x0008 => {
@@ -794,10 +794,10 @@ impl CdBlock {
                 // proceeding to GetToc → auth → Play. (Same W1C reasoning as
                 // CSCT below.)
                 //
-                // CSCT ("1 sector read complete") is likewise W1C — it stays set
-                // after the read pump raises it until the host writes HIRQ.
-                // Clearing it on read made our loader never see "read complete".
-                self.hirq &= !HIRQ_BFUL;
+                // CSCT ("1 sector read complete") and BFUL ("buffer full") are
+                // likewise W1C — they stay set after the read pump raises them
+                // until the host writes HIRQ. Clearing them on read can make a
+                // streaming host miss the exact transition it is polling for.
                 // Debug: env-gated HIRQ read-watch (logs each *changed* value
                 // the host reads), to see which HIRQ state the BIOS CD-boot
                 // loader branches on at the post-IP.BIN read-file-vs-re-recognize
@@ -810,7 +810,12 @@ impl CdBlock {
                         eprintln!("HIRQrd {:04X}", self.hirq);
                     }
                 }
-                self.hirq
+                let hirq = self.hirq;
+                #[cfg(not(test))]
+                if std::env::var_os("SAT_BFUL_READ_CLEAR").is_some() {
+                    self.hirq &= !HIRQ_BFUL;
+                }
+                hirq
             }
             0x000C => self.hirq_mask,
             0x0018 => {
@@ -933,6 +938,12 @@ impl CdBlock {
     /// one 32-bit big-endian word of the active sector-data transfer.
     pub fn read_data_port(&mut self) -> u32 {
         self.read_data_port32()
+    }
+
+    /// Read the CD data-transfer port as one 16-bit halfword. Some games poll
+    /// the same sector stream from the CPU instead of only through SCU DMA.
+    pub fn read_data_port_halfword(&mut self) -> u16 {
+        self.read_data_port16()
     }
 
     pub fn write32(&mut self, offset: u32, val: u32) {
@@ -1694,6 +1705,14 @@ impl CdBlock {
         v
     }
 
+    /// Drop decoded presentation audio waiting in the CD-DA jitter buffer.
+    /// The drive position and play state remain serialized; the buffer will
+    /// re-prime from the restored timeline if CD audio is still playing.
+    pub fn clear_audio_buffer(&mut self) {
+        self.cd_audio.clear();
+        self.cd_audio_primed = false;
+    }
+
     /// Drain `n` CD-DA samples for **realtime playback** (`Saturn::take_audio`),
     /// through a **pre-roll jitter buffer**: the read pump fills [`Self::cd_audio`]
     /// in sector bursts on the scheduler's batch cadence, but the host pulls a
@@ -1728,44 +1747,82 @@ impl CdBlock {
         if ofs > end {
             return;
         }
+        #[cfg(not(test))]
+        if cd_xfer_trace() {
+            eprintln!(
+                "CDXFER delete part={buf} ofs={ofs} num={num} end={end} avail_before={} free_before={}",
+                self.partitions[buf].blocks.len(),
+                self.free_blocks
+            );
+        }
         let removed: Vec<usize> = self.partitions[buf].blocks.drain(ofs..end).collect();
         for b in removed {
             self.free_block(b);
         }
     }
 
-    /// One 32-bit big-endian word from the active sector-data transfer (the
-    /// data port at `0x..18000` / FIFO offset `0x8000`). When the blocks are
-    /// drained, a Get-and-Delete frees them. Falls back to the 16-bit TOC
-    /// stream (as two words) when no 32-bit transfer is active.
-    fn read_data_port32(&mut self) -> u32 {
+    /// One 16-bit big-endian halfword from the active sector-data transfer
+    /// (the data port at `0x..18000` / FIFO offset `0x8000`). When no sector
+    /// transfer is active, falls back to the staged TOC/file-info FIFO.
+    fn read_data_port16(&mut self) -> u16 {
         let Some(x) = self.xfer32.clone() else {
-            return ((self.read_fifo16() as u32) << 16) | self.read_fifo16() as u32;
+            return self.read_fifo16();
         };
         if x.sect >= x.num {
             if x.delete {
                 self.delete_partition_sectors(x.part, x.pos, x.num);
             }
             self.xfer32 = None;
-            return 0xFFFF_FFFF;
+            return 0xFFFF;
         }
         let bi = self.partitions[x.part].blocks[x.pos + x.sect];
         let size = self.blocks[bi].size.max(0) as usize;
         let o = x.offs;
         let d = &self.blocks[bi].data;
-        let rv = ((*d.get(o).unwrap_or(&0) as u32) << 24)
-            | ((*d.get(o + 1).unwrap_or(&0) as u32) << 16)
-            | ((*d.get(o + 2).unwrap_or(&0) as u32) << 8)
-            | (*d.get(o + 3).unwrap_or(&0) as u32);
+        #[cfg(not(test))]
+        if cd_xfer_trace() && o == 0 {
+            eprintln!(
+                "CDXFER read part={} pos={} sect={}/{} block={} fad={} size={} delete={} done={}",
+                x.part,
+                x.pos,
+                x.sect,
+                x.num,
+                bi,
+                self.blocks[bi].fad,
+                size,
+                x.delete,
+                self.xfer_done
+            );
+        }
+        let rv = ((*d.get(o).unwrap_or(&0) as u16) << 8) | (*d.get(o + 1).unwrap_or(&0) as u16);
         if let Some(xm) = self.xfer32.as_mut() {
-            xm.offs += 4;
+            xm.offs += 2;
             if xm.offs >= size {
                 xm.offs = 0;
                 xm.sect += 1;
+                #[cfg(not(test))]
+                if cd_xfer_trace() {
+                    eprintln!(
+                        "CDXFER sector_done part={} pos={} sect={} block={} fad={} done={}",
+                        x.part,
+                        x.pos,
+                        x.sect,
+                        bi,
+                        self.blocks[bi].fad,
+                        self.xfer_done + 2
+                    );
+                }
             }
         }
-        self.xfer_done += 4;
+        self.xfer_done += 2;
         rv
+    }
+
+    /// One 32-bit big-endian word from the data port. The hardware-facing port
+    /// is 16-bit; compose two halfword reads so CPU word reads and SCU DMA see
+    /// the same stream position as explicit 16-bit polling code.
+    fn read_data_port32(&mut self) -> u32 {
+        ((self.read_data_port16() as u32) << 16) | self.read_data_port16() as u32
     }
 
     /// One 16-bit big-endian word from the staged TOC/file-info buffer.
@@ -2161,6 +2218,13 @@ impl CdBlock {
                 }
                 self.cr3 = 0x0000;
                 self.cr4 = 0x0000;
+                #[cfg(not(test))]
+                if cd_xfer_trace() {
+                    eprintln!(
+                        "CDXFER end_data xfer_done={} active={:?} transfer_request={} free={}",
+                        xferd, self.xfer32, self.transfer_request, self.free_blocks
+                    );
+                }
                 // A Get-and-Delete transfer (0x63) frees the sectors it covered
                 // when the transfer ends (MAME `cmd_end_data_transfer`,
                 // `XFERTYPE32_GETDELETESECTOR`): the host reads exactly the
@@ -2552,6 +2616,23 @@ impl CdBlock {
                     self.cd_report();
                     self.cr1 |= STAT_TRANS;
                     self.hirq |= HIRQ_CMOK | HIRQ_EHST | HIRQ_DRDY;
+                    #[cfg(not(test))]
+                    if cd_xfer_trace() {
+                        let first = self.partitions[bufnum]
+                            .blocks
+                            .get(sectofs)
+                            .map(|&bi| {
+                                format!(
+                                    "block={bi} fad={} size={}",
+                                    self.blocks[bi].fad, self.blocks[bi].size
+                                )
+                            })
+                            .unwrap_or_else(|| "block=none".to_string());
+                        eprintln!(
+                            "CDXFER stage cmd={command:02X} part={bufnum} ofs={sectofs} num={sectnum} avail={avail} free={} {first}",
+                            self.free_blocks
+                        );
+                    }
                 }
             }
             0x62 => {
@@ -2576,6 +2657,13 @@ impl CdBlock {
                 } else {
                     if sectnum == 0xFFFF {
                         sectnum = avail.saturating_sub(sectofs);
+                    }
+                    #[cfg(not(test))]
+                    if cd_xfer_trace() {
+                        eprintln!(
+                            "CDXFER del_cmd part={bufnum} ofs={sectofs} num={sectnum} avail={avail} free={}",
+                            self.free_blocks
+                        );
                     }
                     self.delete_partition_sectors(bufnum, sectofs, sectnum);
                     self.cd_report();
@@ -3051,8 +3139,10 @@ mod tests {
             println!("no roms/{cue_name}; skipped");
             return;
         };
-        let disc = Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
-            .expect("parse the Doukyuusei cue");
+        let disc = Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
+        .expect("parse the Doukyuusei cue");
         let audio = disc
             .tracks()
             .iter()
@@ -3072,7 +3162,10 @@ mod tests {
             let sec = disc
                 .read_full_sector(start_fad + i)
                 .expect("audio sector present");
-            expect.extend(sec.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+            expect.extend(
+                sec.chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]])),
+            );
         }
 
         // Drive the CD-block's read pump exactly as a Play command would: one
@@ -3090,8 +3183,14 @@ mod tests {
         }
 
         let peak = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
-        assert!(peak > 1000, "CD-DA output is real audio (peak {peak}), not silence");
-        assert_eq!(pcm, expect, "our CD-DA decode is byte-identical to the disc");
+        assert!(
+            peak > 1000,
+            "CD-DA output is real audio (peak {peak}), not silence"
+        );
+        assert_eq!(
+            pcm, expect,
+            "our CD-DA decode is byte-identical to the disc"
+        );
 
         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
         let _ = std::fs::write("/tmp/ours_track2.pcm", &bytes);
@@ -3285,6 +3384,20 @@ mod tests {
     }
 
     #[test]
+    fn reading_hirq_does_not_clear_buffer_full() {
+        let mut c = CdBlock::new();
+        c.hirq = HIRQ_MPED | HIRQ_BFUL | HIRQ_CSCT;
+        assert_eq!(c.read16(0x0008) & HIRQ_BFUL, HIRQ_BFUL);
+        assert_eq!(
+            c.hirq & HIRQ_BFUL,
+            HIRQ_BFUL,
+            "BFUL is latched until the host writes HIRQ"
+        );
+        c.write16(0x0008, !HIRQ_BFUL);
+        assert_eq!(c.hirq & HIRQ_BFUL, 0, "W1C write clears BFUL");
+    }
+
+    #[test]
     fn reset_selector_clears_filters_and_get_sector_info_rejects_when_empty() {
         let mut c = CdBlock::new();
         c.filters[0].fad = 0x1234;
@@ -3367,6 +3480,24 @@ mod tests {
     }
 
     #[test]
+    fn sector_data_fifo_streams_16_bit_halfwords() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        cmd(&mut c, 0x6100, 0x0000, 0x0000, 0x0002);
+
+        assert_eq!(c.read16(0x8000), 0xDEAD, "sector 0 high half");
+        assert_eq!(c.read16(0x8000), 0xBEEF, "sector 0 low half");
+        for _ in 0..1022 {
+            let _ = c.read16(0x8000);
+        }
+        assert_eq!(c.read16(0x8000), 0x1234, "sector 1 high half");
+        assert_eq!(c.read16(0x8000), 0x5678, "sector 1 low half");
+        assert_eq!(c.xfer_done, 2052, "16-bit reads count transferred bytes");
+    }
+
+    #[test]
     fn get_and_delete_sector_data_frees_the_blocks_when_drained() {
         let mut c = CdBlock::new();
         c.insert_disc(data_disc());
@@ -3425,6 +3556,22 @@ mod tests {
         // The SCU-DMA data-port alias at 0x0581_8000 streams the same bytes.
         let (w, _) = sat.bus.read32(0x0581_8000, AccessKind::Data);
         assert_eq!(w, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn data_port_alias_routes_16_bit_reads_through_the_bus() {
+        use crate::Saturn;
+        use sh2::bus::{AccessKind, Bus};
+        let mut sat = Saturn::with_blank_bios();
+        sat.insert_disc(data_disc());
+        let cd = &mut sat.bus.cd_block;
+        play(cd, 150, 1);
+        pump(cd);
+        cmd(cd, 0x6100, 0x0000, 0x0000, 0x0001); // Get Sector Data
+
+        let (hi, _) = sat.bus.read16(0x0581_8000, AccessKind::Data);
+        let (lo, _) = sat.bus.read16(0x0581_8000, AccessKind::Data);
+        assert_eq!((hi, lo), (0xDEAD, 0xBEEF));
     }
 
     /// A minimal ISO9660 disc: PVD at FAD 166 → root dir at FAD 167 with
@@ -3722,7 +3869,10 @@ mod tests {
         assert_eq!(c.hirq & HIRQ_EFLS, HIRQ_EFLS);
         // An out-of-range filter index → disconnected (NO_FILTER).
         cmd(&mut c, 0x7100, 0x0000, 0xFF00, 0x0000);
-        assert_eq!(c.cd_device_filter, NO_FILTER, "invalid filter → disconnected");
+        assert_eq!(
+            c.cd_device_filter, NO_FILTER,
+            "invalid filter → disconnected"
+        );
     }
 
     // ===== Abort file (0x75) — with and without a disc =====
@@ -3781,7 +3931,10 @@ mod tests {
         // CR3 high byte. start/end both FAD (bit 0x80 in CR1/CR3 low byte).
         // CR1 = 0x10 | 0x80 (FAD), CR2 = 150; CR3 = (0x03<<8)|0x80, CR4 = 2.
         cmd(&mut c, 0x1080, 150, 0x0380, 0x0002);
-        assert_eq!(c.cur_play_repeat, 0x03, "repeat field decoded from play-mode");
+        assert_eq!(
+            c.cur_play_repeat, 0x03,
+            "repeat field decoded from play-mode"
+        );
         // The end field is start + count when both are FAD-addressed.
         assert_eq!(c.cur_play_end & 0x7F_FFFF, 150 + 2, "end = start + count");
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
@@ -3839,7 +3992,11 @@ mod tests {
         assert_eq!(c.status & !STAT_PERI, STAT_BUSY, "still BUSY mid-settle");
         // Past the settle, inside the radial seek proper.
         c.tick(cd2m(256_000));
-        assert_eq!(c.status & !STAT_PERI, STAT_SEEK, "SEEK only after the settle");
+        assert_eq!(
+            c.status & !STAT_PERI,
+            STAT_SEEK,
+            "SEEK only after the settle"
+        );
         // The split phases don't break end-to-end completion.
         pump(&mut c);
         assert_eq!(c.partitions[0].blocks.len(), 1, "sector buffered");
@@ -3869,7 +4026,11 @@ mod tests {
         c.write16(0x0020, 0x0000);
         c.write16(0x0024, 0x0000); // CR4 completes + dispatches the command
         assert_eq!(c.cr2, 0x0005, "the intended GetSubcodeQ executed (5 words)");
-        assert_eq!(c.cr1 & STAT_TRANS, STAT_TRANS, "subcode staged for transfer");
+        assert_eq!(
+            c.cr1 & STAT_TRANS,
+            STAT_TRANS,
+            "subcode staged for transfer"
+        );
     }
 
     /// The periodic report composes into CR1–4 only after the host CONSUMED
@@ -3899,7 +4060,10 @@ mod tests {
         let _ = c.read16(0x0024); // CR4 read = consumption
         c.tick(cd2m(2_000_000)); // next periodic recomposes with the new FAD
         let after = (c.read16(0x0018), c.read16(0x001C), c.read16(0x0020));
-        assert_ne!(a, after, "after consumption the periodic must publish a fresh report");
+        assert_ne!(
+            a, after,
+            "after consumption the periodic must publish a fresh report"
+        );
     }
 
     /// Get Subcode (0x20) type 0 stages the 10-byte Q channel — [ctrl/adr,
@@ -3919,7 +4083,11 @@ mod tests {
         assert_eq!(c.cr2, 0x0005, "5 words of subcode Q");
         assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY, "data ready");
         assert_eq!(c.read16(0x8000), 0x4101, "ctrl/adr 0x41, track 1");
-        assert_eq!(c.read16(0x8000), 0x0100 | ((rel >> 16) & 0xFF) as u16, "index 1 + rel hi");
+        assert_eq!(
+            c.read16(0x8000),
+            0x0100 | ((rel >> 16) & 0xFF) as u16,
+            "index 1 + rel hi"
+        );
         assert_eq!(c.read16(0x8000), (rel & 0xFFFF) as u16, "rel-FAD");
         assert_eq!(c.read16(0x8000), ((fad >> 16) & 0xFF) as u16, "abs hi");
         assert_eq!(c.read16(0x8000), (fad & 0xFFFF) as u16, "abs-FAD");
@@ -3955,7 +4123,11 @@ mod tests {
         cmd(&mut c, 0x1000, 0x0201, 0x0F00, 0x0263);
         assert_ne!(c.cr1, STAT_REJECT, "consistent track forms accepted");
         pump(&mut c);
-        assert!(c.cd_curfad >= 154, "head in the audio track (FAD {})", c.cd_curfad);
+        assert!(
+            c.cd_curfad >= 154,
+            "head in the audio track (FAD {})",
+            c.cd_curfad
+        );
         assert_ne!(c.status & !STAT_PERI, STAT_PAUSE, "repeat ∞ never pauses");
         let pcm = c.take_cd_audio(2);
         assert_eq!(pcm[0], 0x4321, "track 2 PCM streamed to the CD-DA mixer");
@@ -4112,6 +4284,19 @@ mod tests {
         assert!(!c.cd_audio_primed, "still un-primed below the pre-roll");
     }
 
+    #[test]
+    fn clear_audio_buffer_drops_decoded_cdda_preroll() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        assert!(c.read_cd_audio_sector(FAD_OFFSET));
+        c.cd_audio_primed = true;
+
+        c.clear_audio_buffer();
+
+        assert!(c.cd_audio.is_empty(), "decoded CDDA samples dropped");
+        assert!(!c.cd_audio_primed, "pre-roll state reset");
+    }
+
     // ===== dbg_play_cdda / dbg_play_first_audio_track debug hooks =====
 
     #[test]
@@ -4121,10 +4306,15 @@ mod tests {
         // dbg_play_cdda(fad, sectors): drives the real start_seek Play machinery.
         c.dbg_play_cdda(FAD_OFFSET, 2);
         assert_eq!(
-            c.cur_play_start, 0x80_0000 | FAD_OFFSET,
+            c.cur_play_start,
+            0x80_0000 | FAD_OFFSET,
             "play start armed (FAD-addressed)"
         );
-        assert_eq!(c.cur_play_end, 0x80_0000 | (FAD_OFFSET + 2), "play end armed");
+        assert_eq!(
+            c.cur_play_end,
+            0x80_0000 | (FAD_OFFSET + 2),
+            "play end armed"
+        );
         assert_eq!(c.play_end_irq, HIRQ_PEND, "PEND at range end");
         assert_eq!(c.drive_phase, DrivePhase::SeekStart, "seek started");
     }
@@ -4143,7 +4333,10 @@ mod tests {
         // A data-only disc has no audio track → returns false, arms nothing.
         let mut d = CdBlock::new();
         d.insert_disc(iso_disc());
-        assert!(!d.dbg_play_first_audio_track(), "no audio track on a data disc");
+        assert!(
+            !d.dbg_play_first_audio_track(),
+            "no audio track on a data disc"
+        );
     }
 
     // ===== reset_selector variants =====
@@ -4264,4 +4457,10 @@ mod tests {
 fn cd_rwatch() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var_os("CD_RWATCH").is_some())
+}
+
+#[cfg(not(test))]
+fn cd_xfer_trace() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("SAT_CD_XFER_TRACE").is_some())
 }
