@@ -14,6 +14,7 @@
 
 use std::env;
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,81 @@ fn host_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn write_wav_header(mut w: impl Write, pcm_bytes: u32) -> std::io::Result<()> {
+    let riff_bytes = 36u32.saturating_add(pcm_bytes);
+    w.write_all(b"RIFF")?;
+    w.write_all(&riff_bytes.to_le_bytes())?;
+    w.write_all(b"WAVEfmt ")?;
+    w.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    w.write_all(&1u16.to_le_bytes())?; // PCM
+    w.write_all(&2u16.to_le_bytes())?; // stereo
+    w.write_all(&44_100u32.to_le_bytes())?;
+    w.write_all(&(44_100u32 * 2 * 2).to_le_bytes())?;
+    w.write_all(&4u16.to_le_bytes())?; // block align
+    w.write_all(&16u16.to_le_bytes())?; // bits per sample
+    w.write_all(b"data")?;
+    w.write_all(&pcm_bytes.to_le_bytes())
+}
+
+struct WavDump {
+    path: String,
+    file: fs::File,
+    pcm_bytes: u32,
+}
+
+impl WavDump {
+    fn from_env(name: &str) -> Option<Self> {
+        let path = std::env::var(name).ok()?;
+        let mut file = match fs::File::create(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("create audio dump {path} failed: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = write_wav_header(&mut file, 0) {
+            eprintln!("create audio dump {path} failed: {e}");
+            return None;
+        }
+        Some(Self {
+            path,
+            file,
+            pcm_bytes: 0,
+        })
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) {
+        for &sample in samples {
+            if self.file.write_all(&sample.to_le_bytes()).is_ok() {
+                self.pcm_bytes = self.pcm_bytes.saturating_add(2);
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+    fn reset(&mut self) {
+        if self.file.set_len(0).is_ok()
+            && self.file.seek(SeekFrom::Start(0)).is_ok()
+            && write_wav_header(&mut self.file, 0).is_ok()
+        {
+            self.pcm_bytes = 0;
+        }
+    }
+}
+
+impl Drop for WavDump {
+    fn drop(&mut self) {
+        if self.file.seek(SeekFrom::Start(0)).is_ok()
+            && write_wav_header(&mut self.file, self.pcm_bytes).is_ok()
+        {
+            eprintln!(
+                "wrote audio dump {} ({} bytes PCM)",
+                self.path, self.pcm_bytes
+            );
+        }
+    }
 }
 
 /// Classify a master-SH-2 PC into a coarse memory region for the OSD's live
@@ -382,8 +458,17 @@ fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
 /// cap chased the full audio target and so dropped ~1/3 of rendered frames on
 /// VF2 even at 6 ms/frame — cutting distinct fps and adding input latency
 /// (`tmp/vf2_perflog`). `max` is the catch-up ceiling (`SAT_MAX_BURST`, ≥1).
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
 fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
     if depth < catchup_floor { max.max(1) } else { 1 }
+}
+
+#[cfg(feature = "sdl-frontend")]
+fn atomic_saturating_sub(v: &std::sync::atomic::AtomicU32, n: u32) {
+    use std::sync::atomic::Ordering;
+    let _ = v.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(n))
+    });
 }
 
 /// Decode the bundled PNG icon (`jupiter/assets/app_icon.png`, embedded at build time)
@@ -486,6 +571,37 @@ fn run(
         eprintln!("loaded backup RAM from {}", battery_path.display());
     }
 
+    if let Ok(path) = std::env::var("SAT_LOADSTATE") {
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("read save state {path} failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(e) = saturn.load_state(&bytes) {
+            eprintln!("load save state {path} failed: {e:?}");
+            return ExitCode::from(1);
+        }
+        let m = saturn.master();
+        let s = saturn.slave();
+        eprintln!(
+            "loaded save state {path}\n  master: PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}\n  slave : PC={:08X} PR={:08X} SR={:08X} GBR={:08X} R15={:08X} halted={}",
+            m.regs.pc,
+            m.regs.pr,
+            m.regs.sr.0,
+            m.regs.gbr,
+            m.regs.r[15],
+            saturn.master_is_halted(),
+            s.regs.pc,
+            s.regs.pr,
+            s.regs.sr.0,
+            s.regs.gbr,
+            s.regs.r[15],
+            saturn.slave_is_halted(),
+        );
+    }
+
     let sdl = sdl3::init().expect("SDL3 init");
     let video = sdl.video().expect("SDL3 video subsystem");
     // Host game controllers (the SDL gamepad API normalizes every recognized pad
@@ -579,8 +695,9 @@ fn run(
     //
     // Audio pacing uses an AtomicU32 mirror of the SDL queue depth that the
     // main thread refreshes every iteration (the SDL audio handles are not
-    // Send), plus the bytes produced inside the current burst — at most one
-    // vsync stale, bounded by the burst cap, and self-correcting either way.
+    // Send), plus chunks already sent to the SDL thread but not yet handed to
+    // SDL. Without tracking that in-flight reserve, a slow present/event pass
+    // can make the emu thread think the host queue is lower than it really is.
     let audio_ms: u64 = std::env::var("SAT_AUDIO_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -589,6 +706,7 @@ fn run(
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
     let mut audio_started = false;
     let mut audio_drop_until_reset = false;
+    let mut audio_dump = WavDump::from_env("SAT_AUDIO_DUMP");
     // Catch-up ceiling: the *most* game-frames `burst_cap` will collapse into
     // one render when the audio reserve has drained low. Normal play renders
     // every frame regardless (see `burst_cap`); this only bounds recovery from a
@@ -605,6 +723,30 @@ fn run(
     let catchup_floor = audio_target_bytes / 3;
 
     let perflog = std::env::var_os("SAT_PERFLOG").is_some();
+    let audio_queue_log = std::env::var_os("SAT_AUDIO_QUEUE_LOG").is_some();
+    let audio_watchdog_ms: u64 = std::env::var("SAT_AUDIO_WATCHDOG_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(750);
+    let movie_probe: Option<u64> = std::env::var("SAT_MOVIE_PROBE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| std::env::var_os("SAT_MOVIE_PROBE").map(|_| 30));
+    let scsp_movie_probe = std::env::var_os("SAT_SCSP_MOVIE_PROBE").is_some();
+    let scripted_pad: Option<u16> = std::env::var("SAT_PAD")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+    let pad_from: u64 = std::env::var("SAT_PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let pad_to: u64 = std::env::var("SAT_PAD_TO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX);
+    let frame_limit: Option<u64> = std::env::var("SAT_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, mpsc};
@@ -646,6 +788,7 @@ fn run(
     let (audio_tx, audio_rx) = mpsc::channel::<AudioMsg>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
     let audio_mirror = Arc::new(AtomicU32::new(0));
+    let audio_inflight = Arc::new(AtomicU32::new(0));
     let osd_open = Arc::new(AtomicBool::new(false));
     let quit_flag = Arc::new(AtomicBool::new(false));
 
@@ -687,6 +830,7 @@ fn run(
 
     std::thread::scope(|scope| {
         let emu_mirror = Arc::clone(&audio_mirror);
+        let emu_inflight = Arc::clone(&audio_inflight);
         let emu_osd_open = Arc::clone(&osd_open);
         let emu_quit = Arc::clone(&quit_flag);
         // Returns the machine plus the final save base — a BIOS swap re-keys
@@ -712,6 +856,9 @@ fn run(
             let mut pl_frames = 0u32;
             let mut pl_bursts = [0u32; 3];
             let mut pl_last = std::time::Instant::now();
+            let mut input_suppress_frames = 0u32;
+            let mut audio_pacing_idle_since: Option<std::time::Instant> = None;
+            let mut next_movie_probe = movie_probe.filter(|&period| period != 0);
 
             // Optional input recording (SAT_INPUT_REC=<path>): an "input movie"
             // for deterministic headless replay (sdbg `replay`). Writes the RTC
@@ -803,18 +950,26 @@ fn run(
                             let _ = osd.toggle();
                         }
                         EmuIn::Nav(nav) => {
-                            if let Some(action) = osd.handle(nav, &ctx)
-                                && dispatch_osd(
+                            if let Some(action) = osd.handle(nav, &ctx) {
+                                let suppress_input = matches!(
+                                    action,
+                                    osd::OsdAction::Reset | osd::OsdAction::Load(_)
+                                );
+                                if dispatch_osd(
                                     action,
                                     &mut osd,
                                     &mut saturn,
                                     &mut sess,
                                     &ui_tx,
                                     &audio_tx,
-                                )
-                            {
-                                let _ = ui_tx.send(UiMsg::Quit);
-                                break 'emu;
+                                ) {
+                                    let _ = ui_tx.send(UiMsg::Quit);
+                                    break 'emu;
+                                }
+                                if suppress_input {
+                                    held = 0;
+                                    input_suppress_frames = 3;
+                                }
                             }
                         }
                         EmuIn::Quicksave => match fs::write(sess.state_path(), saturn.save_state())
@@ -830,6 +985,8 @@ fn run(
                                     let _ = audio_tx.send(AudioMsg::Reset);
                                     eprintln!("quickload: {}", path.display());
                                     osd.set_toast("Quickload", 90);
+                                    held = 0;
+                                    input_suppress_frames = 3;
                                 }
                                 Err(e) => {
                                     let _ = audio_tx.send(AudioMsg::Reset);
@@ -890,16 +1047,19 @@ fn run(
                     continue;
                 }
 
-                saturn.set_pad1(held);
+                let game_held = if input_suppress_frames != 0 { 0 } else { held };
+                if scripted_pad.is_none() {
+                    saturn.set_pad1(game_held);
+                }
                 // Record a pad-state change at the frame it takes effect (the
                 // burst below holds `held` constant for its whole span).
                 if let Some(f) = rec.as_mut()
-                    && held != rec_last
+                    && game_held != rec_last
                 {
                     use std::io::Write;
-                    let _ = writeln!(f, "{rec_frame} {held:04X}");
+                    let _ = writeln!(f, "{rec_frame} {game_held:04X}");
                     let _ = f.flush();
-                    rec_last = held;
+                    rec_last = game_held;
                 }
                 // Audio-paced burst: run frames until the (mirrored) SDL queue
                 // depth plus what this burst just produced reaches the target.
@@ -907,30 +1067,95 @@ fn run(
                 // collapses (run N, show 1) when the reserve has drained low —
                 // chasing the full target unconditionally dropped ~1/3 of VF2's
                 // frames and added input latency.
-                let mut depth = emu_mirror.load(Ordering::Relaxed);
+                let mut depth = emu_mirror
+                    .load(Ordering::Relaxed)
+                    .saturating_add(emu_inflight.load(Ordering::Relaxed));
                 let cap = burst_cap(depth, catchup_floor, max_frames_per_burst);
                 let mut burst = 0u32;
                 while depth < audio_target_bytes && burst < cap {
+                    if let Some(bits) = scripted_pad {
+                        let frame = rec_frame + burst as u64;
+                        saturn.set_pad1(if (pad_from..pad_to).contains(&frame) {
+                            bits
+                        } else {
+                            0
+                        });
+                    }
                     let t = std::time::Instant::now();
                     saturn.advance_frame();
                     pl_advance += t.elapsed();
                     let chunk = saturn.take_audio();
                     let bytes = (chunk.len() * 2) as u32;
                     depth += bytes;
-                    // Credit the in-flight bytes into the shared mirror too: the
-                    // main thread refreshes it only once per vsync, so without
-                    // this every emu iteration in between re-reads the same stale
-                    // depth and over-produces (~3% fast bursts, then an overshoot
-                    // stall — visible as alternating fast/slow gameplay). The
-                    // main thread's authoritative `store` re-anchors the mirror
-                    // to the real SDL queue size each frame.
-                    emu_mirror.fetch_add(bytes, Ordering::Relaxed);
-                    let _ = audio_tx.send(AudioMsg::Chunk(chunk));
+                    emu_inflight.fetch_add(bytes, Ordering::Relaxed);
+                    if audio_tx.send(AudioMsg::Chunk { samples: chunk, bytes }).is_err() {
+                        atomic_saturating_sub(&emu_inflight, bytes);
+                    }
                     burst += 1;
                 }
                 pl_frames += burst;
                 pl_bursts[(burst as usize).min(2)] += 1;
                 rec_frame += burst as u64;
+                input_suppress_frames = input_suppress_frames.saturating_sub(burst);
+                if burst > 0
+                    && let Some(period) = movie_probe
+                    && (period == 0 || {
+                        let next = next_movie_probe.get_or_insert(period);
+                        let crossed = rec_frame >= *next;
+                        while rec_frame >= *next {
+                            *next = next.saturating_add(period);
+                        }
+                        crossed
+                    })
+                {
+                    let (cd_status, cd_fad, cd_left, cd_free, parts) =
+                        saturn.bus.cd_block.debug_state();
+                    let part_summary = parts
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &n)| n != 0)
+                        .map(|(i, n)| format!("{i}:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let scsp_probe = if scsp_movie_probe {
+                        let (mslc, monitor) = saturn.bus.scsp.dbg_slot_monitor();
+                        let active = (0..32)
+                            .filter(|&i| saturn.bus.scsp.slot_active(i))
+                            .take(8)
+                            .map(|i| {
+                                let d = saturn.bus.scsp.slot_debug(i);
+                                let ca = ((d.cur >> 12) & 0xFFFF) >> 12;
+                                format!(
+                                    "{i}:sa={:05X} cur={} ca={ca:X} step={} lsa={} lea={} lp={} eg={} tl={:02X}",
+                                    d.sa,
+                                    d.cur >> 12,
+                                    d.step,
+                                    d.lsa,
+                                    d.lea,
+                                    d.lpctl,
+                                    d.eg_state,
+                                    d.tl
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        format!(" scsp_mslc={mslc} mon={monitor:04X} slots=[{active}]")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "SDLMOVIE f={rec_frame:04} pc={:08X} cd_st={cd_status:02X} fad={cd_fad} left={cd_left} free={cd_free} parts=[{part_summary}] depth={depth} mirror={} inflight={} burst={burst}{scsp_probe}",
+                        saturn.master().regs.pc,
+                        emu_mirror.load(Ordering::Relaxed),
+                        emu_inflight.load(Ordering::Relaxed),
+                    );
+                }
+                if let Some(limit) = frame_limit
+                    && rec_frame >= limit
+                {
+                    let _ = ui_tx.send(UiMsg::Quit);
+                    break 'emu;
+                }
 
                 // Collect the frame the worker rendered while we computed,
                 // overlay any toast, and hand it to the main thread; then
@@ -940,30 +1165,48 @@ fn run(
                 // same state would keep the worker re-rendering an identical
                 // frame, burning a core and memory bandwidth for nothing.
                 if burst > 0 {
-                if let Some((mut rendered, dims)) = pipe.wait() {
-                    last_frame.copy_from_slice(&rendered);
-                    last_dims = dims;
-                    osd.tick_toast();
-                    osd.render_overlay(&mut rendered, dims.0, dims.1, &ctx);
-                    match frame_tx.try_send((rendered, dims)) {
-                        Ok(()) => {}
-                        Err(mpsc::TrySendError::Full((b, _)))
-                        | Err(mpsc::TrySendError::Disconnected((b, _))) => pool.push(b),
+                    audio_pacing_idle_since = None;
+                    if let Some((mut rendered, dims)) = pipe.wait() {
+                        last_frame.copy_from_slice(&rendered);
+                        last_dims = dims;
+                        osd.tick_toast();
+                        osd.render_overlay(&mut rendered, dims.0, dims.1, &ctx);
+                        match frame_tx.try_send((rendered, dims)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full((b, _)))
+                            | Err(mpsc::TrySendError::Disconnected((b, _))) => pool.push(b),
+                        }
                     }
-                }
-                // Feed the pipe a spare whenever it lacks one — this must be
-                // independent of the wait() result above: if a submit was ever
-                // skipped for want of a spare, wait() yields None from then
-                // on, and a recycle gated behind it would never run again
-                // (the black-screen pipeline deadlock).
-                if pipe.needs_spare()
-                    && let Some(b) = pool.pop()
-                {
-                    pipe.recycle(b);
-                }
-                pipe.submit(&saturn);
+                    // Feed the pipe a spare whenever it lacks one — this must be
+                    // independent of the wait() result above: if a submit was ever
+                    // skipped for want of a spare, wait() yields None from then
+                    // on, and a recycle gated behind it would never run again
+                    // (the black-screen pipeline deadlock).
+                    if pipe.needs_spare()
+                        && let Some(b) = pool.pop()
+                    {
+                        pipe.recycle(b);
+                    }
+                    pipe.submit(&saturn);
                 } else {
                     // Audio reserve full: nothing to do until it drains a bit.
+                    // If the SDL queue mirror/in-flight accounting ever gets
+                    // stuck high across an OSD reset/load edge, the emulation
+                    // thread would otherwise stop producing frames forever.
+                    let now = std::time::Instant::now();
+                    let idle_since = audio_pacing_idle_since.get_or_insert(now);
+                    if now.duration_since(*idle_since)
+                        >= std::time::Duration::from_millis(audio_watchdog_ms.max(16))
+                    {
+                        let mirror = emu_mirror.load(Ordering::Relaxed);
+                        let inflight = emu_inflight.load(Ordering::Relaxed);
+                        eprintln!(
+                            "SDL audio pacing watchdog: stalled with mirror={mirror} inflight={inflight} target={audio_target_bytes}; clearing pacing reserve"
+                        );
+                        emu_mirror.store(0, Ordering::Relaxed);
+                        emu_inflight.store(0, Ordering::Relaxed);
+                        audio_pacing_idle_since = None;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
 
@@ -1004,6 +1247,9 @@ fn run(
         let mut pl_present = std::time::Duration::ZERO;
         let mut pl_iters = 0u32;
         let mut pl_last = std::time::Instant::now();
+        let mut audio_last_queued = 0u32;
+        let mut audio_last_change = std::time::Instant::now();
+        let mut audio_last_log = std::time::Instant::now();
         'main: loop {
             // (See the event-range flush note in the git history: SDL ≥ 2.28
             // emits display events 0.37's binding panics on.)
@@ -1230,6 +1476,7 @@ fn run(
             // on. `queued_bytes()` is already in source (44.1 kHz) units, so no
             // device-rate scaling is needed. Start playback once the reserve has
             // first filled, so a cold start never drains an empty stream.
+            let mut audio_chunks_this_iter = 0u32;
             while let Ok(msg) = audio_rx.try_recv() {
                 match msg {
                     AudioMsg::Reset => {
@@ -1238,19 +1485,59 @@ fn run(
                         audio_started = false;
                         audio_drop_until_reset = false;
                         audio_mirror.store(0, Ordering::Relaxed);
+                        audio_inflight.store(0, Ordering::Relaxed);
+                        if let Some(dump) = audio_dump.as_mut() {
+                            dump.reset();
+                        }
+                        audio_last_queued = 0;
+                        audio_last_change = std::time::Instant::now();
                     }
-                    AudioMsg::Chunk(chunk) => {
-                        if !audio_drop_until_reset {
-                            let _ = audio_stream.put_data_i16(&chunk);
+                    AudioMsg::Chunk { samples, bytes } => {
+                        atomic_saturating_sub(&audio_inflight, bytes);
+                        audio_chunks_this_iter += 1;
+                        if !audio_drop_until_reset
+                            && audio_stream.put_data_i16(&samples).is_ok()
+                            && let Some(dump) = audio_dump.as_mut()
+                        {
+                            dump.write_samples(&samples);
                         }
                     }
                 }
             }
-            let src_size = audio_stream.queued_bytes().unwrap_or(0) as u32;
+            let mut src_size = audio_stream.queued_bytes().unwrap_or(0) as u32;
+            let audio_now = std::time::Instant::now();
+            if src_size != audio_last_queued {
+                audio_last_queued = src_size;
+                audio_last_change = audio_now;
+            } else if audio_watchdog_ms != 0
+                && audio_started
+                && audio_chunks_this_iter == 0
+                && src_size > catchup_floor
+                && audio_last_change.elapsed()
+                    >= std::time::Duration::from_millis(audio_watchdog_ms)
+            {
+                eprintln!(
+                    "SDL audio queue watchdog: queued_bytes stuck at {src_size}; clearing host stream"
+                );
+                let _ = audio_stream.pause();
+                let _ = audio_stream.clear();
+                audio_started = false;
+                audio_mirror.store(0, Ordering::Relaxed);
+                src_size = 0;
+                audio_last_queued = 0;
+                audio_last_change = audio_now;
+            }
             audio_mirror.store(src_size, Ordering::Relaxed);
             if !audio_started && src_size >= audio_target_bytes {
                 let _ = audio_stream.resume();
                 audio_started = true;
+            }
+            if audio_queue_log && audio_last_log.elapsed().as_secs() >= 1 {
+                eprintln!(
+                    "SDLAUDIO queued={src_size} inflight={} target={audio_target_bytes} started={audio_started} drop={audio_drop_until_reset} chunks={audio_chunks_this_iter}",
+                    audio_inflight.load(Ordering::Relaxed),
+                );
+                audio_last_log = std::time::Instant::now();
             }
 
             // Window-affecting OSD actions are applied here (the canvas is
@@ -1374,7 +1661,7 @@ enum EmuIn {
 /// must clear host-queued samples before later chunks from the new timeline play.
 #[cfg(feature = "sdl-frontend")]
 enum AudioMsg {
-    Chunk(Vec<i16>),
+    Chunk { samples: Vec<i16>, bytes: u32 },
     Reset,
 }
 
@@ -2263,6 +2550,7 @@ fn run(
     }
     let mut last_pc = u32::MAX;
     let mut dump_dims = (FRAME_WIDTH, FRAME_HEIGHT);
+    let mut audio_dump = WavDump::from_env("SAT_AUDIO_DUMP");
     for f in 0..headless_frames {
         apply_scripted_pad(&mut saturn, f);
         if cache_purge {
@@ -2274,6 +2562,14 @@ fn run(
             saturn.slave_mut().dbg_slow_fetch = slow_fetch;
         }
         dump_dims = saturn.run_frame(&mut framebuffer);
+        let mut frame_audio = if audio_dump.is_some() {
+            saturn.take_audio()
+        } else {
+            Vec::new()
+        };
+        if let Some(dump) = audio_dump.as_mut() {
+            dump.write_samples(&frame_audio);
+        }
         if let Some(period) = movie_probe
             && (period == 0 || f % period == 0)
         {
@@ -2307,7 +2603,11 @@ fn run(
                 .take(dump_dims.0 * dump_dims.1)
                 .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
                 .count();
-            let audio = saturn.take_audio();
+            let audio = if audio_dump.is_some() {
+                std::mem::take(&mut frame_audio)
+            } else {
+                saturn.take_audio()
+            };
             let audio_abs: i64 = audio.iter().map(|&x| (x as i64).abs()).sum();
             let scsp_probe = if scsp_movie_probe {
                 let (mslc, monitor) = saturn.bus.scsp.dbg_slot_monitor();
@@ -2352,7 +2652,6 @@ fn run(
             }
         }
     }
-
     if std::env::var_os("SAT_REGWATCH").is_some() {
         let log = std::mem::take(&mut saturn.master_mut().dbg_regwatch_log);
         eprintln!("REGWATCH: {} transition(s) to target value:", log.len());
