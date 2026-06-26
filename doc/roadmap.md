@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1149 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1154 workspace-wide, 0 failures**, ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -407,7 +407,14 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   framebuffer stays bit-identical, so accuracy is untouched. Shaders authored
   GLSL → SPIR-V (precompiled, or `SDL_shadercross`; DXIL/MSL for non-Vulkan
   hosts). De-risk with a passthrough-shader spike first; the `--backend`
-  render-driver selector is the groundwork. **Device entry point:**
+  render-driver selector is the groundwork. **Capability detection: DONE**
+  (`jupiter/src/present_gpu.rs`) — the `gpu` config key / `--gpu` flag
+  (`off` default / `auto` / `on`) probes the host by attempting
+  `sdl3::gpu::Device::new` for its shader format (SPIR-V/DXIL/MSL) and logs the
+  verdict (`GpuCapability`), falling back to the `SDL_Renderer` blit; `unsafe`-free
+  because `Device::new` returns a `Result` (the cheap pre-probes aren't safe-wrapped
+  in sdl3-rs 0.18.4). Follow-up: read the chosen backend (`SDL_GetGPUDeviceDriver`,
+  also unwrapped) to label it + reject a software Vulkan. **Device entry point:**
   `SDL_CreateGPUDevice(format_flags, debug_mode, name)` /
   `SDL_CreateGPUDeviceWithProperties` (safe-wrapped by `sdl3::gpu` — no `unsafe`
   despite the workspace `forbid`). The `name` picks the **backend**

@@ -19,6 +19,15 @@ see the README Acknowledgements); and the compiled outputs (`.spv` / `.dxil` /
 > lands, nothing here is loaded — the frontend presents through the plain
 > `SDL_Renderer` blit (the `--backend` render-driver selector). This README will
 > graduate to the real load paths / config keys when the feature ships.
+>
+> The one piece already built is the **capability probe** (`jupiter/src/present_gpu.rs`):
+> the `gpu` config key / `--gpu` flag (`off` default / `auto` / `on`) makes the
+> frontend try to create an `SDL_GPU` device for this host's shader format
+> (SPIR-V / DXIL / MSL, per the table below) and log whether it's available —
+> the gate the presenter will consult. It's `off` by default (the safe probe
+> allocates a device); see [ADR-0019](../doc/adr/0019-gpu-is-presentation-only.md)
+> "Capability detection" for why, and for the known limitation (no backend-name
+> readback, so no software-rasterizer rejection yet).
 
 ## The accuracy contract (what a shader must NOT touch)
 

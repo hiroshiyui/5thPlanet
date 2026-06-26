@@ -40,6 +40,27 @@ presentation**. Concretely:
   with the `SDL_Renderer` blit as the default and fallback. Not a separate GPU
   stack.
 
+### Capability detection (added 2026-06-27)
+
+Whether the `SDL_GPU` presenter can run at all is a *runtime* property of the
+host, so the frontend probes it (`jupiter/src/present_gpu.rs`). The workspace
+forbids `unsafe`, and sdl3-rs 0.18.4 gives a **safe** `sdl3::gpu::Device::new(...)
+-> Result` but **no** safe wrapper for the cheap non-allocating pre-probes
+(`SDL_GPUSupportsShaderFormats`, `SDL_GetNumGPUDrivers`). So the `unsafe`-free
+detection is: pick the shader format we'd ship for this OS (SPIR-V on Vulkan, DXIL
+on D3D12, MSL on Metal — `ShaderKind`) → attempt `Device::new` for it → `Ok` means
+SDL_GPU is available, `Err` means log `SDL_GetError` and keep the `SDL_Renderer`
+path. Because the safe probe must *allocate* a device, it is **opt-in** (the `gpu`
+config key / `--gpu` flag: `off` default, `auto`, `on`); the default flips to
+`auto` when the presenter actually consumes the verdict (`GpuCapability`).
+
+**Known limitation / follow-up:** sdl3-rs 0.18.4 also leaves
+`SDL_GetGPUDeviceDriver` unwrapped, so the probe reports only *whether* a device
+was created, not *which* backend it chose — and therefore cannot reject a slow
+software Vulkan (llvmpipe/lavapipe). Reading the driver back (to label the backend
+and reject software rasterizers) waits on a newer sdl3-rs with a safe accessor, or
+a justified, narrowly-scoped `#![allow(unsafe_code)]` shim.
+
 ## Consequences
 
 - **Easier:** cross-platform presentation comes for free (SDL's backends); the

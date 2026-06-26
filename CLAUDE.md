@@ -151,6 +151,17 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      (preferred → opengl → software) and `build_canvas` sets the
                      hint + builds the canvas. The VDP stays software — this is
                      presentation only; no Vulkan (SDL3's 2D renderer has none).
+                     The `present_gpu` module (`present_gpu.rs`, also sdl-free
+                     pure parts) is the **SDL_GPU capability probe** — groundwork
+                     for the planned CRT-shader presenter (ADR-0019): the `gpu`
+                     config key / `--gpu` flag (`off` default / `auto` / `on`)
+                     attempts `sdl3::gpu::Device::new` for the host's shader
+                     format (SPIR-V/DXIL/MSL) and logs the verdict
+                     (`GpuCapability`), falling back to the `SDL_Renderer` blit.
+                     `unsafe`-free because `Device::new` returns a `Result` (the
+                     cheap pre-probes + the `SDL_GetGPUDeviceDriver` backend-name
+                     readback aren't safe-wrapped in sdl3-rs 0.18.4 — so it can't
+                     yet reject a software Vulkan; ADR-0019 follow-up).
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```
