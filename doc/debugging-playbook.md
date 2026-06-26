@@ -79,6 +79,40 @@ instead of 0" — while the root was a dropped cache purge two layers up.)
    bug, check that class *first* on its next blocker before any deep RE — a title
    that trips on one fidelity gap usually trips on the same family again.
 
+## Common tracing principles
+
+- **Classify the failure before explaining it.** Decide whether the symptom is
+  frontend pacing, audio queueing, render, input, or core emulation. For movie
+  stalls, sample frame progress, CD FAD, buffer occupancy, audio queue state, and
+  SH-2 PCs before blaming the CD player or renderer.
+- **Turn "random" into replayable.** Intermittent title bugs usually come from
+  RTC seed, input timing, savestate timing, or interrupt timing. Capture input or
+  a pre-failure savestate, then prove repeated headless runs reach the same bad
+  state.
+- **Trace transitions, not just final hangs.** The final park point is often a
+  downstream victim. Find the last successful event and the first missing event:
+  completed DMA without `EndDataXfer`, key-on without samples, VDP command list
+  published but stale, and so on.
+- **Compare good and bad timelines.** A lucky run is evidence. Diff CD commands,
+  DMA completions, SCU interrupts, SH-2 PCs, buffer state, and key registers until
+  the first semantic divergence appears.
+- **Instrument narrowly.** Prefer env-gated probes, watchpoints, breakpoints, and
+  per-subsystem traces over broad logging. Remove temporary probes once the root
+  is understood.
+- **Follow ownership boundaries.** A full CD buffer does not prove the CD block is
+  wrong; repeated audio does not prove the frontend is wrong; blank graphics do
+  not prove VDP rendering is wrong. Verify whether the subsystem is the cause or
+  only the place where the earlier error becomes visible.
+- **Anchor fixes in hardware invariants.** Examples: interrupts are not accepted
+  in delay slots, SCU `IST` is write-0-clear, cache-through aliases must fold to
+  physical addresses, CCR access width matters, and DMA completion timing is part
+  of the contract.
+- **Rerun the original repro.** A unit test validates the invariant; the captured
+  title repro validates that the user-visible failure is actually gone.
+- **Document ruled-out hypotheses.** Keep the negative evidence with the case:
+  frontend pacing, cache coherency, read-pump behavior, HIRQ latch semantics,
+  DMA halt behavior, or any other plausible path already disproven.
+
 ## The cardinal rule: instruments must not perturb the core
 
 Every probe is **observer-only and golden-safe** — an env-gated read or a
