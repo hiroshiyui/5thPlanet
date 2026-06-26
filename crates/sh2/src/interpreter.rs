@@ -170,6 +170,10 @@ pub struct Cpu {
     /// + 2). Capped to avoid unbounded growth. Not serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub dbg_ftcsr_log: alloc::vec::Vec<(u32, u8, bool, u64)>,
+    /// Debug only: only record [`Self::dbg_ftcsr_log`] once the CPU cycle has
+    /// reached this value (0 = always). Not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub dbg_ftcsr_after: u64,
     /// Debug only: when >0, push the executing PC into [`Self::dbg_pc_log`] each
     /// step and decrement. Armed (once) by the first FTCSR *write* while
     /// [`Self::dbg_ftcsr`] — captures the path right after the master clears the
@@ -228,6 +232,7 @@ impl Cpu {
             dbg_regwatch_log: alloc::vec::Vec::new(),
             dbg_ftcsr: false,
             dbg_ftcsr_log: alloc::vec::Vec::new(),
+            dbg_ftcsr_after: 0,
             dbg_pc_capture: 0,
             dbg_pc_log: alloc::vec::Vec::new(),
             decode_lut: build_decode_lut(),
@@ -329,7 +334,11 @@ impl Cpu {
         // Register-write watch (debug): if `R[idx]` transitions to the target
         // value within the cycle window, log the executing PC. Off-path when
         // disabled (one `is_some` check); `instr_pc` is captured only when armed.
-        let instr_pc = if self.dbg_regwatch.is_some() { self.regs.pc } else { 0 };
+        let instr_pc = if self.dbg_regwatch.is_some() {
+            self.regs.pc
+        } else {
+            0
+        };
         if self.dbg_pc_capture > 0 {
             self.dbg_pc_log.push(self.regs.pc);
             self.dbg_pc_capture -= 1;
@@ -1376,12 +1385,21 @@ impl Cpu {
             return (self.cache.ccr(), 0);
         }
         if OnChip::owns(addr) {
-            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            let stall = if is_divu_reg(addr) {
+                self.pipeline.stall_for_divide()
+            } else {
+                0
+            };
             self.timer_sync_pre(addr);
             let v = self.onchip.read8(addr);
             self.timer_sync_post(addr);
-            if self.dbg_ftcsr && addr == FTCSR_ADDR && self.dbg_ftcsr_log.len() < 16384 {
-                self.dbg_ftcsr_log.push((self.regs.pc, v, false, self.pipeline.cycles));
+            if self.dbg_ftcsr
+                && addr == FTCSR_ADDR
+                && self.pipeline.cycles >= self.dbg_ftcsr_after
+                && self.dbg_ftcsr_log.len() < 16384
+            {
+                self.dbg_ftcsr_log
+                    .push((self.regs.pc, v, false, self.pipeline.cycles));
             }
             return (v, stall);
         }
@@ -1439,7 +1457,11 @@ impl Cpu {
             return (ccr | (ccr << 8), 0);
         }
         if OnChip::owns(addr) {
-            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            let stall = if is_divu_reg(addr) {
+                self.pipeline.stall_for_divide()
+            } else {
+                0
+            };
             self.timer_sync_pre(addr);
             let v = self.onchip.read16(addr);
             self.timer_sync_post(addr);
@@ -1467,7 +1489,11 @@ impl Cpu {
                             self.dbg_stale_fetch = Some((phys, v, mem, self.pipeline.cycles));
                         }
                     }
-                    let extra = if matches!(kind, AccessKind::Fetch) { self.dbg_slow_fetch } else { 0 };
+                    let extra = if matches!(kind, AccessKind::Fetch) {
+                        self.dbg_slow_fetch
+                    } else {
+                        0
+                    };
                     return (v, extra);
                 }
                 cache::Probe::Miss => {
@@ -1491,7 +1517,11 @@ impl Cpu {
         bus: &mut impl Bus,
     ) -> (u32, u32) {
         if OnChip::owns(addr) {
-            let stall = if is_divu_reg(addr) { self.pipeline.stall_for_divide() } else { 0 };
+            let stall = if is_divu_reg(addr) {
+                self.pipeline.stall_for_divide()
+            } else {
+                0
+            };
             self.timer_sync_pre(addr);
             let v = self.onchip.read32(addr);
             self.timer_sync_post(addr);
@@ -1556,9 +1586,11 @@ impl Cpu {
             if let Some(lat) = self.onchip.divu.take_pending_latency() {
                 self.pipeline.schedule_divide(lat);
             }
-            if self.dbg_ftcsr && addr == FTCSR_ADDR {
+            if self.dbg_ftcsr && addr == FTCSR_ADDR && self.pipeline.cycles >= self.dbg_ftcsr_after
+            {
                 if self.dbg_ftcsr_log.len() < 16384 {
-                    self.dbg_ftcsr_log.push((self.regs.pc, val, true, self.pipeline.cycles));
+                    self.dbg_ftcsr_log
+                        .push((self.regs.pc, val, true, self.pipeline.cycles));
                 }
                 // Arm the post-clear PC trace once: the first FTCSR write is the
                 // master ack/clear of the slave's round-1 done — capture what it
@@ -1817,7 +1849,11 @@ impl Cpu {
             // own kind (and pays the full first-access cost); the remaining
             // three are `LineFill` continuation beats, which an SDRAM host
             // charges nothing for (SH7604 burst read — Mednafen `BurstHax`).
-            let beat_kind = if chunk == 0 { kind } else { AccessKind::LineFill };
+            let beat_kind = if chunk == 0 {
+                kind
+            } else {
+                AccessKind::LineFill
+            };
             let (val, s) = bus.read32(base + chunk * 4, beat_kind);
             let off = (chunk * 4) as usize;
             line[off..off + 4].copy_from_slice(&val.to_be_bytes());

@@ -46,6 +46,58 @@ fn smp_batch() -> u32 {
     })
 }
 
+fn trace_scu_interrupt(
+    site: &str,
+    source: crate::scu::Source,
+    level: u8,
+    imask: u8,
+    pc: u32,
+    cycle: u64,
+    ims: u32,
+    ist: u32,
+) {
+    let Ok(mode) = std::env::var("SAT_SCU_INT_TRACE") else {
+        return;
+    };
+    let after = std::env::var("SAT_SCU_INT_AFTER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if cycle < after {
+        return;
+    }
+    let selected = match mode.as_str() {
+        "1" | "cd-dma" | "movie" => matches!(
+            source,
+            crate::scu::Source::Cd
+                | crate::scu::Source::Level0DmaEnd
+                | crate::scu::Source::Level1DmaEnd
+                | crate::scu::Source::Level2DmaEnd
+                | crate::scu::Source::DmaIllegal
+        ),
+        "all" => true,
+        _ => mode.split(',').any(|name| {
+            matches!(
+                (name.trim(), source),
+                ("cd", crate::scu::Source::Cd)
+                    | ("l0", crate::scu::Source::Level0DmaEnd)
+                    | ("level0", crate::scu::Source::Level0DmaEnd)
+                    | ("l1", crate::scu::Source::Level1DmaEnd)
+                    | ("level1", crate::scu::Source::Level1DmaEnd)
+                    | ("l2", crate::scu::Source::Level2DmaEnd)
+                    | ("level2", crate::scu::Source::Level2DmaEnd)
+                    | ("dma-illegal", crate::scu::Source::DmaIllegal)
+            )
+        }),
+    };
+    if selected {
+        eprintln!(
+            "SCUIRQ {site} cyc={cycle} pc={pc:08X} src={source:?} lvl={level} vec={:02X} imask={imask} IMS={ims:08X} IST={ist:08X}",
+            source.vector()
+        );
+    }
+}
+
 /// INTBACK SF-busy time in microseconds, computed from the request.
 ///
 /// Reconciled against Mednafen (the LLE reference), which models INTBACK as a
@@ -144,13 +196,13 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
     let mut halt_cost = 0u64;
     // A transfer halts the CPUs iff either endpoint is on the C-bus
     // (Mednafen `d->WriteBus == 2 || d->ReadFunc == DMA_ReadCBus`).
-    let halting = |src: u32, dst: u32| {
-        scu_dma_bus(src) == Some(2) || scu_dma_bus(dst) == Some(2)
-    };
+    let halting = |src: u32, dst: u32| scu_dma_bus(src) == Some(2) || scu_dma_bus(dst) == Some(2);
     // Cached: this runs per pending DMA on the per-instruction hot path, and
     // `env::var` takes a process-global lock + allocates on every call.
     static DMALOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let dmalog = *DMALOG.get_or_init(|| std::env::var_os("DMALOG").is_some());
+    static DMA_NO_HALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dma_no_halt = *DMA_NO_HALT.get_or_init(|| std::env::var_os("SAT_DMA_NO_HALT").is_some());
     while let Some(req) = bus.scu.take_pending_dma() {
         if dmalog {
             eprintln!(
@@ -178,7 +230,7 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 let (size, s0) = bus.read32(index, AccessKind::Dma);
                 let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
                 let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                if table_halting {
+                if table_halting && !dma_no_halt {
                     halt_cost += (s0 + s1 + s2) as u64;
                 }
                 let last = isrc_raw & 0x8000_0000 != 0;
@@ -188,7 +240,7 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 if !bios_src(isrc) {
                     let mut cost = 0u64;
                     scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
-                    if halting(isrc, idst) {
+                    if halting(isrc, idst) && !dma_no_halt {
                         halt_cost += cost;
                     }
                 }
@@ -219,7 +271,7 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
                 req.dst_add,
                 &mut cost,
             );
-            if halting(req.src, req.dst) {
+            if halting(req.src, req.dst) && !dma_no_halt {
                 halt_cost += cost;
             }
             ends
@@ -381,7 +433,11 @@ type SeqLog = (u32, usize, Vec<(u32, u64)>);
 /// `(trigger_low24_pcs, filter, records[(pc_low24, R[0..16], PR, cycle)])` — see
 /// [`Saturn::enable_pctrace`]. `filter = Some((reg, value))` records only when
 /// `R[reg] == value` (lets a hot inner-loop trigger be narrowed to one event).
-type PcTrace = (Vec<u32>, Option<(usize, u32)>, Vec<(u32, [u32; 16], u32, u64)>);
+type PcTrace = (
+    Vec<u32>,
+    Option<(usize, u32)>,
+    Vec<(u32, [u32; 16], u32, u64)>,
+);
 
 impl Saturn {
     /// Construct with a real BIOS image. Both CPUs start with default
@@ -765,7 +821,19 @@ impl Saturn {
         let cd_active = bus.cd_block.irq_active();
         bus.scu.set_cd_int(cd_active);
         let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
+        let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
+        let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
         if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+            trace_scu_interrupt(
+                "step",
+                source,
+                level,
+                imask,
+                pc,
+                cycle,
+                bus.scu.ims,
+                bus.scu.ist,
+            );
             scheduler
                 .entity_mut(*master_id)
                 .sh2_mut()
@@ -1095,8 +1163,11 @@ impl Saturn {
                     // is excluded: it is already a cycle-exact clamp edge AND the
                     // bus ORs it live for the display-off case, so any VBLANK
                     // mismatch is that correct correction, not batch-drain jitter.
-                    let (s, e) =
-                        if reg == 0x00A { (stored, vcnt) } else { (stored & 0x0006, bits & 0x0006) };
+                    let (s, e) = if reg == 0x00A {
+                        (stored, vcnt)
+                    } else {
+                        (stored & 0x0006, bits & 0x0006)
+                    };
                     rj.push((pc, cyc, reg, s, e));
                 }
             };
@@ -1108,10 +1179,18 @@ impl Saturn {
         macro_rules! apply_fti {
             () => {
                 if core::mem::take(&mut bus.slave_input_capture) {
-                    scheduler.entity_mut(*slave_id).sh2_mut().cpu.fti_input_capture();
+                    scheduler
+                        .entity_mut(*slave_id)
+                        .sh2_mut()
+                        .cpu
+                        .fti_input_capture();
                 }
                 if core::mem::take(&mut bus.master_input_capture) {
-                    scheduler.entity_mut(*master_id).sh2_mut().cpu.fti_input_capture();
+                    scheduler
+                        .entity_mut(*master_id)
+                        .sh2_mut()
+                        .cpu
+                        .fti_input_capture();
                 }
             };
         }
@@ -1149,7 +1228,19 @@ impl Saturn {
                 // per-source vector (0x40 + index) is latched, not the 64+level
                 // auto-vector.
                 let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
+                let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
+                let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
                 if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+                    trace_scu_interrupt(
+                        "run",
+                        source,
+                        level,
+                        imask,
+                        pc,
+                        cycle,
+                        bus.scu.ims,
+                        bus.scu.ist,
+                    );
                     scheduler
                         .entity_mut(*master_id)
                         .sh2_mut()
@@ -1185,7 +1276,8 @@ impl Saturn {
                     let e = scheduler.entity(*master_id).sh2();
                     let pc = e.cpu.regs.pc & 0x00FF_FFFF;
                     let pass = filter.is_none_or(|(reg, val)| e.cpu.regs.r[reg] == val);
-                    if log.len() < 65536 && pass && pcs.contains(&pc) && !e.cpu.next_is_delay_slot() {
+                    if log.len() < 65536 && pass && pcs.contains(&pc) && !e.cpu.next_is_delay_slot()
+                    {
                         log.push((pc, e.cpu.regs.r, e.cpu.regs.pr, e.cpu.pipeline.cycles));
                     }
                 }
@@ -1198,7 +1290,11 @@ impl Saturn {
                 // duration — the SCU owns the CPU bus (Mednafen
                 // `RecalcDMAHalt` → `SetExtHalt` on both cores); a pure A↔B
                 // transfer halts neither (see `drain_dma`).
-                let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
+                let dma_cost = if bus.scu.dma_pending() {
+                    drain_dma(bus)
+                } else {
+                    0
+                };
                 if dma_cost != 0 {
                     scheduler
                         .entity_mut(*master_id)
@@ -1223,7 +1319,11 @@ impl Saturn {
                 apply_fti!(); // slave may have pulsed the master's FTI
                 record_raster!(); // log any raster read the slave just did
                 // A slave-triggered C-bus DMA halts both CPUs the same way.
-                let dma_cost = if bus.scu.dma_pending() { drain_dma(bus) } else { 0 };
+                let dma_cost = if bus.scu.dma_pending() {
+                    drain_dma(bus)
+                } else {
+                    0
+                };
                 if dma_cost != 0 {
                     scheduler
                         .entity_mut(*slave_id)
@@ -1733,10 +1833,18 @@ impl Saturn {
     /// interrupt itself need not be delivered.
     fn drain_input_capture(&mut self) {
         if std::mem::take(&mut self.bus.slave_input_capture) {
-            self.scheduler.entity_mut(self.slave_id).sh2_mut().cpu.fti_input_capture();
+            self.scheduler
+                .entity_mut(self.slave_id)
+                .sh2_mut()
+                .cpu
+                .fti_input_capture();
         }
         if std::mem::take(&mut self.bus.master_input_capture) {
-            self.scheduler.entity_mut(self.master_id).sh2_mut().cpu.fti_input_capture();
+            self.scheduler
+                .entity_mut(self.master_id)
+                .sh2_mut()
+                .cpu
+                .fti_input_capture();
         }
     }
 
@@ -1916,10 +2024,7 @@ mod tests {
     fn vblank_edge_helpers_partition_the_frame() {
         // From frame start, the next VBlank-IN is exactly VBLANK_IN_CYCLE away,
         // and the next VBlank-OUT is a full frame away.
-        assert_eq!(
-            Saturn::cycles_to_next_vblank_in(0),
-            Saturn::VBLANK_IN_CYCLE
-        );
+        assert_eq!(Saturn::cycles_to_next_vblank_in(0), Saturn::VBLANK_IN_CYCLE);
         assert_eq!(Saturn::cycles_to_next_vblank_out(0), CYCLES_PER_FRAME);
         // Just past VBlank-IN, the next one is in the following frame.
         let past = Saturn::VBLANK_IN_CYCLE + 10;
@@ -1928,7 +2033,10 @@ mod tests {
             CYCLES_PER_FRAME - past + Saturn::VBLANK_IN_CYCLE
         );
         // VBlank-OUT counts down to the frame boundary.
-        assert_eq!(Saturn::cycles_to_next_vblank_out(past), CYCLES_PER_FRAME - past);
+        assert_eq!(
+            Saturn::cycles_to_next_vblank_out(past),
+            CYCLES_PER_FRAME - past
+        );
     }
 
     #[test]
@@ -1970,7 +2078,11 @@ mod tests {
             if frame & 1 == 1 {
                 bits |= 0x0002; // ODD
             }
-            assert_eq!(Saturn::raster_state(now, h_res), (line, bits), "now={now} h_res={h_res}");
+            assert_eq!(
+                Saturn::raster_state(now, h_res),
+                (line, bits),
+                "now={now} h_res={h_res}"
+            );
         };
         check(0, 0); // frame 0, line 0, active display
         check(Saturn::VBLANK_IN_CYCLE - 1, 0); // last active cycle

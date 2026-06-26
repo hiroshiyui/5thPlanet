@@ -144,6 +144,7 @@ pub struct BpHit {
     pub regs: [u32; 16],
     pub pr: u32,
     pub gbr: u32,
+    pub cycle: u64,
     pub code: Vec<u16>,
     pub probe: u32,
 }
@@ -307,8 +308,7 @@ impl SchedEntity for Sh2Entity {
             // capture (which needs `&mut ctx`).
             let pc = self.cpu.regs.pc;
             let bp = self.bps.iter().find_map(|&(p, guard)| {
-                (p == pc && guard.is_none_or(|(idx, val)| self.cpu.regs.r[idx] == val))
-                    .then_some(p)
+                (p == pc && guard.is_none_or(|(idx, val)| self.cpu.regs.r[idx] == val)).then_some(p)
             });
             if let Some(bp) = bp
                 && self.bp_hit.is_none()
@@ -329,6 +329,7 @@ impl SchedEntity for Sh2Entity {
                     regs: self.cpu.regs.r,
                     pr: self.cpu.regs.pr,
                     gbr: self.cpu.regs.gbr,
+                    cycle: self.cpu.pipeline.cycles,
                     code,
                     probe,
                 });
