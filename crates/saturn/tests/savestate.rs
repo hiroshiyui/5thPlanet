@@ -18,8 +18,10 @@ fn save_load_roundtrip_preserves_ram() {
     let mut sat = Saturn::with_blank_bios();
     sat.reset();
     // Stamp distinctive data into both work-RAM tiers.
-    sat.bus.write32(LOW_WRAM + 0x40, 0xDEAD_BEEF, AccessKind::Data);
-    sat.bus.write32(HIGH_WRAM + 0x80, 0xCAFE_F00D, AccessKind::Data);
+    sat.bus
+        .write32(LOW_WRAM + 0x40, 0xDEAD_BEEF, AccessKind::Data);
+    sat.bus
+        .write32(HIGH_WRAM + 0x80, 0xCAFE_F00D, AccessKind::Data);
 
     let snapshot = sat.save_state();
 
@@ -41,7 +43,8 @@ fn snapshot_then_equal_runs_stay_identical() {
     let mut a = Saturn::with_blank_bios();
     a.reset();
     a.run_for(50_000);
-    a.bus.write32(LOW_WRAM + 0x10, 0x1234_5678, AccessKind::Data);
+    a.bus
+        .write32(LOW_WRAM + 0x10, 0x1234_5678, AccessKind::Data);
 
     let snapshot = a.save_state();
 
@@ -52,6 +55,11 @@ fn snapshot_then_equal_runs_stay_identical() {
     // Identical state in → identical state out after an identical run.
     a.run_for(200_000);
     b.run_for(200_000);
+    // Generated audio samples are a frontend presentation queue. A restored
+    // state drops stale queued output, so drain both sides before comparing
+    // replayable machine state.
+    let _ = a.take_audio();
+    let _ = b.take_audio();
     assert_eq!(
         a.save_state(),
         b.save_state(),

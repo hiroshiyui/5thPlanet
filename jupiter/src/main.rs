@@ -26,9 +26,9 @@ mod config;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod osd;
 #[cfg(any(feature = "sdl-frontend", test))]
-mod render_pipe;
-#[cfg(any(feature = "sdl-frontend", test))]
 mod present;
+#[cfg(any(feature = "sdl-frontend", test))]
+mod render_pipe;
 
 /// Host wall-clock time as seconds since the Unix epoch (0 if the clock is
 /// somehow before the epoch). Used to seed the Saturn RTC.
@@ -56,7 +56,12 @@ fn print_diag_section(title: &str, results: &[saturn::diagnostics::DiagOutcome])
     println!("{title}");
     let mut passed = 0usize;
     for o in results {
-        let tag = if o.passed { passed += 1; "PASS" } else { "FAIL" };
+        let tag = if o.passed {
+            passed += 1;
+            "PASS"
+        } else {
+            "FAIL"
+        };
         println!("  [{tag}] {}/{}  {}", o.category, o.name, o.detail);
     }
     println!("  {passed}/{} passed", results.len());
@@ -69,7 +74,10 @@ fn print_diag_section(title: &str, results: &[saturn::diagnostics::DiagOutcome])
 /// **System / boot-compatibility** checks also run against a fresh throwaway
 /// machine booted from that media (+ the disc, if given).
 fn run_doctor(bios_path: Option<String>, disc_path: Option<String>) -> ExitCode {
-    let mut ok = print_diag_section("5thPlanet self-diagnostics:", &saturn::diagnostics::run_all());
+    let mut ok = print_diag_section(
+        "5thPlanet self-diagnostics:",
+        &saturn::diagnostics::run_all(),
+    );
 
     if let Some(bp) = bios_path {
         match fs::read(&bp) {
@@ -98,7 +106,11 @@ fn run_doctor(bios_path: Option<String>, disc_path: Option<String>) -> ExitCode 
         }
     }
 
-    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 fn main() -> ExitCode {
@@ -143,10 +155,10 @@ fn main() -> ExitCode {
             eprintln!("  --cart=rom:<path>      game ROM cart image");
             eprintln!("  --mouse[=1|2]          Shuttle Mouse on port 2 (default) or 1;");
             eprintln!("                         host mouse + clicks, Return = mouse Start,");
-            eprintln!("                         F10 = toggle pointer capture (Esc/OSD also releases)");
             eprintln!(
-                "  --backend=<api>        presentation backend: auto (default) | opengl |"
+                "                         F10 = toggle pointer capture (Esc/OSD also releases)"
             );
+            eprintln!("  --backend=<api>        presentation backend: auto (default) | opengl |");
             eprintln!(
                 "                         opengles | direct3d11 | direct3d12 | metal | software"
             );
@@ -355,7 +367,9 @@ fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
             let bytes = fs::read(&img).map_err(|e| format!("{}: {e}", img.display()))?;
             Disc::from_ccd(&ccd, bytes)
         }
-        other => Err(format!("unknown disc format '.{other}' (use .cue / .iso / .ccd)")),
+        other => Err(format!(
+            "unknown disc format '.{other}' (use .cue / .iso / .ccd)"
+        )),
     }
 }
 
@@ -380,9 +394,13 @@ fn burst_cap(depth: u32, catchup_floor: u32, max: u32) -> u32 {
 fn set_window_icon(window: &mut sdl3::video::Window) {
     const ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
     let decoder = png::Decoder::new(ICON_PNG);
-    let Ok(mut reader) = decoder.read_info() else { return };
+    let Ok(mut reader) = decoder.read_info() else {
+        return;
+    };
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let Ok(info) = reader.next_frame(&mut buf) else { return };
+    let Ok(info) = reader.next_frame(&mut buf) else {
+        return;
+    };
     // SDL's ABGR8888 byte order on little-endian hosts is [R,G,B,A] in memory,
     // matching the `png` crate's RGBA8 output — so no per-pixel swap is needed.
     if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
@@ -511,7 +529,10 @@ fn run(
         FRAME_HEIGHT as u32 * cfg.scale as u32,
         backend_pref,
     );
-    eprintln!("render backend: {active_driver} (requested {})", backend_pref.to_token());
+    eprintln!(
+        "render backend: {active_driver} (requested {})",
+        backend_pref.to_token()
+    );
     set_window_icon(canvas.window_mut());
     if cfg.fullscreen {
         let _ = canvas.window_mut().set_fullscreen(true);
@@ -567,6 +588,7 @@ fn run(
         .max(10);
     let audio_target_bytes = (176_400 * audio_ms / 1000) as u32;
     let mut audio_started = false;
+    let mut audio_drop_until_reset = false;
     // Catch-up ceiling: the *most* game-frames `burst_cap` will collapse into
     // one render when the audio reserve has drained low. Normal play renders
     // every frame regardless (see `burst_cap`); this only bounds recovery from a
@@ -621,7 +643,7 @@ fn run(
     let (emu_tx, emu_rx) = mpsc::channel::<EmuIn>();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, (usize, usize))>(2);
     let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
-    let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>();
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioMsg>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
     let audio_mirror = Arc::new(AtomicU32::new(0));
     let osd_open = Arc::new(AtomicBool::new(false));
@@ -632,7 +654,12 @@ fn run(
     let (bios_paths, bios_active) = scan_bios_images(&save_base);
     let bios_names: Vec<String> = bios_paths
         .iter()
-        .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+        .map(|p| {
+            p.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     // The disc browser opens in the launched disc's directory (when it's an
     // image path), else the working directory.
@@ -777,7 +804,14 @@ fn run(
                         }
                         EmuIn::Nav(nav) => {
                             if let Some(action) = osd.handle(nav, &ctx)
-                                && dispatch_osd(action, &mut osd, &mut saturn, &mut sess, &ui_tx)
+                                && dispatch_osd(
+                                    action,
+                                    &mut osd,
+                                    &mut saturn,
+                                    &mut sess,
+                                    &ui_tx,
+                                    &audio_tx,
+                                )
                             {
                                 let _ = ui_tx.send(UiMsg::Quit);
                                 break 'emu;
@@ -788,13 +822,26 @@ fn run(
                             Ok(()) => osd.set_toast("Quicksave", 90),
                             Err(e) => eprintln!("save state failed: {e}"),
                         },
-                        EmuIn::Quickload => match fs::read(sess.state_path()) {
+                        EmuIn::Quickload => {
+                            let path = sess.state_path();
+                            match fs::read(&path) {
                             Ok(bytes) => match saturn.load_state(&bytes) {
-                                Ok(()) => osd.set_toast("Quickload", 90),
-                                Err(e) => eprintln!("load state failed: {e}"),
+                                Ok(()) => {
+                                    let _ = audio_tx.send(AudioMsg::Reset);
+                                    eprintln!("quickload: {}", path.display());
+                                    osd.set_toast("Quickload", 90);
+                                }
+                                Err(e) => {
+                                    let _ = audio_tx.send(AudioMsg::Reset);
+                                    eprintln!("load state {} failed: {e}", path.display());
+                                }
                             },
-                            Err(e) => eprintln!("no state to load ({e})"),
-                        },
+                            Err(e) => {
+                                let _ = audio_tx.send(AudioMsg::Reset);
+                                eprintln!("no state to load at {} ({e})", path.display());
+                            }
+                            }
+                        }
                         #[cfg(debug_assertions)]
                         EmuIn::PlayCdda => {
                             if saturn.dbg_play_first_audio_track() {
@@ -878,7 +925,7 @@ fn run(
                     // main thread's authoritative `store` re-anchors the mirror
                     // to the real SDL queue size each frame.
                     emu_mirror.fetch_add(bytes, Ordering::Relaxed);
-                    let _ = audio_tx.send(chunk);
+                    let _ = audio_tx.send(AudioMsg::Chunk(chunk));
                     burst += 1;
                 }
                 pl_frames += burst;
@@ -976,8 +1023,7 @@ fn run(
                             let _ = emu_tx.send(EmuIn::BindResult(b, None));
                         } else if let Some(sc) = scancode {
                             keymap[b as usize % config::PAD_BUTTONS] = sc;
-                            let _ =
-                                emu_tx.send(EmuIn::BindResult(b, Some(sc.name().to_string())));
+                            let _ = emu_tx.send(EmuIn::BindResult(b, Some(sc.name().to_string())));
                         } else {
                             // A key with no scancode: keep waiting.
                             rebind_target = Some(b);
@@ -1014,6 +1060,11 @@ fn run(
                         keycode: Some(Keycode::F9),
                         ..
                     } => {
+                        let _ = audio_stream.pause();
+                        let _ = audio_stream.clear();
+                        audio_started = false;
+                        audio_drop_until_reset = true;
+                        audio_mirror.store(0, Ordering::Relaxed);
                         let _ = emu_tx.send(EmuIn::Quickload);
                     }
                     // F8 CD-audio play is a debug-build-only diagnostic (it
@@ -1149,11 +1200,11 @@ fn run(
             // closed, so the host cursor is captured + hidden and the game
             // draws its own; Esc (the OSD) releases the pointer.
             if mouse_port.is_some() {
-                let want_grab =
-                    mouse_capture_enabled && !osd_open.load(Ordering::Relaxed);
+                let want_grab = mouse_capture_enabled && !osd_open.load(Ordering::Relaxed);
                 if want_grab != mouse_grabbed {
                     mouse_grabbed = want_grab;
-                    sdl.mouse().set_relative_mouse_mode(canvas.window(), mouse_grabbed);
+                    sdl.mouse()
+                        .set_relative_mouse_mode(canvas.window(), mouse_grabbed);
                 }
                 let ms = events.mouse_state();
                 let mut buttons = 0u8;
@@ -1179,8 +1230,21 @@ fn run(
             // on. `queued_bytes()` is already in source (44.1 kHz) units, so no
             // device-rate scaling is needed. Start playback once the reserve has
             // first filled, so a cold start never drains an empty stream.
-            while let Ok(chunk) = audio_rx.try_recv() {
-                let _ = audio_stream.put_data_i16(&chunk);
+            while let Ok(msg) = audio_rx.try_recv() {
+                match msg {
+                    AudioMsg::Reset => {
+                        let _ = audio_stream.pause();
+                        let _ = audio_stream.clear();
+                        audio_started = false;
+                        audio_drop_until_reset = false;
+                        audio_mirror.store(0, Ordering::Relaxed);
+                    }
+                    AudioMsg::Chunk(chunk) => {
+                        if !audio_drop_until_reset {
+                            let _ = audio_stream.put_data_i16(&chunk);
+                        }
+                    }
+                }
             }
             let src_size = audio_stream.queued_bytes().unwrap_or(0) as u32;
             audio_mirror.store(src_size, Ordering::Relaxed);
@@ -1306,6 +1370,14 @@ enum EmuIn {
     BindResult(u8, Option<String>),
 }
 
+/// Ordered audio-control stream from emulation to SDL. A machine timeline reset
+/// must clear host-queued samples before later chunks from the new timeline play.
+#[cfg(feature = "sdl-frontend")]
+enum AudioMsg {
+    Chunk(Vec<i16>),
+    Reset,
+}
+
 /// Messages from the emulation thread back to the SDL main thread —
 /// window-affecting OSD actions (the canvas is not Send) and quit.
 #[cfg(feature = "sdl-frontend")]
@@ -1406,10 +1478,19 @@ impl Session {
 
         let mut entries = Vec::with_capacity(dirs.len() + files.len() + 1);
         if self.browse_dir.parent().is_some() {
-            entries.push(osd::BrowseEntry { name: "..".into(), is_dir: true });
+            entries.push(osd::BrowseEntry {
+                name: "..".into(),
+                is_dir: true,
+            });
         }
-        entries.extend(dirs.into_iter().map(|name| osd::BrowseEntry { name, is_dir: true }));
-        entries.extend(files.into_iter().map(|name| osd::BrowseEntry { name, is_dir: false }));
+        entries.extend(
+            dirs.into_iter()
+                .map(|name| osd::BrowseEntry { name, is_dir: true }),
+        );
+        entries.extend(files.into_iter().map(|name| osd::BrowseEntry {
+            name,
+            is_dir: false,
+        }));
         self.browse_entries = entries;
     }
 }
@@ -1552,6 +1633,7 @@ fn dispatch_osd(
     saturn: &mut saturn::Saturn,
     sess: &mut Session,
     ui_tx: &std::sync::mpsc::Sender<UiMsg>,
+    audio_tx: &std::sync::mpsc::Sender<AudioMsg>,
 ) -> bool {
     use osd::OsdAction;
     match action {
@@ -1559,6 +1641,7 @@ fn dispatch_osd(
         OsdAction::Quit => return true,
         OsdAction::Reset => {
             saturn.reset();
+            let _ = audio_tx.send(AudioMsg::Reset);
             osd.set_toast("Reset", 120);
             osd.close();
         }
@@ -1566,16 +1649,27 @@ fn dispatch_osd(
             Ok(()) => osd.set_toast(format!("Saved slot {n}"), 120),
             Err(e) => osd.set_toast(format!("Save failed: {e}"), 180),
         },
-        OsdAction::Load(n) => match fs::read(sess.slot_path(n)) {
-            Ok(bytes) => match saturn.load_state(&bytes) {
-                Ok(()) => {
-                    osd.set_toast(format!("Loaded slot {n}"), 120);
-                    osd.close();
+        OsdAction::Load(n) => {
+            let path = sess.slot_path(n);
+            match fs::read(&path) {
+                Ok(bytes) => match saturn.load_state(&bytes) {
+                    Ok(()) => {
+                        let _ = audio_tx.send(AudioMsg::Reset);
+                        eprintln!("loaded slot {n}: {}", path.display());
+                        osd.set_toast(format!("Loaded slot {n}"), 120);
+                        osd.close();
+                    }
+                    Err(e) => {
+                        eprintln!("load slot {n} {} failed: {e}", path.display());
+                        osd.set_toast(format!("Load failed: {e}"), 180)
+                    }
+                },
+                Err(e) => {
+                    eprintln!("slot {n} empty at {} ({e})", path.display());
+                    osd.set_toast(format!("Slot {n} empty"), 120)
                 }
-                Err(e) => osd.set_toast(format!("Load failed: {e}"), 180),
-            },
-            Err(_) => osd.set_toast(format!("Slot {n} empty"), 120),
-        },
+            }
+        }
         OsdAction::EjectDisc => {
             saturn.eject_disc();
             osd.set_toast("Disc ejected", 120);
@@ -1614,6 +1708,7 @@ fn dispatch_osd(
                             saturn.reset();
                             saturn.set_region(osd_region_to_code(sess.ui.region));
                             saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
+                            let _ = audio_tx.send(AudioMsg::Reset);
                             sess.launched_spec = Some(spec);
                             osd.set_toast(format!("Loaded {}", e.name), 150);
                             osd.close();
@@ -1654,7 +1749,11 @@ fn dispatch_osd(
             sess.cfg.fullscreen = sess.ui.fullscreen;
             sess.cfg.save();
             osd.set_toast(
-                if sess.ui.fullscreen { "Fullscreen on" } else { "Fullscreen off" },
+                if sess.ui.fullscreen {
+                    "Fullscreen on"
+                } else {
+                    "Fullscreen off"
+                },
                 90,
             );
         }
@@ -1666,6 +1765,7 @@ fn dispatch_osd(
             saturn.reset();
             saturn.set_region(osd_region_to_code(r));
             saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
+            let _ = audio_tx.send(AudioMsg::Reset);
             sess.cfg.region = Some(osd_region_to_token(r).to_string());
             sess.cfg.save();
             let name = match r {
@@ -1722,10 +1822,8 @@ fn dispatch_osd(
                     if let Ok(b) = fs::read(sess.save_base.with_extension("bup")) {
                         saturn.load_internal_backup(&b);
                     }
-                    osd.set_toast(
-                        format!("BIOS: {} (power cycle)", sess.bios_names[i]),
-                        150,
-                    );
+                    let _ = audio_tx.send(AudioMsg::Reset);
+                    osd.set_toast(format!("BIOS: {} (power cycle)", sess.bios_names[i]), 150);
                     osd.close();
                 }
             }
@@ -1748,6 +1846,7 @@ fn dispatch_osd(
             saturn.reset();
             saturn.set_region(osd_region_to_code(sess.ui.region));
             saturn.insert_cartridge(osd_cart_to_cartridge(k));
+            let _ = audio_tx.send(AudioMsg::Reset);
             sess.cfg.cartridge = osd_cart_to_token(k).to_string();
             sess.cfg.save();
             let name = match k {
@@ -1865,6 +1964,28 @@ fn run(
             saturn.slave_is_halted(),
         );
     }
+    let cd_cmd_log = std::env::var_os("SAT_CD_CMD_LOG").is_some();
+    if cd_cmd_log {
+        saturn.bus.cd_block.cmd_log_on = true;
+        saturn.bus.cd_block.hirq_log_on = true;
+    }
+    let ftcsr_log = std::env::var("SAT_FTCSR_LOG").ok();
+    if let Some(mode) = ftcsr_log.as_deref() {
+        let after = std::env::var("SAT_FTCSR_AFTER_CYC")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if matches!(mode, "1" | "master" | "all") {
+            saturn.master_mut().dbg_ftcsr = true;
+            saturn.master_mut().dbg_ftcsr_after = after;
+            saturn.master_mut().dbg_ftcsr_log.clear();
+        }
+        if matches!(mode, "slave" | "all") {
+            saturn.slave_mut().dbg_ftcsr = true;
+            saturn.slave_mut().dbg_ftcsr_after = after;
+            saturn.slave_mut().dbg_ftcsr_log.clear();
+        }
+    }
 
     // Optional scripted port-1 pad input: `SAT_PAD=0xBITS` (saturn::smpc::pad
     // mask) held over the frame window [`SAT_PAD_FROM`, `SAT_PAD_TO`) — lets a
@@ -1957,6 +2078,10 @@ fn run(
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(u32::MAX);
+        let after_cycle = std::env::var("SAT_FBP_AFTER_CYC")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let mut hit = None;
         for f in 0..headless_frames {
             apply_scripted_pad(&mut saturn, f);
@@ -1967,7 +2092,8 @@ fn run(
                 saturn.take_master_bp_hit()
             };
             if let Some(h) = h {
-                let matched = rreg.is_none_or(|r| (rlo..rhi).contains(&h.regs[r]));
+                let matched =
+                    h.cycle >= after_cycle && rreg.is_none_or(|r| (rlo..rhi).contains(&h.regs[r]));
                 if matched {
                     hit = Some(h);
                     break;
@@ -1982,8 +2108,8 @@ fn run(
         }
         match hit {
             Some(h) => {
-                let (r, pr, gbr, code) = (h.regs, h.pr, h.gbr, &h.code);
-                eprintln!("FBP {bp:08X} hit. PR={pr:08X} GBR={gbr:08X} regs:");
+                let (r, pr, gbr, cycle, code) = (h.regs, h.pr, h.gbr, h.cycle, &h.code);
+                eprintln!("FBP {bp:08X} hit. PR={pr:08X} GBR={gbr:08X} cycle={cycle} regs:");
                 for (i, v) in r.iter().enumerate() {
                     eprintln!("  R{i:<2}= {v:08X}");
                 }
@@ -2099,6 +2225,11 @@ fn run(
     // boot can be located in time — BIOS ROM (0x0000_0000), work-RAM shell/game
     // (0x0600_0000+), etc. — without per-instruction overhead.
     let pctrace = std::env::var_os("SAT_PCTRACE").is_some();
+    let movie_probe: Option<u32> = std::env::var("SAT_MOVIE_PROBE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| std::env::var_os("SAT_MOVIE_PROBE").map(|_| 30));
+    let scsp_movie_probe = std::env::var_os("SAT_SCSP_MOVIE_PROBE").is_some();
     // Debug: `SAT_CACHE_PURGE=1` purges both SH-2 I-caches each frame, to test
     // whether a stale-cache fetch is the blocker (if a game runs past a spurious
     // illegal-instruction fault only with this on, the cache is incoherent).
@@ -2106,7 +2237,10 @@ fn run(
     // Debug: `SAT_SLOW_FETCH=N` charges N extra stall cycles per instruction-fetch
     // cache hit on both SH-2s — a timing-probe to test inter-CPU-race hypotheses
     // (changes timing only, no cache value/content change). 0 = off.
-    let slow_fetch: u32 = std::env::var("SAT_SLOW_FETCH").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let slow_fetch: u32 = std::env::var("SAT_SLOW_FETCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     // Debug: `SAT_REGWATCH=idx:hexval[:after_cyc]` logs (on the master) every PC
     // where R[idx] transitions to the value — finds where a value is computed
     // into a register, beating the bp-stack / line-granular-read-watch confounds.
@@ -2118,7 +2252,10 @@ fn run(
             && let Ok(idx) = i.trim().parse::<u8>()
             && let Ok(val) = u32::from_str_radix(v.trim().trim_start_matches("0x"), 16)
         {
-            let after = p.get(2).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            let after = p
+                .get(2)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
             let m = saturn.master_mut();
             m.dbg_regwatch = Some((idx, val));
             m.dbg_regwatch_after = after;
@@ -2137,6 +2274,76 @@ fn run(
             saturn.slave_mut().dbg_slow_fetch = slow_fetch;
         }
         dump_dims = saturn.run_frame(&mut framebuffer);
+        if let Some(period) = movie_probe
+            && (period == 0 || f % period == 0)
+        {
+            let (cd_status, cd_fad, cd_left, cd_free, parts) = saturn.bus.cd_block.debug_state();
+            let part_summary = parts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| n != 0)
+                .map(|(i, n)| format!("{i}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let (plots, cmds, px, dur) = saturn.bus.vdp1.dbg_take_frame();
+            let vdp1_front = saturn
+                .bus
+                .vdp1
+                .display_fb()
+                .as_slice()
+                .chunks_exact(2)
+                .filter(|p| p[0] != 0 || p[1] != 0)
+                .count();
+            let vdp1_draw = saturn
+                .bus
+                .vdp1
+                .fb
+                .as_slice()
+                .chunks_exact(2)
+                .filter(|p| p[0] != 0 || p[1] != 0)
+                .count();
+            let out_nonblack = framebuffer
+                .chunks_exact(4)
+                .take(dump_dims.0 * dump_dims.1)
+                .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                .count();
+            let audio = saturn.take_audio();
+            let audio_abs: i64 = audio.iter().map(|&x| (x as i64).abs()).sum();
+            let scsp_probe = if scsp_movie_probe {
+                let (mslc, monitor) = saturn.bus.scsp.dbg_slot_monitor();
+                let active = (0..32)
+                    .filter(|&i| saturn.bus.scsp.slot_active(i))
+                    .take(8)
+                    .map(|i| {
+                        let d = saturn.bus.scsp.slot_debug(i);
+                        let ca = ((d.cur >> 12) & 0xFFFF) >> 12;
+                        format!(
+                            "{i}:sa={:05X} cur={} ca={ca:X} step={} lsa={} lea={} lp={} eg={} tl={:02X}",
+                            d.sa,
+                            d.cur >> 12,
+                            d.step,
+                            d.lsa,
+                            d.lea,
+                            d.lpctl,
+                            d.eg_state,
+                            d.tl
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(" scsp_mslc={mslc} mon={monitor:04X} slots=[{active}]")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "MOVIE f={f:04} pc={:08X} cd_st={cd_status:02X} fad={cd_fad} left={cd_left} free={cd_free} parts=[{part_summary}] \
+                 vdp2_disp={} tvmd={:04X} bgon={:04X} vdp1 plots={plots} cmds={cmds} px={px} dur={dur} front={vdp1_front} draw={vdp1_draw} out={out_nonblack} audio_abs={audio_abs}{scsp_probe}",
+                saturn.master().regs.pc,
+                saturn.bus.vdp2.regs.display_enabled(),
+                saturn.bus.vdp2.regs.read16(0x000),
+                saturn.bus.vdp2.regs.read16(0x020),
+            );
+        }
         if pctrace {
             let pc = saturn.master().regs.pc;
             if pc != last_pc {
@@ -2168,6 +2375,84 @@ fn run(
             "IRQ: PC={pc:08X} SR.imask={imask} SCU.IMS={ims:08X} SCU.IST={ist:08X} \
              [0x06000348]={mask348:08X} VDP2.TVSTAT={tvstat:04X} GBR={gbr:08X} VDP2.TVMD={tvmd:04X}"
         );
+    }
+
+    if cd_cmd_log {
+        let name = |c: u8| -> &'static str {
+            match c {
+                0x00 => "GetStatus",
+                0x01 => "GetHwInfo",
+                0x02 => "GetToc",
+                0x03 => "GetSession",
+                0x04 => "Init",
+                0x06 => "EndDataXfer",
+                0x10 => "Play",
+                0x11 => "Seek",
+                0x12 => "Scan",
+                0x20 => "GetSubcodeQ",
+                0x30 => "SetDevConn",
+                0x31 => "GetDevConn",
+                0x32 => "GetLastBuf",
+                0x40 => "SetFilterRange",
+                0x42 => "SetFilterSubhdr",
+                0x44 => "SetFilterMode",
+                0x46 => "SetFilterConn",
+                0x48 => "ResetSelector",
+                0x50 => "GetBufSize",
+                0x51 => "GetBufStat",
+                0x52 => "CalcActualSize",
+                0x53 => "GetActualDataSize",
+                0x60 => "SetSectorLen",
+                0x61 => "GetSectorData",
+                0x62 => "DelSectorData",
+                0x63 => "GetThenDel",
+                0x64 => "PutSectorData",
+                0x67 => "GetCopyError",
+                0x70 => "ChangeDir",
+                0x71 => "ReadDir",
+                0x72 => "GetFileScope",
+                0x73 => "GetFileInfo",
+                0x74 => "ReadFile",
+                0x75 => "AbortFile",
+                0xE0 => "Auth",
+                0xE1 => "GetDiscRegion",
+                _ => "?",
+            }
+        };
+        let tail = std::env::var("SAT_CD_CMD_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80usize);
+        let log = &saturn.bus.cd_block.cmd_log;
+        eprintln!("CD command log tail {tail} of {}:", log.len());
+        for (i, e) in log.iter().enumerate().skip(log.len().saturating_sub(tail)) {
+            eprintln!(
+                "  [{i:04}] @{:08X} {:02X} {:<14} in={:04X},{:04X},{:04X},{:04X} -> out={:04X},{:04X},{:04X},{:04X} HIRQ {:04X}->{:04X} st={:02X}",
+                e.caller_pc,
+                e.cmd,
+                name(e.cmd),
+                e.cr_in[0],
+                e.cr_in[1],
+                e.cr_in[2],
+                e.cr_in[3],
+                e.cr_out[0],
+                e.cr_out[1],
+                e.cr_out[2],
+                e.cr_out[3],
+                e.hirq_in,
+                e.hirq_out,
+                e.status,
+            );
+        }
+        let hlog = &saturn.bus.cd_block.hirq_log;
+        eprintln!("CD HIRQ log tail {tail} of {}:", hlog.len());
+        for (i, (old, new, cause)) in hlog
+            .iter()
+            .enumerate()
+            .skip(hlog.len().saturating_sub(tail))
+        {
+            eprintln!("  [{i:04}] {old:04X}->{new:04X} cause={cause:03X}");
+        }
     }
 
     if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
@@ -2237,6 +2522,42 @@ fn run(
         match fs::write(&path, &ppm) {
             Ok(()) => eprintln!("wrote framebuffer to {path}"),
             Err(e) => eprintln!("failed to write framebuffer to {path}: {e}"),
+        }
+    }
+
+    if ftcsr_log.is_some() {
+        let tail = std::env::var("SAT_FTCSR_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120usize);
+        let dump = |name: &str, log: &[(u32, u8, bool, u64)]| {
+            eprintln!("FTCSR {name} tail {tail} of {}:", log.len());
+            for (pc, val, is_write, cycle) in log.iter().skip(log.len().saturating_sub(tail)) {
+                eprintln!(
+                    "  {} pc={pc:08X} val={val:02X} ICF={} cyc={cycle}",
+                    if *is_write { "WR" } else { "RD" },
+                    u8::from(val & 0x80 != 0)
+                );
+            }
+        };
+        dump("master", &saturn.master().dbg_ftcsr_log);
+        dump("slave", &saturn.slave().dbg_ftcsr_log);
+        let pc_tail = std::env::var("SAT_FTCSR_PC_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0usize);
+        if pc_tail != 0 {
+            let dump_pc = |name: &str, pcs: &[u32]| {
+                eprintln!(
+                    "FTCSR post-write PC {name} head {pc_tail} of {}:",
+                    pcs.len()
+                );
+                for pc in pcs.iter().take(pc_tail) {
+                    eprintln!("  {pc:08X}");
+                }
+            };
+            dump_pc("master", &saturn.master().dbg_pc_log);
+            dump_pc("slave", &saturn.slave().dbg_pc_log);
         }
     }
 

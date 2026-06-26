@@ -170,6 +170,11 @@ impl Saturn {
         if let Cartridge::Rom { bytes } = &mut loaded.bus.cartridge {
             *bytes = cart_rom;
         }
+        // Presentation audio buffers may contain samples already generated
+        // before the state was saved. Do not replay those stale samples after
+        // loading into a new timeline.
+        loaded.bus.cd_block.clear_audio_buffer();
+        loaded.bus.scsp.clear_output_buffer();
 
         *self = loaded;
         Ok(())
