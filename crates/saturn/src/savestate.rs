@@ -49,8 +49,11 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// SH-2 cache LRU representation from a per-set way-order array
 /// (`[[u8; WAYS]; SETS]`, true LRU) to the SH7604's 6-bit pseudo-LRU state
 /// (`[u8; SETS]`) — the hardware-faithful replacement order (fixes the
-/// Sangokushi V instruction-cache-coherency hang).
-const VERSION: u32 = 11;
+/// Sangokushi V instruction-cache-coherency hang). v12 `#[serde(skip)]`'d the
+/// presentation-only audio buffers (`Scsp::out`, `CdBlock::cd_audio` +
+/// `cd_audio_primed`) — `load_state` clears them, so they no longer bloat the
+/// snapshot.
+const VERSION: u32 = 12;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
