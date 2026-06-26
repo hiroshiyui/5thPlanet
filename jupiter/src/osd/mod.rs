@@ -263,6 +263,10 @@ enum Screen {
     /// Settings hub → Graphics / Region / Cartridge.
     Settings,
     Graphics,
+    /// Stub chooser for the (planned) SDL_GPU CRT-shader presenter — see
+    /// ADR-0019 + `shaders/README.md`. Currently a read-only placeholder; it
+    /// will list the presets from `shaders/` once the presenter lands.
+    Shaders,
     Controller,
     Region,
     Cartridge,
@@ -430,7 +434,7 @@ impl Osd {
                 v
             }
             Screen::Settings => vec![
-                mk("Graphics", Select::Push(Screen::Graphics)),
+                mk("Graphics...", Select::Push(Screen::Graphics)),
                 mk("Controller", Select::Push(Screen::Controller)),
                 mk("Region", Select::Push(Screen::Region)),
                 mk("Cartridge", Select::Push(Screen::Cartridge)),
@@ -456,6 +460,19 @@ impl Osd {
                         &format!("Renderer: {}", ctx.backend.label()),
                         Select::Emit(OsdAction::SetBackend(ctx.backend.next())),
                     ),
+                    mk("Shaders...", Select::Push(Screen::Shaders)),
+                    mk("Back", Select::Close),
+                ]
+            }
+            Screen::Shaders => {
+                // Stub: the SDL_GPU CRT-shader presenter is a backlog item
+                // (ADR-0019; `shaders/README.md`). Read-only placeholder rows so
+                // the menu path exists; once the presenter lands this lists the
+                // presets discovered under `shaders/` (frontend-supplied, like
+                // the disc browser's `BrowseEntry` rows).
+                vec![
+                    mk("Shader: None (passthrough)", Select::Close),
+                    mk("(CRT shaders coming soon)", Select::Close),
                     mk("Back", Select::Close),
                 ]
             }
@@ -626,6 +643,7 @@ impl Osd {
             Screen::Slots { saving: false } => "Load State",
             Screen::Settings => "Settings",
             Screen::Graphics => "Graphics",
+            Screen::Shaders => "Shaders",
             Screen::Controller => "Controller",
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
@@ -936,6 +954,25 @@ mod tests {
     }
 
     #[test]
+    fn graphics_opens_shaders_chooser_stub() {
+        let mut osd = Osd::new();
+        osd.toggle(); // open at Main
+        let c = ctx(true);
+        // Main → Settings → Graphics... → Shaders... (each Push emits no action).
+        assert_eq!(select_main(&mut osd, &c, "Settings"), None);
+        assert_eq!(select_main(&mut osd, &c, "Graphics..."), None);
+        assert_eq!(select_main(&mut osd, &c, "Shaders..."), None);
+        assert_eq!(Osd::title(osd.screen()), "Shaders");
+        // The stub is read-only: a "None" placeholder + Back, nothing emitted.
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label.contains("None")));
+        assert!(items.iter().any(|it| it.label == "Back"));
+        // Back pops to Graphics (Select::Close = pop one, no action).
+        assert_eq!(select_main(&mut osd, &c, "Back"), None);
+        assert_eq!(Osd::title(osd.screen()), "Graphics");
+    }
+
+    #[test]
     fn save_submenu_emits_slot_and_back_pops() {
         let mut osd = Osd::new();
         osd.toggle();
@@ -1082,7 +1119,7 @@ mod tests {
         osd.toggle();
         let c = ctx(true); // scale = 2, fullscreen = false
         assert_eq!(select_main(&mut osd, &c, "Settings"), None); // push Settings
-        assert_eq!(select_main(&mut osd, &c, "Graphics"), None); // push Graphics
+        assert_eq!(select_main(&mut osd, &c, "Graphics..."), None); // push Graphics
         // Scale 2 → next is 3.
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::SetScale(3)));
         // Fullscreen item toggles.
@@ -1121,7 +1158,7 @@ mod tests {
         osd.toggle();
         let c = ctx(true); // backend = Auto
         select_main(&mut osd, &c, "Settings");
-        select_main(&mut osd, &c, "Graphics");
+        select_main(&mut osd, &c, "Graphics...");
         // The row reads "Renderer: Auto"; activating it advances to OpenGL.
         assert_eq!(
             select_main(&mut osd, &c, "Renderer: Auto"),
@@ -1150,7 +1187,7 @@ mod tests {
         let mut c = ctx(true);
         c.scale = 4;
         select_main(&mut osd, &c, "Settings");
-        select_main(&mut osd, &c, "Graphics");
+        select_main(&mut osd, &c, "Graphics...");
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::SetScale(1)));
     }
 
