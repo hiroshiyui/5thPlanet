@@ -11,8 +11,7 @@ pub const VRAM_BYTES: usize = 512 * 1024;
 
 /// VDP1 VRAM storage (512 KiB) — the command table plus character and
 /// gouraud data. Offsets fold modulo size so the region mirrors; big-endian.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Vram {
     bytes: Vec<u8>,
 }

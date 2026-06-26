@@ -482,7 +482,10 @@ impl Osd {
                 // The active region is marked with a leading '*'.
                 let row = |name: &str, r: OsdRegion| {
                     let mark = if ctx.region == r { "* " } else { "  " };
-                    mk(&format!("{mark}{name}"), Select::Emit(OsdAction::SetRegion(r)))
+                    mk(
+                        &format!("{mark}{name}"),
+                        Select::Emit(OsdAction::SetRegion(r)),
+                    )
                 };
                 vec![
                     row("Japan", OsdRegion::Japan),
@@ -495,7 +498,10 @@ impl Osd {
             Screen::Cartridge => {
                 let row = |name: &str, k: OsdCart| {
                     let mark = if ctx.cart == k { "* " } else { "  " };
-                    mk(&format!("{mark}{name}"), Select::Emit(OsdAction::SetCartridge(k)))
+                    mk(
+                        &format!("{mark}{name}"),
+                        Select::Emit(OsdAction::SetCartridge(k)),
+                    )
                 };
                 vec![
                     row("None", OsdCart::None),
@@ -555,9 +561,15 @@ impl Osd {
                 let mut v = Vec::with_capacity(ctx.diag_results.len() + 5);
                 v.push(mk("Run all", Select::Emit(OsdAction::RunDiagnostics)));
                 // Live "current session" status (read-only) — no boot involved.
-                v.push(mk(&format!("Region: {}", ctx.region.label()), Select::Close));
                 v.push(mk(
-                    &format!("Disc: {}", if ctx.disc_present { "present" } else { "none" }),
+                    &format!("Region: {}", ctx.region.label()),
+                    Select::Close,
+                ));
+                v.push(mk(
+                    &format!(
+                        "Disc: {}",
+                        if ctx.disc_present { "present" } else { "none" }
+                    ),
                     Select::Close,
                 ));
                 v.push(mk(
@@ -589,10 +601,16 @@ impl Osd {
                 // metadata (inherited workspace-wide); the product name is
                 // 5thPlanet (the binary is `jupiter`).
                 vec![
-                    mk(concat!("5thPlanet  v", env!("CARGO_PKG_VERSION")), Select::Close),
+                    mk(
+                        concat!("5thPlanet  v", env!("CARGO_PKG_VERSION")),
+                        Select::Close,
+                    ),
                     mk("An accuracy-first SEGA Saturn emulator", Select::Close),
                     mk(concat!("(C) ", env!("CARGO_PKG_AUTHORS")), Select::Close),
-                    mk(concat!("License: ", env!("CARGO_PKG_LICENSE")), Select::Close),
+                    mk(
+                        concat!("License: ", env!("CARGO_PKG_LICENSE")),
+                        Select::Close,
+                    ),
                     mk("Provided AS IS, without warranty.", Select::Close),
                     mk("Full terms: see the LICENSE file.", Select::Close),
                     mk("Back", Select::Close),
@@ -714,9 +732,19 @@ impl Osd {
             let py = c.h.saturating_sub(ph) / 2;
             c.fill_rect(px, py, pw, ph, PANEL_BG);
             c.rect_outline(px, py, pw, ph, PANEL_BORDER);
-            c.draw_text(px + (pw - Canvas::text_width(&line1)) / 2, py + 10, &line1, TITLE);
+            c.draw_text(
+                px + (pw - Canvas::text_width(&line1)) / 2,
+                py + 10,
+                &line1,
+                TITLE,
+            );
             let line2 = "(Esc cancels)";
-            c.draw_text(px + (pw - Canvas::text_width(line2)) / 2, py + 26, line2, ITEM);
+            c.draw_text(
+                px + (pw - Canvas::text_width(line2)) / 2,
+                py + 26,
+                line2,
+                ITEM,
+            );
             self.draw_toast(c);
             return;
         }
@@ -749,8 +777,7 @@ impl Osd {
             .map(|it| Canvas::text_width(&it.label))
             .max()
             .unwrap_or(0);
-        let pw = (widest + TEXT_INSET + 8)
-            .clamp(180, c.w.saturating_sub(8).max(180));
+        let pw = (widest + TEXT_INSET + 8).clamp(180, c.w.saturating_sub(8).max(180));
         let ph = 28 + shown * 12 + 8;
         let px = c.w.saturating_sub(pw) / 2;
         let py = c.h.saturating_sub(ph) / 2;
@@ -787,7 +814,11 @@ impl Osd {
             };
             // A per-item colour (diagnostics PASS/FAIL) overrides the default,
             // but the selected row stays white so the highlight stays legible.
-            let color = if i == sel { base } else { items[i].color.unwrap_or(base) };
+            let color = if i == sel {
+                base
+            } else {
+                items[i].color.unwrap_or(base)
+            };
             c.draw_text(px + 12, ry, &items[i].label, color);
         }
 
@@ -845,10 +876,16 @@ mod tests {
     }
 
     fn dir(name: &str) -> BrowseEntry {
-        BrowseEntry { name: name.into(), is_dir: true }
+        BrowseEntry {
+            name: name.into(),
+            is_dir: true,
+        }
     }
     fn file(name: &str) -> BrowseEntry {
-        BrowseEntry { name: name.into(), is_dir: false }
+        BrowseEntry {
+            name: name.into(),
+            is_dir: false,
+        }
     }
 
     /// Navigate from the main screen to a named item by repeated Down, then
@@ -856,7 +893,10 @@ mod tests {
     fn select_main(osd: &mut Osd, c: &OsdCtx, label: &str) -> Option<OsdAction> {
         // Find the index of `label` on the current screen.
         let items = osd.items(osd.screen(), c);
-        let idx = items.iter().position(|it| it.label == label).expect("item exists");
+        let idx = items
+            .iter()
+            .position(|it| it.label == label)
+            .expect("item exists");
         for _ in 0..idx {
             osd.handle(Nav::Down, c);
         }
@@ -902,7 +942,7 @@ mod tests {
         let c = ctx(true);
         osd.handle(Nav::Down, &c); // Save State
         assert_eq!(osd.handle(Nav::Select, &c), None); // pushes Slots
-                                                       // Slots screen: Slot 0 selected → Save(0)
+        // Slots screen: Slot 0 selected → Save(0)
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Save(0)));
         // Selecting slot 2 then Save.
         osd.handle(Nav::Down, &c);
@@ -932,16 +972,38 @@ mod tests {
         );
         // With results present, each renders as a [PASS]/[FAIL] row.
         c.diag_results = vec![
-            DiagResultRow { label: "cpu/cpu_add_imm".into(), passed: true },
-            DiagResultRow { label: "memory/mem_roundtrip_low".into(), passed: false },
+            DiagResultRow {
+                label: "cpu/cpu_add_imm".into(),
+                passed: true,
+            },
+            DiagResultRow {
+                label: "memory/mem_roundtrip_low".into(),
+                passed: false,
+            },
         ];
-        let labels: Vec<String> = osd.items(osd.screen(), &c).into_iter().map(|it| it.label).collect();
-        assert!(labels.iter().any(|l| l.starts_with("[PASS] cpu/cpu_add_imm")));
-        assert!(labels.iter().any(|l| l.starts_with("[FAIL] memory/mem_roundtrip")));
+        let labels: Vec<String> = osd
+            .items(osd.screen(), &c)
+            .into_iter()
+            .map(|it| it.label)
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.starts_with("[PASS] cpu/cpu_add_imm"))
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.starts_with("[FAIL] memory/mem_roundtrip"))
+        );
         // Live "current session" status rows reflect ctx (region/disc/PC).
         assert!(labels.iter().any(|l| l == "Region: Japan"));
         assert!(labels.iter().any(|l| l == "Disc: present"));
-        assert!(labels.iter().any(|l| l == "Master PC: 06001234 High WRAM (game)"));
+        assert!(
+            labels
+                .iter()
+                .any(|l| l == "Master PC: 06001234 High WRAM (game)")
+        );
     }
 
     #[test]
@@ -950,13 +1012,19 @@ mod tests {
         osd.toggle();
         let c = ctx(true);
         assert_eq!(select_main(&mut osd, &c, "About..."), None); // pushes About
-        let labels: Vec<String> =
-            osd.items(osd.screen(), &c).into_iter().map(|it| it.label).collect();
+        let labels: Vec<String> = osd
+            .items(osd.screen(), &c)
+            .into_iter()
+            .map(|it| it.label)
+            .collect();
         assert!(
             labels.iter().any(|l| l.contains(env!("CARGO_PKG_VERSION"))),
             "About lists the version: {labels:?}"
         );
-        assert!(labels.iter().any(|l| l.starts_with("License:")), "About lists the license");
+        assert!(
+            labels.iter().any(|l| l.starts_with("License:")),
+            "About lists the license"
+        );
         // Back pops to Main (still open).
         assert_eq!(osd.handle(Nav::Back, &c), None);
         assert!(osd.is_open());
@@ -1019,7 +1087,10 @@ mod tests {
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::SetScale(3)));
         // Fullscreen item toggles.
         osd.handle(Nav::Down, &c);
-        assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ToggleFullscreen));
+        assert_eq!(
+            osd.handle(Nav::Select, &c),
+            Some(OsdAction::ToggleFullscreen)
+        );
     }
 
     #[test]
@@ -1306,7 +1377,10 @@ mod tests {
         let (w, h) = (320usize, 240usize);
         let mut buf = vec![0u8; w * h * 4];
         osd.render_overlay(&mut buf, w, h, &c); // must not panic / overflow
-        assert!(buf.iter().any(|&b| b != 0), "scrolled browser paints pixels");
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "scrolled browser paints pixels"
+        );
     }
 
     #[test]

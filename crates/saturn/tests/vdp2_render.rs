@@ -82,7 +82,11 @@ fn back_screen_single_colour_fills_the_backdrop_from_vram() {
     // Every sampled pixel is the single back-screen colour (green).
     for &(x, y) in &[(0usize, 0usize), (160, 100), (319, 223)] {
         let px = (y * FRAME_WIDTH + x) * 4;
-        assert_eq!(&out[px..px + 4], &[0, 0xFF, 0, 0xFF], "green backdrop at ({x},{y})");
+        assert_eq!(
+            &out[px..px + 4],
+            &[0, 0xFF, 0, 0xFF],
+            "green backdrop at ({x},{y})"
+        );
     }
 }
 
@@ -201,7 +205,11 @@ fn color_offset_disabled_leaves_dot_unchanged() {
     sat.run_frame(&mut out);
 
     let px = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[px..px + 4], &[132, 132, 132, 0xFF], "untouched grey dot");
+    assert_eq!(
+        &out[px..px + 4],
+        &[132, 132, 132, 0xFF],
+        "untouched grey dot"
+    );
 }
 
 #[test]
@@ -223,10 +231,18 @@ fn nbg0_horizontal_reduction_halves_the_layer() {
     sat.run_frame(&mut out);
 
     let px = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[px..px + 4], &[0xFF, 0, 0, 0xFF], "src x=100 maps to screen x=50");
+    assert_eq!(
+        &out[px..px + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "src x=100 maps to screen x=50"
+    );
     // Neighbours sample even source columns (98, 102) — both empty → backdrop.
     let left = (60 * FRAME_WIDTH + 49) * 4;
-    assert_eq!(&out[left..left + 4], &[0, 0, 0, 0xFF], "screen x=49 → src 98 (empty)");
+    assert_eq!(
+        &out[left..left + 4],
+        &[0, 0, 0, 0xFF],
+        "screen x=49 → src 98 (empty)"
+    );
 }
 
 #[test]
@@ -295,10 +311,18 @@ fn special_color_calc_mode2_gates_blending_by_sfcode() {
 
     // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
     let a = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[a..a + 4], &[123, 0, 132, 0xFF], "code 4: SFCODE bit set → blended");
+    assert_eq!(
+        &out[a..a + 4],
+        &[123, 0, 132, 0xFF],
+        "code 4: SFCODE bit set → blended"
+    );
     // Dot B: cc gated off → opaque red.
     let b = (60 * FRAME_WIDTH + 52) * 4;
-    assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "code 2: SFCODE bit clear → opaque");
+    assert_eq!(
+        &out[b..b + 4],
+        &[255, 0, 0, 0xFF],
+        "code 2: SFCODE bit clear → opaque"
+    );
 }
 
 #[test]
@@ -334,9 +358,17 @@ fn special_priority_mode2_raises_lsb_by_sfcode() {
     sat.run_frame(&mut out);
 
     let a = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[a..a + 4], &[255, 0, 0, 0xFF], "code 4: NBG0 prio→3, wins tie (red)");
+    assert_eq!(
+        &out[a..a + 4],
+        &[255, 0, 0, 0xFF],
+        "code 4: NBG0 prio→3, wins tie (red)"
+    );
     let b = (60 * FRAME_WIDTH + 52) * 4;
-    assert_eq!(&out[b..b + 4], &[0, 255, 0, 0xFF], "code 2: NBG0 prio→2, NBG1 shows (green)");
+    assert_eq!(
+        &out[b..b + 4],
+        &[0, 255, 0, 0xFF],
+        "code 2: NBG0 prio→2, NBG1 shows (green)"
+    );
 }
 
 #[test]
@@ -357,7 +389,14 @@ fn rpmd_selects_rotation_parameter_set_for_rbg0() {
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
     // Identity transform for parameter set A (0x40000) and B (0x40080).
     for base in [0x40000u32, 0x40080] {
-        for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+        for &(k, val) in &[
+            (4u32, ONE),
+            (5, ONE),
+            (7, ONE),
+            (11, ONE),
+            (19, ONE),
+            (20, ONE),
+        ] {
             sat.bus.vdp2.vram.write32(base + k * 4, val);
         }
     }
@@ -373,11 +412,19 @@ fn rpmd_selects_rotation_parameter_set_for_rbg0() {
 
     sat.bus.write16(0x05F8_00B0, 0x0000, AccessKind::Data); // RPMD = 0 → param A
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[0xFF, 0, 0, 0xFF], "RPMD=0 → param A bitmap (red)");
+    assert_eq!(
+        &out[px..px + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "RPMD=0 → param A bitmap (red)"
+    );
 
     sat.bus.write16(0x05F8_00B0, 0x0001, AccessKind::Data); // RPMD = 1 → param B
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[0, 0xFF, 0, 0xFF], "RPMD=1 → param B bitmap (green)");
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 0xFF, 0, 0xFF],
+        "RPMD=1 → param B bitmap (green)"
+    );
 }
 
 #[test]
@@ -397,7 +444,14 @@ fn hires_mode_renders_the_rotation_layer_at_half_dot_resolution() {
     sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR = 1
     sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
-    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
         sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
     }
     sat.bus.vdp2.cram.write16(2, 0x001F); // code 1 = red
@@ -409,9 +463,21 @@ fn hires_mode_renders_the_rotation_layer_at_half_dot_resolution() {
     assert_eq!(w, 640);
     let px = |x: usize| (10 * w + x) * 4;
     // Plane dot 10 occupies display dots 20 and 21 — and nothing else nearby.
-    assert_eq!(&out[px(20)..px(20) + 4], &[0xFF, 0, 0, 0xFF], "first half of the doubled dot");
-    assert_eq!(&out[px(21)..px(21) + 4], &[0xFF, 0, 0, 0xFF], "second half of the doubled dot");
-    assert_ne!(&out[px(10)..px(10) + 4], &[0xFF, 0, 0, 0xFF], "x=10 would be the un-doubled bug");
+    assert_eq!(
+        &out[px(20)..px(20) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "first half of the doubled dot"
+    );
+    assert_eq!(
+        &out[px(21)..px(21) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "second half of the doubled dot"
+    );
+    assert_ne!(
+        &out[px(10)..px(10) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "x=10 would be the un-doubled bug"
+    );
     assert_ne!(&out[px(22)..px(22) + 4], &[0xFF, 0, 0, 0xFF]);
 }
 
@@ -447,10 +513,18 @@ fn special_color_calc_mode3_uses_cram_msb_in_rgb888_mode() {
 
     // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
     let a = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[a..a + 4], &[123, 0, 132, 0xFF], "CRAM MSB set → blended");
+    assert_eq!(
+        &out[a..a + 4],
+        &[123, 0, 132, 0xFF],
+        "CRAM MSB set → blended"
+    );
     // Dot B: MSB clear → cc gated off → opaque red.
     let b = (60 * FRAME_WIDTH + 52) * 4;
-    assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "CRAM MSB clear → opaque");
+    assert_eq!(
+        &out[b..b + 4],
+        &[255, 0, 0, 0xFF],
+        "CRAM MSB clear → opaque"
+    );
 }
 
 #[test]
@@ -480,7 +554,11 @@ fn special_color_calc_mode3_always_blends_rgb_direct_dots() {
 
     // Red over blue at alpha = (31-16)*255/31 = 123 → [123, 0, 132].
     let px = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[px..px + 4], &[123, 0, 132, 0xFF], "RGB direct dot blends under SFCCMD 3");
+    assert_eq!(
+        &out[px..px + 4],
+        &[123, 0, 132, 0xFF],
+        "RGB direct dot blends under SFCCMD 3"
+    );
 }
 
 #[test]
@@ -499,7 +577,14 @@ fn rbg0_special_color_calc_mode2_gates_blending_by_sfcode() {
     // Rotation parameter table at VRAM byte 0x40000; identity transform.
     sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
-    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
         sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
     }
     // Backdrop = blue.
@@ -525,10 +610,18 @@ fn rbg0_special_color_calc_mode2_gates_blending_by_sfcode() {
 
     // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
     let a = (60 * FRAME_WIDTH + 50) * 4;
-    assert_eq!(&out[a..a + 4], &[123, 0, 132, 0xFF], "code 4: SFCODE bit set → blended");
+    assert_eq!(
+        &out[a..a + 4],
+        &[123, 0, 132, 0xFF],
+        "code 4: SFCODE bit set → blended"
+    );
     // Dot B: cc gated off → opaque red.
     let b = (60 * FRAME_WIDTH + 52) * 4;
-    assert_eq!(&out[b..b + 4], &[255, 0, 0, 0xFF], "code 2: SFCODE bit clear → opaque");
+    assert_eq!(
+        &out[b..b + 4],
+        &[255, 0, 0, 0xFF],
+        "code 2: SFCODE bit clear → opaque"
+    );
 }
 
 #[test]
@@ -562,12 +655,20 @@ fn extended_color_calc_blends_front_over_second_third_average() {
     // EXCEN off: front blends only with the 2nd layer (green) at alpha 123.
     sat.bus.write16(0x05F8_00EC, 0x0003, AccessKind::Data); // CCCTL: N0 + N1 cc, EXCEN off
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[123, 132, 0, 0xFF], "EXCEN off → red over green");
+    assert_eq!(
+        &out[px..px + 4],
+        &[123, 132, 0, 0xFF],
+        "EXCEN off → red over green"
+    );
 
     // EXCEN on: front blends with avg(green, blue) = (0,127,127).
     sat.bus.write16(0x05F8_00EC, 0x0403, AccessKind::Data); // CCCTL: + EXCEN (bit 10)
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[123, 65, 65, 0xFF], "EXCEN on → red over avg(green, blue)");
+    assert_eq!(
+        &out[px..px + 4],
+        &[123, 65, 65, 0xFF],
+        "EXCEN on → red over avg(green, blue)"
+    );
 }
 
 #[test]
@@ -598,13 +699,21 @@ fn vram_cycle_pattern_gates_a_tile_layers_character_fetch() {
     // Grant: bank0 gets NBG0 name-table (code 0) + character (code 4) slots.
     sat.bus.write16(0x05F8_0010, 0x0400, AccessKind::Data); // CYCA0 bank0 slots: N0NT,N0CG,…
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[255, 0, 0, 0xFF], "bank0 grants NBG0 CG → tile renders (red)");
+    assert_eq!(
+        &out[px..px + 4],
+        &[255, 0, 0, 0xFF],
+        "bank0 grants NBG0 CG → tile renders (red)"
+    );
 
     // Deny: remove the NBG0 character slot (no bank holds code 4) → char fetch
     // dummied → transparent → backdrop blue shows.
     sat.bus.write16(0x05F8_0010, 0x0000, AccessKind::Data); // all slots N0NT, none = N0CG
     sat.run_frame(&mut out);
-    assert_eq!(&out[px..px + 4], &[0, 0, 255, 0xFF], "no CG grant → NBG0 char blanks → backdrop");
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 0, 255, 0xFF],
+        "no CG grant → NBG0 char blanks → backdrop"
+    );
 }
 
 /// Per-dot rotation coefficients (VF2's fight floor): with a VRAM bank
@@ -628,7 +737,14 @@ fn rotation_coefficients_walk_per_dot_when_a_bank_is_granted() {
     // = entry << 16).
     sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTAU
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
-    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
         sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
     }
     sat.bus.vdp2.vram.write32(0x40000 + 23 * 4, 0x0001_0000); // DKAx = 1 entry/dot (.10 units ×1024, raw <<6)
@@ -651,13 +767,21 @@ fn rotation_coefficients_walk_per_dot_when_a_bank_is_granted() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
     let px = |x: usize| (10 * FRAME_WIDTH + x) * 4;
-    assert_eq!(&out[px(0)..px(0) + 4], &[0xFF, 0, 0, 0xFF], "dot 0: coeff 1.0 → red");
+    assert_eq!(
+        &out[px(0)..px(0) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "dot 0: coeff 1.0 → red"
+    );
     assert_ne!(
         &out[px(1)..px(1) + 4],
         &[0xFF, 0, 0, 0xFF],
         "dot 1: per-dot transparent coefficient"
     );
-    assert_eq!(&out[px(2)..px(2) + 4], &[0xFF, 0, 0, 0xFF], "dot 2: visible again");
+    assert_eq!(
+        &out[px(2)..px(2) + 4],
+        &[0xFF, 0, 0, 0xFF],
+        "dot 2: visible again"
+    );
 }
 
 /// RAMCTL.CRKTE: the coefficient table reads from the upper half of CRAM.
@@ -673,7 +797,14 @@ fn rotation_coefficients_read_from_cram_when_crkte() {
     sat.bus.write16(0x05F8_000E, 0x8000, AccessKind::Data); // RAMCTL.CRKTE
     sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data);
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data);
-    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
         sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
     }
     sat.bus.write16(0x05F8_00B4, 0x0003, AccessKind::Data); // coeff on, 1-word
@@ -710,7 +841,14 @@ fn rotation_coefficient_lines_halve_in_double_density_interlace() {
     sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR = 1
     sat.bus.write16(0x05F8_00BC, 0x0002, AccessKind::Data); // RPTA → 0x40000
     sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data);
-    for &(k, val) in &[(4u32, ONE), (5, ONE), (7, ONE), (11, ONE), (19, ONE), (20, ONE)] {
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
         sat.bus.vdp2.vram.write32(0x40000 + k * 4, val);
     }
     sat.bus.vdp2.vram.write32(0x40000 + 22 * 4, 0x0001_0000); // DKAst = 1 entry/line
@@ -732,8 +870,24 @@ fn rotation_coefficient_lines_halve_in_double_density_interlace() {
     sat.run_frame(&mut out);
     let px = |x: usize, y: usize| (y * 320 + x) * 4;
     let red = [0xFFu8, 0, 0, 0xFF];
-    assert_ne!(&out[px(4, 0)..px(4, 0) + 4], &red, "display 0 → coeff line 0 (transparent)");
-    assert_ne!(&out[px(4, 1)..px(4, 1) + 4], &red, "display 1 → still coeff line 0");
-    assert_eq!(&out[px(4, 2)..px(4, 2) + 4], &red, "display 2 → coeff line 1 (solid)");
-    assert_eq!(&out[px(4, 3)..px(4, 3) + 4], &red, "display 3 → still coeff line 1");
+    assert_ne!(
+        &out[px(4, 0)..px(4, 0) + 4],
+        &red,
+        "display 0 → coeff line 0 (transparent)"
+    );
+    assert_ne!(
+        &out[px(4, 1)..px(4, 1) + 4],
+        &red,
+        "display 1 → still coeff line 0"
+    );
+    assert_eq!(
+        &out[px(4, 2)..px(4, 2) + 4],
+        &red,
+        "display 2 → coeff line 1 (solid)"
+    );
+    assert_eq!(
+        &out[px(4, 3)..px(4, 3) + 4],
+        &red,
+        "display 3 → still coeff line 1"
+    );
 }

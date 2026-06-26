@@ -38,8 +38,7 @@ pub const REGS_END: u32 = 0x05F8_01FF;
 /// The VDP2 background generator: VRAM + CRAM + the register bank. The
 /// multi-layer compositor (NBG0–3, RBG0/1, and the VDP1 sprite layer) lives in
 /// [`renderer`].
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Vdp2 {
     pub regs: Vdp2Regs,
     pub vram: Vram,
@@ -279,10 +278,18 @@ mod tests {
         // Byte writes into the VCNT pair (0x00A/0x00B) must not stick.
         v.write8(REGS_BASE + 0x00A, 0x00);
         v.write8(REGS_BASE + 0x00B, 0x00);
-        assert_eq!(v.regs.read16(0x00A), 0xABCD, "VCNT preserved against byte writes");
+        assert_eq!(
+            v.regs.read16(0x00A),
+            0xABCD,
+            "VCNT preserved against byte writes"
+        );
         // But a writable register byte does take the write (TVMD low byte).
         v.write8(REGS_BASE + 0x001, 0xC3);
-        assert_eq!(v.regs.read8(0x001), 0xC3, "writable register byte takes the write");
+        assert_eq!(
+            v.regs.read8(0x001),
+            0xC3,
+            "writable register byte takes the write"
+        );
     }
 
     #[test]
@@ -303,7 +310,11 @@ mod tests {
         // Seed a non-zero TVSTAT (e.g. ODD/PAL bits) via the backdoor.
         v.regs.write16(0x004, 0x0001);
         // The bus read OR's in only VBLANK (bit 3), preserving the rest.
-        assert_eq!(v.read16(REGS_BASE + 0x004), 0x0009, "0x0001 | VBLANK(0x0008)");
+        assert_eq!(
+            v.read16(REGS_BASE + 0x004),
+            0x0009,
+            "0x0001 | VBLANK(0x0008)"
+        );
     }
 
     #[test]

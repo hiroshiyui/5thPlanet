@@ -19,8 +19,7 @@ pub const FB_HEIGHT: i32 = 256;
 /// VDP1's double-buffered frame buffer (256 KiB): the plotter draws here and
 /// VDP2 composites it as the sprite layer. Supports the 8bpp and DIE-interlace
 /// layouts; addressing folds modulo size.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Framebuffer {
     bytes: Vec<u8>,
     /// The TVM mode this buffer's contents were plotted in: `true` = the

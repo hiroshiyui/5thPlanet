@@ -159,7 +159,11 @@ impl CoeffCtx {
         let r = &vdp2.regs;
         let rp = RotationParams::read(&vdp2.vram, r.rotation_table_addr(), param);
         let crkte = r.coeff_in_cram();
-        let bank_ok = if crkte { [true; 4] } else { r.rotation_coeff_banks() };
+        let bank_ok = if crkte {
+            [true; 4]
+        } else {
+            r.rotation_coeff_banks()
+        };
         Self {
             enabled: r.rbg_coeff_enabled(param),
             one_word: r.rbg_coeff_size_word(param),
@@ -167,8 +171,7 @@ impl CoeffCtx {
             crkte,
             per_dot: crkte || bank_ok.iter().any(|&b| b),
             bank_ok,
-            base: (r.rbg_coeff_addr_offset(param) << 26)
-                .wrapping_add((rp.kast as u32) >> 6),
+            base: (r.rbg_coeff_addr_offset(param) << 26).wrapping_add((rp.kast as u32) >> 6),
             dkast: rp.dkast >> 6,
             dkax: rp.dkax >> 6,
         }
@@ -177,9 +180,7 @@ impl CoeffCtx {
     /// Raw coefficient word for dot `(x, y)`, or the per-line value when the
     /// per-dot mode is off. Bit 31 = transparent; low 24 bits = signed value.
     fn read(&self, vdp2: &Vdp2, x: u32, y: u32) -> u32 {
-        let mut accum = self
-            .base
-            .wrapping_add((self.dkast as u32).wrapping_mul(y));
+        let mut accum = self.base.wrapping_add((self.dkast as u32).wrapping_mul(y));
         if self.per_dot {
             accum = accum.wrapping_add((self.dkax as u32).wrapping_mul(x));
         }
@@ -391,7 +392,14 @@ impl NbgCtx {
                 stride: (lscx as u32 + lscy as u32 + lzmx as u32) * 4,
             }
         } else {
-            LineScrollCtx { lscx: false, lscy: false, lzmx: false, table: 0, interval: 1, stride: 0 }
+            LineScrollCtx {
+                lscx: false,
+                lscy: false,
+                lzmx: false,
+                table: 0,
+                interval: 1,
+                stride: 0,
+            }
         };
         // Vertical cell scroll shares one table; when both NBG0 and NBG1 use it
         // their longwords interleave (NBG0 even, NBG1 odd). Frame-invariant.
@@ -440,7 +448,11 @@ impl NbgCtx {
             // Bitmap mode exists only on NBG0/1; the accessors' bit math is
             // undefined for NBG2/3 (they can never be bitmap-enabled).
             bm_base: if n < 2 { r.nbg_bitmap_base(n) } else { 0 },
-            bm_dims: if n < 2 { bitmap_dims(r.nbg_bitmap_size(n)) } else { (512, 256) },
+            bm_dims: if n < 2 {
+                bitmap_dims(r.nbg_bitmap_size(n))
+            } else {
+                (512, 256)
+            },
             bm_spr: n < 2 && r.nbg_bitmap_special_priority(n),
             bm_scc: n < 2 && r.nbg_bitmap_special_calc(n),
         }
@@ -469,7 +481,11 @@ impl FrameCtx {
 /// `(width, height)` decoded from TVMD. `out` must hold at least
 /// `width × height × 4` bytes — size it to [`FRAMEBUFFER_BYTES`]; content is
 /// packed at a `width × 4` pitch.
-pub fn render_frame(vdp2: &Vdp2, sprite_fb: Option<&Framebuffer>, out: &mut [u8]) -> (usize, usize) {
+pub fn render_frame(
+    vdp2: &Vdp2,
+    sprite_fb: Option<&Framebuffer>,
+    out: &mut [u8],
+) -> (usize, usize) {
     // Active resolution from TVMD (320/352/640/704 × 224/240/256[×2]). The
     // content is packed tightly with row stride = `w`, so the caller uploads
     // `w × h` with a `w × 4` pitch.
@@ -530,81 +546,117 @@ fn render_line(
     w: usize,
     row: &mut [u8],
 ) {
-        let backdrop = back_color(vdp2, y);
-        for x in 0..w {
-            let (sx, sy) = (x as u32, y as u32);
-            // Evaluate layers in VDP2's default front-to-back order, keeping
-            // the top two by priority (front order wins ties) so colour
-            // calculation can blend the front layer with the one below it:
-            // sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
-            let mut top: Option<Dot> = None;
-            let mut second: Option<Dot> = None;
-            let mut third: Option<Dot> = None;
-            let mut shadow = false;
+    let backdrop = back_color(vdp2, y);
+    for x in 0..w {
+        let (sx, sy) = (x as u32, y as u32);
+        // Evaluate layers in VDP2's default front-to-back order, keeping
+        // the top two by priority (front order wins ties) so colour
+        // calculation can blend the front layer with the one below it:
+        // sprite > RBG0 > NBG0 > RBG1 > NBG1..3.
+        let mut top: Option<Dot> = None;
+        let mut second: Option<Dot> = None;
+        let mut third: Option<Dot> = None;
+        let mut shadow = false;
 
-            // The sprite layer may produce a colour dot or an MSB shadow.
-            if window_allows(vdp2, ctx, sprite_fb, vdp2.regs.sprite_window_control(), sx, sy) {
-                match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
-                    Some(SpriteDot::Colour(d)) => {
-                        insert_dot(&mut top, &mut second, &mut third, Some(d))
-                    }
-                    Some(SpriteDot::Shadow) => shadow = true,
-                    None => {}
+        // The sprite layer may produce a colour dot or an MSB shadow.
+        if window_allows(
+            vdp2,
+            ctx,
+            sprite_fb,
+            vdp2.regs.sprite_window_control(),
+            sx,
+            sy,
+        ) {
+            match sprite_fb.and_then(|fb| sample_sprite(vdp2, fb, sx, sy)) {
+                Some(SpriteDot::Colour(d)) => {
+                    insert_dot(&mut top, &mut second, &mut third, Some(d))
                 }
+                Some(SpriteDot::Shadow) => shadow = true,
+                None => {}
             }
-            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, rbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 2, sx, sy));
-            insert_dot(&mut top, &mut second, &mut third, nbg_layer(vdp2, ctx, sprite_fb, 3, sx, sy));
-
-            let mut rgb = match top {
-                Some(t) => match t.cc {
-                    Some((ratio, add)) => {
-                        // Line-colour screen: when LNCLEN selects the top layer,
-                        // the line colour is the colour-calc partner (it sits at
-                        // the bottom of the colour-calc stack); otherwise the
-                        // colour-calc partner is the layer below — or, under
-                        // extended colour calc, the 2nd/3rd-layer average.
-                        let lce =
-                            vdp2.regs.line_colour_enable() & (1 << t.layer.screen_bit()) != 0;
-                        let below = if lce {
-                            line_color(vdp2, y)
-                                .or_else(|| second.map(|s| s.rgb))
-                                .unwrap_or(backdrop)
-                        } else if let Some(s) = second {
-                            excc_partner(vdp2, s, third, backdrop)
-                        } else {
-                            backdrop
-                        };
-                        blend(t.rgb, below, ratio, add)
-                    }
-                    None => t.rgb,
-                },
-                None => backdrop,
-            };
-            // Colour offset (CLOFEN/CLOFSL + COAR..COBB): add the per-screen
-            // signed RGB offset to the final dot, keyed on the front screen
-            // (back screen when nothing is on top) — applied after colour calc,
-            // before sprite-shadow halving, matching Mednafen's MixIt order.
-            rgb = apply_color_offset(vdp2, top, rgb);
-            // An MSB-shadow sprite darkens the screen beneath it by half — but
-            // only screens whose SDCTL shadow-receive bit is set (NBG/RBG via
-            // Layer::screen_bit, the back screen via bit 5). C2: previously every
-            // screen was darkened unconditionally.
-            if shadow {
-                let receiver = top.map_or(5, |t| t.layer.screen_bit());
-                if vdp2.regs.shadow_enabled(receiver) {
-                    rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
-                }
-            }
-            let dst = x * 4;
-            row[dst] = rgb.0;
-            row[dst + 1] = rgb.1;
-            row[dst + 2] = rgb.2;
-            row[dst + 3] = 0xFF;
         }
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            rbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy),
+        );
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            nbg_layer(vdp2, ctx, sprite_fb, 0, sx, sy),
+        );
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            rbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy),
+        );
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            nbg_layer(vdp2, ctx, sprite_fb, 1, sx, sy),
+        );
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            nbg_layer(vdp2, ctx, sprite_fb, 2, sx, sy),
+        );
+        insert_dot(
+            &mut top,
+            &mut second,
+            &mut third,
+            nbg_layer(vdp2, ctx, sprite_fb, 3, sx, sy),
+        );
+
+        let mut rgb = match top {
+            Some(t) => match t.cc {
+                Some((ratio, add)) => {
+                    // Line-colour screen: when LNCLEN selects the top layer,
+                    // the line colour is the colour-calc partner (it sits at
+                    // the bottom of the colour-calc stack); otherwise the
+                    // colour-calc partner is the layer below — or, under
+                    // extended colour calc, the 2nd/3rd-layer average.
+                    let lce = vdp2.regs.line_colour_enable() & (1 << t.layer.screen_bit()) != 0;
+                    let below = if lce {
+                        line_color(vdp2, y)
+                            .or_else(|| second.map(|s| s.rgb))
+                            .unwrap_or(backdrop)
+                    } else if let Some(s) = second {
+                        excc_partner(vdp2, s, third, backdrop)
+                    } else {
+                        backdrop
+                    };
+                    blend(t.rgb, below, ratio, add)
+                }
+                None => t.rgb,
+            },
+            None => backdrop,
+        };
+        // Colour offset (CLOFEN/CLOFSL + COAR..COBB): add the per-screen
+        // signed RGB offset to the final dot, keyed on the front screen
+        // (back screen when nothing is on top) — applied after colour calc,
+        // before sprite-shadow halving, matching Mednafen's MixIt order.
+        rgb = apply_color_offset(vdp2, top, rgb);
+        // An MSB-shadow sprite darkens the screen beneath it by half — but
+        // only screens whose SDCTL shadow-receive bit is set (NBG/RBG via
+        // Layer::screen_bit, the back screen via bit 5). C2: previously every
+        // screen was darkened unconditionally.
+        if shadow {
+            let receiver = top.map_or(5, |t| t.layer.screen_bit());
+            if vdp2.regs.shadow_enabled(receiver) {
+                rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+            }
+        }
+        let dst = x * 4;
+        row[dst] = rgb.0;
+        row[dst + 1] = rgb.1;
+        row[dst + 2] = rgb.2;
+        row[dst + 3] = 0xFF;
+    }
 }
 
 /// Which screen produced a dot — used by the per-layer enables (line-colour
@@ -701,7 +753,11 @@ fn resolve_special(
 
     // Priority: modes >= 1 clear the register LSB; the per-character bit then
     // sets it (mode 1, or mode 2 on paletted dots).
-    let mut prio = if priomode >= 1 { prio_reg & !1 } else { prio_reg };
+    let mut prio = if priomode >= 1 {
+        prio_reg & !1
+    } else {
+        prio_reg
+    };
     if ta_prio == 1 || (ta_prio == 2 && !s.is_rgb) {
         prio |= s.spr as u8;
     }
@@ -863,7 +919,12 @@ fn apply_color_offset(vdp2: &Vdp2, top: Option<Dot>, rgb: (u8, u8, u8)) -> (u8, 
 /// colour (the back screen counts as RGB). Mirrors Mednafen's non-line
 /// `MIXIT_SPECIAL_EXCC_CRAM0`/`CRAM12` branch (`vdp2_render.cpp:2537-2550`); the
 /// line-colour and gradient EXCC variants are deferred.
-fn excc_partner(vdp2: &Vdp2, second: Dot, third: Option<Dot>, backdrop: (u8, u8, u8)) -> (u8, u8, u8) {
+fn excc_partner(
+    vdp2: &Vdp2,
+    second: Dot,
+    third: Option<Dot>,
+    backdrop: (u8, u8, u8),
+) -> (u8, u8, u8) {
     if !vdp2.regs.extended_color_calc_active()
         || vdp2.regs.ccctl() & (1 << second.layer.cc_ctl_bit()) == 0
     {
@@ -935,7 +996,10 @@ fn window_allows(
         pass = fold(pass, win_pixel(vdp2, ctx, 1, x, y, true, ctl & 0x04 != 0));
     }
     if swe {
-        pass = fold(pass, sprite_window_pixel(vdp2, sprite_fb, x, y, ctl & 0x10 != 0));
+        pass = fold(
+            pass,
+            sprite_window_pixel(vdp2, sprite_fb, x, y, ctl & 0x10 != 0),
+        );
     }
     pass
 }
@@ -992,7 +1056,11 @@ fn rot_param_window_b(vdp2: &Vdp2, ctx: &FrameCtx, x: u32, y: u32) -> bool {
 /// two display lines — without the halving the lower half of the screen
 /// wraps back to the top of the buffer.
 fn sprite_fb_word(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> u16 {
-    let y = if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 { y >> 1 } else { y };
+    let y = if (vdp2.regs.tvmd() >> 6) & 0b11 == 3 {
+        y >> 1
+    } else {
+        y
+    };
     let word = fb.pixel(sprite_framebuffer_x(vdp2, x), y as i32);
     if fb.hires8() {
         let byte = if vdp2.regs.screen_dims().0 >= 640 {
@@ -1021,7 +1089,15 @@ fn sprite_framebuffer_x(vdp2: &Vdp2, display_x: u32) -> i32 {
 /// pass inside the window, clear → pass outside. With a line window enabled,
 /// the horizontal start/end come from the per-line table (the vertical bounds
 /// stay from WPSY/WPEY).
-fn win_pixel(vdp2: &Vdp2, ctx: &FrameCtx, w: usize, x: u32, y: u32, enable: bool, area: bool) -> bool {
+fn win_pixel(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    w: usize,
+    x: u32,
+    y: u32,
+    enable: bool,
+    area: bool,
+) -> bool {
     if !enable {
         return true;
     }
@@ -1030,7 +1106,11 @@ fn win_pixel(vdp2: &Vdp2, ctx: &FrameCtx, w: usize, x: u32, y: u32, enable: bool
         // One 32-bit entry per line: start X in bits 25..16, end X in bits
         // 9..0 — hi-res dot units, halved in normal modes like the rectangle
         // path (see `window_rect`).
-        let xshift = if vdp2.regs.h_resolution() & 0x2 != 0 { 0 } else { 1 };
+        let xshift = if vdp2.regs.h_resolution() & 0x2 != 0 {
+            0
+        } else {
+            1
+        };
         let word = vdp2.vram.read32(vdp2.regs.window_line_table(w) + y * 4);
         sx = ((word >> 16) & 0x3FF) >> xshift;
         ex = (word & 0x3FF) >> xshift;
@@ -1042,7 +1122,14 @@ fn win_pixel(vdp2: &Vdp2, ctx: &FrameCtx, w: usize, x: u32, y: u32, enable: bool
 /// An enabled, in-window NBG layer's dot at `(x, y)`, or `None`. Resolves the
 /// per-dot special priority / colour-calc function (SFPRMD/SFCCMD) from the
 /// sampled dot's attributes.
-fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: usize, x: u32, y: u32) -> Option<Dot> {
+fn nbg_layer(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    sprite_fb: Option<&Framebuffer>,
+    n: usize,
+    x: u32,
+    y: u32,
+) -> Option<Dot> {
     let nc = &ctx.nbg[n];
     if !nc.enabled {
         return None;
@@ -1076,14 +1163,22 @@ fn nbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, n: us
 /// An enabled, in-window rotation layer's dot at `(x, y)`, or `None`. RBG0 uses
 /// special-function layer index 4 (SFPRMD/SFCCMD bits 8..9); RBG1 shares NBG0's
 /// slot (index 0).
-fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which: usize, x: u32, y: u32) -> Option<Dot> {
+fn rbg_layer(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    sprite_fb: Option<&Framebuffer>,
+    which: usize,
+    x: u32,
+    y: u32,
+) -> Option<Dot> {
     let rc = &ctx.rbg[which];
     if !rc.enabled {
         return None;
     }
     // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
     // ungated for now.
-    let gated = which != 0 || window_allows(vdp2, ctx, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
+    let gated =
+        which != 0 || window_allows(vdp2, ctx, sprite_fb, vdp2.regs.rbg0_window_control(), x, y);
     if !gated {
         return None;
     }
@@ -1136,9 +1231,10 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
                 1 => 1,
                 // Mode 2: parameter A's coefficient MSB switches the dot to
                 // parameter B (Mednafen `SetupRotVars` EffRPMD == 2).
-                2 => (ctx.coeff[0].enabled
-                    && ctx.coeff[0].read(vdp2, mx, my) & 0x8000_0000 != 0)
-                    as usize,
+                2 => {
+                    (ctx.coeff[0].enabled && ctx.coeff[0].read(vdp2, mx, my) & 0x8000_0000 != 0)
+                        as usize
+                }
                 _ => rot_param_window_b(vdp2, ctx, wx, my) as usize,
             }
         }
@@ -1155,7 +1251,6 @@ fn rbg_layer(vdp2: &Vdp2, ctx: &FrameCtx, sprite_fb: Option<&Framebuffer>, which
         is_rgb: s.is_rgb,
     })
 }
-
 
 /// Per-line scroll for NBG0/NBG1 at screen line `y`, read from the line-scroll
 /// table (SCRCTL/LSTAn): `(dx, dy, zoom_x)`, where `dx`/`dy` are integer scroll
@@ -1286,7 +1381,14 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
             let entry = vdp2.vram.read32(off);
             (entry & 0x00FF_FFFF != 0).then(|| {
                 let (rgb, msb) = direct_rgb888(entry);
-                Sample { rgb, code: 0, spr, scc, is_rgb: true, msb }
+                Sample {
+                    rgb,
+                    code: 0,
+                    spr,
+                    scc,
+                    is_rgb: true,
+                    msb,
+                }
             })
         }
         // 16bpp RGB555 direct colour.
@@ -1307,7 +1409,14 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
             (idx != 0 || tpon).then(|| {
                 let (rgb, msb) = cram_cc(vdp2, coff | idx);
-                Sample { rgb, code: idx as u8, spr, scc, is_rgb: false, msb }
+                Sample {
+                    rgb,
+                    code: idx as u8,
+                    spr,
+                    scc,
+                    is_rgb: false,
+                    msb,
+                }
             })
         }
         // 4bpp paletted (16 colour). The BMPNA palette bank is a later
@@ -1317,7 +1426,14 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
             (nibble != 0 || tpon).then(|| {
                 let (rgb, msb) = cram_cc(vdp2, coff | nibble);
-                Sample { rgb, code: nibble as u8, spr, scc, is_rgb: false, msb }
+                Sample {
+                    rgb,
+                    code: nibble as u8,
+                    spr,
+                    scc,
+                    is_rgb: false,
+                    msb,
+                }
             })
         }
     }
@@ -1432,7 +1548,11 @@ fn sample_pattern_cell(
     // base is therefore always `char × 0x20`.
     let subcell = (in_y / 8) * 2 + (in_x / 8);
     let (px, py) = (in_x % 8, in_y % 8);
-    let cell = if depth == 1 { pat.cell + subcell * 2 } else { pat.cell + subcell };
+    let cell = if depth == 1 {
+        pat.cell + subcell * 2
+    } else {
+        pat.cell + subcell
+    };
     // VRAM cycle-pattern gating: a character fetch landing in a bank the VCP
     // table doesn't grant this NBG reads as a transparent dummy tile (code 0).
     let cg_blocked = cg_gate.is_some_and(|mask| mask & (1 << (((cell * 32) >> 17) & 3)) == 0);
@@ -1510,9 +1630,26 @@ fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, sx: u32, sy: u32) -> Optio
     let pat = if nt_mask & (1 << nt_bank) != 0 {
         decode_pattern(vdp2, pn_addr, nc.fmt, two_cells, nc.depth)
     } else {
-        Pattern { cell: 0, palette: 0, hflip: false, vflip: false, spr: false, scc: false }
+        Pattern {
+            cell: 0,
+            palette: 0,
+            hflip: false,
+            vflip: false,
+            spr: false,
+            scc: false,
+        }
     };
-    sample_pattern_cell(vdp2, &pat, two_cells, nc.depth, in_x, in_y, nc.coff, nc.tpon, Some(cg_mask))
+    sample_pattern_cell(
+        vdp2,
+        &pat,
+        two_cells,
+        nc.depth,
+        in_x,
+        in_y,
+        nc.coff,
+        nc.tpon,
+        Some(cg_mask),
+    )
 }
 
 // Sprite-data type tables (VDP2 manual §"Sprite Data", values per MAME's
@@ -1624,7 +1761,14 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
 /// RBG layer, 0/1) for the per-layer colour attributes (CRAM offset, transparent
 /// pen). RBG0 may drive itself from either parameter set via RPMD; RBG1 is fixed
 /// to set B — hence the two indices are kept distinct.
-fn sample_rbg(vdp2: &Vdp2, ctx: &FrameCtx, param: usize, layer: usize, x: u32, y: u32) -> Option<Sample> {
+fn sample_rbg(
+    vdp2: &Vdp2,
+    ctx: &FrameCtx,
+    param: usize,
+    layer: usize,
+    x: u32,
+    y: u32,
+) -> Option<Sample> {
     let rp = &ctx.rot[param];
     let cc = &ctx.coeff[param];
     // Coefficient table: per-dot (or per-line) kx/ky/Xp override giving
@@ -1698,7 +1842,14 @@ fn sample_rot_bitmap(
             let entry = vdp2.vram.read32(base + (py * w + px) * 4);
             (entry & 0x00FF_FFFF != 0).then(|| {
                 let (rgb, msb) = direct_rgb888(entry);
-                Sample { rgb, code: 0, spr, scc, is_rgb: true, msb }
+                Sample {
+                    rgb,
+                    code: 0,
+                    spr,
+                    scc,
+                    is_rgb: true,
+                    msb,
+                }
             })
         }
         3 => {
@@ -1716,7 +1867,14 @@ fn sample_rot_bitmap(
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
             (idx != 0 || tpon).then(|| {
                 let (rgb, msb) = cram_cc(vdp2, coff | idx);
-                Sample { rgb, code: idx as u8, spr, scc, is_rgb: false, msb }
+                Sample {
+                    rgb,
+                    code: idx as u8,
+                    spr,
+                    scc,
+                    is_rgb: false,
+                    msb,
+                }
             })
         }
         _ => {
@@ -1724,7 +1882,14 @@ fn sample_rot_bitmap(
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
             (nibble != 0 || tpon).then(|| {
                 let (rgb, msb) = cram_cc(vdp2, coff | nibble);
-                Sample { rgb, code: nibble as u8, spr, scc, is_rgb: false, msb }
+                Sample {
+                    rgb,
+                    code: nibble as u8,
+                    spr,
+                    scc,
+                    is_rgb: false,
+                    msb,
+                }
             })
         }
     }
@@ -1793,7 +1958,9 @@ fn sample_rot_tile(
 
     let pat = decode_pattern(vdp2, pn_addr, geo.fmt, two_cells, depth);
     // No VCP gating on the rotation path yet (RDBS bank selection unmodelled).
-    sample_pattern_cell(vdp2, &pat, two_cells, depth, in_x, in_y, rc.coff, rc.tpon, None)
+    sample_pattern_cell(
+        vdp2, &pat, two_cells, depth, in_x, in_y, rc.coff, rc.tpon, None,
+    )
 }
 
 #[cfg(test)]
@@ -2138,7 +2305,11 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 10, 10), [0xFF, 0, 0, 0xFF], "byte 2x → dot x");
-        assert_eq!(pixel(&buf, 11, 10), [0, 0, 0, 0xFF], "zero byte transparent");
+        assert_eq!(
+            pixel(&buf, 11, 10),
+            [0, 0, 0, 0xFF],
+            "zero byte transparent"
+        );
     }
 
     /// The sprite layer's palette codes go through the CRAOFB.SPCAOS colour-RAM
@@ -2638,7 +2809,11 @@ mod tests {
         fb.set_pixel(0, 0, 0x8000);
         let mut buf = fresh_buf();
         render_frame(&v, Some(&fb), &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "inside sprite window → NBG0");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "inside sprite window → NBG0"
+        );
         assert_eq!(pixel(&buf, 1, 0), [0, 0xFF, 0, 0xFF], "outside → backdrop");
     }
 
@@ -2765,8 +2940,16 @@ mod tests {
         v.vram.write8(0, 0xAB);
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "even column → high nibble");
-        assert_eq!(pixel(&buf, 1, 0), [0, 0, 0xFF, 0xFF], "odd column → low nibble");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "even column → high nibble"
+        );
+        assert_eq!(
+            pixel(&buf, 1, 0),
+            [0, 0, 0xFF, 0xFF],
+            "odd column → low nibble"
+        );
     }
 
     /// `tpon` (BGON.NxTPON) makes palette code 0 the *solid* backdrop colour
@@ -2816,11 +2999,23 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         // x=0: outside-W0 false, but inside-W1 true → OR passes → red.
-        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "inside W1 passes via OR");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "inside W1 passes via OR"
+        );
         // x=1: outside-W0 false AND inside-W1 false → suppressed → backdrop.
-        assert_eq!(pixel(&buf, 1, 0), [0, 0xFF, 0, 0xFF], "neither window passes");
+        assert_eq!(
+            pixel(&buf, 1, 0),
+            [0, 0xFF, 0, 0xFF],
+            "neither window passes"
+        );
         // x=3: outside-W0 true → OR passes → red.
-        assert_eq!(pixel(&buf, 3, 0), [0xFF, 0, 0, 0xFF], "outside W0 passes via OR");
+        assert_eq!(
+            pixel(&buf, 3, 0),
+            [0xFF, 0, 0, 0xFF],
+            "outside W0 passes via OR"
+        );
     }
 
     /// Per-column vertical cell scroll with BOTH NBG0 and NBG1 enabled: the
@@ -2846,14 +3041,22 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         // NBG0 (front) column 0 scrolled +5 → screen (0,0) samples (0,5) → red.
-        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "NBG0 +5 (even longword)");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "NBG0 +5 (even longword)"
+        );
         // Now make NBG0 transparent at (0,0) and place an NBG1 dot at (0,7),
         // which NBG1's +7 column scroll brings to screen (0,0) → blue shows.
         v.vram.write8(5 * 512, 0); // clear NBG0 dot
         v.vram.write8(7 * 512 + 0x2_0000, 2); // NBG1 dot at (0,7)
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 +7 (odd longword)");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0, 0xFF, 0xFF],
+            "NBG1 +7 (odd longword)"
+        );
     }
 
     /// Regression: a NEGATIVE vertical cell-scroll offset (scroll up) is
@@ -2912,7 +3115,11 @@ mod tests {
         render_frame(&v, Some(&fb), &mut buf);
         // sprite pri 5 ≥ SPCCN 5 → cc on; alpha=(31-15)*255/31=131.
         // red·131 over blue·124 = (131,0,124).
-        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF], "sprite cc ratio blend");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [131, 0, 124, 0xFF],
+            "sprite cc ratio blend"
+        );
     }
 
     /// When the SPCCCS condition is NOT met (mode 1, ==, and priorities differ)
@@ -2935,7 +3142,11 @@ mod tests {
         let fb = sprite_fb_with(0, 0, 0x0012);
         let mut buf = fresh_buf();
         render_frame(&v, Some(&fb), &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "no blend → opaque red");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "no blend → opaque red"
+        );
     }
 
     /// Rotation coefficient table in WORD size, mode 1 (kx only): the 15-bit
@@ -2962,7 +3173,11 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         // mode 1 overrides kx=2 (ky stays 1): screen (1,0) samples plane (2,0).
-        assert_eq!(pixel(&buf, 1, 0), [0xFF, 0, 0, 0xFF], "word-size kx=2 override");
+        assert_eq!(
+            pixel(&buf, 1, 0),
+            [0xFF, 0, 0, 0xFF],
+            "word-size kx=2 override"
+        );
     }
 
     /// Rotation bitmap at 16bpp RGB direct colour, and the R0BMSZ=1 (512×512)
@@ -2984,12 +3199,20 @@ mod tests {
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         // Screen (40,200) → plane (40, 400) → blue (only because size=512×512).
-        assert_eq!(pixel(&buf, 40, 200), [0, 0, 0xFF, 0xFF], "16bpp at row 400 (h=512)");
+        assert_eq!(
+            pixel(&buf, 40, 200),
+            [0, 0, 0xFF, 0xFF],
+            "16bpp at row 400 (h=512)"
+        );
         // With size 0 (512×256) the same plane row 400 wraps to 144 → empty.
         v.regs.write16(0x02A, 0x3200); // clear R0BMSZ
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 40, 200), [0, 0, 0, 0xFF], "h=256 wraps → no dot");
+        assert_eq!(
+            pixel(&buf, 40, 200),
+            [0, 0, 0, 0xFF],
+            "h=256 wraps → no dot"
+        );
     }
 
     #[test]
@@ -3028,7 +3251,11 @@ mod tests {
         // Screen (0,0) → plane y 0 → the dot → red.
         assert_eq!(pixel(&buf, 0, 0), [0xFF, 0, 0, 0xFF], "in-bounds dot");
         // Screen (0,200) → plane y 400 ≥ 256 → outside → transparent → backdrop.
-        assert_eq!(pixel(&buf, 0, 200), [0, 0, 0, 0xFF], "mode-2 outside → backdrop");
+        assert_eq!(
+            pixel(&buf, 0, 200),
+            [0, 0, 0, 0xFF],
+            "mode-2 outside → backdrop"
+        );
     }
 
     /// Rotation tile background with 16×16 (2×2) characters: the 4-cell stepping
@@ -3055,7 +3282,11 @@ mod tests {
         v.cram.write16(7 * 2, 0x001F); // palette 0 index 7 → red
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 1, 2), [0xFF, 0, 0, 0xFF], "rot 16×16 TL subcell");
+        assert_eq!(
+            pixel(&buf, 1, 2),
+            [0xFF, 0, 0, 0xFF],
+            "rot 16×16 TL subcell"
+        );
     }
 
     /// Bitmap size code 2 = 1024×256: the row pitch becomes 1024, so a dot at
@@ -3094,7 +3325,11 @@ mod tests {
         v.vram.write8(0x2_0000, 2); // NBG1 dot
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0xFF, 0xFF], "NBG1 (pri 6) wins over NBG0");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0, 0xFF, 0xFF],
+            "NBG1 (pri 6) wins over NBG0"
+        );
     }
 
     /// Sprite colour-calc condition mode 0 (priority ≤ SPCCN) enables the blend
@@ -3149,7 +3384,11 @@ mod tests {
         v.vram.write32(0x8000, 0x0900_0000); // Xst = 2304.0 (> 2048)
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "outside field → backdrop");
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0, 0, 0, 0xFF],
+            "outside field → backdrop"
+        );
     }
 
     /// 1-word pattern names with CNSM set (12-bit char, no flip) for an NBG
@@ -3169,5 +3408,4 @@ mod tests {
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 3, 0), [0xFF, 0, 0, 0xFF], "cnsm 12-bit char");
     }
-
 }

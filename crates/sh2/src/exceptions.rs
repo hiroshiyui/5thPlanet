@@ -25,5 +25,8 @@ pub enum Exception {
     UserBreak,
     Trapa(u8),
     /// `(vector, level)` from INTC.
-    External { vector: u8, level: u8 },
+    External {
+        vector: u8,
+        level: u8,
+    },
 }

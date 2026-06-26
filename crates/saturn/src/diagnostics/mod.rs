@@ -36,22 +36,86 @@ struct Diag {
 }
 
 const REGISTRY: &[Diag] = &[
-    Diag { name: "cpu_add_imm", category: "cpu", run: cpu_add_imm },
-    Diag { name: "cpu_sub_reg", category: "cpu", run: cpu_sub_reg },
-    Diag { name: "cpu_mull_macl", category: "cpu", run: cpu_mull_macl },
-    Diag { name: "branch_delay_slot", category: "branch", run: branch_delay_slot },
-    Diag { name: "mem_roundtrip_low", category: "memory", run: mem_roundtrip_low },
-    Diag { name: "mem_roundtrip_high", category: "memory", run: mem_roundtrip_high },
-    Diag { name: "divu_divide", category: "onchip", run: divu_divide },
-    Diag { name: "timer_frc_advances", category: "onchip", run: timer_frc_advances },
-    Diag { name: "cpu_logic_ops", category: "cpu", run: cpu_logic_ops },
-    Diag { name: "cpu_shift_ops", category: "cpu", run: cpu_shift_ops },
-    Diag { name: "scu_dma_copy", category: "scu", run: scu_dma_copy },
-    Diag { name: "dmac_transfer", category: "onchip", run: dmac_transfer },
-    Diag { name: "cpu_mac_l", category: "cpu", run: cpu_mac_l },
-    Diag { name: "cpu_cmp_branch", category: "branch", run: cpu_cmp_branch },
-    Diag { name: "vdp2_back_screen", category: "vdp2", run: vdp2_back_screen },
-    Diag { name: "scsp_tone", category: "scsp", run: scsp_tone },
+    Diag {
+        name: "cpu_add_imm",
+        category: "cpu",
+        run: cpu_add_imm,
+    },
+    Diag {
+        name: "cpu_sub_reg",
+        category: "cpu",
+        run: cpu_sub_reg,
+    },
+    Diag {
+        name: "cpu_mull_macl",
+        category: "cpu",
+        run: cpu_mull_macl,
+    },
+    Diag {
+        name: "branch_delay_slot",
+        category: "branch",
+        run: branch_delay_slot,
+    },
+    Diag {
+        name: "mem_roundtrip_low",
+        category: "memory",
+        run: mem_roundtrip_low,
+    },
+    Diag {
+        name: "mem_roundtrip_high",
+        category: "memory",
+        run: mem_roundtrip_high,
+    },
+    Diag {
+        name: "divu_divide",
+        category: "onchip",
+        run: divu_divide,
+    },
+    Diag {
+        name: "timer_frc_advances",
+        category: "onchip",
+        run: timer_frc_advances,
+    },
+    Diag {
+        name: "cpu_logic_ops",
+        category: "cpu",
+        run: cpu_logic_ops,
+    },
+    Diag {
+        name: "cpu_shift_ops",
+        category: "cpu",
+        run: cpu_shift_ops,
+    },
+    Diag {
+        name: "scu_dma_copy",
+        category: "scu",
+        run: scu_dma_copy,
+    },
+    Diag {
+        name: "dmac_transfer",
+        category: "onchip",
+        run: dmac_transfer,
+    },
+    Diag {
+        name: "cpu_mac_l",
+        category: "cpu",
+        run: cpu_mac_l,
+    },
+    Diag {
+        name: "cpu_cmp_branch",
+        category: "branch",
+        run: cpu_cmp_branch,
+    },
+    Diag {
+        name: "vdp2_back_screen",
+        category: "vdp2",
+        run: vdp2_back_screen,
+    },
+    Diag {
+        name: "scsp_tone",
+        category: "scsp",
+        run: scsp_tone,
+    },
 ];
 
 /// Run every built-in diagnostic and collect the outcomes (registry order).
@@ -60,7 +124,12 @@ pub fn run_all() -> Vec<DiagOutcome> {
         .iter()
         .map(|d| {
             let (passed, detail) = (d.run)();
-            DiagOutcome { name: d.name, category: d.category, passed, detail }
+            DiagOutcome {
+                name: d.name,
+                category: d.category,
+                passed,
+                detail,
+            }
         })
         .collect()
 }
@@ -75,7 +144,9 @@ pub fn run_all() -> Vec<DiagOutcome> {
 /// emulator correct?".
 pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) -> Vec<DiagOutcome> {
     // TOC facts are pure — read them before the disc is moved into the machine.
-    let toc = disc.as_ref().map(|d| (d.first_track(), d.last_track(), d.lead_out_fad()));
+    let toc = disc
+        .as_ref()
+        .map(|d| (d.first_track(), d.last_track(), d.lead_out_fad()));
     let has_disc = disc.is_some();
 
     let mut sat = Saturn::new(bios);
@@ -133,7 +204,11 @@ pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) ->
                 detail: format!(
                     "master PC=0x{:08X} ({})",
                     sat.master().regs.pc,
-                    if reached_hwram { "reached HWRAM" } else { "never reached HWRAM" }
+                    if reached_hwram {
+                        "reached HWRAM"
+                    } else {
+                        "never reached HWRAM"
+                    }
                 ),
             });
         }
@@ -179,7 +254,13 @@ fn verdict_advanced(first: u32, second: u32) -> (bool, String) {
 
 /// Emit the five instructions that build `0x0020_0100` into R1 (clobbers R2).
 fn build_low_scratch_addr() -> [u16; 5] {
-    [mov_imm(1, 0x20), shll16(1), mov_imm(2, 1), shll8(2), add(1, 2)]
+    [
+        mov_imm(1, 0x20),
+        shll16(1),
+        mov_imm(2, 1),
+        shll8(2),
+        add(1, 2),
+    ]
 }
 
 /// Emit the seven instructions that build the [`SENTINEL`] (`0x2A2A2A2A`) into
@@ -236,10 +317,10 @@ fn branch_delay_slot() -> (bool, String) {
     // bra disp=1 skips exactly the one instruction after the delay slot:
     // target = (bra_pc + 4) + disp*2, with bra@0x22 → target 0x28 (the addr build).
     let mut code = vec![
-        mov_imm(0, 1),      // 0x20  R0 = 1
-        asm_bra(1),         // 0x22  BRA target (delay slot follows)
-        add_imm(0, 41),     // 0x24  delay slot: R0 = 42 (must run)
-        mov_imm(0, 99),     // 0x26  skipped (must NOT run)
+        mov_imm(0, 1),  // 0x20  R0 = 1
+        asm_bra(1),     // 0x22  BRA target (delay slot follows)
+        add_imm(0, 41), // 0x24  delay slot: R0 = 42 (must run)
+        mov_imm(0, 99), // 0x26  skipped (must NOT run)
     ];
     code.extend(build_low_scratch_addr()); // 0x28.. target
     code.extend([movl_store(1, 0), bra_self(), NOP]);
@@ -257,7 +338,14 @@ fn mem_roundtrip_low() -> (bool, String) {
 /// Same round-trip through High WRAM (`0x0600_0100`).
 fn mem_roundtrip_high() -> (bool, String) {
     // build 0x0600_0100 into R1 (clobbers R2): 6<<24 | 0x100.
-    let base = vec![mov_imm(1, 6), shll16(1), shll8(1), mov_imm(2, 1), shll8(2), add(1, 2)];
+    let base = vec![
+        mov_imm(1, 6),
+        shll16(1),
+        shll8(1),
+        mov_imm(2, 1),
+        shll8(2),
+        add(1, 2),
+    ];
     let code = roundtrip_code(base, 4);
     verdict(read_high(&run_program(&code), HIGH_SCRATCH), SENTINEL)
 }
@@ -288,9 +376,9 @@ fn roundtrip_code(base_addr_seq: Vec<u16>, result_off: i8) -> Vec<u16> {
 fn divu_divide() -> (bool, String) {
     let code = [
         mov_imm(1, -1),
-        shll8(1),         // R1 = 0xFFFFFF00 (DVSR)
+        shll8(1), // R1 = 0xFFFFFF00 (DVSR)
         mov_imm(2, 4),
-        add(2, 1),        // R2 = 0xFFFFFF04 (DVDNT)
+        add(2, 1), // R2 = 0xFFFFFF04 (DVDNT)
         mov_imm(3, 3),
         movl_store(1, 3), // DVSR = 3
         mov_imm(4, 126),
@@ -301,7 +389,7 @@ fn divu_divide() -> (bool, String) {
         shll16(1),
         mov_imm(5, 1),
         shll8(5),
-        add(1, 5),        // R1 = 0x0020_0100
+        add(1, 5), // R1 = 0x0020_0100
         movl_store(1, 0),
         bra_self(),
         NOP,
@@ -317,21 +405,21 @@ fn divu_divide() -> (bool, String) {
 fn timer_frc_advances() -> (bool, String) {
     let mut code = vec![
         mov_imm(1, -2),
-        shll8(1),    // R1 = 0xFFFFFE00
+        shll8(1), // R1 = 0xFFFFFE00
         mov_imm(2, 0x12),
-        add(1, 2),   // R1 = 0xFFFFFE12 (FRC, 16-bit)
+        add(1, 2), // R1 = 0xFFFFFE12 (FRC, 16-bit)
         // Low scratch base in R5 (= 0x0020_0100).
         mov_imm(5, 0x20),
         shll16(5),
         mov_imm(6, 1),
         shll8(6),
         add(5, 6),
-        movw_load(3, 1), // R3 = FRC (first)
+        movw_load(3, 1),  // R3 = FRC (first)
         movl_store(5, 3), // scratch[0x100] = first
     ];
     code.extend([NOP; 16]); // burn cycles so the counter ticks
     code.extend([
-        movw_load(4, 1),  // R4 = FRC (second)
+        movw_load(4, 1), // R4 = FRC (second)
         mov_imm(6, 4),
         add(6, 5),        // R6 = 0x0020_0104
         movl_store(6, 4), // scratch[0x104] = second
@@ -377,12 +465,23 @@ fn scu_dma_copy() -> (bool, String) {
     let mut code = sentinel_r0().to_vec(); // R0 = sentinel 0x2A2A2A2A
     code.extend([
         // R2 = source 0x0020_0200, plant the sentinel there
-        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
+        mov_imm(2, 0x20),
+        shll16(2),
+        mov_imm(4, 2),
+        shll8(4),
+        add(2, 4),
         movl_store(2, 0),
         // R3 = dest 0x0020_0300
-        mov_imm(3, 0x20), shll16(3), mov_imm(4, 3), shll8(4), add(3, 4),
+        mov_imm(3, 0x20),
+        shll16(3),
+        mov_imm(4, 3),
+        shll8(4),
+        add(3, 4),
         // R1 = SCU base 0x05FE_0000 (6<<8 = 0x600, -2 = 0x5FE, <<16)
-        mov_imm(1, 6), shll8(1), add_imm(1, -2), shll16(1),
+        mov_imm(1, 6),
+        shll8(1),
+        add_imm(1, -2),
+        shll16(1),
         movl_store(1, 2), // D0R (base+0x00) = source
     ]);
     // D0W (base+0x04) = dest
@@ -390,16 +489,34 @@ fn scu_dma_copy() -> (bool, String) {
     // D0C (base+0x08) = 4 bytes
     code.extend([mov_imm(4, 0x08), add(4, 1), mov_imm(5, 4), movl_store(4, 5)]);
     // D0AD (base+0x0C) = 0x101 (read +4, write +2 — the contiguous-copy form)
-    code.extend([mov_imm(5, 1), shll8(5), add_imm(5, 1), mov_imm(4, 0x0C), add(4, 1), movl_store(4, 5)]);
+    code.extend([
+        mov_imm(5, 1),
+        shll8(5),
+        add_imm(5, 1),
+        mov_imm(4, 0x0C),
+        add(4, 1),
+        movl_store(4, 5),
+    ]);
     // D0MD (base+0x14) = (1<<16)|(1<<8)|7 = 0x10107 (RUP | WUP | manual factor)
     code.extend([
-        mov_imm(5, 1), shll16(5),
-        mov_imm(6, 1), shll8(6), add(5, 6),
+        mov_imm(5, 1),
+        shll16(5),
+        mov_imm(6, 1),
+        shll8(6),
+        add(5, 6),
         add_imm(5, 7),
-        mov_imm(4, 0x14), add(4, 1), movl_store(4, 5),
+        mov_imm(4, 0x14),
+        add(4, 1),
+        movl_store(4, 5),
     ]);
     // D0EN (base+0x10) = DGO (0x100) — triggers the transfer
-    code.extend([mov_imm(5, 1), shll8(5), mov_imm(4, 0x10), add(4, 1), movl_store(4, 5)]);
+    code.extend([
+        mov_imm(5, 1),
+        shll8(5),
+        mov_imm(4, 0x10),
+        add(4, 1),
+        movl_store(4, 5),
+    ]);
     code.extend([bra_self(), NOP]);
     verdict(read_low(&run_program(&code), DEST), SENTINEL)
 }
@@ -416,10 +533,18 @@ fn dmac_transfer() -> (bool, String) {
     let mut code = sentinel_r0().to_vec(); // R0 = sentinel 0x2A2A2A2A
     code.extend([
         // R2 = source 0x0020_0200, plant the sentinel
-        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
+        mov_imm(2, 0x20),
+        shll16(2),
+        mov_imm(4, 2),
+        shll8(4),
+        add(2, 4),
         movl_store(2, 0),
         // R3 = dest 0x0020_0300
-        mov_imm(3, 0x20), shll16(3), mov_imm(4, 3), shll8(4), add(3, 4),
+        mov_imm(3, 0x20),
+        shll16(3),
+        mov_imm(4, 3),
+        shll8(4),
+        add(3, 4),
         // R1 = SAR0 base 0xFFFFFF80
         mov_imm(1, -128),
         movl_store(1, 2), // SAR0 (base+0x00) = source
@@ -429,7 +554,14 @@ fn dmac_transfer() -> (bool, String) {
     // TCR0 (base+0x08) = 1 longword
     code.extend([mov_imm(4, 0x08), add(4, 1), mov_imm(5, 1), movl_store(4, 5)]);
     // CHCR0 (base+0x0C) = 0x5C01 (DM=inc, SM=inc, TS=long, DE=1)
-    code.extend([mov_imm(5, 0x5C), shll8(5), add_imm(5, 1), mov_imm(4, 0x0C), add(4, 1), movl_store(4, 5)]);
+    code.extend([
+        mov_imm(5, 0x5C),
+        shll8(5),
+        add_imm(5, 1),
+        mov_imm(4, 0x0C),
+        add(4, 1),
+        movl_store(4, 5),
+    ]);
     // DMAOR (base+0x30) = 1 (DME) — arms the master enable, runs the transfer
     code.extend([mov_imm(5, 1), mov_imm(4, 0x30), add(4, 1), movl_store(4, 5)]);
     code.extend([bra_self(), NOP]);
@@ -443,16 +575,40 @@ fn dmac_transfer() -> (bool, String) {
 fn cpu_mac_l() -> (bool, String) {
     let mut code = vec![
         // R1 = 0x0020_0200 (array base)
-        mov_imm(1, 0x20), shll16(1), mov_imm(4, 2), shll8(4), add(1, 4),
+        mov_imm(1, 0x20),
+        shll16(1),
+        mov_imm(4, 2),
+        shll8(4),
+        add(1, 4),
         // A = [3, 4] at +0x00 / +0x04
-        mov_imm(5, 3), movl_store(1, 5),
-        mov_imm(4, 4), add(4, 1), mov_imm(5, 4), movl_store(4, 5),
+        mov_imm(5, 3),
+        movl_store(1, 5),
+        mov_imm(4, 4),
+        add(4, 1),
+        mov_imm(5, 4),
+        movl_store(4, 5),
         // B = [10, 3] at +0x10 / +0x14
-        mov_imm(4, 0x10), add(4, 1), mov_imm(5, 10), movl_store(4, 5),
-        mov_imm(4, 0x14), add(4, 1), mov_imm(5, 3), movl_store(4, 5),
+        mov_imm(4, 0x10),
+        add(4, 1),
+        mov_imm(5, 10),
+        movl_store(4, 5),
+        mov_imm(4, 0x14),
+        add(4, 1),
+        mov_imm(5, 3),
+        movl_store(4, 5),
         // R2 = &A (0x200200), R3 = &B (0x200210)
-        mov_imm(2, 0x20), shll16(2), mov_imm(4, 2), shll8(4), add(2, 4),
-        mov_imm(3, 0x20), shll16(3), mov_imm(4, 2), shll8(4), add(3, 4), mov_imm(4, 0x10), add(3, 4),
+        mov_imm(2, 0x20),
+        shll16(2),
+        mov_imm(4, 2),
+        shll8(4),
+        add(2, 4),
+        mov_imm(3, 0x20),
+        shll16(3),
+        mov_imm(4, 2),
+        shll8(4),
+        add(3, 4),
+        mov_imm(4, 0x10),
+        add(3, 4),
         CLRMAC,
         mac_l(2, 3), // 3*10 = 30
         mac_l(2, 3), // + 4*3 = 42
@@ -468,12 +624,12 @@ fn cpu_mac_l() -> (bool, String) {
 /// way leaves the wrong value).
 fn cpu_cmp_branch() -> (bool, String) {
     let mut code = vec![
-        mov_imm(1, 5),   // 0x20
-        mov_imm(2, 5),   // 0x22
-        cmp_eq(2, 1),    // 0x24  T = (R2 == R1) = 1
-        bt(0),           // 0x26  if T: target = PC+4 = 0x2A (skips the next insn)
-        mov_imm(0, 7),   // 0x28  wrong value (must be skipped)
-        mov_imm(0, 42),  // 0x2A  target: correct value
+        mov_imm(1, 5),  // 0x20
+        mov_imm(2, 5),  // 0x22
+        cmp_eq(2, 1),   // 0x24  T = (R2 == R1) = 1
+        bt(0),          // 0x26  if T: target = PC+4 = 0x2A (skips the next insn)
+        mov_imm(0, 7),  // 0x28  wrong value (must be skipped)
+        mov_imm(0, 42), // 0x2A  target: correct value
     ];
     code.extend(build_low_scratch_addr());
     code.extend([movl_store(1, 0), bra_self(), NOP]);
@@ -506,7 +662,10 @@ fn vdp2_back_screen() -> (bool, String) {
     let px = ((h / 2) * w + w / 2) * 4;
     let got = [fb[px], fb[px + 1], fb[px + 2], fb[px + 3]];
     let want = [0x00, 0xFF, 0x00, 0xFF];
-    (got == want, format!("centre pixel {got:02X?}, want {want:02X?}"))
+    (
+        got == want,
+        format!("centre pixel {got:02X?}, want {want:02X?}"),
+    )
 }
 
 /// SCSP synthesis: program slot 0 to loop a full-scale 64-sample sine at full
@@ -537,7 +696,8 @@ fn scsp_tone() -> (bool, String) {
     sat.bus.write16(SCSP + 0x400, 0x000F, AccessKind::Data); // MVOL = 0xF
     // Slot 0: SA / loop window / instant attack / full direct level, key on last
     // (the KYONEX strobe in reg0 is processed while the SCSP is running).
-    sat.bus.write16(SCSP + 0x02, SA_LOW as u16, AccessKind::Data); // reg1 SA-low
+    sat.bus
+        .write16(SCSP + 0x02, SA_LOW as u16, AccessKind::Data); // reg1 SA-low
     sat.bus.write16(SCSP + 0x04, 0, AccessKind::Data); // reg2 LSA
     sat.bus.write16(SCSP + 0x06, 63, AccessKind::Data); // reg3 LEA (loop end)
     sat.bus.write16(SCSP + 0x08, 0x001F, AccessKind::Data); // reg4 AR = max
@@ -572,7 +732,11 @@ mod tests {
     #[test]
     fn all_diagnostics_pass() {
         for o in run_all() {
-            assert!(o.passed, "diagnostic {}/{} failed: {}", o.category, o.name, o.detail);
+            assert!(
+                o.passed,
+                "diagnostic {}/{} failed: {}",
+                o.category, o.name, o.detail
+            );
         }
     }
 
@@ -589,13 +753,21 @@ mod tests {
         code.extend(build_low_scratch_addr());
         code.extend([movl_store(1, 0), bra_self(), NOP]);
         let (passed, detail) = verdict(read_low(&run_program(&code), LOW_SCRATCH), 99);
-        assert!(!passed, "a wrong expectation must be reported as failure (detail: {detail})");
+        assert!(
+            !passed,
+            "a wrong expectation must be reported as failure (detail: {detail})"
+        );
         assert!(
             detail.contains("0000002A") && detail.contains("00000063"),
             "detail should show got 0x2A vs want 0x63: {detail}"
         );
         // The same all-pass predicate `all_diagnostics_pass` relies on must flag it.
-        let outcomes = [DiagOutcome { name: "neg_control", category: "test", passed, detail }];
+        let outcomes = [DiagOutcome {
+            name: "neg_control",
+            category: "test",
+            passed,
+            detail,
+        }];
         assert!(
             !outcomes.iter().all(|o| o.passed),
             "the CI gate's all-pass predicate must reject a failing outcome"
@@ -620,14 +792,23 @@ mod tests {
         use sh2::isa::Op;
         assert!(matches!(decode(mul_l(4, 5)), Op::MulL { rn: 4, rm: 5 }));
         assert!(matches!(decode(sts_macl(0)), Op::StsMacl { rn: 0 }));
-        assert!(matches!(decode(movl_store(1, 0)), Op::MovLS { rn: 1, rm: 0 }));
-        assert!(matches!(decode(movl_load(0, 1)), Op::MovLL { rn: 0, rm: 1 }));
+        assert!(matches!(
+            decode(movl_store(1, 0)),
+            Op::MovLS { rn: 1, rm: 0 }
+        ));
+        assert!(matches!(
+            decode(movl_load(0, 1)),
+            Op::MovLL { rn: 0, rm: 1 }
+        ));
         assert!(matches!(decode(shll16(1)), Op::Shll16 { rn: 1 }));
         assert!(matches!(decode(shll8(2)), Op::Shll8 { rn: 2 }));
         assert!(matches!(decode(add(1, 2)), Op::Add { rn: 1, rm: 2 }));
         assert!(matches!(decode(sub(0, 5)), Op::Sub { rn: 0, rm: 5 }));
         assert!(matches!(decode(asm_bra(1)), Op::Bra { disp: 1 }));
-        assert!(matches!(decode(movw_load(3, 1)), Op::MovWL { rn: 3, rm: 1 }));
+        assert!(matches!(
+            decode(movw_load(3, 1)),
+            Op::MovWL { rn: 3, rm: 1 }
+        ));
         assert!(matches!(decode(and_(0, 2)), Op::And { rn: 0, rm: 2 }));
         assert!(matches!(decode(or_(0, 2)), Op::Or { rn: 0, rm: 2 }));
         assert!(matches!(decode(xor_(0, 2)), Op::Xor { rn: 0, rm: 2 }));

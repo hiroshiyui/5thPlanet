@@ -78,10 +78,7 @@ fn shlln_shlrn_multi_bit_shifts() {
     let mut bus = MemBus::new(64 * 1024);
     // SHLL2 R1 -> 0x4108 ; SHLL8 R1 -> 0x4118 ; SHLL16 R1 -> 0x4128
     // SHLR2 R2 -> 0x4209 ; SHLR8 R2 -> 0x4219 ; SHLR16 R2 -> 0x4229
-    let mut c = cpu(
-        &mut bus,
-        &[0x4108, 0x4118, 0x4128, 0x4209, 0x4219, 0x4229],
-    );
+    let mut c = cpu(&mut bus, &[0x4108, 0x4118, 0x4128, 0x4209, 0x4219, 0x4229]);
     c.regs.r[1] = 0x0000_0001;
     c.step(&mut bus);
     assert_eq!(c.regs.r[1], 4);

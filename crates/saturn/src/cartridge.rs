@@ -56,8 +56,7 @@ const ID_BRAM_16MBIT: u8 = 0x23; // 2 MiB
 const ID_BRAM_32MBIT: u8 = 0x24; // 4 MiB
 
 /// What is plugged into the slot. Defaults to [`Cartridge::None`].
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Cartridge {
     /// Empty slot — ID byte reads `0xFF`, all cart space floats high.
     #[default]

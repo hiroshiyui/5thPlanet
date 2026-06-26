@@ -6,9 +6,9 @@
 //! is a concrete value derived from the SH-2 software / SH7604 hardware
 //! manual semantics the code cites.
 
-use sh2::{Cpu, Lookup};
 use sh2::harness::MemBus;
 use sh2::regs::Sr;
+use sh2::{Cpu, Lookup};
 
 const PC0: u32 = 0x0000_1000;
 const SP0: u32 = 0x0000_8000;
@@ -63,7 +63,11 @@ fn mac_l_clamps_to_negative_floor_when_s_set() {
     cpu.regs.macl = 0x0000_0000;
     cpu.step(&mut bus);
     let result = ((cpu.regs.mach as u64) << 32) | cpu.regs.macl as u64;
-    assert_eq!(result as i64, -(1i64 << 47), "clamped to -floor 48-bit signed");
+    assert_eq!(
+        result as i64,
+        -(1i64 << 47),
+        "clamped to -floor 48-bit signed"
+    );
 }
 
 #[test]
@@ -122,7 +126,10 @@ fn rte_executes_delay_slot_then_resumes_popped_pc_and_sr() {
 
     cpu.step(&mut bus); // SETT delay slot runs, THEN PC := resume
     assert!(cpu.regs.sr.t(), "delay slot SETT took effect");
-    assert_eq!(cpu.regs.pc, resume, "resumed at the popped PC after the slot");
+    assert_eq!(
+        cpu.regs.pc, resume,
+        "resumed at the popped PC after the slot"
+    );
 
     cpu.step(&mut bus); // MOV #9, R3 at the resume target
     assert_eq!(cpu.regs.r[3], 9, "execution continued at the resume PC");
@@ -194,7 +201,10 @@ fn assoc_purge_byte_read_in_region_5_is_open_bus() {
     bus.write_u32(0x4000, 0xAABB_CCDD);
     cpu.step(&mut bus);
     // !0 byte sign-extended → 0xFFFF_FFFF.
-    assert_eq!(cpu.regs.r[2], 0xFFFF_FFFF, "byte assoc-purge read is open bus");
+    assert_eq!(
+        cpu.regs.r[2], 0xFFFF_FFFF,
+        "byte assoc-purge read is open bus"
+    );
 }
 
 #[test]
@@ -240,14 +250,29 @@ fn ccr_word_access_sets_cp_and_preserves_ce() {
     let purges_before = cpu.cache.dbg_purges();
 
     cpu.step(&mut bus); // MOV.W @CCR,R0
-    assert_eq!(cpu.regs.r[0], 0x0101, "word read mirrors CCR into both bytes (SH7604 / Mednafen CCR|CCR<<8)");
+    assert_eq!(
+        cpu.regs.r[0], 0x0101,
+        "word read mirrors CCR into both bytes (SH7604 / Mednafen CCR|CCR<<8)"
+    );
     cpu.step(&mut bus); // OR #0x10,R0
     assert_eq!(cpu.regs.r[0] & 0xFF, 0x11, "CP bit requested");
     cpu.step(&mut bus); // MOV.W R0,@CCR
 
-    assert_eq!(cpu.cache.ccr(), 0x01, "CP is write-only; CE remains enabled");
-    assert_eq!(cpu.cache.dbg_purges(), purges_before + 1, "word write triggered CP purge");
-    assert_eq!(cpu.cache.lookup_data(cached_addr), Lookup::Miss, "resident line was purged");
+    assert_eq!(
+        cpu.cache.ccr(),
+        0x01,
+        "CP is write-only; CE remains enabled"
+    );
+    assert_eq!(
+        cpu.cache.dbg_purges(),
+        purges_before + 1,
+        "word write triggered CP purge"
+    );
+    assert_eq!(
+        cpu.cache.lookup_data(cached_addr),
+        Lookup::Miss,
+        "resident line was purged"
+    );
 }
 
 #[test]
@@ -259,7 +284,10 @@ fn onchip_register_reached_through_mov_l_routes_to_onchip_not_bus() {
     cpu.regs.r[1] = 0xFFFF_FF8C; // DMAC CHCR0
     cpu.regs.r[2] = 0x0000_ABCD;
     cpu.step(&mut bus); // write
-    assert_eq!(cpu.onchip.dmac.channels[0].chcr, 0x0000_ABCD, "routed to OnChip");
+    assert_eq!(
+        cpu.onchip.dmac.channels[0].chcr, 0x0000_ABCD,
+        "routed to OnChip"
+    );
     cpu.step(&mut bus); // read back
     assert_eq!(cpu.regs.r[3], 0x0000_ABCD, "read back via on-chip routing");
 }

@@ -290,7 +290,11 @@ impl Dbg {
         if let Some((pc, g)) = &self.bp68 {
             let g = g
                 .map(|(r, v)| {
-                    let n = if r < 8 { format!("D{r}") } else { format!("A{}", r - 8) };
+                    let n = if r < 8 {
+                        format!("D{r}")
+                    } else {
+                        format!("A{}", r - 8)
+                    };
                     format!("  if {n}=={v:08X}")
                 })
                 .unwrap_or_default();
@@ -395,16 +399,28 @@ impl Dbg {
             let f = &oc.frt;
             println!(
                 "{who} FRT: TIER={:02X}(ICIE={}) FTCSR={:02X}(ICF={} OCFA={} OCFB={} OVF={}) FRC={:04X} FICR={:04X}",
-                f.tier, (f.tier >> 7) & 1,
-                f.ftcsr, (f.ftcsr >> 7) & 1, (f.ftcsr >> 3) & 1, (f.ftcsr >> 2) & 1, (f.ftcsr >> 1) & 1,
-                f.frc, f.ficr,
+                f.tier,
+                (f.tier >> 7) & 1,
+                f.ftcsr,
+                (f.ftcsr >> 7) & 1,
+                (f.ftcsr >> 3) & 1,
+                (f.ftcsr >> 2) & 1,
+                (f.ftcsr >> 1) & 1,
+                f.frc,
+                f.ficr,
             );
             let w = &oc.wdt;
             // WTCSR: OVF bit7, WT/IT bit6 (1=watchdog,0=interval), TME bit5 (enable), CKS bits2-0.
             println!(
                 "{who} WDT: WTCSR={:02X}(TME={} WT/IT={} OVF={} CKS={}) WTCNT={:02X} RSTCSR={:02X} int_active={}",
-                w.wtcsr, (w.wtcsr >> 5) & 1, (w.wtcsr >> 6) & 1, (w.wtcsr >> 7) & 1, w.wtcsr & 7,
-                w.wtcnt, w.rstcsr, w.interrupt_active() as u8,
+                w.wtcsr,
+                (w.wtcsr >> 5) & 1,
+                (w.wtcsr >> 6) & 1,
+                (w.wtcsr >> 7) & 1,
+                w.wtcsr & 7,
+                w.wtcnt,
+                w.rstcsr,
+                w.interrupt_active() as u8,
             );
         }
     }
@@ -422,8 +438,13 @@ impl Dbg {
             let [fh, fm, dh, dm] = c.dbg_stats();
             println!(
                 "{who} CACHE: CCR={:02X} enabled={} Idis={} Ddis={} 2way={} | fetch {fh}h/{fm}m  data {dh}h/{dm}m | purges full={} assoc={}",
-                c.ccr(), c.enabled() as u8, c.inst_disabled() as u8, c.data_disabled() as u8, c.two_way() as u8,
-                c.dbg_purges(), c.dbg_assoc_purges(),
+                c.ccr(),
+                c.enabled() as u8,
+                c.inst_disabled() as u8,
+                c.data_disabled() as u8,
+                c.two_way() as u8,
+                c.dbg_purges(),
+                c.dbg_assoc_purges(),
             );
         }
     }
@@ -447,7 +468,11 @@ impl Dbg {
             for (addr, data) in lines {
                 let mut mem = [0u8; 16];
                 for i in 0..4 {
-                    let w = self.sat.bus.read32(addr.wrapping_add(i * 4), AccessKind::Data).0;
+                    let w = self
+                        .sat
+                        .bus
+                        .read32(addr.wrapping_add(i * 4), AccessKind::Data)
+                        .0;
                     mem[i as usize * 4..i as usize * 4 + 4].copy_from_slice(&w.to_be_bytes());
                 }
                 if mem != data {
@@ -478,10 +503,14 @@ impl Dbg {
             let s = self.sat.slave().dbg_stale_fetch;
             if m.is_some() || s.is_some() {
                 if let Some((a, c, mem, cyc)) = m {
-                    println!("MASTER STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})");
+                    println!(
+                        "MASTER STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})"
+                    );
                 }
                 if let Some((a, c, mem, cyc)) = s {
-                    println!("SLAVE STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})");
+                    println!(
+                        "SLAVE STALE FETCH @{a:08X}: cache {c:04X} vs mem {mem:04X} (cycle {cyc}, frame {f})"
+                    );
                 }
                 caught = true;
                 break;
@@ -887,10 +916,9 @@ impl Dbg {
                 continue;
             }
             let mut it = line.split_whitespace();
-            if let (Some(fr), Some(m)) = (
-                it.next().and_then(parse_dec),
-                it.next().and_then(parse_num),
-            ) {
+            if let (Some(fr), Some(m)) =
+                (it.next().and_then(parse_dec), it.next().and_then(parse_num))
+            {
                 events.push((fr, m as u16));
             }
         }
@@ -942,8 +970,17 @@ impl Dbg {
     /// best-effort stack call-chain (return-address-shaped stack words). No
     /// frame pointers on SH-2, so the chain is heuristic but reliably surfaces
     /// the callers; symbols annotate each.
-    fn report_bp_hit(&mut self, which: &str, frame: u64, h: &saturn::scheduler::BpHit, chain: bool) {
-        println!("{which} breakpoint hit at frame {frame}: pc={}", self.fmt_addr(h.pc));
+    fn report_bp_hit(
+        &mut self,
+        which: &str,
+        frame: u64,
+        h: &saturn::scheduler::BpHit,
+        chain: bool,
+    ) {
+        println!(
+            "{which} breakpoint hit at frame {frame}: pc={}",
+            self.fmt_addr(h.pc)
+        );
         if let Some(a) = self.bp_probe {
             println!("  probe [{a:08X}] = {:08X} (raw WRAM via bus)", h.probe);
         }
@@ -956,7 +993,12 @@ impl Dbg {
             "  r8-15: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
             r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
         );
-        println!("  pr={:08X} gbr={:08X} code={:04X?}", h.pr, h.gbr, &h.code[..h.code.len().min(8)]);
+        println!(
+            "  pr={:08X} gbr={:08X} code={:04X?}",
+            h.pr,
+            h.gbr,
+            &h.code[..h.code.len().min(8)]
+        );
         if chain {
             let sp = r[15];
             println!("  stack call-chain (sp={sp:08X}, likely return addrs):");
@@ -1029,7 +1071,8 @@ impl Dbg {
         // breakpoint for exact register state (the frame-batched trace pass runs
         // past it). Cheap — external media is referenced, not embedded.
         let snap = self.sat.save_state();
-        let mut recent: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(64);
+        let mut recent: std::collections::VecDeque<u32> =
+            std::collections::VecDeque::with_capacity(64);
         let mut cursor = 0usize; // index into `reference` matched so far
         let mut pcs: Vec<u32> = Vec::with_capacity(8_000_000);
         for f in 0..max_frames {
@@ -1068,7 +1111,14 @@ impl Dbg {
     /// Print the first-divergence context: the matched-prefix tail (both sides
     /// agree), the diverging PC on each side, the reference's continuation, and
     /// a disassembly of what *ours* executed there.
-    fn report_divergence(&mut self, reference: &[u32], i: usize, our_pc: u32, add: u32, frame: u64) {
+    fn report_divergence(
+        &mut self,
+        reference: &[u32],
+        i: usize,
+        our_pc: u32,
+        add: u32,
+        frame: u64,
+    ) {
         const TAIL: usize = 6; // matched context before the split
         const AHEAD: usize = 8; // reference continuation after the split
         let exec = our_pc.wrapping_sub(add);
@@ -1235,7 +1285,11 @@ impl Dbg {
                     Some(pc) => {
                         let g = Self::parse_guard(a2, a3);
                         self.sbps.push((pc, g));
-                        println!("slave bp #{} @ {}", self.mbps.len() + self.sbps.len() - 1, self.fmt_addr(pc));
+                        println!(
+                            "slave bp #{} @ {}",
+                            self.mbps.len() + self.sbps.len() - 1,
+                            self.fmt_addr(pc)
+                        );
                     }
                     None => println!("unknown symbol/address {tok:?}"),
                 },
@@ -1366,7 +1420,10 @@ impl Dbg {
             }
             "ftcsrdump" => {
                 let log = core::mem::take(&mut self.sat.master_mut().dbg_ftcsr_log);
-                println!("FTCSR: {} byte access(es) [pc ~= access instr + 2]:", log.len());
+                println!(
+                    "FTCSR: {} byte access(es) [pc ~= access instr + 2]:",
+                    log.len()
+                );
                 for (pc, val, is_w, cyc) in &log {
                     let icf = if val & 0x80 != 0 { "ICF=1" } else { "ICF=0" };
                     println!(
@@ -1381,8 +1438,15 @@ impl Dbg {
                 // `ftcsr`): the master's path right after acking the slave's
                 // round-1 done — the streaming round-2 decision. One PC per line.
                 let log = core::mem::take(&mut self.sat.master_mut().dbg_pc_log);
-                let n = a1.and_then(parse_dec).map(|v| v as usize).unwrap_or(log.len());
-                println!("post-clear PC trace: {} PCs (showing {})", log.len(), n.min(log.len()));
+                let n = a1
+                    .and_then(parse_dec)
+                    .map(|v| v as usize)
+                    .unwrap_or(log.len());
+                println!(
+                    "post-clear PC trace: {} PCs (showing {})",
+                    log.len(),
+                    n.min(log.len())
+                );
                 for pc in log.iter().take(n) {
                     println!("{pc:08X}");
                 }
@@ -1837,7 +1901,10 @@ not-a-pc
         let mut r = VecDeque::new();
         assert!(collapse_should_log(&mut r, 0x100), "first sight logs");
         assert!(collapse_should_log(&mut r, 0x200));
-        assert!(!collapse_should_log(&mut r, 0x100), "repeat within window suppressed");
+        assert!(
+            !collapse_should_log(&mut r, 0x100),
+            "repeat within window suppressed"
+        );
         assert!(!collapse_should_log(&mut r, 0x200));
         // Fill the window past 64 distinct PCs so 0x100 is evicted, then it logs
         // again — a spin that idles longer than the window re-logs one pass.

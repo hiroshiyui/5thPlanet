@@ -104,8 +104,7 @@ impl Command {
 /// clock, the RTC, peripheral input via `INTBACK` (digital pad / Shuttle
 /// Mouse), and slave/sound on-off. Registers live at odd byte offsets; a write
 /// to COMREG queues a [`Command`] the Saturn aggregate drains.
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Smpc {
     pub ireg: [u8; 7],
     pub oreg: [u8; 32],

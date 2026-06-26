@@ -406,8 +406,8 @@ mod libcdio_tests {
 /// behind the `libcdio` feature, and wrapped in a safe [`Cdio`] handle.
 #[cfg(feature = "libcdio")]
 mod ffi {
-    use super::{TrackInfo, FAD_OFFSET, SECTOR_RAW, SECTOR_USER};
-    use core::ffi::{c_char, c_int, c_void, CStr};
+    use super::{FAD_OFFSET, SECTOR_RAW, SECTOR_USER, TrackInfo};
+    use core::ffi::{CStr, c_char, c_int, c_void};
     use std::ffi::CString;
 
     // libcdio opaque handle + the small slice of its C API we use. Signatures

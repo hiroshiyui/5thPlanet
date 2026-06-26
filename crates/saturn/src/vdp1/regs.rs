@@ -32,8 +32,7 @@ pub const EDSR_CEF: u16 = 0x0002;
 
 /// VDP1's 24-byte register bank (TVMR/FBCR/PTMR/… control + EDSR/LOPR/COPR/MODR
 /// status). Plain register storage; the plotter and frame-change logic read it.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Vdp1Regs {
     /// Writeable control registers, flat big-endian (offsets 0x00..0x0E).
     raw: [u8; REG_BYTES],

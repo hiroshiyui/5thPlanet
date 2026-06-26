@@ -511,16 +511,21 @@ mod tests {
         // the same TEMP cell.
         let prog = [
             // s0: X=MIXS[0], Y=COEF[0], ZERO B, SHIFT3 → ACC = MIXS·Y
-            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
-            // s1: SHIFT3 (shifts the s0 ACC), TWT→TEMP[5], ZERO keeps ACC sane
             [
-                ip0(0, 1, 5),
                 0,
+                ip1(1, 1, 0x20, 0, 0),
                 ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
                 0,
             ],
+            // s1: SHIFT3 (shifts the s0 ACC), TWT→TEMP[5], ZERO keeps ACC sane
+            [ip0(0, 1, 5), 0, ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
             // s2: X=TEMP[5] (XSEL=0, TRA=5), Y=COEF[0], ZERO B, SHIFT3 → ACC
-            [ip0(5, 0, 0), ip1(0, 1, 0, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            [
+                ip0(5, 0, 0),
+                ip1(0, 1, 0, 0, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
             // s3: SHIFT3, EWT→EFREG[0]
             [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
         ];
@@ -552,7 +557,12 @@ mod tests {
         let table = 1u16 << 15;
         let prog = [
             // s0: ACC = MIXS[0]·Y (a known non-zero shifter source next step)
-            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            [
+                0,
+                ip1(1, 1, 0x20, 0, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
             // s1: SHIFT3 → shifter, MWT (NOFL raw) to MADRS[0], table absolute
             [
                 0,
@@ -574,7 +584,12 @@ mod tests {
             //   resolution block, so MEMS only sees read_value next step).
             [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
             // s5: IWT → MEMS[2] now sees the resolved read_value.
-            [0, ip1(0, 0, 0, 1, 2), ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            [
+                0,
+                ip1(0, 0, 0, 1, 2),
+                ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0),
+                0,
+            ],
         ];
         load(&mut dsp, &prog);
         dsp.set_sample(0x6000, 0);
@@ -602,14 +617,34 @@ mod tests {
         dsp.rbl = 0x2000;
         let table = 1u16 << 15;
         let prog = [
-            [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
-            [0, 0, ip2(1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0) | table, ip3(0, 0, 0, 0)],
+            [
+                0,
+                ip1(1, 1, 0x20, 0, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
+            [
+                0,
+                0,
+                ip2(1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0) | table,
+                ip3(0, 0, 0, 0),
+            ],
             [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
-            [0, 0, ip2(0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0) | table, ip3(0, 0, 0, 0)],
+            [
+                0,
+                0,
+                ip2(0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0) | table,
+                ip3(0, 0, 0, 0),
+            ],
             // resolve the read (IWT runs before the resolution block, so MEMS
             // only sees read_value on the following step).
             [0, 0, ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
-            [0, ip1(0, 0, 0, 1, 0), ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 0],
+            [
+                0,
+                ip1(0, 0, 0, 1, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0),
+                0,
+            ],
         ];
         load(&mut dsp, &prog);
         dsp.set_sample(0x6000, 0);
@@ -621,7 +656,10 @@ mod tests {
             dspfloat_to_int(raw),
             "MRT(dsp-float) read-back matches the decoded delay word"
         );
-        assert_ne!(dsp.mems[0], 0, "the dsp-float path carried a non-zero value");
+        assert_ne!(
+            dsp.mems[0], 0,
+            "the dsp-float path carried a non-zero value"
+        );
     }
 
     #[test]
@@ -634,7 +672,12 @@ mod tests {
         dsp.exts[0] = 0x1234;
         let prog = [
             // s0: X = EXTS[0] (IRA 0x30, XSEL=1), Y=COEF[0], ZERO, SHIFT3
-            [0, ip1(1, 1, 0x30, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            [
+                0,
+                ip1(1, 1, 0x30, 0, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
             // s1: SHIFT3, EWT→EFREG[0]
             [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
         ];
@@ -653,7 +696,12 @@ mod tests {
         dsp.mems[7] = 0x20_0000; // a 24-bit-domain value
         let prog = [
             // s0: X = MEMS[7] (IRA 7, XSEL=1), Y=COEF[0], ZERO, SHIFT3
-            [0, ip1(1, 1, 7, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+            [
+                0,
+                ip1(1, 1, 7, 0, 0),
+                ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                0,
+            ],
             // s1: SHIFT3, EWT→EFREG[0]
             [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
         ];
@@ -674,7 +722,12 @@ mod tests {
             let macc = |b: u16| ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, b); // SHIFT3, BSEL=b
             let prog = [
                 // s0: ACC = X·Y (ZERO B to start clean)
-                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+                [
+                    0,
+                    ip1(1, 1, 0x20, 0, 0),
+                    ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                    0,
+                ],
                 // s1: ACC = X·Y + (BSEL? ACC : TEMP[0]==0)
                 [0, ip1(1, 1, 0x20, 0, 0), macc(bsel), 0],
                 // s2: SHIFT3, EWT→EFREG[0]
@@ -707,9 +760,19 @@ mod tests {
             // `bsel` at bit0 but not negb — add it manually.
             let negb_bit = (negb & 1) << 2;
             let prog = [
-                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0), 0],
+                [
+                    0,
+                    ip1(1, 1, 0x20, 0, 0),
+                    ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+                    0,
+                ],
                 // s1: ACC = X·Y + (NEGB? -ACC : +ACC), BSEL=1
-                [0, ip1(1, 1, 0x20, 0, 0), ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1) | negb_bit, 0],
+                [
+                    0,
+                    ip1(1, 1, 0x20, 0, 0),
+                    ip2(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1) | negb_bit,
+                    0,
+                ],
                 [0, 0, ip2(0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0), 0],
             ];
             load(&mut dsp, &prog);

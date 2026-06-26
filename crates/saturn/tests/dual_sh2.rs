@@ -81,7 +81,10 @@ fn master_writes_sentinel_slave_observes_it_within_budget() {
             break;
         }
     }
-    assert!(observed, "slave never observed master's sentinel write within {BUDGET} cycles");
+    assert!(
+        observed,
+        "slave never observed master's sentinel write within {BUDGET} cycles"
+    );
 
     // Sanity: the shared memory itself holds the sentinel (proves it
     // wasn't slave R10 getting stamped by some other path).
@@ -100,11 +103,7 @@ fn run_for_advances_both_cpus_independently() {
         MASTER_PC,
         &[0x0009, 0x0009, 0xAFFD, 0x0009], // NOP NOP BRA -3 NOP
     );
-    load(
-        &mut sat.bus,
-        SLAVE_PC,
-        &[0x0009, 0x0009, 0xAFFD, 0x0009],
-    );
+    load(&mut sat.bus, SLAVE_PC, &[0x0009, 0x0009, 0xAFFD, 0x0009]);
     sat.master_mut().regs.pc = MASTER_PC;
     sat.master_mut().regs.r[15] = 0x0020_8000;
     sat.slave_mut().regs.pc = SLAVE_PC;
@@ -116,7 +115,10 @@ fn run_for_advances_both_cpus_independently() {
     assert!(m >= 200, "master reached horizon");
     assert!(s >= 200, "slave reached horizon");
     let drift = m.abs_diff(s);
-    assert!(drift < 50, "drift {drift} suggests scheduler fairness regressed");
+    assert!(
+        drift < 50,
+        "drift {drift} suggests scheduler fairness regressed"
+    );
 }
 
 #[test]
@@ -146,13 +148,26 @@ fn pctrace_records_register_state_at_trigger_pcs() {
     sat.run_for(300);
 
     let log = sat.take_pctrace();
-    assert!(!log.is_empty(), "pctrace recorded nothing at the looping trigger PC");
+    assert!(
+        !log.is_empty(),
+        "pctrace recorded nothing at the looping trigger PC"
+    );
     for (pc, regs, _pr, _cyc) in &log {
-        assert_eq!(*pc, trigger & 0x00FF_FFFF, "recorded a non-trigger / delay-slot PC");
-        assert_eq!(regs[3], 5, "captured register state wrong (r3 should be the MOV #5 value)");
+        assert_eq!(
+            *pc,
+            trigger & 0x00FF_FFFF,
+            "recorded a non-trigger / delay-slot PC"
+        );
+        assert_eq!(
+            regs[3], 5,
+            "captured register state wrong (r3 should be the MOV #5 value)"
+        );
     }
     // take_pctrace drains but leaves the logger armed; an immediate re-take is empty.
-    assert!(sat.take_pctrace().is_empty(), "take_pctrace should drain the buffer");
+    assert!(
+        sat.take_pctrace().is_empty(),
+        "take_pctrace should drain the buffer"
+    );
 }
 
 #[test]
@@ -242,13 +257,21 @@ fn byte_and_long_writes_to_fti_region_also_pulse_input_capture() {
     sat.reset();
     sat.bus.write8(0x0100_0000, 0x12, AccessKind::Data); // byte -> slave FTI
     sat.run_for(512);
-    assert_eq!(sat.slave().onchip.frt.ftcsr & 0x80, 0x80, "byte write set slave ICF");
+    assert_eq!(
+        sat.slave().onchip.frt.ftcsr & 0x80,
+        0x80,
+        "byte write set slave ICF"
+    );
 
     let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
     sat.reset();
     sat.bus.write32(0x0180_0000, 0x1234_5678, AccessKind::Data); // long -> master FTI
     sat.run_for(512);
-    assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "long write set master ICF");
+    assert_eq!(
+        sat.master().onchip.frt.ftcsr & 0x80,
+        0x80,
+        "long write set master ICF"
+    );
 }
 
 /// Regression guard for the `b65cd18` black-screen bug: a pending SMPC command
@@ -274,7 +297,10 @@ fn pending_smpc_command_does_not_break_the_batch() {
     bios[4..8].copy_from_slice(&0x0020_8400u32.to_be_bytes()); // slave reset SP
     let mut sat = Saturn::new(bios);
     sat.reset();
-    assert!(sat.slave_is_halted(), "precondition: slave halted at power-on");
+    assert!(
+        sat.slave_is_halted(),
+        "precondition: slave halted at power-on"
+    );
     // Master: MOV.B R2,@R1 (write SSHON to COMREG), then spin.
     load(&mut sat.bus, MASTER_PC, &[0x2120, 0xAFFE, 0x0009]);
     // Slave (entered via the reset vector on SSHON): ADD #1,R10 in a tight loop.
@@ -291,8 +317,14 @@ fn pending_smpc_command_does_not_break_the_batch() {
     // no cycles this window.
     let before = sat.now();
     sat.run_for(50);
-    assert!(sat.now() >= before + 50, "run_for advanced the full budget (no stall)");
-    assert!(!sat.slave_is_halted(), "SSHON drained at the boundary → slave released");
+    assert!(
+        sat.now() >= before + 50,
+        "run_for advanced the full budget (no stall)"
+    );
+    assert!(
+        !sat.slave_is_halted(),
+        "SSHON drained at the boundary → slave released"
+    );
     assert_eq!(
         sat.slave().regs.r[10],
         0,
@@ -337,10 +369,17 @@ fn multiple_master_breakpoints_fire_at_the_first_reached() {
     sat.set_master_bps(vec![(PC + 6, None), (PC + 2, None)]);
     sat.run_for(64);
     let hit = sat.take_master_bp_hit().expect("a breakpoint must fire");
-    assert_eq!(hit.pc, PC + 2, "the first PC reached fires, not the first listed");
+    assert_eq!(
+        hit.pc,
+        PC + 2,
+        "the first PC reached fires, not the first listed"
+    );
     // The bp fires when `regs.pc == bp` (the bp instruction is *pending*), so
     // only the ADD #1 ahead of it has retired: R0 == 1.
-    assert_eq!(hit.regs[0], 1, "regs are captured at the bp instruction (pre-execute)");
+    assert_eq!(
+        hit.regs[0], 1,
+        "regs are captured at the bp instruction (pre-execute)"
+    );
 }
 
 /// A register-guarded breakpoint in a multi-bp set fires only on the matching
@@ -374,5 +413,8 @@ fn guarded_breakpoint_in_a_set_waits_for_its_register_value() {
     sat.run_for(256);
     let hit = sat.take_master_bp_hit().expect("the guarded bp must fire");
     assert_eq!(hit.pc, PC);
-    assert_eq!(hit.regs[0], 5, "fires on the iteration where R0 == the guard value");
+    assert_eq!(
+        hit.regs[0], 5,
+        "fires on the iteration where R0 == the guard value"
+    );
 }

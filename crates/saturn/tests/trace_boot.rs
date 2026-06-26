@@ -1297,8 +1297,9 @@ fn dump_framebuffer() {
     sat.set_rtc_unix(1_700_000_000);
     if let Ok(cue_name) = std::env::var("CUE")
         && let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
         println!("inserted disc roms/{cue_name}");
@@ -2162,8 +2163,10 @@ fn vf2_trajectory() {
     sat.insert_disc(disc);
     sat.enable_pctrace(vec![BIOS_GIVEUP]);
 
-    let frames: u32 =
-        std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let mut first_late_game = None;
     let mut first_giveup = None;
@@ -2203,7 +2206,10 @@ fn vf2_trajectory() {
         "milestones: late_game={first_late_game:?} giveup={first_giveup:?} \
          max_job_fad={max_job_fad} stall_frames={stall_frames}"
     );
-    assert!(first_late_game.is_some(), "VF2 never reached late game code");
+    assert!(
+        first_late_game.is_some(),
+        "VF2 never reached late game code"
+    );
     assert!(first_giveup.is_none(), "VF2 entered the BIOS give-up path");
     assert!(
         stall_frames < 300,
@@ -2531,8 +2537,10 @@ fn bios_audio_probe() {
             .unwrap_or_else(|| "NEVER/not-in-startup".into())
     );
     if vdp1log {
-        let drawn: Vec<&(u32, u32, u32, u32, u64)> =
-            vdp1_series.iter().filter(|&&(_, p, _, _, _)| p > 0).collect();
+        let drawn: Vec<&(u32, u32, u32, u32, u64)> = vdp1_series
+            .iter()
+            .filter(|&&(_, p, _, _, _)| p > 0)
+            .collect();
         let max_cmds = drawn.iter().map(|&&(_, _, c, _, _)| c).max().unwrap_or(0);
         println!(
             "  VDP1 per-frame: {} of {} frames drew; peak command_count={max_cmds}",
@@ -2854,9 +2862,8 @@ fn bios_bgm_sample_audible() {
     // Boot with the audio CD so the BIOS reaches the player panel and its sound
     // driver stages the BGM instrument sample into sound RAM.
     if let Ok(cue) = std::fs::read_to_string(root.join("roms/audiocd.cue"))
-        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |n| {
-            std::fs::read(root.join("roms").join(n)).ok()
-        })
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
     {
         sat.insert_disc(d);
     }
@@ -2870,10 +2877,15 @@ fn bios_bgm_sample_audible() {
     const SA: u32 = 0x10740;
     const LSA: u16 = 0x00A9;
     const LEA: u16 = 0x0152;
-    let sample: Vec<u16> = (0..LEA as u32).map(|i| sat.bus.scsp.ram.read16(SA + i * 2)).collect();
+    let sample: Vec<u16> = (0..LEA as u32)
+        .map(|i| sat.bus.scsp.ram.read16(SA + i * 2))
+        .collect();
     let nonzero = sample.iter().filter(|&&w| w != 0).count();
     println!("BGM instrument @0x{SA:05X}: {LEA} samples, {nonzero} non-zero");
-    assert!(nonzero > 0, "the BIOS loaded a non-zero BGM instrument sample");
+    assert!(
+        nonzero > 0,
+        "the BIOS loaded a non-zero BGM instrument sample"
+    );
 
     // Synthesize it through a clean SCSP — no 68k, no trigger dependency.
     let mut scsp = saturn::scsp::Scsp::new();
@@ -2890,7 +2902,8 @@ fn bios_bgm_sample_audible() {
     scsp.ctrl.write16(0x10, 0x0000); // OCT/FNS = 0 (native sample rate)
     scsp.ctrl.write16(0x16, 0xE000); // DISDL=7 direct out, centre pan
     // data[0]: KYONEX|KYONB (0x1800) | forward-loop (0x20) | SA high nibble.
-    scsp.ctrl.write16(0x00, 0x1800 | 0x20 | ((SA >> 16) & 0xF) as u16);
+    scsp.ctrl
+        .write16(0x00, 0x1800 | 0x20 | ((SA >> 16) & 0xF) as u16);
 
     // ~2 s of synthesis into the SCSP output buffer, drained to a RAW file.
     let mut pcm: Vec<u8> = Vec::new();
@@ -2907,7 +2920,10 @@ fn bios_bgm_sample_audible() {
     println!(
         "wrote /tmp/bios_bgm_sample.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_sample.pcm"
     );
-    assert!(peak > 1000, "the BGM instrument synthesizes to real audio (peak {peak})");
+    assert!(
+        peak > 1000,
+        "the BGM instrument synthesizes to real audio (peak {peak})"
+    );
 }
 
 /// Verification (manual): is the BIOS BGM **note-sequence data** valid? Renders
@@ -2932,9 +2948,8 @@ fn bios_bgm_sequence_audible() {
     sat.set_region(saturn::smpc::region::JAPAN);
     sat.set_rtc_unix(1_700_000_000);
     if let Ok(cue) = std::fs::read_to_string(root.join("roms/audiocd.cue"))
-        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |n| {
-            std::fs::read(root.join("roms").join(n)).ok()
-        })
+        && let Ok(d) =
+            saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
     {
         sat.insert_disc(d);
     }
@@ -2948,9 +2963,13 @@ fn bios_bgm_sequence_audible() {
     const SA: u32 = 0x10740;
     const LSA: u16 = 0x00A9;
     const LEA: u16 = 0x0152;
-    let sample: Vec<u16> = (0..LEA as u32).map(|i| sat.bus.scsp.ram.read16(SA + i * 2)).collect();
+    let sample: Vec<u16> = (0..LEA as u32)
+        .map(|i| sat.bus.scsp.ram.read16(SA + i * 2))
+        .collect();
     const SEQ: u32 = 0x18200;
-    let seq: Vec<u8> = (0..0x400u32).map(|i| sat.bus.scsp.ram.read8(SEQ + i)).collect();
+    let seq: Vec<u8> = (0..0x400u32)
+        .map(|i| sat.bus.scsp.ram.read8(SEQ + i))
+        .collect();
     print!("seq @0x{SEQ:05X}:");
     for b in &seq[..48] {
         print!(" {b:02X}");
@@ -2961,13 +2980,16 @@ fn bios_bgm_sequence_audible() {
     // `[status 0x40-0x4F, note, vel, gate, delta]` with a note in a musical range
     // and a non-zero velocity. Walk the whole sound-RAM sequence block; on a
     // match record (note, gate, delta) and skip the event, else step one byte.
-    let big: Vec<u8> = (0..0x1000u32).map(|i| sat.bus.scsp.ram.read8(SEQ + i)).collect();
+    let big: Vec<u8> = (0..0x1000u32)
+        .map(|i| sat.bus.scsp.ram.read8(SEQ + i))
+        .collect();
     let mut events: Vec<(u8, u8, u8)> = Vec::new();
     let mut p = 0usize;
     while p + 4 < big.len() && events.len() < 256 {
         let (st, note, vel, gate, delta) = (big[p], big[p + 1], big[p + 2], big[p + 3], big[p + 4]);
-        let is_note_on =
-            (0x40..=0x4F).contains(&st) && (0x24..=0x60).contains(&note) && (0x20..=0x7F).contains(&vel);
+        let is_note_on = (0x40..=0x4F).contains(&st)
+            && (0x24..=0x60).contains(&note)
+            && (0x20..=0x7F).contains(&vel);
         if is_note_on {
             events.push((note, gate, delta));
             p += 5;
@@ -3033,10 +3055,17 @@ fn bios_bgm_sequence_audible() {
             }
         }
     }
-    println!("rendered {} bytes ({:.1}s), peak {peak}", pcm.len(), pcm.len() as f64 / 176_400.0);
+    println!(
+        "rendered {} bytes ({:.1}s), peak {peak}",
+        pcm.len(),
+        pcm.len() as f64 / 176_400.0
+    );
     std::fs::write("/tmp/bios_bgm_seq.pcm", &pcm).unwrap();
     println!("wrote /tmp/bios_bgm_seq.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/bios_bgm_seq.pcm");
-    assert!(peak > 1000, "the sequence rendered to real audio (peak {peak})");
+    assert!(
+        peak > 1000,
+        "the sequence rendered to real audio (peak {peak})"
+    );
 }
 
 /// Demonstration (manual): the **running emulator** plays a disc's CD-DA track.
@@ -3099,7 +3128,10 @@ fn emulator_plays_cdda_track() {
             pcm.extend_from_slice(&s.to_le_bytes());
         }
     }
-    println!("running emulator produced {} bytes of audio, peak {peak}", pcm.len());
+    println!(
+        "running emulator produced {} bytes of audio, peak {peak}",
+        pcm.len()
+    );
     std::fs::write("/tmp/emu_cdda.pcm", &pcm).unwrap();
     println!("wrote /tmp/emu_cdda.pcm — aplay -f S16_LE -r 44100 -c 2 /tmp/emu_cdda.pcm");
     assert!(
@@ -3137,8 +3169,9 @@ fn menu_dispatch_seqlog() {
     let cue_name =
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
         println!("inserted disc roms/{cue_name}");
@@ -3151,16 +3184,29 @@ fn menu_dispatch_seqlog() {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(0x01_BD64);
-    let seq_reg: usize = std::env::var("SEQ_REG").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let pad_from: u32 = std::env::var("PAD_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(2450);
-    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2700);
+    let seq_reg: usize = std::env::var("SEQ_REG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let pad_from: u32 = std::env::var("PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2450);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2700);
     sat.enable_seqlog(seq_pc, seq_reg);
     println!("logging R{seq_reg} at low24-PC 0x{seq_pc:06X}; START one-shot at frame {pad_from}");
 
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     for f in 0..frames {
         // One-shot START: hold for 6 frames starting at pad_from.
-        let held = if f >= pad_from && f < pad_from + 6 { 0x0800u16 } else { 0 };
+        let held = if f >= pad_from && f < pad_from + 6 {
+            0x0800u16
+        } else {
+            0
+        };
         sat.set_pad1(held);
         sat.run_frame(&mut fb);
         let recs = sat.take_seqlog();
@@ -3216,7 +3262,9 @@ fn menu_dispatch_seqlog() {
             for off in (0..len).step_by(16) {
                 let mut row = format!("  0x{:08X}:", base + off);
                 for w in 0..4 {
-                    let (v, _) = sat.bus.read32(base + off + w * 4, sh2::bus::AccessKind::Data);
+                    let (v, _) = sat
+                        .bus
+                        .read32(base + off + w * 4, sh2::bus::AccessKind::Data);
                     row.push_str(&format!(" {v:08X}"));
                 }
                 println!("{row}");
@@ -3260,8 +3308,9 @@ fn menu_savestate_probe() {
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     // The disc must be inserted before load_state (it is re-grafted by fingerprint).
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
     } else {
@@ -3269,7 +3318,10 @@ fn menu_savestate_probe() {
         return;
     }
 
-    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2440);
+    let snap_at: u32 = std::env::var("SNAP_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2440);
     // Snapshots live under the workspace `tmp/` (project convention — not the
     // system /tmp). SNAP_FILE overrides; a relative override resolves against the
     // workspace root, not the test's cwd (which cargo sets to the crate dir).
@@ -3292,12 +3344,17 @@ fn menu_savestate_probe() {
     // one event (record only when R[reg]==val). Dumped after the run as usual.
     let boot_trace = std::env::var("BOOT_TRACE").is_ok();
     let parse_pcs = |v: &str| -> Vec<u32> {
-        v.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()
+        v.split(',')
+            .filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
     };
     let pctrace_when: Option<(usize, u32)> = std::env::var("PCTRACE_WHEN").ok().and_then(|s| {
         let p: Vec<&str> = s.split(',').collect();
         match p[..] {
-            [r, v] => Some((r.trim().parse().ok()?, u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?)),
+            [r, v] => Some((
+                r.trim().parse().ok()?,
+                u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?,
+            )),
             _ => None,
         }
     });
@@ -3313,7 +3370,8 @@ fn menu_savestate_probe() {
 
     if std::env::var("FORCE_SNAP").is_err() && std::path::Path::new(&snap_file).exists() {
         let bytes = std::fs::read(&snap_file).expect("read snapshot");
-        sat.load_state(&bytes).expect("load_state (BIOS/disc must match the snapshot)");
+        sat.load_state(&bytes)
+            .expect("load_state (BIOS/disc must match the snapshot)");
         println!("loaded snapshot {snap_file} (≈f{snap_at})");
     } else {
         println!("booting to f{snap_at} to build snapshot (one-time, no-render)…");
@@ -3322,7 +3380,10 @@ fn menu_savestate_probe() {
         }
         let bytes = sat.save_state();
         std::fs::write(&snap_file, &bytes).expect("write snapshot");
-        println!("wrote snapshot {snap_file} ({} bytes) at f{snap_at}", bytes.len());
+        println!(
+            "wrote snapshot {snap_file} ({} bytes) at f{snap_at}",
+            bytes.len()
+        );
     }
 
     // Probe from the snapshot: press START shortly after the load, run PROBE_FRAMES.
@@ -3330,12 +3391,25 @@ fn menu_savestate_probe() {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(0x01_1798);
-    let seq_reg: usize = std::env::var("SEQ_REG").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let start_at: u32 = std::env::var("START_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let start_period: Option<u32> = std::env::var("START_PERIOD").ok().and_then(|s| s.parse().ok());
-    let start_len: u32 = std::env::var("START_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
-    let probe_frames: u32 =
-        std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(340);
+    let seq_reg: usize = std::env::var("SEQ_REG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let start_at: u32 = std::env::var("START_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let start_period: Option<u32> = std::env::var("START_PERIOD")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let start_len: u32 = std::env::var("START_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let probe_frames: u32 = std::env::var("PROBE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(340);
     sat.enable_seqlog(seq_pc, seq_reg);
     // PCTRACE=pc1,pc2,…: multi-PC logic analyzer — capture full master reg state
     // each time the master executes any listed PC (low-24), interleaved in order.
@@ -3359,7 +3433,11 @@ fn menu_savestate_probe() {
     // exact branch where ours' control flow diverges.
     let pcwin: Option<(u64, u64)> = std::env::var("PCWIN").ok().and_then(|s| {
         let n: Vec<u64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        if let [lo, hi] = n[..] { Some((lo, hi)) } else { None }
+        if let [lo, hi] = n[..] {
+            Some((lo, hi))
+        } else {
+            None
+        }
     });
     if pcwin.is_some() {
         sat.enable_master_pcstream();
@@ -3374,17 +3452,27 @@ fn menu_savestate_probe() {
     // SLAVE_BP=pc[,probe]: break the slave at `pc`, capture R0..15/PR/GBR (and a
     // bus probe of `probe` — the cache-coherency test: probe = raw bus value, vs
     // the slave's cached register read of the same addr).
-    let slave_bp: Option<u32> = std::env::var("SLAVE_BP")
+    let slave_bp: Option<u32> = std::env::var("SLAVE_BP").ok().and_then(|s| {
+        u32::from_str_radix(
+            s.split(',').next().unwrap().trim().trim_start_matches("0x"),
+            16,
+        )
         .ok()
-        .and_then(|s| u32::from_str_radix(s.split(',').next().unwrap().trim().trim_start_matches("0x"), 16).ok());
+    });
     // MASTER_BP=pc[,probe]: same, for the master (capture R0..15/PR + bus probe).
-    let master_bp: Option<u32> = std::env::var("MASTER_BP")
+    let master_bp: Option<u32> = std::env::var("MASTER_BP").ok().and_then(|s| {
+        u32::from_str_radix(
+            s.split(',').next().unwrap().trim().trim_start_matches("0x"),
+            16,
+        )
         .ok()
-        .and_then(|s| u32::from_str_radix(s.split(',').next().unwrap().trim().trim_start_matches("0x"), 16).ok());
+    });
     if let Some(pc) = master_bp {
         sat.set_master_bp(pc);
         if let Some(pr) = std::env::var("MASTER_BP").ok().and_then(|s| {
-            s.split(',').nth(1).and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+            s.split(',')
+                .nth(1)
+                .and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
         }) {
             sat.set_master_bp_probe(Some(pr));
         }
@@ -3392,7 +3480,9 @@ fn menu_savestate_probe() {
     if let Some(pc) = slave_bp {
         sat.set_slave_bp(pc);
         if let Some(pr) = std::env::var("SLAVE_BP").ok().and_then(|s| {
-            s.split(',').nth(1).and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+            s.split(',')
+                .nth(1)
+                .and_then(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
         }) {
             sat.set_slave_bp_probe(Some(pr));
         }
@@ -3450,8 +3540,14 @@ fn menu_savestate_probe() {
         println!("--- VDP state in menu ---");
         println!(
             "VDP2: TVMD=0x{:04X} (DISP={}) {}×{}  BGON=0x{:04X}  PRINA=0x{:04X} PRINB=0x{:04X}  SPCTL=0x{:04X}",
-            r.tvmd(), r.display_enabled(), w, h, r.bgon(),
-            r.read16(0x0F8), r.read16(0x0FA), r.read16(0x0E0)
+            r.tvmd(),
+            r.display_enabled(),
+            w,
+            h,
+            r.bgon(),
+            r.read16(0x0F8),
+            r.read16(0x0FA),
+            r.read16(0x0E0)
         );
         println!(
             "VDP1 plots/frame: peak (plots={}, cmds={}, px={}); last frame (plots={}, cmds={}, px={})",
@@ -3480,7 +3576,9 @@ fn menu_savestate_probe() {
         }
         println!(
             "VDP1 display FB: {} non-zero px of {} ({} distinct pixel values)",
-            nonzero, fbb.len() / 2, distinct.len()
+            nonzero,
+            fbb.len() / 2,
+            distinct.len()
         );
         // VDP1 DRAW buffer (self.fb at FB_BASE) — where the plotter writes. If this
         // has the 15120 px but display is empty, the swap isn't reaching display.
@@ -3495,7 +3593,8 @@ fn menu_savestate_probe() {
         }
         println!(
             "VDP1 DRAW buffer (0x05C80000): {} non-zero px ({} distinct values)",
-            draw_nonzero, draw_distinct.len()
+            draw_nonzero,
+            draw_distinct.len()
         );
         // Composited output frame: count non-zero pixels (what reaches the screen).
         let mut out_nonzero = 0usize;
@@ -3504,7 +3603,10 @@ fn menu_savestate_probe() {
                 out_nonzero += 1;
             }
         }
-        println!("composited output: {out_nonzero} non-black px (of {})", fb.len() / 4);
+        println!(
+            "composited output: {out_nonzero} non-black px (of {})",
+            fb.len() / 4
+        );
         // Optional: write the composited frame as a PPM image for visual inspection.
         if let Ok(path) = std::env::var("PPM") {
             let (w, h) = sat.bus.vdp2.regs.screen_dims();
@@ -3529,12 +3631,15 @@ fn menu_savestate_probe() {
                 vram_nonzero += 1;
             }
         }
-        println!("VDP2 VRAM (0x05E00000): {vram_nonzero} non-zero 16-bit words of {}", 0x80000 / 2);
+        println!(
+            "VDP2 VRAM (0x05E00000): {vram_nonzero} non-zero 16-bit words of {}",
+            0x80000 / 2
+        );
         // Full VDP2 register file (0x000..0x120) — diff menu vs press-start to find
         // the compositing register the menu changes that blanks the screen.
         if std::env::var("VDP2REGS").is_ok() {
             for base in (0..0x120u32).step_by(16) {
-                let mut row = format!("  R[{base:03X}]:", );
+                let mut row = format!("  R[{base:03X}]:",);
                 for o in (0..16u32).step_by(2) {
                     row.push_str(&format!(" {:04X}", sat.bus.vdp2.regs.read16(base + o)));
                 }
@@ -3565,11 +3670,21 @@ fn menu_savestate_probe() {
             .ok()
             .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
             .unwrap_or_else(|| (0..10).collect());
-        println!("--- PCTRACE: {} hits over {probe_frames} frames (PCs: {}) ---",
+        println!(
+            "--- PCTRACE: {} hits over {probe_frames} frames (PCs: {}) ---",
             log.len(),
-            pctrace_pcs.iter().map(|p| format!("{p:06X}")).collect::<Vec<_>>().join(","));
+            pctrace_pcs
+                .iter()
+                .map(|p| format!("{p:06X}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         for (pc, r, pr, cyc) in &log {
-            let rs = regs.iter().map(|&i| format!("r{i}={:08X}", r[i])).collect::<Vec<_>>().join(" ");
+            let rs = regs
+                .iter()
+                .map(|&i| format!("r{i}={:08X}", r[i]))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!("  cyc={cyc:>12} pc=0x{pc:06X} pr=0x{pr:08X}  {rs}");
         }
     }
@@ -3593,8 +3708,17 @@ fn menu_savestate_probe() {
                 let (r, pr, gbr, probe) = (h.regs, h.pr, h.gbr, h.probe);
                 println!("MASTER BP hit @0x{bp_pc:06X}:");
                 for b in (0..16).step_by(4) {
-                    println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
-                        b, r[b], b+1, r[b+1], b+2, r[b+2], b+3, r[b+3]);
+                    println!(
+                        "  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
+                        b,
+                        r[b],
+                        b + 1,
+                        r[b + 1],
+                        b + 2,
+                        r[b + 2],
+                        b + 3,
+                        r[b + 3]
+                    );
                 }
                 println!("  PR={pr:08X} GBR={gbr:08X} probe(bus,no-cache)={probe:08X}");
             }
@@ -3607,8 +3731,17 @@ fn menu_savestate_probe() {
                 let (r, pr, gbr, probe) = (h.regs, h.pr, h.gbr, h.probe);
                 println!("SLAVE BP hit @0x{bp_pc:06X}:");
                 for b in (0..16).step_by(4) {
-                    println!("  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
-                        b, r[b], b+1, r[b+1], b+2, r[b+2], b+3, r[b+3]);
+                    println!(
+                        "  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}  r{:<2}={:08X}",
+                        b,
+                        r[b],
+                        b + 1,
+                        r[b + 1],
+                        b + 2,
+                        r[b + 2],
+                        b + 3,
+                        r[b + 3]
+                    );
                 }
                 println!("  PR={pr:08X} GBR={gbr:08X} probe(bus,no-cache)={probe:08X}");
             }
@@ -3624,17 +3757,23 @@ fn menu_savestate_probe() {
         }
         let mut v: Vec<_> = h.into_iter().collect();
         v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
-        println!("--- SLAVE most-recent PC window: {} entries, {} distinct ---", tr.len(), v.len());
+        println!(
+            "--- SLAVE most-recent PC window: {} entries, {} distinct ---",
+            tr.len(),
+            v.len()
+        );
         for (pc, c) in v.iter().take(16) {
             println!("  slave PC 0x{pc:08X}: {c}×");
         }
         let min = tr.iter().min().copied().unwrap_or(0);
         let max = tr.iter().max().copied().unwrap_or(0);
         println!("  slave PC range 0x{min:08X}..0x{max:08X}");
-        println!("  reaches poll 0x060160F2? {}  reaches PROCEED 0x060160FA? {}  reaches CGD-load Jsr 0x06016102? {}",
+        println!(
+            "  reaches poll 0x060160F2? {}  reaches PROCEED 0x060160FA? {}  reaches CGD-load Jsr 0x06016102? {}",
             tr.contains(&0x0601_60F2),
             tr.contains(&0x0601_60FA),
-            tr.contains(&0x0601_6102));
+            tr.contains(&0x0601_6102)
+        );
     }
 
     if let Ok(spec) = std::env::var("READMEM") {
@@ -3646,7 +3785,9 @@ fn menu_savestate_probe() {
             for off in (0..len).step_by(16) {
                 let mut row = format!("  0x{:08X}:", base + off);
                 for w in 0..4 {
-                    let (v, _) = sat.bus.read32(base + off + w * 4, sh2::bus::AccessKind::Data);
+                    let (v, _) = sat
+                        .bus
+                        .read32(base + off + w * 4, sh2::bus::AccessKind::Data);
                     row.push_str(&format!(" {v:08X}"));
                 }
                 println!("{row}");
@@ -3656,10 +3797,16 @@ fn menu_savestate_probe() {
 
     if let Some((lo, hi)) = pcwin {
         let ps = sat.take_master_pcstream();
-        println!("--- PCWIN master trace, cyc [{lo},{hi}] ({} total entries) ---", ps.len());
+        println!(
+            "--- PCWIN master trace, cyc [{lo},{hi}] ({} total entries) ---",
+            ps.len()
+        );
         for (pc, cyc) in ps.iter().filter(|(_, c)| *c >= lo && *c <= hi) {
             let (w, _) = sat.bus.read16(*pc, sh2::bus::AccessKind::Fetch);
-            println!("  cyc={cyc:>12} 0x{pc:08X}: {w:04X}  {}", sh2::debug::disasm(sh2::decoder::decode(w)));
+            println!(
+                "  cyc={cyc:>12} 0x{pc:08X}: {w:04X}  {}",
+                sh2::debug::disasm(sh2::decoder::decode(w))
+            );
         }
     }
 
@@ -3748,7 +3895,8 @@ fn doukyuusei_renders_non_black() {
         println!("no roms/{cue_name}; skipped");
         return;
     };
-    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
     else {
         println!("cue parse failed; skipped");
         return;
@@ -3758,7 +3906,10 @@ fn doukyuusei_renders_non_black() {
     sat.set_region(saturn::smpc::region::JAPAN);
     sat.set_rtc_unix(1_700_000_000);
     sat.insert_disc(disc);
-    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2200);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2200);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let mut in_hwram = 0u32;
     for f in 0..frames {
@@ -3769,12 +3920,18 @@ fn doukyuusei_renders_non_black() {
             in_hwram += 1;
         }
     }
-    let nonblack = fb.chunks_exact(4).filter(|p| (p[0] | p[1] | p[2]) != 0).count();
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
     println!(
         "doukyuusei: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
         sat.master().regs.pc
     );
-    assert!(in_hwram >= 290, "master not running game code (HWRAM) — boot/exec regression");
+    assert!(
+        in_hwram >= 290,
+        "master not running game code (HWRAM) — boot/exec regression"
+    );
     assert!(
         nonblack > 10_000,
         "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
@@ -3806,7 +3963,8 @@ fn vf2_renders_non_black() {
         println!("no roms/{cue_name}; skipped");
         return;
     };
-    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
     else {
         println!("cue parse failed; skipped");
         return;
@@ -3822,7 +3980,10 @@ fn vf2_renders_non_black() {
         sat.load_internal_backup(&bup);
     }
     sat.insert_disc(disc);
-    let frames: u32 = std::env::var("FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(2200);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2200);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let mut in_hwram = 0u32;
     for f in 0..frames {
@@ -3831,12 +3992,18 @@ fn vf2_renders_non_black() {
             in_hwram += 1;
         }
     }
-    let nonblack = fb.chunks_exact(4).filter(|p| (p[0] | p[1] | p[2]) != 0).count();
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
     println!(
         "vf2: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
         sat.master().regs.pc
     );
-    assert!(in_hwram >= 290, "master not running game code (HWRAM) — boot/exec regression");
+    assert!(
+        in_hwram >= 290,
+        "master not running game code (HWRAM) — boot/exec regression"
+    );
     assert!(
         nonblack > 10_000,
         "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
@@ -3872,15 +4039,19 @@ fn bench_fps() {
     let cue_name =
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
     } else {
         println!("no disc roms/{cue_name}; aborting");
         return;
     }
-    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let snap_at: u32 = std::env::var("SNAP_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     let snap_file =
         std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
     const CYC: u64 = 479_151;
@@ -3895,9 +4066,13 @@ fn bench_fps() {
         std::fs::write(&snap_file, &b).expect("write snapshot");
         b
     };
-    sat.load_state(&snap).expect("load_state (BIOS/disc must match)");
+    sat.load_state(&snap)
+        .expect("load_state (BIOS/disc must match)");
 
-    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let n: u32 = std::env::var("BENCH_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
 
     // Compute only (run_for): the CPU/bus/SCSP cost without rendering.
@@ -3919,12 +4094,21 @@ fn bench_fps() {
 
     let cfps = n as f64 / compute.as_secs_f64();
     let rfps = n as f64 / rendered.as_secs_f64();
-    println!("--- ours sustained fps (snapshot ≈f{snap_at}, {}×{}) ---", dims.0, dims.1);
+    println!(
+        "--- ours sustained fps (snapshot ≈f{snap_at}, {}×{}) ---",
+        dims.0, dims.1
+    );
     println!("compute-only : {n} frames in {compute:?} = {cfps:.1} fps");
     println!("compute+render: {n} frames in {rendered:?} = {rfps:.1} fps");
-    println!("real-time target ≈ 60 fps NTSC → headroom: {:.0}% (render path)", rfps / 60.0 * 100.0);
+    println!(
+        "real-time target ≈ 60 fps NTSC → headroom: {:.0}% (render path)",
+        rfps / 60.0 * 100.0
+    );
     let render_share = 1.0 - compute.as_secs_f64() / rendered.as_secs_f64();
-    println!("render is {:.0}% of the compute+render frame time", render_share * 100.0);
+    println!(
+        "render is {:.0}% of the compute+render frame time",
+        render_share * 100.0
+    );
 }
 
 /// Cache-internals probe: load the heavy Press-Start snapshot, run BENCH_FRAMES
@@ -3957,15 +4141,19 @@ fn bench_cache() {
     let cue_name =
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
     } else {
         println!("no disc roms/{cue_name}; aborting");
         return;
     }
-    let snap_at: u32 = std::env::var("SNAP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let snap_at: u32 = std::env::var("SNAP_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     let snap_file =
         std::env::var("SNAP_FILE").unwrap_or_else(|_| format!("/tmp/dk_menu_f{snap_at}.sav"));
     const CYC: u64 = 479_151;
@@ -3977,9 +4165,13 @@ fn bench_cache() {
         std::fs::write(&snap_file, sat.save_state()).expect("write snapshot");
     }
     let snap = std::fs::read(&snap_file).expect("read snapshot");
-    sat.load_state(&snap).expect("load_state (BIOS/disc must match)");
+    sat.load_state(&snap)
+        .expect("load_state (BIOS/disc must match)");
 
-    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let n: u32 = std::env::var("BENCH_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
     sat.master_mut().cache.dbg_reset_stats();
     sat.slave_mut().cache.dbg_reset_stats();
     for _ in 0..n {
@@ -3990,15 +4182,22 @@ fn bench_cache() {
         let [fh, fm, dh, dm] = s;
         let (hits, misses) = (fh + dh, fm + dm);
         let total = hits + misses;
-        let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+        let rate = if total > 0 {
+            hits as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         println!("--- {who} cache over {n} frames ---");
         println!("  fetch: {fh} hit / {fm} miss");
         println!("  data : {dh} hit / {dm} miss");
         println!("  total: {hits} hit / {misses} miss  ({total} probes, {rate:.3}% hit)");
         // Hit path copies a full 16-byte line per access; misses also fetch 16 B
         // (4× read32). Bytes moved through the line buffer ≈ 16 × total probes.
-        println!("  line-bytes copied ≈ {} MiB ({:.1} MiB/frame)",
-            total * 16 / (1024 * 1024), total as f64 * 16.0 / n as f64 / (1024.0 * 1024.0));
+        println!(
+            "  line-bytes copied ≈ {} MiB ({:.1} MiB/frame)",
+            total * 16 / (1024 * 1024),
+            total as f64 * 16.0 / n as f64 / (1024.0 * 1024.0)
+        );
     };
     report("master", sat.master().cache.dbg_stats());
     report("slave", sat.slave().cache.dbg_stats());
@@ -4034,8 +4233,9 @@ fn bench_stages() {
     let cue_name =
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
     } else {
@@ -4043,15 +4243,30 @@ fn bench_stages() {
         return;
     }
     const CYC: u64 = 479_151;
-    let frames: u32 = std::env::var("STAGE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
-    let window: u32 = std::env::var("WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let frames: u32 = std::env::var("STAGE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+    let window: u32 = std::env::var("WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
     // Optional START injection (to profile past the title into the menu).
-    let pad_from: u32 = std::env::var("PAD_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+    let pad_from: u32 = std::env::var("PAD_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
 
-    println!("stage fps (compute-only = pipeline ceiling), window={window} frames; ~60 = real-time");
+    println!(
+        "stage fps (compute-only = pipeline ceiling), window={window} frames; ~60 = real-time"
+    );
     let mut t = Instant::now();
     for f in 0..frames {
-        let held = if f >= pad_from && f < pad_from + 6 { 0x0800u16 } else { 0 };
+        let held = if f >= pad_from && f < pad_from + 6 {
+            0x0800u16
+        } else {
+            0
+        };
         sat.set_pad1(held);
         sat.run_for(CYC);
         let _ = sat.take_audio(); // drain so the SCSP mixer doesn't freeze (cap)
@@ -4093,8 +4308,9 @@ fn presstart_pchist() {
     let cue_name =
         std::env::var("CUE").unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M).cue".into());
     if let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name))
-        && let Ok(d) =
-            saturn::disc::Disc::from_cue(&cue, |name| std::fs::read(root.join("roms").join(name)).ok())
+        && let Ok(d) = saturn::disc::Disc::from_cue(&cue, |name| {
+            std::fs::read(root.join("roms").join(name)).ok()
+        })
     {
         sat.insert_disc(d);
     } else {
@@ -4102,8 +4318,14 @@ fn presstart_pchist() {
         return;
     }
     const CYC: u64 = 479_151;
-    let at: u32 = std::env::var("PROFILE_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2400);
-    let nframes: u32 = std::env::var("HIST_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    let at: u32 = std::env::var("PROFILE_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2400);
+    let nframes: u32 = std::env::var("HIST_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
     for _ in 0..at {
         sat.run_for(CYC);
         let _ = sat.take_audio();
@@ -4124,7 +4346,10 @@ fn presstart_pchist() {
     v.sort_by_key(|&(_, n)| core::cmp::Reverse(n));
     println!("master-PC histogram at ~f{at} ({total} insns / {nframes} frames), top 30:");
     for (pc, n) in v.iter().take(30) {
-        println!("  {pc:08X}  {:5.2}%  ({n})", *n as f64 / total as f64 * 100.0);
+        println!(
+            "  {pc:08X}  {:5.2}%  ({n})",
+            *n as f64 / total as f64 * 100.0
+        );
     }
     // Also bucket by 64 KiB region to show where the work concentrates.
     let mut region: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
@@ -4156,10 +4381,14 @@ fn disc_read_content_check() {
             .unwrap_or_else(|_| "Doukyuusei - if (Japan) (1M, 2M) (Track 1).bin".into()),
     );
     let Ok(cue) = std::fs::read_to_string(root.join("roms").join(cue_name)) else {
-        println!("no cue; skipped"); return;
+        println!("no cue; skipped");
+        return;
     };
-    let Ok(disc) = saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok()) else {
-        println!("cue parse failed"); return;
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed");
+        return;
     };
     let img = std::fs::read(&bin).expect("read track1.bin");
     const SECT: usize = 2352;
@@ -4173,7 +4402,12 @@ fn disc_read_content_check() {
         let raw = &img[off..off + 2048];
         let (ok, same, first_diff, head): (bool, bool, Option<usize>, [u8; 8]) =
             match disc.read_sector(fad) {
-                Some(o) => (true, o == raw, (0..2048).find(|&i| o[i] != raw[i]), o[..8].try_into().unwrap()),
+                Some(o) => (
+                    true,
+                    o == raw,
+                    (0..2048).find(|&i| o[i] != raw[i]),
+                    o[..8].try_into().unwrap(),
+                ),
                 None => (false, false, Some(0), [0; 8]),
             };
         println!(
@@ -4238,7 +4472,9 @@ fn raster_jitter_probe() {
             stale.len()
         );
         println!("  VCNT max |Δscanline|: {max_vcnt_delta}");
-        println!("  TVSTAT differing bits (union): {bit_diff:#06X} (HBLANK=0x4 ODD=0x2 VBLANK=0x8)");
+        println!(
+            "  TVSTAT differing bits (union): {bit_diff:#06X} (HBLANK=0x4 ODD=0x2 VBLANK=0x8)"
+        );
         for (pc, n) in top.iter().take(5) {
             println!("    stale-read PC {pc:08X}: {n}");
         }
@@ -4251,7 +4487,10 @@ fn raster_jitter_probe() {
         sat.set_region(saturn::smpc::region::JAPAN);
         sat.set_rtc_unix(1_700_000_000);
         sat.enable_raster_jitter();
-        let frames: u32 = std::env::var("PROBE_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+        let frames: u32 = std::env::var("PROBE_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
         for _ in 0..frames {
             sat.run_for(CYC);
             let _ = sat.take_audio();
@@ -4336,8 +4575,10 @@ fn bench_vf2_fight() {
     sat.set_region(saturn::smpc::region::JAPAN);
     sat.set_rtc_unix(1_700_000_000);
     sat.insert_disc(disc);
-    let fight_at: u32 =
-        std::env::var("FIGHT_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2700);
+    let fight_at: u32 = std::env::var("FIGHT_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2700);
     let snap_file = format!("tmp/vf2_fight_f{fight_at}.sav");
     const CYC: u64 = 479_151;
     let snap = if std::path::Path::new(&root.join(&snap_file)).exists() {
@@ -4360,7 +4601,10 @@ fn bench_vf2_fight() {
     };
     sat.load_state(&snap).expect("load fight snapshot");
 
-    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let n: u32 = std::env::var("BENCH_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
     let t0 = Instant::now();
     for _ in 0..n {
@@ -4376,10 +4620,16 @@ fn bench_vf2_fight() {
     let rendered = t1.elapsed();
     let cfps = n as f64 / compute.as_secs_f64();
     let rfps = n as f64 / rendered.as_secs_f64();
-    println!("--- VF2 fight (snapshot f{fight_at}, {}x{}) ---", dims.0, dims.1);
+    println!(
+        "--- VF2 fight (snapshot f{fight_at}, {}x{}) ---",
+        dims.0, dims.1
+    );
     println!("compute-only  : {n} frames in {compute:?} = {cfps:.1} fps");
     println!("compute+render: {n} frames in {rendered:?} = {rfps:.1} fps");
-    println!("render share  : {:.0}%", (1.0 - compute.as_secs_f64() / rendered.as_secs_f64()) * 100.0);
+    println!(
+        "render share  : {:.0}%",
+        (1.0 - compute.as_secs_f64() / rendered.as_secs_f64()) * 100.0
+    );
     let (plots, _, _, cmds, px) = sat.bus.vdp1.dbg_plots();
     println!("vdp1: plots={plots} last_cmds={cmds} last_pixels={px}");
     // Audio-production probe (the fight audio-starvation hunt): the frontend
@@ -4425,13 +4675,17 @@ fn bench_vf2_pipeline() {
     let disc =
         saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
             .expect("parse cue");
-    let snap = std::fs::read(root.join("tmp/vf2_fight_f2700.sav")).expect("fight snapshot (run bench_vf2_fight once)");
+    let snap = std::fs::read(root.join("tmp/vf2_fight_f2700.sav"))
+        .expect("fight snapshot (run bench_vf2_fight once)");
     let mut sat = Saturn::new(bios);
     sat.reset();
     sat.insert_disc(disc);
     sat.load_state(&snap).expect("load fight snapshot");
 
-    let n: u32 = std::env::var("BENCH_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let n: u32 = std::env::var("BENCH_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     let (tx, rx) = mpsc::sync_channel::<(saturn::Vdp2, saturn::vdp1::Framebuffer)>(1);
     let (done_tx, done_rx) = mpsc::channel::<()>();
     std::thread::scope(|s| {
@@ -4452,7 +4706,8 @@ fn bench_vf2_pipeline() {
             if in_flight {
                 done_rx.recv().ok(); // wait for the previous render
             }
-            tx.send((sat.bus.vdp2.clone(), sat.bus.vdp1.display_fb().clone())).ok();
+            tx.send((sat.bus.vdp2.clone(), sat.bus.vdp1.display_fb().clone()))
+                .ok();
             in_flight = true;
         }
         if in_flight {

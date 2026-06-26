@@ -143,7 +143,14 @@ impl RotationParams {
     /// parameter-table scales, and `xp` (when set, 16.16) replaces the
     /// viewpoint X term — the coefficient table's mode-3 payload (VDP2 manual
     /// "Coefficient Table"; Mednafen `case 3: Xp = sext << 2`).
-    pub fn transform_k(&self, sx: i32, sy: i32, kx: i32, ky: i32, xp_ovr: Option<i32>) -> (i32, i32) {
+    pub fn transform_k(
+        &self,
+        sx: i32,
+        sy: i32,
+        kx: i32,
+        ky: i32,
+        xp_ovr: Option<i32>,
+    ) -> (i32, i32) {
         let dx = mfx(self.a, self.dx) + mfx(self.b, self.dy);
         let dy = mfx(self.d, self.dx) + mfx(self.e, self.dy);
 

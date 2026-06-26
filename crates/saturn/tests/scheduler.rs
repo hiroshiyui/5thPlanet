@@ -202,9 +202,21 @@ fn pick_behind_breaks_ties_by_insertion_order() {
     // contract says the most-behind pick resolves ties to the lowest insertion
     // order, so the first full round of steps must go A, B, C in that order.
     let mut s = Scheduler::new();
-    s.add(Ordered { id: 0, cycles: 0, rate: 5 });
-    s.add(Ordered { id: 1, cycles: 0, rate: 5 });
-    s.add(Ordered { id: 2, cycles: 0, rate: 5 });
+    s.add(Ordered {
+        id: 0,
+        cycles: 0,
+        rate: 5,
+    });
+    s.add(Ordered {
+        id: 1,
+        cycles: 0,
+        rate: 5,
+    });
+    s.add(Ordered {
+        id: 2,
+        cycles: 0,
+        rate: 5,
+    });
     let mut order = Vec::new();
     // Advancing to 5 takes exactly one round (each goes 0 → 5).
     s.run_for(5, &mut order);
@@ -252,8 +264,16 @@ fn halted_entity_with_max_deadline_is_never_stepped() {
     // most-behind and the halted one accumulates zero steps — the scheduler
     // skips it without any special-casing (the Sh2Entity halted-slave model).
     let mut s = Scheduler::new();
-    let live = s.add(Haltable { cycles: 0, halted: false, steps: 0 });
-    let dead = s.add(Haltable { cycles: 0, halted: true, steps: 0 });
+    let live = s.add(Haltable {
+        cycles: 0,
+        halted: false,
+        steps: 0,
+    });
+    let dead = s.add(Haltable {
+        cycles: 0,
+        halted: true,
+        steps: 0,
+    });
     s.run_for(8, &mut ());
     assert_eq!(s.entity(live).steps, 8, "live entity advances to horizon");
     assert_eq!(s.entity(dead).steps, 0, "halted entity is skipped entirely");

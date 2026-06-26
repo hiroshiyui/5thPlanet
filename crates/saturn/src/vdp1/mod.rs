@@ -46,8 +46,7 @@ pub const REGS_END: u32 = 0x05D0_0017;
 /// The VDP1 sprite/polygon engine: VRAM + the double-buffered frame buffer +
 /// the register bank, driving the command-list plotter. A `PTMR` write runs
 /// the list and latches draw-end status.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Vdp1 {
     pub vram: Vram,
     /// Draw buffer — the plotter renders here.
@@ -342,7 +341,13 @@ impl Vdp1 {
         let prev_copr = self.regs.read16(0x14);
         self.erase_framebuffer();
         self.regs.cef_clear();
-        let Vdp1 { vram, fb, regs, timing, .. } = self;
+        let Vdp1 {
+            vram,
+            fb,
+            regs,
+            timing,
+            ..
+        } = self;
         // TVMR bit 0 selects the 8 bits/pixel frame buffer; FBCR bits 3/2
         // (DIE/DIL) select double-interlace plotting. Latch the pixel layout
         // onto the draw buffer so the swap publishes it to the VDP2 sprite
@@ -465,7 +470,11 @@ mod tests {
         assert!(end >= 1000, "draw-end is at/after the kick cycle");
         // Settling at the completion cycle latches draw-end and clears it.
         v.settle(end);
-        assert_eq!(v.draw_end_cycle(), None, "completed plot is no longer pending");
+        assert_eq!(
+            v.draw_end_cycle(),
+            None,
+            "completed plot is no longer pending"
+        );
         assert!(v.take_draw_end(), "the sprite-draw-end notification fired");
     }
 
@@ -551,10 +560,18 @@ mod tests {
         let mut v = Vdp1::new();
         v.write16(REGS_BASE + 0x04, 0x0001); // PTMR one-shot → in flight
         assert!(v.is_drawing());
-        assert_eq!(v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF, 0, "CEF not yet set");
+        assert_eq!(
+            v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF,
+            0,
+            "CEF not yet set"
+        );
         v.write16(REGS_BASE + 0x0C, 0x0001); // ENDR
         assert!(!v.is_drawing(), "ENDR finished the draw");
-        assert_eq!(v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF, regs::EDSR_CEF, "CEF latched");
+        assert_eq!(
+            v.read16(REGS_BASE + 0x10) & regs::EDSR_CEF,
+            regs::EDSR_CEF,
+            "CEF latched"
+        );
     }
 
     #[test]

@@ -49,9 +49,7 @@ fn size_sign_extend_each_width() {
 #[test]
 fn cond_from_bits_maps_every_code() {
     use Cond::*;
-    let expected = [
-        T, F, Hi, Ls, Cc, Cs, Ne, Eq, Vc, Vs, Pl, Mi, Ge, Lt, Gt, Le,
-    ];
+    let expected = [T, F, Hi, Ls, Cc, Cs, Ne, Eq, Vc, Vs, Pl, Mi, Ge, Lt, Gt, Le];
     for (bits, &c) in expected.iter().enumerate() {
         assert_eq!(Cond::from_bits(bits as u16), c, "code {bits:#x}");
     }

@@ -560,8 +560,7 @@ fn plot_raises_the_scu_sprite_draw_end_interrupt() {
 fn put_hgradient_char(v: &mut Vdp1, base: u32) -> u16 {
     for row in 0..8u32 {
         for col in 0..8u32 {
-            v.vram
-                .write16(base + (row * 8 + col) * 2, (col + 1) as u16);
+            v.vram.write16(base + (row * 8 + col) * 2, (col + 1) as u16);
         }
     }
     (base / 8) as u16
@@ -701,7 +700,11 @@ fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
     put(&mut v, 1, END);
     v.process_list();
 
-    assert_eq!(v.fb.pixel(100, 100), 0x2468, "centred rect covers the anchor");
+    assert_eq!(
+        v.fb.pixel(100, 100),
+        0x2468,
+        "centred rect covers the anchor"
+    );
     assert_eq!(v.fb.pixel(91, 91), 0x2468, "near the shifted top-left");
     assert_eq!(v.fb.pixel(80, 80), 0, "outside the centred rect");
 }
@@ -761,7 +764,8 @@ fn normal_sprite_vertical_flip_reverses_rows() {
     // Per-row gradient: row r → colour r+1.
     for row in 0..8u32 {
         for col in 0..8u32 {
-            v.vram.write16(0x4000 + (row * 8 + col) * 2, (row + 1) as u16);
+            v.vram
+                .write16(0x4000 + (row * 8 + col) * 2, (row + 1) as u16);
         }
     }
     let srca = (0x4000u32 / 8) as u16;
@@ -785,7 +789,11 @@ fn normal_sprite_vertical_flip_reverses_rows() {
     // Top screen row shows the last texture row (colour 8); bottom shows the
     // first (colour 1).
     assert_eq!(v.fb.pixel(10, 10), 8, "v-flip: top row = last texel row");
-    assert_eq!(v.fb.pixel(10, 17), 1, "v-flip: bottom row = first texel row");
+    assert_eq!(
+        v.fb.pixel(10, 17),
+        1,
+        "v-flip: bottom row = first texel row"
+    );
 }
 
 #[test]
@@ -909,7 +917,11 @@ fn end_code_texel_is_skipped_unless_disabled() {
     );
     put(&mut v2, 1, END);
     v2.process_list();
-    assert_eq!(v2.fb.pixel(10, 10), 0xFF, "ECD set: end-code drawn as colour");
+    assert_eq!(
+        v2.fb.pixel(10, 10),
+        0xFF,
+        "ECD set: end-code drawn as colour"
+    );
 }
 
 #[test]
@@ -939,7 +951,11 @@ fn transparent_texel_is_dropped_when_spd_off_and_kept_when_on() {
     );
     put(&mut bg, 1, END);
     bg.process_list();
-    assert_eq!(bg.fb.pixel(10, 10), 0x1F, "transparent texel keeps background");
+    assert_eq!(
+        bg.fb.pixel(10, 10),
+        0x1F,
+        "transparent texel keeps background"
+    );
 
     let mut on = Vdp1::new();
     on.fb.set_pixel(10, 10, 0x1F);
@@ -1092,7 +1108,11 @@ fn shadow_calc_halves_only_a_marked_destination() {
     put(&mut v, 1, END);
     v.process_list();
     assert_eq!(v.fb.pixel(15, 15), 0xBDEF, "shadow halves MSB-marked dest");
-    assert_eq!(v.fb.pixel(16, 16), 0x7FFF, "shadow leaves unmarked dest alone");
+    assert_eq!(
+        v.fb.pixel(16, 16),
+        0x7FFF,
+        "shadow leaves unmarked dest alone"
+    );
 }
 
 #[test]
@@ -1178,7 +1198,11 @@ fn system_clipping_bounds_a_primitive() {
 fn user_clipping_applies_only_when_cmdpmod_selects_it() {
     let mut v = Vdp1::new();
     // User clip (type 8): rectangle (XA,YA)-(XC,YC) = (15,15)-(25,25).
-    put(&mut v, 0, [w(0x0008, 0), 0, 0, w(15, 15), 0, w(25, 25), 0, 0]);
+    put(
+        &mut v,
+        0,
+        [w(0x0008, 0), 0, 0, w(15, 15), 0, w(25, 25), 0, 0],
+    );
     // Polygon (10,10)-(40,40) with CMDPMOD bit 10 (0x0400) → use the user clip.
     put(
         &mut v,
@@ -1314,7 +1338,11 @@ fn illegal_command_type_terminates_the_list() {
     );
     put(&mut v, 2, END);
     v.process_list();
-    assert_eq!(v.fb.pixel(15, 15), 0, "illegal command ended the list early");
+    assert_eq!(
+        v.fb.pixel(15, 15),
+        0,
+        "illegal command ended the list early"
+    );
 }
 
 #[test]
@@ -1365,7 +1393,11 @@ fn tvm_8bpp_polygon_writes_one_byte_per_dot() {
     v.process_list();
 
     assert!(v.fb.hires8(), "draw buffer latched the 8bpp layout");
-    assert_eq!(v.fb.pixel8(605, 15), 0x5F, "low 8 bits of CMDCOLR, byte layout");
+    assert_eq!(
+        v.fb.pixel8(605, 15),
+        0x5F,
+        "low 8 bits of CMDCOLR, byte layout"
+    );
     assert_eq!(v.fb.pixel8(599, 15), 0, "outside the polygon");
     assert_eq!(v.fb.pixel8(605, 25), 0, "outside the polygon");
 }

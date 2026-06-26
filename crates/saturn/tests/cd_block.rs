@@ -81,7 +81,11 @@ fn insert_then_eject_round_trips_to_nodisc() {
     sat.bus.write16(CR3, 0x0000, AccessKind::Data);
     sat.bus.write16(CR4, 0x0000, AccessKind::Data);
     let (cr1, _) = sat.bus.read16(CR1, AccessKind::Data);
-    assert_eq!(cr1 >> 8, 0x00, "BUSY (recognition spin-up) right after insert");
+    assert_eq!(
+        cr1 >> 8,
+        0x00,
+        "BUSY (recognition spin-up) right after insert"
+    );
 
     sat.eject_disc();
     assert!(!sat.has_disc(), "no disc after eject");
@@ -135,10 +139,7 @@ fn real_ccd_disc_get_toc_over_the_bus() {
         .unwrap_or_default();
     let ccd_path = root.join("roms/SS - Boot Disc.ccd");
     let img_path = root.join("roms/SS - Boot Disc.img");
-    let (Ok(ccd), Ok(img)) = (
-        std::fs::read_to_string(&ccd_path),
-        std::fs::read(&img_path),
-    ) else {
+    let (Ok(ccd), Ok(img)) = (std::fs::read_to_string(&ccd_path), std::fs::read(&img_path)) else {
         println!("no roms/ boot disc; real-disc Get TOC test skipped");
         return;
     };

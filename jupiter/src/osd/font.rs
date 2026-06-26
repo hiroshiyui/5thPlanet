@@ -141,7 +141,15 @@ impl<'a> Canvas<'a> {
     /// == 1` the logical and physical spaces coincide (the lo-res path).
     pub fn new(buf: &'a mut [u8], pw: usize, ph: usize, sx: usize, sy: usize) -> Self {
         let (sx, sy) = (sx.max(1), sy.max(1));
-        Self { buf, w: pw / sx, h: ph / sy, stride: pw, ph, sx, sy }
+        Self {
+            buf,
+            w: pw / sx,
+            h: ph / sy,
+            stride: pw,
+            ph,
+            sx,
+            sy,
+        }
     }
 
     /// Paint one logical pixel — an `sx × sy` block — clipped to both the

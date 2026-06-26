@@ -43,8 +43,7 @@ const REG_BYTES: usize = 0x200;
 /// background enables, plane/scroll/priority, special effects). Mostly passive
 /// storage the renderer samples each frame; the named accessors below decode
 /// the renderer-critical fields.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Vdp2Regs {
     #[serde(with = "serde_big_array::BigArray")]
     raw: [u8; REG_BYTES],
@@ -616,7 +615,11 @@ impl Vdp2Regs {
     /// pixel once whole-layer/line zoom advances the accumulator across a dot.
     /// (Mednafen `XScrollF`/`YScrollF = (V >> 8) & 0xFF`.)
     pub fn nbg_scroll_frac(&self, n: usize) -> (u8, u8) {
-        let (xo, yo) = if n == 0 { (0x072, 0x076) } else { (0x082, 0x086) };
+        let (xo, yo) = if n == 0 {
+            (0x072, 0x076)
+        } else {
+            (0x082, 0x086)
+        };
         (
             ((self.read16(xo) >> 8) & 0xFF) as u8,
             ((self.read16(yo) >> 8) & 0xFF) as u8,
@@ -630,7 +633,11 @@ impl Vdp2Regs {
     /// `.16` to compose with the line-zoom table. A larger increment reduces the
     /// layer (each screen dot steps more source pixels). Only NBG0/1 support it.
     pub fn nbg_coord_inc(&self, n: usize) -> (u32, u32) {
-        let (xi, yi) = if n == 0 { (0x078, 0x07C) } else { (0x088, 0x08C) };
+        let (xi, yi) = if n == 0 {
+            (0x078, 0x07C)
+        } else {
+            (0x088, 0x08C)
+        };
         let inc = |int_off: u32, frac_off: u32| {
             let int = (self.read16(int_off) & 0x7) as u32;
             let frac = ((self.read16(frac_off) >> 8) & 0xFF) as u32;
@@ -1062,7 +1069,11 @@ mod tests {
         // MZCTL: enable NBG0 (bit 0), 4×2 blocks (MZSZH=3 → width 4, MZSZV=1 → height 2).
         r.write16(0x022, (1 << 0) | (3 << 8) | (1 << 12));
         assert_eq!(r.mosaic_coord(1 << 0, 0, 0), (0, 0));
-        assert_eq!(r.mosaic_coord(1 << 0, 3, 1), (0, 0), "snaps to the 4×2 block origin");
+        assert_eq!(
+            r.mosaic_coord(1 << 0, 3, 1),
+            (0, 0),
+            "snaps to the 4×2 block origin"
+        );
         assert_eq!(r.mosaic_coord(1 << 0, 5, 3), (4, 2), "next block over");
         // A layer whose enable bit is clear is untouched (NBG1, RBG0).
         assert_eq!(r.mosaic_coord(1 << 1, 5, 3), (5, 3));
@@ -1192,14 +1203,30 @@ mod tests {
         let mut r = Vdp2Regs::new();
         // CRAOFA (0x0E4): 3 bits per layer, N0..N3 at bits 2:0/6:4/10:8/14:12.
         r.write16(0x0E4, (1 << 0) | (3 << 4) | (5 << 8) | (7 << 12));
-        assert_eq!(r.nbg_color_ram_offset(0), 1 << 8, "N0 offset 1 → CRAM 0x100");
-        assert_eq!(r.nbg_color_ram_offset(1), 3 << 8, "N1 offset 3 → CRAM 0x300");
+        assert_eq!(
+            r.nbg_color_ram_offset(0),
+            1 << 8,
+            "N0 offset 1 → CRAM 0x100"
+        );
+        assert_eq!(
+            r.nbg_color_ram_offset(1),
+            3 << 8,
+            "N1 offset 3 → CRAM 0x300"
+        );
         assert_eq!(r.nbg_color_ram_offset(2), 5 << 8);
         assert_eq!(r.nbg_color_ram_offset(3), 7 << 8);
         // CRAOFB (0x0E6): RBG0 at bits 2:0; RBG1 reuses NBG0's offset.
         r.write16(0x0E6, 2);
-        assert_eq!(r.rbg_color_ram_offset(0), 2 << 8, "RBG0 offset 2 → CRAM 0x200");
-        assert_eq!(r.rbg_color_ram_offset(1), 1 << 8, "RBG1 shares NBG0's offset");
+        assert_eq!(
+            r.rbg_color_ram_offset(0),
+            2 << 8,
+            "RBG0 offset 2 → CRAM 0x200"
+        );
+        assert_eq!(
+            r.rbg_color_ram_offset(1),
+            1 << 8,
+            "RBG1 shares NBG0's offset"
+        );
     }
 
     #[test]
@@ -1313,7 +1340,11 @@ mod tests {
         r.write16(0x108, 0x000C); // CCRNA: N0 ratio = 12
         assert!(r.color_calc_add_mode());
         assert_eq!(r.nbg_color_calc_ratio(0), 12);
-        assert_eq!(r.nbg_color_calc(0), Some((12, true)), "enabled → (ratio, add)");
+        assert_eq!(
+            r.nbg_color_calc(0),
+            Some((12, true)),
+            "enabled → (ratio, add)"
+        );
         assert_eq!(r.nbg_color_calc(1), None, "N1 disabled → None");
         // RBG0 uses CCCTL bit 4 + CCRR (0x10C).
         r.write16(0x0EC, 0x0010 | 0x0100);
@@ -1340,10 +1371,26 @@ mod tests {
         r.write16(0x01C, 0x21FF); // bank3 slots0-3: N2NT,N1NT,NOP,NOP
         r.write16(0x01E, 0xFFFF);
         // bit b set ⇒ NBG`n` may fetch NT / CG from VRAM bank b.
-        assert_eq!(r.nbg_vcp_fetch_masks(0), (0b0010, 0b0001), "NBG0: NT bank1, CG bank0");
-        assert_eq!(r.nbg_vcp_fetch_masks(1), (0b1000, 0b0100), "NBG1: NT bank3, CG bank2");
-        assert_eq!(r.nbg_vcp_fetch_masks(2), (0b1000, 0b0100), "NBG2: NT bank3, CG bank2");
-        assert_eq!(r.nbg_vcp_fetch_masks(3), (0b0010, 0b0001), "NBG3: NT bank1, CG bank0");
+        assert_eq!(
+            r.nbg_vcp_fetch_masks(0),
+            (0b0010, 0b0001),
+            "NBG0: NT bank1, CG bank0"
+        );
+        assert_eq!(
+            r.nbg_vcp_fetch_masks(1),
+            (0b1000, 0b0100),
+            "NBG1: NT bank3, CG bank2"
+        );
+        assert_eq!(
+            r.nbg_vcp_fetch_masks(2),
+            (0b1000, 0b0100),
+            "NBG2: NT bank3, CG bank2"
+        );
+        assert_eq!(
+            r.nbg_vcp_fetch_masks(3),
+            (0b0010, 0b0001),
+            "NBG3: NT bank1, CG bank0"
+        );
     }
 
     #[test]
@@ -1356,8 +1403,16 @@ mod tests {
         r.write16(0x010, 0x0004); // bank0 slot0 = N0NT, slot1 = N0CG (0x0004 → 0,0,0,4)
         // esb(0)=0, esb(1)=0 → both banks 0 and 1 see VCPRegs[0].
         let (nt, cg) = r.nbg_vcp_fetch_masks(0);
-        assert_eq!(nt & 0b0011, 0b0011, "NT granted in both halves of unsplit bank A");
-        assert_eq!(cg & 0b0011, 0b0011, "CG granted in both halves of unsplit bank A");
+        assert_eq!(
+            nt & 0b0011,
+            0b0011,
+            "NT granted in both halves of unsplit bank A"
+        );
+        assert_eq!(
+            cg & 0b0011,
+            0b0011,
+            "CG granted in both halves of unsplit bank A"
+        );
     }
 
     #[test]
@@ -1376,10 +1431,16 @@ mod tests {
         r.write16(0x000, 0x0000);
         r.write16(0x00E, 0x0000); // RAMCTL CRMD = 0
         r.write16(0x0EC, 0x0400 | 0x8000);
-        assert!(!r.extended_color_calc_active(), "gradient precedence → inactive");
+        assert!(
+            !r.extended_color_calc_active(),
+            "gradient precedence → inactive"
+        );
         // …but in RGB888 CRAM mode the gradient bit doesn't apply, so EXCC holds.
         r.write16(0x00E, 0x2000); // CRMD = 2
-        assert!(r.extended_color_calc_active(), "RGB888 + EXCEN (gradient n/a) → active");
+        assert!(
+            r.extended_color_calc_active(),
+            "RGB888 + EXCEN (gradient n/a) → active"
+        );
     }
 
     #[test]

@@ -100,8 +100,11 @@ impl EdgeStepper {
             d_error: fx((dmax - 2 * dmax) - 1),
             d_error_inc: fx(2 * max_adxdy),
             d_error_adj: fx(-(2 * dmax)),
-            d_error_cmp: fx(if (if abs_dy > abs_dx { dy } else { dx }) < 0 { -1 } else { 0 })
-                as i32,
+            d_error_cmp: fx(if (if abs_dy > abs_dx { dy } else { dx }) < 0 {
+                -1
+            } else {
+                0
+            }) as i32,
         }
     }
 
@@ -158,8 +161,7 @@ struct LineWalk {
 /// `UserClip*` / `LocalX/Y`. The `dta` fractional accumulator likewise
 /// carries `AdjustDrawTiming` residue (Mednafen `DTACounter`). Owned and
 /// serialized by [`super::Vdp1`].
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DrawTiming {
     local_x: i32,
     local_y: i32,
@@ -239,7 +241,11 @@ impl DrawTiming {
     /// Per-plot cost of one pixel step: 6 when the framebuffer is read back
     /// (MSB-on or half-background colour calc), else 1 (`PlotPixel`).
     fn ppc(mode: u16) -> u64 {
-        if mode & 0x8000 != 0 || mode & 0x0001 != 0 { 6 } else { 1 }
+        if mode & 0x8000 != 0 || mode & 0x0001 != 0 {
+            6
+        } else {
+            1
+        }
     }
 
     fn polygon_cost(&mut self, w: &[u16; 16]) -> u64 {
@@ -431,12 +437,10 @@ impl DrawTiming {
                     != 0;
                 p0.1 == p1.1 && (p0.0 < self.uclip_x0 || p0.0 > self.uclip_x1)
             } else {
-                clipped |= (((self.sys_clip_x - p0.0) & (self.sys_clip_x - p1.0))
-                    | (p0.0 & p1.0))
+                clipped |= (((self.sys_clip_x - p0.0) & (self.sys_clip_x - p1.0)) | (p0.0 & p1.0))
                     & 0x1000
                     != 0;
-                clipped |= (((self.sys_clip_y - p0.1) & (self.sys_clip_y - p1.1))
-                    | (p0.1 & p1.1))
+                clipped |= (((self.sys_clip_y - p0.1) & (self.sys_clip_y - p1.1)) | (p0.1 & p1.1))
                     & 0x1000
                     != 0;
                 p0.1 == p1.1 && p0.0 > self.sys_clip_x
@@ -527,12 +531,9 @@ impl DrawTiming {
     fn walk_span(&self, aa: bool, mode: u16, w: &LineWalk, ppc: u64) -> u64 {
         let user_clip_en = mode & 0x400 != 0;
         let user_clip_mode = mode & 0x200 != 0;
-        let clipo =
-            (((self.sys_clip_y & 0x3FF) as u32) << 16) | ((self.sys_clip_x & 0x3FF) as u32);
-        let uclipo0 =
-            (((self.uclip_y0 & 0x3FF) as u32) << 16) | ((self.uclip_x0 & 0x3FF) as u32);
-        let uclipo1 =
-            (((self.uclip_y1 & 0x3FF) as u32) << 16) | ((self.uclip_x1 & 0x3FF) as u32);
+        let clipo = (((self.sys_clip_y & 0x3FF) as u32) << 16) | ((self.sys_clip_x & 0x3FF) as u32);
+        let uclipo0 = (((self.uclip_y0 & 0x3FF) as u32) << 16) | ((self.uclip_x0 & 0x3FF) as u32);
+        let uclipo1 = (((self.uclip_y1 & 0x3FF) as u32) << 16) | ((self.uclip_x1 & 0x3FF) as u32);
 
         let mut xy = w.xy;
         let mut error = w.error;

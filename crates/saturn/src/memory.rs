@@ -15,8 +15,7 @@
 /// `0x0000_0000..0x0010_0000`. A bus-side caller passes in a local
 /// offset that's already been folded into the region's range; the ROM
 /// then folds *that* into `rom.len()` so any image size mirrors cleanly.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BiosRom {
     // The BIOS image is read-only external media (and copyrighted), so save
     // states reference it rather than embedding it: `#[serde(skip)]` omits
@@ -73,8 +72,7 @@ impl BiosRom {
 /// Generic byte-addressable RAM region. Used for both work RAM tiers and
 /// backup RAM. `size` is the region's byte length; addresses are folded
 /// modulo `size` so mirrored aliases work transparently.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Ram {
     bytes: Vec<u8>,
 }
@@ -159,8 +157,7 @@ pub const INTERNAL_BACKUP_BYTES: usize = 32 * 1024;
 /// signature, so a fresh instance is pre-formatted the same way
 /// (MAME `nvram_init`); the frontend overwrites it with the persisted file
 /// when one exists.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupRam {
     data: Vec<u8>,
 }
@@ -235,8 +232,7 @@ impl BackupRam {
 /// Stand-in for a region of registers that hasn't been modeled yet
 /// (SMPC, SCU, VDP1/2, SCSP, A-bus, etc.). Reads return 0; writes are
 /// dropped. Holds a name for traceable debug output.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StubRegisterBank {
     // Debug-only label, and a borrowed `&'static str` at that, so it's not
     // serialized; a reloaded stub carries no state to lose (reads return 0,

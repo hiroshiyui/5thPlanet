@@ -228,7 +228,10 @@ impl Disc {
                     if !have_file {
                         return Err(String::from("TRACK before FILE"));
                     }
-                    let number: u8 = it.next().and_then(|s| s.parse().ok()).ok_or("bad TRACK #")?;
+                    let number: u8 = it
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or("bad TRACK #")?;
                     let (mode, sector_size) = parse_track_type(it.next().unwrap_or(""))?;
                     cur = Some(Pending {
                         number,
@@ -241,7 +244,8 @@ impl Disc {
                 Some(kw) if kw == "INDEX" => {
                     let idx: u8 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0xFF);
                     if idx == 1 {
-                        let frame = mmss_ff_to_frames(it.next().unwrap_or("")).ok_or("bad INDEX")?;
+                        let frame =
+                            mmss_ff_to_frames(it.next().unwrap_or("")).ok_or("bad INDEX")?;
                         if let Some(p) = cur.as_mut() {
                             p.index01_frame = frame;
                         }
@@ -256,9 +260,17 @@ impl Disc {
         if pending.is_empty() {
             return Err(String::from("no tracks in CUE"));
         }
-        Disc::from_pending_tracks(image, pending.into_iter().map(|p| {
-            (p.number, p.mode, p.sector_size, p.file_base + p.index01_frame as usize * p.sector_size)
-        }))
+        Disc::from_pending_tracks(
+            image,
+            pending.into_iter().map(|p| {
+                (
+                    p.number,
+                    p.mode,
+                    p.sector_size,
+                    p.file_base + p.index01_frame as usize * p.sector_size,
+                )
+            }),
+        )
     }
 
     /// Parse a CloneCD `.ccd` + raw `.img`. The CCD's `[Entry]` blocks give a
@@ -280,7 +292,12 @@ impl Disc {
         let mut in_entry = false;
         let mut commit = |point: &mut Option<u32>, control, plba: &mut Option<i64>, pmin| {
             if let (Some(p), Some(l)) = (*point, *plba) {
-                entries.push(Entry { point: p, control, plba: l, pmin });
+                entries.push(Entry {
+                    point: p,
+                    control,
+                    plba: l,
+                    pmin,
+                });
             }
             *point = None;
             *plba = None;
@@ -327,7 +344,11 @@ impl Disc {
                 .map(|e| (e.control, e.plba))
                 .ok_or_else(|| alloc::format!("CCD: missing track {tno}"))?;
             // CCD Control bit 2 (0x4) = data track.
-            let mode = if control & 0x04 != 0 { TrackMode::Mode1 } else { TrackMode::Audio };
+            let mode = if control & 0x04 != 0 {
+                TrackMode::Mode1
+            } else {
+                TrackMode::Audio
+            };
             tracks.push((tno, mode, 2352, lba.max(0) as usize * 2352));
         }
         let mut disc = Disc::from_pending_tracks(img, tracks.into_iter())?;
@@ -403,10 +424,16 @@ impl Disc {
     /// silence is order-neutral → undetermined → no flag).
     pub fn audio_looks_msb_first(&self) -> bool {
         let (mut le_jumps, mut be_jumps, mut probed) = (0u32, 0u32, 0u32);
-        for t in self.tracks.iter().filter(|t| t.mode == TrackMode::Audio && t.length >= 8) {
+        for t in self
+            .tracks
+            .iter()
+            .filter(|t| t.mode == TrackMode::Audio && t.length >= 8)
+        {
             let mid = t.start_fad + t.length / 2;
             for s in 0..4 {
-                let Some(raw) = self.read_full_sector(mid + s) else { break };
+                let Some(raw) = self.read_full_sector(mid + s) else {
+                    break;
+                };
                 if raw.len() < 2352 {
                     break;
                 }
@@ -434,7 +461,9 @@ impl Disc {
     pub fn read_sector(&self, fad: u32) -> Option<&[u8]> {
         let t = self.track_at_fad(fad)?;
         let rel = (fad - t.start_fad) as usize;
-        let base = t.image_offset + rel * t.sector_size + t.mode.user_offset_2352() * (t.sector_size == 2352) as usize;
+        let base = t.image_offset
+            + rel * t.sector_size
+            + t.mode.user_offset_2352() * (t.sector_size == 2352) as usize;
         self.image.get(base..base + SECTOR_USER)
     }
 
@@ -682,7 +711,11 @@ mod tests {
             }
             h
         };
-        assert_eq!(d.fingerprint(), fresh, "cached fingerprint must match the raw FNV-1a");
+        assert_eq!(
+            d.fingerprint(),
+            fresh,
+            "cached fingerprint must match the raw FNV-1a"
+        );
         // Identity: equal images → equal fingerprint; a one-byte change differs.
         assert_eq!(Disc::from_iso(img.clone()).fingerprint(), d.fingerprint());
         img[SECTOR_USER * 2] ^= 0xFF;
@@ -797,10 +830,22 @@ PLBA=0
         assert_eq!(parse_int("0XFF"), Some(0xFF), "uppercase 0X prefix");
         assert_eq!(parse_int("4350"), Some(4350));
         assert_eq!(parse_int("-150"), Some(-150));
-        assert_eq!(parse_int("  12 "), Some(12), "surrounding whitespace trimmed");
+        assert_eq!(
+            parse_int("  12 "),
+            Some(12),
+            "surrounding whitespace trimmed"
+        );
         assert_eq!(parse_int("zz"), None, "non-numeric → None");
-        assert_eq!(mmss_ff_to_frames("01:02"), None, "missing frame field → None");
-        assert_eq!(mmss_ff_to_frames("xx:02:00"), None, "non-numeric minutes → None");
+        assert_eq!(
+            mmss_ff_to_frames("01:02"),
+            None,
+            "missing frame field → None"
+        );
+        assert_eq!(
+            mmss_ff_to_frames("xx:02:00"),
+            None,
+            "non-numeric minutes → None"
+        );
     }
 
     #[test]
@@ -811,7 +856,10 @@ PLBA=0
         assert_eq!(d.lead_out_fad(), FAD_OFFSET + 2);
         assert!(d.read_sector(150).is_some());
         assert!(d.read_sector(151).is_some());
-        assert!(d.read_sector(152).is_none(), "the partial sector is not addressable");
+        assert!(
+            d.read_sector(152).is_none(),
+            "the partial sector is not addressable"
+        );
     }
 
     #[test]
@@ -907,7 +955,11 @@ FILE \"g.bin\" BINARY
         let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
         // Track 2 starts at frame 3 (INDEX 01), not frame 1 (INDEX 00).
         assert_eq!(d.tracks()[1].start_fad, 153);
-        assert_eq!(d.tracks()[0].length, 3, "track 1 runs up to track 2's INDEX 01");
+        assert_eq!(
+            d.tracks()[0].length,
+            3,
+            "track 1 runs up to track 2's INDEX 01"
+        );
     }
 
     #[test]
@@ -916,30 +968,34 @@ FILE \"g.bin\" BINARY
         // FILE without a quoted name.
         assert!(Disc::from_cue("FILE game.bin BINARY\n", load).is_err());
         // A missing FILE the loader can't resolve.
-        assert!(
-            Disc::from_cue("FILE \"missing.bin\" BINARY\n", |_| None).is_err()
-        );
+        assert!(Disc::from_cue("FILE \"missing.bin\" BINARY\n", |_| None).is_err());
         // TRACK before any FILE.
         assert!(Disc::from_cue("TRACK 01 MODE1/2352\n", load).is_err());
         // No tracks at all.
         assert!(Disc::from_cue("REM just a comment\n", load).is_err());
         // Unsupported TRACK type.
-        assert!(
-            Disc::from_cue(
-                "FILE \"g.bin\" BINARY\n  TRACK 01 MODE9/9999\n",
-                load
-            )
-            .is_err()
-        );
+        assert!(Disc::from_cue("FILE \"g.bin\" BINARY\n  TRACK 01 MODE9/9999\n", load).is_err());
     }
 
     #[test]
     fn parse_track_type_covers_every_supported_token() {
         assert_eq!(parse_track_type("AUDIO").unwrap(), (TrackMode::Audio, 2352));
-        assert_eq!(parse_track_type("MODE1/2048").unwrap(), (TrackMode::Mode1, 2048));
-        assert_eq!(parse_track_type("MODE1/2352").unwrap(), (TrackMode::Mode1, 2352));
-        assert_eq!(parse_track_type("MODE2/2336").unwrap(), (TrackMode::Mode2, 2336));
-        assert_eq!(parse_track_type("MODE2/2352").unwrap(), (TrackMode::Mode2, 2352));
+        assert_eq!(
+            parse_track_type("MODE1/2048").unwrap(),
+            (TrackMode::Mode1, 2048)
+        );
+        assert_eq!(
+            parse_track_type("MODE1/2352").unwrap(),
+            (TrackMode::Mode1, 2352)
+        );
+        assert_eq!(
+            parse_track_type("MODE2/2336").unwrap(),
+            (TrackMode::Mode2, 2336)
+        );
+        assert_eq!(
+            parse_track_type("MODE2/2352").unwrap(),
+            (TrackMode::Mode2, 2352)
+        );
         // Case-insensitive.
         assert_eq!(parse_track_type("audio").unwrap(), (TrackMode::Audio, 2352));
         assert!(parse_track_type("CDG").is_err());
@@ -970,9 +1026,17 @@ PLBA=4
         let img = vec![0u8; 2352 * 8];
         let d = Disc::from_ccd(ccd, img).unwrap();
         assert_eq!(d.last_track(), 2);
-        assert_eq!(d.tracks()[0].mode, TrackMode::Audio, "control bit 2 clear → audio");
+        assert_eq!(
+            d.tracks()[0].mode,
+            TrackMode::Audio,
+            "control bit 2 clear → audio"
+        );
         assert_eq!(d.tracks()[0].ctrl_addr(), 0x01);
-        assert_eq!(d.tracks()[1].mode, TrackMode::Mode1, "control bit 2 set → data");
+        assert_eq!(
+            d.tracks()[1].mode,
+            TrackMode::Mode1,
+            "control bit 2 set → data"
+        );
         assert_eq!(d.tracks()[1].start_fad, 154); // LBA 4 + 150
         assert_eq!(d.lead_out_fad(), 158); // LBA 8 + 150
     }
@@ -1018,7 +1082,10 @@ PLBA=0
         assert!(d.track_at_fad(149).is_none(), "before first track");
         assert_eq!(d.track_at_fad(150).unwrap().number, 1);
         assert_eq!(d.track_at_fad(152).unwrap().number, 1);
-        assert!(d.track_at_fad(153).is_none(), "lead-out is past the last track");
+        assert!(
+            d.track_at_fad(153).is_none(),
+            "lead-out is past the last track"
+        );
     }
 
     #[test]
@@ -1054,9 +1121,15 @@ PLBA=0
         assert_eq!(info.start_fad, 150);
 
         let mut user = [0u8; SECTOR_USER];
-        assert!(SectorSource::read_sector(&d, 150, &mut user), "2048 bytes read");
+        assert!(
+            SectorSource::read_sector(&d, 150, &mut user),
+            "2048 bytes read"
+        );
         assert_eq!(user[0], 0x5A);
-        assert!(!SectorSource::read_sector(&d, 149, &mut user), "no lead-in sector");
+        assert!(
+            !SectorSource::read_sector(&d, 149, &mut user),
+            "no lead-in sector"
+        );
 
         let mut full = [0u8; 2352];
         assert_eq!(SectorSource::read_full_sector(&d, 150, &mut full), 2352);
