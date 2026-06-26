@@ -19,7 +19,7 @@
 //!   0x94         T1S  — timer 1 set value
 //!   0x98         T1MD — timer 1 mode
 //!   0xA0         IMS  — interrupt mask (1 = masked)
-//!   0xA4         IST  — interrupt status (W1C)
+//!   0xA4         IST  — interrupt status (write-0-clear)
 //!   0xA8         AIACK — A-bus interrupt acknowledge
 //!   0xB0         ASR0 — A-bus set 0
 //!   0xB4         ASR1 — A-bus set 1
@@ -139,8 +139,7 @@ const ALL_SOURCES: &[Source] = &[
 /// One SCU DMA channel's register set (`D*R/W/C/AD/EN/MD`). The three levels
 /// differ only in transfer-count width; the accessors below decode the
 /// mode/add fields (direct vs indirect, address-update, increments).
-#[derive(Clone, Copy, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DmaChannel {
     pub read_addr: u32,
     pub write_addr: u32,
@@ -196,8 +195,7 @@ impl DmaChannel {
 /// the A-bus refresh/wait registers, and the embedded [`scu_dsp::Dsp`]. The
 /// transfers and the DSP run at the Saturn aggregate, since the SCU can't reach
 /// the bus from inside it.
-#[derive(Clone, Debug, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Scu {
     pub channels: [DmaChannel; NUM_CHANNELS],
     pub dstp: u32,
@@ -222,7 +220,7 @@ pub struct Scu {
     /// Sources that have been asserted since the last drain. The
     /// Saturn aggregate's `drain_scu_intc` pops one per call and
     /// raises it on the master SH-2's INTC. Distinct from `ist`: `ist`
-    /// is software-visible state (cleared by W1C from a handler);
+    /// is software-visible state (cleared by write-0-clear from a handler);
     /// `fresh_assertions` tracks edges so we don't re-fire on the SH-2
     /// every batch while software is still handling the previous one.
     fresh_assertions: u32,
@@ -251,8 +249,7 @@ pub struct Scu {
 /// Snapshot of a queued DMA request handed to the bus drainer. The drainer
 /// (`system::drain_dma`) performs the byte movement through the bus,
 /// since the SCU itself can't reach it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DmaRequest {
     pub channel: usize,
     pub src: u32,
@@ -325,9 +322,9 @@ impl Scu {
             0x94 => self.t1s = val,
             0x98 => self.t1md = val,
             0xA0 => self.ims = val & 0xBFFF, // IMS is 16-bit; bit 14 is unused (scu.inc)
-            // IST is write-1-to-clear: software acknowledges interrupts
-            // by writing the bit it wants to clear.
-            0xA4 => self.ist &= !val,
+            // IST is write-AND-to-clear: a written 0 bit clears the flag,
+            // a written 1 bit leaves it untouched (Mednafen `IPending &= DB`).
+            0xA4 => self.ist &= val,
             0xA8 => {
                 self.aiack = val;
                 // A-bus interrupt acknowledge: writing bit 0 clears the
@@ -597,6 +594,7 @@ impl Scu {
             c.write_addr = final_dst;
         }
         c.transfer_count = 0;
+        c.enable &= !DGO_BIT;
         let source = match channel {
             0 => Source::Level0DmaEnd,
             1 => Source::Level1DmaEnd,
@@ -608,7 +606,7 @@ impl Scu {
 
     /// Assert an interrupt source: set its IST bit and mark it as a
     /// fresh assertion the Saturn drainer should forward to the master
-    /// SH-2. Software clears IST manually via the standard W1C path.
+    /// SH-2. Software clears IST manually via the standard write-0-clear path.
     pub fn raise(&mut self, source: Source) {
         let bit = 1 << source.bit();
         self.ist |= bit;
@@ -692,14 +690,6 @@ impl Scu {
     /// for that source so we don't re-fire on the SH-2 on the next
     /// drain (re-firing only happens after a new `raise`).
     ///
-    /// Acknowledging the interrupt **also clears its `IST` status bit**:
-    /// the Saturn SCU clears a pending interrupt's IST bit when the SH-2
-    /// takes the vector (the interrupt-acknowledge cycle), not only via
-    /// the software W1C path — game/BIOS handlers seldom W1C IST (VF2 and
-    /// the real BIOS each write IST only a couple of times across a whole
-    /// run), so without ack-clear the IST bits accumulate stale-set
-    /// forever and any handler that reads IST to decide masking sees the
-    /// wrong state.
     /// Assert/deassert the CD-block external interrupt ([`Source::Cd`]) as a
     /// level = `active` (`(CD HIRQ & HIRQ_Mask) != 0`). Mirrors Mednafen's
     /// `RecalcIRQOut` → `ABusIRQCheck` (`cdb.cpp` / `scu.inc`): a fresh SCU
@@ -710,11 +700,16 @@ impl Scu {
     /// lands the instant the CD raises an unmasked HIRQ bit — the GFS file
     /// library polls nothing; it is driven by this interrupt.
     pub fn set_cd_int(&mut self, active: bool) {
-        if active && !self.cd_prohibit {
+        static CD_NO_PROHIBIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_prohibit =
+            *CD_NO_PROHIBIT.get_or_init(|| std::env::var_os("SAT_CD_NO_PROHIBIT").is_some());
+        if active && (!self.cd_prohibit || no_prohibit) {
             let bit = 1u32 << Source::Cd.bit();
             self.fresh_assertions |= bit;
             self.ist |= bit;
-            self.cd_prohibit = true;
+            if !no_prohibit {
+                self.cd_prohibit = true;
+            }
         }
     }
 
@@ -744,7 +739,7 @@ impl Scu {
                 continue;
             }
             self.fresh_assertions &= !bit;
-            self.ist &= !bit; // SCU clears IST on the SH-2 acknowledge cycle
+            self.ist &= !bit;
             return Some((source, lvl));
         }
         None
@@ -804,7 +799,11 @@ mod tests {
         s.write32(0xA8, 1);
         s.write32(0xA0, 0x0000);
         s.set_cd_int(true);
-        assert_eq!(s.take_pending_interrupt(7), None, "imask 7 gates the level-7 CD int");
+        assert_eq!(
+            s.take_pending_interrupt(7),
+            None,
+            "imask 7 gates the level-7 CD int"
+        );
         assert_eq!(s.take_pending_interrupt(6), Some((Source::Cd, 7)));
     }
 
@@ -883,8 +882,15 @@ mod tests {
         assert_eq!(s.read32(0x90), 0x0000_1234);
         assert_eq!(s.read32(0x94), 0x0000_5678);
         assert_eq!(s.read32(0x98), 0x0000_0001);
-        assert_eq!(s.read32(0xA0), 0x0000_BF00, "IMS at 0xA0 (bit 14 masked off)");
-        assert_eq!(s.ims, 0x0000_BF00, "0xA0 write reaches the mask field, masked to 0xBFFF");
+        assert_eq!(
+            s.read32(0xA0),
+            0x0000_BF00,
+            "IMS at 0xA0 (bit 14 masked off)"
+        );
+        assert_eq!(
+            s.ims, 0x0000_BF00,
+            "0xA0 write reaches the mask field, masked to 0xBFFF"
+        );
     }
 
     #[test]
@@ -963,6 +969,20 @@ mod tests {
     }
 
     #[test]
+    fn finish_dma_clears_the_channel_go_bit() {
+        let mut s = Scu::new();
+        s.channels[0].enable = DGO_BIT | 1;
+        s.channels[0].transfer_count = 0x10;
+        s.finish_dma(0, 0, 0);
+        assert_eq!(s.channels[0].enable & DGO_BIT, 0);
+        assert_eq!(
+            s.channels[0].enable & 1,
+            1,
+            "finish clears DGO without disturbing the start-enable bit"
+        );
+    }
+
+    #[test]
     fn take_pending_interrupt_resolves_by_priority() {
         let mut s = Scu::new();
         s.ims = 0; // reset masks all sources; unmask to test delivery
@@ -1009,9 +1029,11 @@ mod tests {
         s.ims = 0; // reset masks all sources; unmask to test acknowledge
         s.raise(Source::DspEnd);
         let _ = s.take_pending_interrupt(0).unwrap();
-        // The SCU clears IST on the SH-2 acknowledge cycle (vector fetch);
-        // it does not linger stale-set waiting for a software W1C.
-        assert_eq!(s.ist & (1 << Source::DspEnd.bit()), 0);
+        assert_eq!(
+            s.ist & (1 << Source::DspEnd.bit()),
+            0,
+            "vector acceptance clears the delivered IST bit"
+        );
         // Re-draining without a fresh raise returns nothing.
         assert!(s.take_pending_interrupt(0).is_none());
         // After a new raise, the same source fires again.
@@ -1021,13 +1043,14 @@ mod tests {
 
     #[test]
     fn a_masked_source_keeps_its_ist_bit_until_it_is_actually_taken() {
-        // Ack-clear only happens on delivery: a pending-but-masked source
-        // keeps its IST bit set (matching hardware — masking gates delivery,
-        // not the status latch).
+        // Masking gates delivery, not the visible status latch.
         let mut s = Scu::new();
         s.ims = 1 << Source::VBlankOut.bit();
         s.raise(Source::VBlankOut);
-        assert!(s.take_pending_interrupt(0).is_none(), "masked: not delivered");
+        assert!(
+            s.take_pending_interrupt(0).is_none(),
+            "masked: not delivered"
+        );
         assert_ne!(
             s.ist & (1 << Source::VBlankOut.bit()),
             0,
@@ -1085,7 +1108,10 @@ mod tests {
         s.write32(0x08, 0); // count 0
         s.write32(0x14, (1 << 24) | 7); // indirect + manual
         s.write32(0x10, DGO_BIT);
-        assert!(s.take_pending_dma().is_some(), "indirect fires with count 0");
+        assert!(
+            s.take_pending_dma().is_some(),
+            "indirect fires with count 0"
+        );
     }
 
     #[test]
@@ -1095,7 +1121,10 @@ mod tests {
         s.write32(0x14, 0); // D0MD: factor 0
         s.write32(0x08, 0x10);
         s.write32(0x10, DGO_BIT); // armed
-        assert!(s.take_pending_dma().is_none(), "factor-0 channel waits for the event");
+        assert!(
+            s.take_pending_dma().is_none(),
+            "factor-0 channel waits for the event"
+        );
         // A non-matching event leaves it armed.
         s.trigger_dma_factor(3); // Timer0 — wrong factor
         assert!(s.take_pending_dma().is_none());
@@ -1103,7 +1132,10 @@ mod tests {
         s.trigger_dma_factor(0); // VBlank-IN
         assert!(s.take_pending_dma().is_some());
         s.trigger_dma_factor(0);
-        assert!(s.take_pending_dma().is_some(), "armed channel re-fires on the next event");
+        assert!(
+            s.take_pending_dma().is_some(),
+            "armed channel re-fires on the next event"
+        );
     }
 
     #[test]
@@ -1111,7 +1143,10 @@ mod tests {
         let mut s = Scu::new();
         s.write32(0x14, 2); // factor 2 (HBlank), but not armed (D*EN bit 8 clear)
         s.trigger_dma_factor(2);
-        assert!(s.take_pending_dma().is_none(), "unarmed channel never triggers");
+        assert!(
+            s.take_pending_dma().is_none(),
+            "unarmed channel never triggers"
+        );
     }
 
     #[test]
@@ -1124,7 +1159,10 @@ mod tests {
         s.write8(0x01, 0x00);
         s.write8(0x02, 0x10);
         s.write8(0x03, 0x00);
-        assert_eq!(s.channels[0].read_addr, 0x0600_1000, "byte writes assemble the word");
+        assert_eq!(
+            s.channels[0].read_addr, 0x0600_1000,
+            "byte writes assemble the word"
+        );
         // A byte write to D0EN's DGO byte must NOT trigger.
         s.write8(0x12, 0x01); // bit 8 of the big-endian enable word
         assert!(s.take_pending_dma().is_none(), "byte writes never fire DMA");
@@ -1138,7 +1176,10 @@ mod tests {
         s.write8(0x29, 0xFF);
         s.write8(0x2A, 0xFF);
         s.write8(0x2B, 0xFF);
-        assert_eq!(s.channels[1].transfer_count, 0x0000_0FFF, "ch1 count masked to 12 bits");
+        assert_eq!(
+            s.channels[1].transfer_count, 0x0000_0FFF,
+            "ch1 count masked to 12 bits"
+        );
     }
 
     #[test]
@@ -1185,7 +1226,10 @@ mod tests {
         // Writing AIACK with bit 0 *clear* leaves the prohibit latch set.
         s.write32(0xA8, 0x0000_0002);
         s.set_cd_int(true);
-        assert!(s.take_pending_interrupt(0).is_none(), "bit 0 clear → latch unchanged");
+        assert!(
+            s.take_pending_interrupt(0).is_none(),
+            "bit 0 clear → latch unchanged"
+        );
         assert_eq!(s.read32(0xA8), 0x0000_0002, "AIACK stored");
     }
 
@@ -1193,7 +1237,11 @@ mod tests {
     fn ims_write_masks_bit14_off() {
         let mut s = Scu::new();
         s.write32(0xA0, 0xFFFF_FFFF);
-        assert_eq!(s.read32(0xA0), 0x0000_BFFF, "IMS is 16-bit with bit 14 unused");
+        assert_eq!(
+            s.read32(0xA0),
+            0x0000_BFFF,
+            "IMS is 16-bit with bit 14 unused"
+        );
     }
 
     #[test]
@@ -1251,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn ist_writes_are_write_one_to_clear() {
+    fn ist_writes_are_write_zero_to_clear() {
         let mut s = Scu::new();
         s.raise(Source::Timer0);
         s.raise(Source::SoundRequest);
@@ -1259,11 +1307,12 @@ mod tests {
             s.ist,
             (1 << Source::Timer0.bit()) | (1 << Source::SoundRequest.bit())
         );
-        // W1C bit Timer0 (IST at 0xA4).
-        s.write32(0xA4, 1 << Source::Timer0.bit());
+        // Clear only Timer0 (IST at 0xA4) by writing that bit as 0 and all
+        // bits to retain as 1.
+        s.write32(0xA4, !(1 << Source::Timer0.bit()));
         assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
-        // Writing 0 doesn't clear anything.
+        // Writing 0 clears every pending bit.
         s.write32(0xA4, 0);
-        assert_eq!(s.ist, 1 << Source::SoundRequest.bit());
+        assert_eq!(s.ist, 0);
     }
 }

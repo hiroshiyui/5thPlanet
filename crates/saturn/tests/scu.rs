@@ -219,8 +219,7 @@ fn dma_indirect_table_accepts_sh2_cache_through_alias() {
     sat.bus
         .write32(tbl + 8, WRAM | 0x8000_0000, AccessKind::Data);
 
-    sat.bus
-        .write32(D0W, tbl | 0x2000_0000, AccessKind::Data);
+    sat.bus.write32(D0W, tbl | 0x2000_0000, AccessKind::Data);
     sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
     sat.bus.write32(D0MD, (1 << 24) | 7, AccessKind::Data);
     sat.bus.write32(D0EN, DGO, AccessKind::Data);
@@ -263,20 +262,20 @@ fn dma_completion_raises_level0_dma_end_through_the_drainer() {
     sat.bus.write32(D0C, 0x40, AccessKind::Data);
     sat.bus.write32(D0EN, DGO, AccessKind::Data);
     sat.run_for(512);
-    // IST bit for Level0DmaEnd should be set; software hasn't W1C'd it yet.
+    // IST bit for Level0DmaEnd should be set; software hasn't cleared it yet.
     let (ist, _) = sat.bus.read32(SCU_BASE + 0xA4, AccessKind::Data);
     assert_ne!(ist & (1 << ScuSource::Level0DmaEnd.bit()), 0);
 }
 
 #[test]
-fn ist_is_w1c_via_bus_write() {
+fn ist_is_write_zero_clear_via_bus_write() {
     let mut sat = build();
     sat.bus.scu.raise(ScuSource::Timer0);
     sat.bus.scu.raise(ScuSource::HBlankIn);
-    // Acknowledge only Timer0 via W1C.
+    // Acknowledge only Timer0 via write-0-clear.
     sat.bus.write32(
         SCU_BASE + 0xA4,
-        1 << ScuSource::Timer0.bit(),
+        !(1 << ScuSource::Timer0.bit()),
         AccessKind::Data,
     );
     let (ist, _) = sat.bus.read32(SCU_BASE + 0xA4, AccessKind::Data);
