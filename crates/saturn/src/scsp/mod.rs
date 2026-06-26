@@ -1473,6 +1473,9 @@ pub struct Scsp {
     sample_acc: i64,
     /// Generated 44.1 kHz output, interleaved L,R. The frontend drains it each
     /// frame; capped so headless runs (which never drain) don't grow unbounded.
+    /// Presentation-only — `load_state` clears it (`clear_output_buffer`), so it
+    /// is not serialized.
+    #[serde(skip)]
     out: Vec<i16>,
     /// Debug-only ring of recent 68k PCs (consecutive duplicates collapsed), for
     /// the `sdbg` `t68` sound-driver trace. `#[serde(skip)]` — not machine state.
@@ -2068,6 +2071,9 @@ struct M68kView<'a> {
 /// cycle-exact 68k lockstep vs Mednafen (`take_68k_itrace`).
 const SCSP_ACCESS_WAIT: u32 = 2;
 
+/// Debug (`SAT_68K_SRAM_WWATCH` + `SAT_68K_SRAM_WWATCH_WIN`): log 68k sound-RAM
+/// writes near a target address, stamped with the SCSP sample counter — the
+/// sound-driver-side counterpart of the bus write-watch. Env cached; no-op unset.
 #[inline]
 fn sound_ram_write_watch(addr: u32, size: u32, val: u32, sample_counter: u64) {
     use std::sync::OnceLock;
@@ -2097,6 +2103,8 @@ fn sound_ram_write_watch(addr: u32, size: u32, val: u32, sample_counter: u64) {
     }
 }
 
+/// Debug (`SAT_68K_REG_LOG`): log every 68k write to an SCSP register, stamped
+/// with the SCSP sample counter — traces the sound driver's register programming.
 #[inline]
 fn sound_reg_write_log(addr: u32, size: u32, val: u32, sample_counter: u64) {
     if std::env::var_os("SAT_68K_REG_LOG").is_none() {

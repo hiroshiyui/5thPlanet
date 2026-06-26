@@ -14,6 +14,12 @@
 use crate::memory::Ram;
 use serde_big_array::BigArray;
 
+/// DSP delay-RAM address bit 18: selects the "dummy" upper half of the 0x80000-
+/// word space (physically zeroed on hardware). A read there returns 0 and a
+/// write is discarded — it must NOT alias back into real sound RAM (Mednafen
+/// `if(!(RWAddr & 0x40000))`).
+const DSP_RAM_DUMMY_BIT: u32 = 0x4_0000;
+
 /// Sign-extend the low `bits` of `v`.
 #[inline]
 fn sext(v: i32, bits: u32) -> i32 {
@@ -286,7 +292,7 @@ impl Dsp {
             // Resolve the delay-RAM access latched on a previous step (the
             // access has latency — Mednafen's ReadPending/WritePending).
             if self.read_pending != 0 {
-                let w = if self.rw_addr & 0x4_0000 != 0 {
+                let w = if self.rw_addr & DSP_RAM_DUMMY_BIT != 0 {
                     0
                 } else {
                     ram.read16(self.rw_addr << 1)
@@ -298,7 +304,7 @@ impl Dsp {
                 };
                 self.read_pending = 0;
             } else if self.write_pending {
-                if self.rw_addr & 0x4_0000 == 0 {
+                if self.rw_addr & DSP_RAM_DUMMY_BIT == 0 {
                     ram.write16(self.rw_addr << 1, self.write_value);
                 }
                 self.write_pending = false;
@@ -631,13 +637,27 @@ mod tests {
         dsp.stopped = false;
         dsp.last_step = 1;
 
+        // Raw 16-bit read path (NOFL=1): the dummy half is silence.
         ram.write16(0, 0x5678);
-        dsp.rw_addr = 0x4_0000;
-        dsp.read_pending = 2; // raw 16-bit read path
+        dsp.rw_addr = DSP_RAM_DUMMY_BIT;
+        dsp.read_pending = 2;
         dsp.step(&mut ram);
-        assert_eq!(dsp.read_value, 0, "dummy delay-RAM half reads as silence");
+        assert_eq!(dsp.read_value, 0, "raw dummy-half read is silence");
 
-        dsp.rw_addr = 0x4_0000;
+        // Float read path (NOFL=0): the zeroed dummy word float-decodes to the
+        // hidden-mantissa value 0x40_0000 (Mednafen `dspfloat_to_int(0)`), NOT
+        // zero — "no real RAM", not "literal zero".
+        dsp.rw_addr = DSP_RAM_DUMMY_BIT;
+        dsp.read_pending = 1;
+        dsp.step(&mut ram);
+        assert_eq!(dsp.read_value, dspfloat_to_int(0));
+        assert_eq!(
+            dsp.read_value, 0x40_0000,
+            "float-decoded dummy half is the hidden bit"
+        );
+
+        // Writes to the dummy half are discarded — never alias into real RAM.
+        dsp.rw_addr = DSP_RAM_DUMMY_BIT;
         dsp.write_pending = true;
         dsp.write_value = 0x1234;
         dsp.step(&mut ram);
