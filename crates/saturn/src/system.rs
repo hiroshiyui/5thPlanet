@@ -59,14 +59,21 @@ fn trace_scu_interrupt(
     ims: u32,
     ist: u32,
 ) {
-    let Ok(mode) = std::env::var("SAT_SCU_INT_TRACE") else {
+    // Cached like the sibling env gates (`DMALOG`, `cd_rwatch`) so interrupt
+    // delivery doesn't take the process-global env lock on every fire.
+    use std::sync::OnceLock;
+    static CFG: OnceLock<Option<(String, u64)>> = OnceLock::new();
+    let Some((mode, after)) = CFG.get_or_init(|| {
+        let mode = std::env::var("SAT_SCU_INT_TRACE").ok()?;
+        let after = std::env::var("SAT_SCU_INT_AFTER")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some((mode, after))
+    }) else {
         return;
     };
-    let after = std::env::var("SAT_SCU_INT_AFTER")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    if cycle < after {
+    if cycle < *after {
         return;
     }
     let selected = match mode.as_str() {
@@ -1274,24 +1281,11 @@ impl Saturn {
                 apply_fti!(); // master may have pulsed the slave's (or its own) FTI
                 record_raster!(); // log any raster read the master just did
                 // If the master's instruction triggered an SCU DMA, run its
-                // synchronous transfer now. `drain_dma` currently returns 0
-                // because the model does not keep a time-running DMA active.
-                let dma_cost = if bus.scu.dma_pending() {
-                    drain_dma(bus)
-                } else {
-                    0
-                };
-                if dma_cost != 0 {
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .pipeline
-                        .cycles += dma_cost;
-                    let s = scheduler.entity_mut(*slave_id).sh2_mut();
-                    if !s.is_halted() {
-                        s.cpu.pipeline.cycles += dma_cost;
-                    }
+                // synchronous transfer now: `drain_dma` completes it immediately
+                // and charges no SH-2 halt (the model never keeps a DMA
+                // time-running), so nothing is added to either CPU's cycle.
+                if bus.scu.dma_pending() {
+                    drain_dma(bus);
                 }
             }
             let mcyc = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
@@ -1304,25 +1298,10 @@ impl Saturn {
                 scheduler.entity_mut(*slave_id).step(bus);
                 apply_fti!(); // slave may have pulsed the master's FTI
                 record_raster!(); // log any raster read the slave just did
-                // A slave-triggered DMA is drained synchronously the same way.
-                let dma_cost = if bus.scu.dma_pending() {
-                    drain_dma(bus)
-                } else {
-                    0
-                };
-                if dma_cost != 0 {
-                    scheduler
-                        .entity_mut(*slave_id)
-                        .sh2_mut()
-                        .cpu
-                        .pipeline
-                        .cycles += dma_cost;
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .pipeline
-                        .cycles += dma_cost;
+                // A slave-triggered SCU DMA is drained synchronously the same
+                // way — immediate completion, no SH-2 halt charge.
+                if bus.scu.dma_pending() {
+                    drain_dma(bus);
                 }
             }
             // NOTE: do NOT break the batch on a pending SMPC command to

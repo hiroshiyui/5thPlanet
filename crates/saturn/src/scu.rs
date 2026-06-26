@@ -594,7 +594,13 @@ impl Scu {
             c.write_addr = final_dst;
         }
         c.transfer_count = 0;
-        c.enable &= !DGO_BIT;
+        // Do NOT clear the D*EN enable (bit 8) here. In our model that bit IS
+        // `armed()`, and a hardware-factor channel (start factor 0..6) re-fires
+        // on every matching event for as long as it stays armed — Mednafen's
+        // `Enable` persists across completion (`SCU_DoDMAEnd` never clears it).
+        // The one-shot is the separate `triggered` flag (cleared in
+        // `take_pending_dma`), so a manual transfer already won't re-fire;
+        // clearing the enable only broke event-driven re-arming (movie/FMV DMA).
         let source = match channel {
             0 => Source::Level0DmaEnd,
             1 => Source::Level1DmaEnd,
@@ -684,12 +690,6 @@ impl Scu {
         }
     }
 
-    /// Pop the highest-priority freshly-asserted source whose IMS bit
-    /// is clear and whose priority exceeds `sh2_imask`. Returns
-    /// `Some((source, level))` if any; clears the fresh-assertion bit
-    /// for that source so we don't re-fire on the SH-2 on the next
-    /// drain (re-firing only happens after a new `raise`).
-    ///
     /// Assert/deassert the CD-block external interrupt ([`Source::Cd`]) as a
     /// level = `active` (`(CD HIRQ & HIRQ_Mask) != 0`). Mirrors Mednafen's
     /// `RecalcIRQOut` → `ABusIRQCheck` (`cdb.cpp` / `scu.inc`): a fresh SCU
@@ -972,16 +972,26 @@ mod tests {
     }
 
     #[test]
-    fn finish_dma_clears_the_channel_go_bit() {
+    fn event_driven_channel_stays_armed_after_completion() {
+        // The D*EN enable (bit 8 = `armed()`) persists across completion, like
+        // Mednafen's `Enable` (`SCU_DoDMAEnd` never clears it): a hardware-factor
+        // channel re-fires on every matching event. `finish_dma` must NOT disarm
+        // it — the per-transfer one-shot is the separate `triggered` flag.
         let mut s = Scu::new();
-        s.channels[0].enable = DGO_BIT | 1;
+        s.channels[0].mode = 0; // start factor 0 (VBlank-IN), direct
+        s.channels[0].enable = DGO_BIT; // armed (bit 8), no immediate go
         s.channels[0].transfer_count = 0x10;
+        s.trigger_dma_factor(0);
+        assert!(
+            s.take_pending_dma().is_some(),
+            "armed channel fires on its event"
+        );
         s.finish_dma(0, 0, 0);
-        assert_eq!(s.channels[0].enable & DGO_BIT, 0);
-        assert_eq!(
-            s.channels[0].enable & 1,
-            1,
-            "finish clears DGO without disturbing the start-enable bit"
+        assert!(s.channels[0].armed(), "enable persists across completion");
+        s.trigger_dma_factor(0);
+        assert!(
+            s.take_pending_dma().is_some(),
+            "still armed → re-fires on the next event"
         );
     }
 

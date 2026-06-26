@@ -335,6 +335,58 @@ fn dma_end_propagates_into_master_sh2_intc_as_external_level5() {
     );
 }
 
+#[test]
+fn scu_interrupt_is_deferred_while_the_master_is_in_a_delay_slot() {
+    // The SH-2 must not accept an interrupt inside a branch delay slot — the
+    // per-instruction SCU sample in `step_cpus` is gated on `!next_is_delay_slot()`.
+    // The reset vector runs an infinite delayed-branch loop (`BRA .` + `NOP`
+    // slot); the Level0DmaEnd handler is installed at its SCU vector, so an
+    // accepted interrupt raises SR.imask to that source's level (5).
+    let mut img = vec![0u8; 512 * 1024];
+    img[0..4].copy_from_slice(&0x0000_0020u32.to_be_bytes()); // reset PC = 0x20
+    img[4..8].copy_from_slice(&0x0604_0000u32.to_be_bytes()); // reset SP (high WRAM)
+    img[0x20..0x22].copy_from_slice(&0xAFFEu16.to_be_bytes()); // BRA .  (target 0x20)
+    img[0x22..0x24].copy_from_slice(&0x0009u16.to_be_bytes()); // NOP    (delay slot)
+    let vec_off = ScuSource::Level0DmaEnd.vector() as usize * 4;
+    img[vec_off..vec_off + 4].copy_from_slice(&0x0020_6000u32.to_be_bytes());
+
+    let mut sat = Saturn::new(img);
+    sat.reset();
+
+    // Execute the BRA with interrupts still masked (reset default imask=0xF) so
+    // nothing preempts it; the next instruction is the delay slot.
+    sat.debug_step_master();
+    assert!(
+        sat.master().next_is_delay_slot(),
+        "after the delayed branch the master is about to run the delay slot"
+    );
+
+    // Now open the gate and make an SCU interrupt pending while in the slot.
+    sat.bus.write32(SCU_BASE + 0xA0, 0, AccessKind::Data); // IMS: unmask all
+    sat.master_mut().regs.sr.set_imask(0); // accept any IRL
+    sat.bus.scu.raise(ScuSource::Level0DmaEnd);
+
+    // Step the delay slot: the interrupt must be DEFERRED, not accepted here.
+    sat.debug_step_master();
+    assert_eq!(
+        sat.master().regs.sr.imask(),
+        0,
+        "interrupt must NOT be accepted inside the delay slot"
+    );
+    assert!(
+        !sat.master().next_is_delay_slot(),
+        "the delay slot was consumed"
+    );
+
+    // The next (non-delay-slot) instruction accepts the still-pending edge.
+    sat.debug_step_master();
+    assert!(
+        sat.master().regs.sr.imask() >= 5,
+        "the deferred interrupt is accepted at the first non-delay-slot boundary; imask = {}",
+        sat.master().regs.sr.imask()
+    );
+}
+
 // ---- SCU-DSP host integration (increment 2) ----
 const PPAF: u32 = SCU_BASE + 0x80;
 const PPD: u32 = SCU_BASE + 0x84;
