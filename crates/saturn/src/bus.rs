@@ -371,7 +371,15 @@ fn ftilog() -> bool {
 /// is set, log any write whose byte span covers `ADDR`, with width, value, access
 /// kind and cycle. No-op (one cheap env check, cached) when unset.
 #[inline]
-fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32) {
+fn write_watch(
+    addr: u32,
+    size: u32,
+    val: u32,
+    k: AccessKind,
+    cycle: u64,
+    pc: u32,
+    scsp_sample: Option<u64>,
+) {
     use std::sync::OnceLock;
     static W: OnceLock<Option<u32>> = OnceLock::new();
     let w = *W.get_or_init(|| {
@@ -424,10 +432,16 @@ fn write_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u3
                 .unwrap_or(0)
         });
         if fa.wrapping_add(size) > ft.saturating_sub(win) && fa < ft.wrapping_add(win.max(1)) {
-            eprintln!(
-                "WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}",
-                size * 8
-            );
+            match scsp_sample {
+                Some(sample) => eprintln!(
+                    "WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X} scsp_sample={sample}",
+                    size * 8
+                ),
+                None => eprintln!(
+                    "WWATCH {t:08X}: w{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}",
+                    size * 8
+                ),
+            }
         }
     }
 }
@@ -460,6 +474,58 @@ fn read_watch(addr: u32, size: u32, val: u32, k: AccessKind, cycle: u64, pc: u32
             "RWATCH {t:08X}: r{}@{addr:08X} val={val:08X} {k:?} cyc={cycle} pc={pc:08X}",
             size * 8
         );
+    }
+}
+
+#[inline]
+fn scsp_stream_write_probe(
+    addr: u32,
+    size: u32,
+    val: u32,
+    cycle: u64,
+    pc: u32,
+    sample: Option<u64>,
+) {
+    use std::sync::OnceLock;
+    static P: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    let Some((target, win)) = *P.get_or_init(|| {
+        let raw = std::env::var("SAT_SCSP_STREAM_PROBE").ok()?;
+        let target = if raw == "1" || raw.eq_ignore_ascii_case("true") {
+            0x0002_8000
+        } else {
+            let s = raw.trim().trim_start_matches("0x");
+            u32::from_str_radix(s, 16).ok().map(|v| {
+                if v >= SCSP_RAM_BASE {
+                    v - SCSP_RAM_BASE
+                } else {
+                    v
+                }
+            })?
+        };
+        let win = std::env::var("SAT_SCSP_STREAM_WIN")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(8);
+        Some((target, win))
+    }) else {
+        return;
+    };
+    if !(SCSP_RAM_BASE..=SCSP_RAM_END).contains(&addr) {
+        return;
+    }
+    let off = addr - SCSP_RAM_BASE;
+    if off.wrapping_add(size) > target.saturating_sub(win) && off < target.wrapping_add(win.max(1))
+    {
+        match sample {
+            Some(sample) => eprintln!(
+                "SCSP_STREAM_WRITE off={off:05X} w{} val={val:08X} sample={sample} cyc={cycle} pc={pc:08X}",
+                size * 8
+            ),
+            None => eprintln!(
+                "SCSP_STREAM_WRITE off={off:05X} w{} val={val:08X} cyc={cycle} pc={pc:08X}",
+                size * 8
+            ),
+        }
     }
 }
 
@@ -689,7 +755,19 @@ impl Bus for SaturnBus {
     }
 
     fn write8(&mut self, addr: u32, val: u8, k: AccessKind) -> u32 {
-        write_watch(addr, 1, val as u32, k, self.cycle, self.step_pc);
+        let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
+            .contains(&addr)
+            .then_some(self.scsp.ctrl.dbg_sample_counter());
+        write_watch(
+            addr,
+            1,
+            val as u32,
+            k,
+            self.cycle,
+            self.step_pc,
+            scsp_sample,
+        );
+        scsp_stream_write_probe(addr, 1, val as u32, self.cycle, self.step_pc, scsp_sample);
         self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
@@ -741,7 +819,19 @@ impl Bus for SaturnBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, k: AccessKind) -> u32 {
-        write_watch(addr, 2, val as u32, k, self.cycle, self.step_pc);
+        let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
+            .contains(&addr)
+            .then_some(self.scsp.ctrl.dbg_sample_counter());
+        write_watch(
+            addr,
+            2,
+            val as u32,
+            k,
+            self.cycle,
+            self.step_pc,
+            scsp_sample,
+        );
+        scsp_stream_write_probe(addr, 2, val as u32, self.cycle, self.step_pc, scsp_sample);
         self.note_write(addr, val as u32);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
@@ -797,7 +887,11 @@ impl Bus for SaturnBus {
     }
 
     fn write32(&mut self, addr: u32, val: u32, k: AccessKind) -> u32 {
-        write_watch(addr, 4, val, k, self.cycle, self.step_pc);
+        let scsp_sample = (SCSP_RAM_BASE..=SCSP_RAM_END)
+            .contains(&addr)
+            .then_some(self.scsp.ctrl.dbg_sample_counter());
+        write_watch(addr, 4, val, k, self.cycle, self.step_pc, scsp_sample);
+        scsp_stream_write_probe(addr, 4, val, self.cycle, self.step_pc, scsp_sample);
         self.note_write(addr, val);
         match addr {
             BIOS_BASE..=BIOS_END => self.bios.write_ignored(),
