@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1154 workspace-wide, 0 failures**, ~85% line coverage
+Current test count: **1153 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -407,13 +407,43 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   framebuffer stays bit-identical, so accuracy is untouched. Shaders authored
   GLSL → SPIR-V (precompiled, or `SDL_shadercross`; DXIL/MSL for non-Vulkan
   hosts). De-risk with a passthrough-shader spike first; the `--backend`
-  render-driver selector is the groundwork. **Capability detection: DONE**
+  render-driver selector is the groundwork. **Capability detection: DONE** (behind
+  the off-by-default **`gpu-preview`** build feature — the probe + the OSD "Shaders…"
+  stub are non-practical until a presenter exists, so they're hidden from normal
+  builds; `cargo build --features gpu-preview` to work on them)
   (`jupiter/src/present_gpu.rs`) — the `gpu` config key / `--gpu` flag
   (`off` default / `auto` / `on`) probes the host by attempting
   `sdl3::gpu::Device::new` for its shader format (SPIR-V/DXIL/MSL) and logs the
   verdict (`GpuCapability`), falling back to the `SDL_Renderer` blit; `unsafe`-free
   because `Device::new` returns a `Result` (the cheap pre-probes aren't safe-wrapped
-  in sdl3-rs 0.18.4). **Presenter DoD:** when the presenter ships and consumes the
+  in sdl3-rs 0.18.4). **Next — passthrough-shader spike (PLANNED, do later;
+  integrated selectable-backend approach):** evolve `gpu=auto/on` from probe-and-drop
+  into a real **SDL_GPU passthrough presenter** that uploads the software-composited
+  frame to a GPU texture and draws it 1:1 to the swapchain — the foundation the CRT
+  passes slot into; `SDL_Renderer` stays default/fallback. Design (exploration-
+  verified, **zero `unsafe` blockers** — templates `sdl3` `examples/gpu-triangle.rs`
+  + `gpu-texture.rs`): (a) a `Presentation` enum {Renderer, Gpu} picked once at
+  startup (`wants_gpu(mode)`), routing the per-frame present + `window_mut()` (icon/
+  fullscreen/scale) and replacing the `texture.update`/`canvas.copy` block in
+  `main.rs`. (b) **Window-ownership crux:** `build_canvas` *consumes* the window into
+  the renderer canvas, but an SDL_GPU device needs a **bare** `sdl3::video::Window` —
+  so the two are mutually exclusive; the GPU presenter owns its own window. (c)
+  **Enable sdl3's `unsafe_textures` feature** (a *dependency* feature — sdl3's own
+  `unsafe`, ours stays `forbid`) so the renderer's now-lifetime-free `Texture` can sit
+  in the enum and stay cached (no per-frame regression on the default path). (d)
+  **Shaders:** `jupiter/src/shaders/passthrough.{vert,frag}.glsl` + committed
+  precompiled `.spv` (via `glslc`, `include_bytes!`) — fullscreen triangle from
+  `gl_VertexIndex` (no vertex buffer); **color is free** (our `[R,G,B,A]` ==
+  `R8G8B8A8Unorm`). (e) Per frame: map transfer buffer → `copy_from_slice` → copy pass
+  `upload_to_gpu_texture` → `wait_and_acquire_swapchain_texture` → render pass (clear,
+  bind pipeline, `bind_fragment_samplers`, `draw_primitives(3,1,0,0)`) → `submit`.
+  Default stays `off` (opt-in). **Gotchas the spike retires (verify at runtime):**
+  the SDL_GPU **fragment sampler is descriptor `set = 2`** (wrong set ⇒ silent black);
+  **Vulkan Y-flip** (image upright, not mirrored); `unsafe_textures` `Texture` has no
+  auto-Drop (`.destroy()` the old one on a resolution change); and the no-GPU host
+  falls back to the renderer cleanly (`on` warns). Verify on this host via
+  `--gpu=auto` (splash upright + correct colours, A/B parity vs renderer, OSD visible
+  through the GPU path). **Presenter DoD:** when the presenter ships and consumes the
   verdict, flip the `gpu` config default `off`→`auto` (search `TODO(gpu-presenter)`
   — also update its default-asserting test + `jupiter.toml.example`). Follow-up:
   read the chosen backend (`SDL_GetGPUDeviceDriver`, also unwrapped) to label it +

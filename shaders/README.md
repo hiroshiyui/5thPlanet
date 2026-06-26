@@ -20,7 +20,9 @@ see the README Acknowledgements); and the compiled outputs (`.spv` / `.dxil` /
 > `SDL_Renderer` blit (the `--backend` render-driver selector). This README will
 > graduate to the real load paths / config keys when the feature ships.
 >
-> The one piece already built is the **capability probe** (`jupiter/src/present_gpu.rs`):
+> The one piece already built is the **capability probe** (`jupiter/src/present_gpu.rs`),
+> behind the **off-by-default `gpu-preview` build feature** (`cargo build --features
+> gpu-preview`) since it's non-practical until a presenter consumes it:
 > the `gpu` config key / `--gpu` flag (`off` default / `auto` / `on`) makes the
 > frontend try to create an `SDL_GPU` device for this host's shader format
 > (SPIR-V / DXIL / MSL, per the table below) and log whether it's available —
