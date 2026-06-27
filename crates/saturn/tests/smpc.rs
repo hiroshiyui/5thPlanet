@@ -265,6 +265,39 @@ fn intback_peripheral_continuation_reports_the_digital_pad() {
 }
 
 #[test]
+fn intback_peripheral_only_returns_the_pad_directly_without_a_continue() {
+    // A peripheral-only INTBACK — IREG0 low nibble 0 (no status acquisition),
+    // IREG1 & 8 (peripheral) — is what Panzer Dragoon Zwei issues every frame to
+    // read the pad. Mednafen (smpc.cpp:1217/1250) runs the status phase ONLY if
+    // `IREG0 & 0xF`, and the peripheral phase's continue-wait runs ONLY if
+    // SR_NPE is set (which only the status phase sets). So with no status, the
+    // peripheral report lands DIRECTLY in OREG0.. with NO continue handshake.
+    // (The old handler always returned the status phase — OREG0 = 0x80 — and
+    // waited for a CONTINUE PDZ never sends, so it saw "no controller".)
+    let mut sat = build();
+    sat.set_pad1(saturn::smpc::pad::START);
+    sat.bus.write8(0x0010_0001, 0x00, AccessKind::Data); // IREG0: no status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    // The pad report is at OREG0 immediately — NOT the 0x80 status byte.
+    assert_eq!(
+        sat.bus.smpc.oreg[0], 0xF1,
+        "port 1: 1 device, direct (not status 0x80)"
+    );
+    assert_eq!(sat.bus.smpc.oreg[1], 0x02, "standard digital pad");
+    assert_eq!(sat.bus.smpc.oreg[2], !0x08, "Start held (active low)");
+    assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "no second-byte buttons");
+    assert_eq!(sat.bus.smpc.oreg[4], 0xF0, "port 2: no peripheral");
+    // No continue is pending, and SF has dropped — the data is ready in one shot.
+    assert_eq!(sat.bus.smpc.intback_stage, 0, "no staged continue expected");
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr & 0x80, 0x80, "SR signals data ready");
+    let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
+    assert_eq!(sf, 0, "SF clears after the one-shot peripheral phase");
+}
+
+#[test]
 fn setsmem_writes_smem_echoed_by_intback_oreg12_15() {
     let mut sat = build();
     // SETSMEM takes the four bytes from IREG0..3.

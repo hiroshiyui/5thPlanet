@@ -1443,12 +1443,40 @@ impl Saturn {
                     // completion.
                     let ireg0 = self.bus.smpc.ireg[0];
                     let ireg1 = self.bus.smpc.ireg[1];
-                    self.respond_to_intback_status();
-                    let stage = (ireg1 & 0x08) >> 3;
-                    self.bus.smpc.intback_stage = stage;
                     self.bus.smpc.pmode = ireg0 >> 4;
-                    let npe = if stage != 0 { 0x20 } else { 0x00 }; // SR_NPE: peripheral data follows
-                    self.bus.smpc.sr = (self.bus.smpc.sr & !0xA0) | 0x0F | npe;
+                    // The status phase runs ONLY if IREG0's low nibble requests
+                    // it (Mednafen `if(IREG[0] & 0xF)`); SR_NPE ("peripheral data
+                    // follows, await CONTINUE") is set ONLY inside it. A
+                    // peripheral-only INTBACK (IREG0 low nibble 0, IREG1 & 8) —
+                    // which Panzer Dragoon Zwei issues every frame to read the pad
+                    // (IREG0=0x00, IREG1=0x08) — therefore returns the peripheral
+                    // report DIRECTLY in OREG0.. with NO continue handshake
+                    // (SR_NPE clear ⇒ Mednafen's JR loop skips its continue-wait).
+                    // Always returning the status phase (OREG0=0x80) + arming the
+                    // continue staging put 0x80 where PDZ expects the 0xF1 port
+                    // byte, and waited for a CONTINUE it correctly never sends —
+                    // so PDZ saw "no controller" and ignored all input. (VF2 only
+                    // survived because its own pad read drives the continue path.)
+                    let want_status = ireg0 & 0x0F != 0;
+                    let want_periph = ireg1 & 0x08 != 0;
+                    if want_status {
+                        self.respond_to_intback_status();
+                        let npe = if want_periph { 0x20 } else { 0x00 }; // SR_NPE: more data follows
+                        self.bus.smpc.sr = (self.bus.smpc.sr & !0xA0) | 0x0F | npe;
+                        // Peripheral data, if also requested, follows via the
+                        // staged CONTINUE handshake.
+                        self.bus.smpc.intback_stage = want_periph as u8;
+                    } else if want_periph {
+                        // Peripheral-only: fill OREG from byte 0 now; SR = "last
+                        // data" (0x80 | pmode); no CONTINUE expected.
+                        self.respond_to_intback_peripheral();
+                        self.bus.smpc.sr = 0x80 | self.bus.smpc.pmode;
+                        self.bus.smpc.intback_stage = 0;
+                    } else {
+                        // Neither status nor peripheral requested: a bare ack.
+                        self.bus.smpc.sr &= !0xA0;
+                        self.bus.smpc.intback_stage = 0;
+                    }
                     let busy = us_to_cycles(intback_busy_us(ireg0, ireg1));
                     self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
                     self.bus.scu.raise(crate::scu::Source::Smpc);

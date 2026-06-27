@@ -1971,6 +1971,115 @@ fn smpc_activity_at_park() {
 /// FRAMES=1800 CUE=vf2_full.cue cargo test -p saturn --test trace_boot -- \
 ///   --ignored --nocapture vf2_render_state
 /// ```
+/// Headless input test: boot a game to a steady screen, then press START and
+/// confirm the game *reacts* (the framebuffer changes / the master PC leaves the
+/// idle title loop). Used to verify Panzer Dragoon Zwei accepts controller input
+/// after the SMPC peripheral-only-INTBACK fix.
+///
+/// ```sh
+/// CUE=PANZER_DRAGOON_ZWEI.cue PRESS=0x800 SETTLE=5400 HOLD=12 AFTER=240 \
+///   cargo test --release -p saturn --test trace_boot -- --ignored --nocapture pad_input_reacts
+/// ```
+#[test]
+#[ignore = "manual: confirm a game reacts to a pad press (needs bios/ + roms/)"]
+fn pad_input_reacts() {
+    use std::io::Write;
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "PANZER_DRAGOON_ZWEI.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let disc =
+        match saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+        {
+            Ok(d) => d,
+            Err(e) => {
+                println!("cue parse failed: {e}");
+                return;
+            }
+        };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let settle: u32 = env_u32("SETTLE", 5400);
+    let hold: u32 = env_u32("HOLD", 12);
+    let after: u32 = env_u32("AFTER", 240);
+    let press = std::env::var("PRESS")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(saturn::smpc::pad::START);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut dims = (320usize, 224usize);
+    let count = |fb: &[u8], w: usize, h: usize| {
+        fb[..w * h * 4]
+            .chunks_exact(4)
+            .filter(|p| (p[0] | p[1] | p[2]) != 0)
+            .count()
+    };
+    let hash = |fb: &[u8], w: usize, h: usize| {
+        let mut h64 = 0xcbf29ce484222325u64;
+        for b in &fb[..w * h * 4] {
+            h64 = (h64 ^ *b as u64).wrapping_mul(0x100000001b3);
+        }
+        h64
+    };
+    for _ in 0..settle {
+        dims = sat.run_frame(&mut fb);
+    }
+    let (w, h) = dims;
+    let before_px = count(&fb, w, h);
+    let before_hash = hash(&fb, w, h);
+    let before_pc = sat.master().regs.pc;
+    {
+        let mut o = std::fs::File::create("/tmp/pad_before.ppm").unwrap();
+        write!(o, "P6\n{w} {h}\n255\n").unwrap();
+        for px in fb.chunks_exact(4).take(w * h) {
+            o.write_all(&px[0..3]).unwrap();
+        }
+    }
+    // Press (hold a few frames so an edge-detected read sees it), then release.
+    sat.set_pad1(press);
+    for _ in 0..hold {
+        dims = sat.run_frame(&mut fb);
+    }
+    sat.set_pad1(0);
+    for _ in 0..after {
+        dims = sat.run_frame(&mut fb);
+    }
+    let (w, h) = dims;
+    let after_px = count(&fb, w, h);
+    let after_hash = hash(&fb, w, h);
+    let after_pc = sat.master().regs.pc;
+    {
+        let mut o = std::fs::File::create("/tmp/pad_after.ppm").unwrap();
+        write!(o, "P6\n{w} {h}\n255\n").unwrap();
+        for px in fb.chunks_exact(4).take(w * h) {
+            o.write_all(&px[0..3]).unwrap();
+        }
+    }
+    println!("before: pc=0x{before_pc:08X} {w}x{h} nonblack={before_px} hash=0x{before_hash:016X}");
+    println!("after : pc=0x{after_pc:08X} nonblack={after_px} hash=0x{after_hash:016X}");
+    println!(
+        "REACTED: {} (frame changed: {})",
+        before_hash != after_hash || before_pc != after_pc,
+        before_hash != after_hash
+    );
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 #[test]
 #[ignore = "manual: post-boot run/render state for a game disc"]
 fn vf2_render_state() {

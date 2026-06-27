@@ -16,8 +16,12 @@
 //!
 //! Implemented commands: the slave-control pair (`SSHON`/`SSHOFF`),
 //! `SNDON`/`SNDOFF` (the SCSP 68k), `SETTIME`/`SETSMEM`, `NMIREQ`,
-//! `RESENAB`/`RESDISA`, and the full staged `INTBACK` (status phase —
-//! RTC/region/SMEM — plus CONTINUE-driven peripheral phases). The
+//! `RESENAB`/`RESDISA`, and `INTBACK` (an optional status phase —
+//! RTC/region/SMEM, gated on `IREG0 & 0xF` — plus peripheral data, either
+//! via CONTINUE-driven phases when status was also returned or returned
+//! directly for a peripheral-only request; the phase gating lives in
+//! [`crate::system`]'s `drain_smpc`, this module owns the register bank
+//! and the IREG0 CONTINUE/BREAK handshake). The
 //! peripheral report lays out one block per controller port from the
 //! [`PortDevice`] selection: the standard digital pad (ID `0x02`,
 //! [`pad`] bits, active-low) and the Shuttle Mouse (ID `0xE3`,
@@ -288,6 +292,34 @@ fn rtc_bytes(unix_secs: u64) -> [u8; 7] {
     ]
 }
 
+/// `SAT_SMPCLOG=1` enable flag (cached). Observer-only.
+fn smpclog_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SAT_SMPCLOG").is_ok())
+}
+
+/// Short name for an SMPC register byte offset (the `SAT_SMPCLOG` decode).
+fn smpc_reg_name(offset: u32) -> &'static str {
+    match offset {
+        0x01 => "IREG0",
+        0x03 => "IREG1",
+        0x05 => "IREG2",
+        0x07 => "IREG3",
+        0x1F => "COMREG",
+        o if (0x21..=0x5F).contains(&o) && (o & 1) == 1 => "OREG",
+        0x61 => "SR",
+        0x63 => "SF",
+        0x75 => "PDR1",
+        0x77 => "PDR2",
+        0x79 => "DDR1",
+        0x7B => "DDR2",
+        0x7D => "IOSEL",
+        0x7F => "EXLE",
+        _ => "?",
+    }
+}
+
 impl Smpc {
     pub fn new() -> Self {
         Self {
@@ -363,8 +395,12 @@ impl Smpc {
         rtc_bytes(self.rtc_secs + elapsed)
     }
 
+    /// Observer-only: `SAT_SMPCLOG=1` logs every SMPC register access (offset +
+    /// value) so the pad-read path a game uses (INTBACK vs direct PDR/DDR/IOSEL
+    /// mode) is visible. Golden-safe (env-gated, no core behaviour change).
+    #[doc(hidden)]
     pub fn read8(&self, offset: u32) -> u8 {
-        match offset {
+        let v = match offset {
             0x01 => self.ireg[0],
             0x03 => self.ireg[1],
             0x05 => self.ireg[2],
@@ -383,10 +419,23 @@ impl Smpc {
             0x7D => self.iosel,
             0x7F => self.exle,
             _ => 0,
+        };
+        if smpclog_on() {
+            eprintln!(
+                "SMPC R {:>5}@{offset:02X} -> {v:02X}",
+                smpc_reg_name(offset)
+            );
         }
+        v
     }
 
     pub fn write8(&mut self, offset: u32, val: u8) {
+        if smpclog_on() {
+            eprintln!(
+                "SMPC W {:>5}@{offset:02X} <- {val:02X}",
+                smpc_reg_name(offset)
+            );
+        }
         match offset {
             0x01 => {
                 self.ireg[0] = val;
