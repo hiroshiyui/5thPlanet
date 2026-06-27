@@ -291,4 +291,4 @@ NB: the SEGA hardware-manual set is SEGA-confidential material that circulated p
 
 ## Skills available in `.claude/skills/`
 
-`code-review`, `commit-and-push`, `docs-engineering`, `dump-game-disc` (rip an owned Saturn disc to a loadable CUE-BIN via redumper), `performance-profile`, `release-engineering`, `security-audit` — all tailored to this project. Prefer invoking them over re-deriving their checklists.
+`code-review`, `commit-and-push`, `docs-engineering`, `dump-game-disc` (rip an owned Saturn disc to a loadable CUE-BIN via redumper), `performance-profile`, `release-engineering`, `security-audit`, `tracing-thoroughly` (a disciplined hard-bug tracing workflow — classify, make deterministic, oracle-diff early, register-completeness, the anti-tunnel-vision "stuck check") — all tailored to this project. Prefer invoking them over re-deriving their checklists.
