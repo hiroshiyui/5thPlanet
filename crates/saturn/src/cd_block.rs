@@ -2471,44 +2471,61 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK;
             }
             0x11 => {
-                // Disc seek (MAME `cmd_seek_disc`). CR1 bit 0x80 = FAD seek
-                // (0xFFFFFF = pause in place); otherwise a track seek where the
-                // track is CR2's high byte. A track-0 / invalid seek is the
-                // drive-stop idiom → STANDBY: the BIOS issues it to halt the
-                // drive between boot probe passes and waits for STANDBY before
-                // continuing, so leaving the status at PAUSE (the old default
-                // handler) stalled the boot loop and dropped to the CD shell.
+                // Disc seek (Mednafen `COMMAND_SEEK`, cdb.cpp:2851). The seek
+                // parameter is a *single* value `((CR1 & 0xFF) << 16) | CR2` —
+                // NOT a CR1-bit-flagged FAD/track split. The old MAME
+                // `cmd_seek_disc` decode keyed FAD-vs-track on `CR1 & 0x80`
+                // (the FAD-marker bit `0x800000`'s top byte) with a `CR2 >> 8`
+                // track byte; that mis-decoded a *track/index* seek whose marker
+                // bit is clear. Panzer Dragoon Zwei's post-FMV teardown issues
+                // `Seek 1100,0200` (param `0x000200` = track 2 / index 0): bit 7
+                // clear sent it down the bogus track arm that set `track` but
+                // left `cd_curfad` at the stale FMV head position and completed
+                // *instantly* (no timed seek), so the BIOS disc-validity service
+                // sampled a non-settled drive and bailed to the CD player.
                 //
-                // A Seek cancels any in-flight play/read and parks the phase
-                // machine; it positions the head and pauses (no read range).
-                self.drive_idle();
-                if self.cr1 & 0x80 != 0 {
-                    let temp = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
-                    if temp == 0xFF_FFFF {
-                        self.status = STAT_PAUSE;
-                    } else {
-                        self.cd_curfad = ((self.cr1 as u32 & 0x7F) << 16) | self.cr2 as u32;
-                        self.status = STAT_PAUSE;
-                    }
-                } else if self.cr2 >> 8 != 0 {
-                    self.status = STAT_PAUSE;
-                    self.track = (self.cr2 >> 8) as u8;
-                } else {
-                    // Stop (Seek target 0): the drive halts. Match Mednafen's
-                    // STOP geometry (cdb.cpp:2846) — every position field goes
-                    // to the "no position" sentinel (0xFF / FAD 0xFFFFFF) and
-                    // the repeat count to 0x7F — so the BIOS's post-stop
-                    // GetStatus poll sees the expected stopped geometry
-                    // (CR2=0xFFFF, CR3=0xFFFF, CR4=0xFFFF) and proceeds, rather
-                    // than reading stale track/ctrl-adr fields and looping.
+                // `0` = Stop, `0xFFFFFF` = Pause-in-place, else a real seek whose
+                // FAD-vs-track addressing is resolved *inside* `seek_start`
+                // (Mednafen `SeekStart1`) by the `0x800000` marker: set → FAD
+                // `& 0x7FFFFF`; clear → track `(p>>8)&0xFF` / index `p&0xFF`,
+                // seeking to that track's start FAD.
+                let cmd_sp = ((self.cr1 as u32 & 0xFF) << 16) | self.cr2 as u32;
+                if cmd_sp == 0 {
+                    // Stop: halt the drive → STANDBY geometry. The BIOS issues
+                    // this to park the drive between boot probe passes and waits
+                    // for STANDBY before continuing (leaving the status at PAUSE
+                    // stalled the boot loop into the CD shell). Match Mednafen's
+                    // STOP geometry (cdb.cpp:2859) — every position field to the
+                    // "no position" sentinel (0xFF / FAD 0xFFFFFF), repeat 0x7F —
+                    // so the post-stop GetStatus poll reads the expected stopped
+                    // geometry rather than stale track/ctrl-adr fields. (Mednafen
+                    // runs a timed STOPPED→STANDBY; we settle STANDBY directly.)
+                    self.drive_idle();
                     self.status = STAT_STANDBY;
                     self.cd_curfad = 0xFFFF_FFFF;
                     self.track = 0xFF;
                     self.ctrladdr = 0xFF;
                     self.index = 0xFF;
                     self.repcnt = 0x7F;
+                    self.cd_report();
+                } else if cmd_sp == 0xFF_FFFF {
+                    // Pause in place (cdb.cpp:2874): drop the read-ahead + play
+                    // range, hold the head.
+                    self.drive_idle();
+                    self.status = STAT_PAUSE;
+                    self.cd_report();
+                } else {
+                    // Real seek: report BUSY now, then the seek machine drives
+                    // BUSY → SEEK → one Play tick → PAUSE, settling at the target
+                    // FAD with a stable PERIODIC report. A bare seek has no play
+                    // range, so the default `cur_play_end = 0x800000` makes
+                    // `check_end_met` (`cd_curfad >= 0`) true on the first
+                    // sector, pausing immediately at the target (cdb.cpp:2888
+                    // `StartSeek(cmd_sp)` with the default end).
+                    self.status = STAT_BUSY;
+                    self.cd_report();
+                    self.start_seek(cmd_sp, 0x80_0000, 0, 0);
                 }
-                self.cd_report();
                 self.hirq |= HIRQ_CMOK;
             }
             0x20 => {
@@ -3459,6 +3476,16 @@ mod tests {
         c.tick(12_000_000);
     }
 
+    /// A 2-track disc (Mode-1 data track 1 from FAD 150, audio track 2 from
+    /// LBA 4 = FAD 154) so a track-form seek to track 2 has a real target.
+    fn two_track_disc() -> Disc {
+        Disc::from_cue(
+            "FILE \"a.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:00:04\n",
+            |_| Some(vec![0u8; 2352 * 8]),
+        )
+        .expect("two-track cue")
+    }
+
     #[test]
     fn set_sector_length_decodes_size_codes() {
         let mut c = CdBlock::new();
@@ -3765,11 +3792,25 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(iso_disc());
         c.drive_phase = DrivePhase::Idle; // skip the recognition spin-up
-        // CR1 bit 0x80 set + a real FAD (0x000200): seek to that FAD, status PAUSE.
+        c.cd_curfad = 0x5000; // a stale head position to prove the seek moves it
+        c.drive_sector = 0x5000;
+        // Param 0x800200 (CR1 low byte 0x80 = FAD marker, CR2 = 0x200): a real
+        // FAD seek to 0x200. Mednafen `COMMAND_SEEK` runs a TIMED seek (BUSY in
+        // flight), settling to PAUSE at the target — not an instant PAUSE.
         cmd(&mut c, 0x1180, 0x0200, 0x0000, 0x0000);
-        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "FAD seek pauses");
-        assert_eq!(c.cd_curfad, 0x0200, "head positioned at the requested FAD");
+        assert_eq!(
+            c.status & !STAT_PERI,
+            STAT_BUSY,
+            "FAD seek reports BUSY in flight (timed, not instant)"
+        );
         assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+        pump(&mut c);
+        assert_eq!(c.cd_curfad, 0x0200, "head settled at the requested FAD");
+        assert_eq!(
+            c.status & !STAT_PERI,
+            STAT_PAUSE,
+            "bare seek settles to PAUSE"
+        );
     }
 
     #[test]
@@ -3784,15 +3825,37 @@ mod tests {
         assert_eq!(c.cd_curfad, 0x0345, "head position preserved (no re-seek)");
     }
 
+    /// The track/index seek form (`0x800000` marker bit CLEAR) — the exact case
+    /// Panzer Dragoon Zwei's post-FMV teardown trips: `Seek 1100,0200`, param
+    /// `0x000200` = track 2, index 0. The old MAME `cmd_seek_disc` decode keyed
+    /// FAD-vs-track on `CR1 & 0x80` and took a bogus track arm that set `track`
+    /// but left `cd_curfad` at the STALE FMV head position and completed
+    /// instantly, so the BIOS disc-validity service sampled an unsettled drive
+    /// and bailed to the CD player. Faithful (Mednafen `COMMAND_SEEK` →
+    /// `SeekStart1`): resolve the track's start FAD and run the timed
+    /// BUSY→SEEK→PAUSE machine, settling `cd_curfad` there.
     #[test]
-    fn seek_disc_track_form_sets_track_and_pauses() {
+    fn seek_disc_track_form_seeks_to_the_track_start() {
         let mut c = CdBlock::new();
-        c.insert_disc(iso_disc());
+        c.insert_disc(two_track_disc());
         c.drive_phase = DrivePhase::Idle;
-        // CR1 bit 0x80 clear, CR2 high byte = track 5: track seek → PAUSE.
-        cmd(&mut c, 0x1100, 0x0500, 0x0000, 0x0000);
-        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "track seek pauses");
-        assert_eq!(c.track, 5, "track set from CR2 high byte");
+        let track2_fad = c.track_start_fad(2).expect("track 2 start FAD");
+        c.cd_curfad = 0x5000; // stale (as if mid-FMV)
+        c.drive_sector = 0x5000;
+        // Param 0x000200 → track 2, index 0 (marker bit clear).
+        cmd(&mut c, 0x1100, 0x0200, 0x0000, 0x0000);
+        assert_eq!(
+            c.status & !STAT_PERI,
+            STAT_BUSY,
+            "track seek reports BUSY in flight (timed, not instant)"
+        );
+        pump(&mut c);
+        assert_eq!(
+            c.cd_curfad, track2_fad,
+            "curfad settled at track 2's start (the old decode left it stale)"
+        );
+        assert_eq!(c.track, 2, "head track is 2");
+        assert_eq!(c.status & !STAT_PERI, STAT_PAUSE, "settles to PAUSE");
     }
 
     #[test]
