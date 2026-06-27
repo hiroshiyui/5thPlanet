@@ -162,6 +162,28 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   edge: the SCU `IST` latch is **guest-cleared, not auto-cleared on vector fetch**
   (the ISR reads IST to identify the source). (Sangokushi V's movie stall lived
   here — see below.)
+- **SMPC INTBACK acquisition modes (status vs peripheral).** INTBACK is two
+  independent, separately-gated fetches: the **status** phase runs only if
+  `IREG0 & 0xF` (RTC/region/SMEM, OREG0 = `0x80`-style status byte), and the
+  **peripheral** phase runs if `IREG1 & 0x8`. The `SR_NPE` "more data, await
+  CONTINUE" bit is set **only inside the status phase**, so the peripheral
+  phase's continue-handshake is required **only when status was also returned**.
+  A **peripheral-only INTBACK** (`IREG0 & 0xF == 0`, `IREG1 & 0x8`) returns the
+  pad report **directly in OREG0.. with no CONTINUE** — many games poll the pad
+  this way every frame. Returning the status phase unconditionally (OREG0 =
+  `0x80`) and always arming the staged CONTINUE makes such a game read "no
+  controller" and ignore all input. (Panzer Dragoon Zwei lived here; `SAT_SMPCLOG`
+  shows the per-frame `IREG0=00 IREG1=08 COMREG=10` poll.)
+- **CD-block command decode — MAME model vs Mednafen oracle.** Some CD-block
+  command handlers were first written against MAME `saturn_cd_hle.cpp`, but the
+  project oracle is Mednafen `cdb.cpp` (LLE↔LLE). For position/timing-sensitive
+  commands the two models genuinely differ — e.g. **Seek (0x11)**: MAME
+  `cmd_seek_disc` keys FAD-vs-track on `CR1 & 0x80`; Mednafen `COMMAND_SEEK` takes
+  a single value `((CR1&0xFF)<<16)|CR2` and resolves FAD-vs-track by the
+  `0x800000` marker bit, running a *timed* BUSY→SEEK→PAUSE that updates
+  `cd_curfad`. A "stale head position / instant completion" symptom ⇒ diff the
+  command body against `cdb.cpp`, not the MAME source. (Panzer Dragoon Zwei lived
+  here — see below.)
 
 ## Case studies (scrubbed)
 
@@ -215,6 +237,50 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   coordinate next to the computed source coordinate, and don't gate the probe on
   the value you're validating; a half-screen repeat is a vertical-sampling-rate
   bug, not VRAM duplication.
+- **Panzer Dragoon Zwei — input dead (peripheral-only INTBACK).** The game
+  reached its title (via the Seek fix below) but accepted **no** controller input
+  — START did nothing, no button skipped the FMV — while **VF2 read input fine**.
+  Classified to the SMPC INTBACK path with a new `SAT_SMPCLOG` access logger
+  (observer-only): PDZ polled `IREG0=00, IREG1=08, COMREG=10` every frame, then
+  read **only OREG0** and re-issued, never writing the CONTINUE bit. Our handler
+  *always* ran the status phase (OREG0 = `0x80`) and armed the staged CONTINUE,
+  so PDZ saw `0x80` where it expected the `0xF1` port byte and gave up. The oracle
+  (`smpc.cpp:1217/1250`) gates the status phase on `IREG0 & 0xF` and sets
+  `SR_NPE` only there, so a peripheral-only INTBACK returns the pad directly in
+  OREG0.. with no handshake. Fix: honour the `IREG0 & 0xF` gate — skip the status
+  phase, fill OREG from byte 0, no CONTINUE. Verified by the title advancing to
+  the main menu (NEW GAME / OPTIONS) on START, with VF2 + SAN5 input unchanged.
+  **Lessons:** "VF2 works, this game doesn't" on a *shared* peripheral path means
+  the two games exercise *different sub-modes* of it — log the actual register
+  traffic of both and diff; a one-off `SAT_SMPCLOG` was the decisive instrument.
+  The symptom subsystem (input) was right, but the bug was an unhandled INTBACK
+  acquisition mode, not the pad-report format (which VF2 proved correct).
+- **Panzer Dragoon Zwei — a MAME-derived CD command in a Mednafen world.** The
+  opening FMV played, then the game bailed to the BIOS CD player. Three competing
+  agents (Mednafen oracle-diff / sdbg verdict-trace / CD-status register-audit)
+  converged: the post-FMV teardown issues `Seek 1100,0200`, and our CD **Seek
+  (0x11) handler was a port of MAME `cmd_seek_disc`** (FAD-vs-track keyed on
+  `CR1 & 0x80`, track from `CR2 >> 8`) — a *different model* from the oracle's
+  `COMMAND_SEEK` (cdb.cpp:2851), where the seek parameter is a single value
+  `((CR1&0xFF)<<16)|CR2` (`0`=Stop, `0xFFFFFF`=Pause, else a seek whose
+  FAD-vs-track addressing is the `0x800000` marker bit, resolved in `SeekStart1`).
+  PDZ's param `0x000200` (marker clear = track 2 / index 0) hit the bogus track
+  arm, which set `track` but **left `cd_curfad` at the stale FMV head FAD** and
+  **completed instantly** (no timed BUSY→SEEK→PAUSE). The BIOS disc-validity
+  service (ROM `0x3BA6`: OK iff `status != 0xFF && (status & 0x20)`) then sampled
+  an unsettled drive → verdict 1 → CD-player relaunch. Fix: route the real-seek
+  case through `start_seek(cmd_sp, 0x800000, 0, 0)` so the phase machine runs and
+  `cd_curfad` settles at the target (a bare seek's `cur_play_end = 0x800000` makes
+  `check_end_met` true on the first sector → PAUSE). Verified by the rendered
+  title screen, not a pixel count. It surfaced only now because the FMV itself
+  began playing only after the Sangokushi V fixes, and no prior game issued a
+  plain *track-form* Seek (BIOS/VF2 set the `0x800000` marker, which the buggy
+  `CR1 & 0x80` test happened to satisfy). **Lessons:** when a single chip command
+  is documented as a MAME port but the project oracle is Mednafen (LLE↔LLE), diff
+  the command body against `cdb.cpp` directly — MAME and Mednafen are genuinely
+  different models, not the same logic differently spelled; a "stale position /
+  instant completion" symptom on a position-sensitive command points at the
+  addressing decode + the missing timed phase machine.
 
 ---
 

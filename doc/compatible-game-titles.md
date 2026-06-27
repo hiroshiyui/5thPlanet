@@ -18,11 +18,13 @@ project.
 | **Virtua Fighter 2** | GS-9079 | JP / v1.01 | ✅ **Fully playable** — title, mode & character select with looping CD-DA BGM, full 3D fights to the K.O. screen at a steady 60 fps; balanced BGM/SFX. | 53440 px |
 | **Doukyuusei ~if~** (同級生 if) | — | JP / v1.01 | ✅ **Fully playable** — graphics, SFX, and voices; in-game record-select menu; native 640×224 hi-res; Shuttle Mouse supported. | 143341 px |
 | **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | — |
+| **Panzer Dragoon Zwei** | GS-9049 | JP / v1.01 | ✅ **Fully playable** — opening Cinepak FMV → title → main menu (NEW GAME / OPTIONS) → game, with controller input working at native 704×448 hi-res. | — |
 
 The **render-golden** column is the headless non-black pixel count asserted by
 the `#[ignore]`d render-regression tests in `crates/saturn/tests/trace_boot.rs`
 (`vf2_renders_non_black`, `doukyuusei_renders_non_black`) — a guard that these
-titles keep rendering. Sangokushi V has no render golden yet.
+titles keep rendering. Sangokushi V and Panzer Dragoon Zwei have no render golden
+yet.
 
 ## Notes
 
@@ -43,6 +45,16 @@ titles keep rendering. Sangokushi V has no render golden yet.
   delay slot. Full chain in the commit messages, the
   [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study, and the
   closed SAN5 entry in [`wip-compatibility-titles.md`](wip-compatibility-titles.md).
+- **Panzer Dragoon Zwei** is the second Sega FILM / Cinepak title, and the first
+  to expose two distinct gaps that the other titles never exercised: a CD **Seek
+  (0x11)** command decoded on the MAME track/FAD model instead of Mednafen's
+  single-value `COMMAND_SEEK` (a post-FMV track-form seek left the head FAD stale
+  and skipped the timed seek, so the BIOS disc-validity check bailed to the CD
+  player), and a **peripheral-only SMPC INTBACK** (`IREG0 & 0xF == 0`) that must
+  skip the status phase and return the pad directly in OREG0 with no CONTINUE —
+  without it the game read "no controller" and ignored all input while other
+  titles, which drive the status+continue handshake, worked. Both are in the
+  [`debugging-playbook.md`](debugging-playbook.md) case studies.
 
 ## Also runs
 

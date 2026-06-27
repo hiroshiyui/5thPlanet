@@ -6,96 +6,78 @@ gathered so far. Each entry is a resume point, not a closed case.
 
 For the fully-working titles see
 [`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2*,
-*Doukyuusei ~if~*, and *Sangokushi V* are fully playable. SAN5's former
-intermittent per-scenario opening movie stall is tracked below as a closed
-regression case. The references this work is checked against
-(Mednafen, MAME, Yabause) are the never-committed local oracles described in
+*Doukyuusei ~if~*, *Sangokushi V*, and *Panzer Dragoon Zwei* are all fully
+playable. SAN5's former intermittent per-scenario opening movie stall and PDZ's
+former post-FMV exit + dead input are tracked below as **closed cases** kept for
+their methodology. The references this work is checked against (Mednafen, MAME,
+Yabause) are the never-committed local oracles described in
 [`adr/0017-reference-oracle-policy.md`](adr/0017-reference-oracle-policy.md).
 
-Panzer Dragoon Zwei (below) **boots with no per-game hack in Mednafen** (checked
-against `mednaref/src/ss/db.cpp`), so it's an **our-side fidelity gap**, not a
-bad dump or a game that needs a quirk flag. It passes authentication and runs
-real game code, then **stalls in the CD-driven Sega FILM / Cinepak movie player**
-during its intro movie — the CD read pump freezes mid-`Play` with status stuck at
-`PLAY`.
+The Cinepak FILM path is now well-exercised: *Sangokushi V* (eighteen Cinepak
+FILM files) was the first title to drive it through to gameplay, and *Panzer
+Dragoon Zwei* is the second. (VF2's opening movie is **Duck TrueMotion**, a
+different codec; all of these decoders are the games' own SH-2 software run by
+LLE — no decoder to implement either way.)
 
-The Cinepak FILM path is **no longer unvalidated**: *Sangokushi V* (playable —
-see [`compatible-game-titles.md`](compatible-game-titles.md)) was the
-first title to drive it through to gameplay, its eighteen Cinepak FILM files
-playing. PDZ's stall is therefore *likely* a **PDZ-specific FILM/timing issue**
-rather than a wholesale gap in the player. SAN5's scenario-opening movie stall
-looked similar at the CD-buffer level, but its confirmed root cause was a SH-2
-interrupt-timing error: SCU DMA-end could be delivered in an `rte` delay slot.
-(VF2's opening movie is **Duck TrueMotion**, a different codec; all of these
-decoders are the games' own SH-2 software run by LLE — no decoder to implement
-either way. See the FMV note below.)
+There are currently **no titles actively under investigation** — the entries
+below are resolved cases retained as resume points / methodology references.
 
 ---
 
-## Panzer Dragoon Zwei (PDZ) — PAUSED
+## Panzer Dragoon Zwei (PDZ) — ✅ RESOLVED (fully playable)
 
-- **Status:** paused by user choice (2026-06-11, low play priority). Root
-  *mechanism* identified; one residual emulation bug remains.
-- **Image:** `roms/pdzwei.cue/.bin` — dump verified bit-identical across two
-  reads (audio byte-swapped at rip time; `.bak` kept). 4 tracks; a `PREGAP`
-  directive on track 2 (parser caveat, not implicated).
+- **Status:** **fully playable** (2026-06-27, user-confirmed): opening Cinepak
+  FMV → title → main menu (NEW GAME / OPTIONS) → game, controller input working.
+  See [`compatible-game-titles.md`](compatible-game-titles.md). Boots with no
+  per-game hack in Mednafen (`mednaref/src/ss/db.cpp`), so both blockers were
+  our-side fidelity gaps. Kept here as a closed case for the methodology.
 
-### Symptom
-Boots; the SEGA-PRESENTS and license screens render (so the 1st-read program
-runs), then the game **silently falls back to the BIOS CD-player UI** at
-~frame 870. Re-launching the application does not progress. **No CPU fault** on
-either SH-2.
+Two distinct fixes, both found by diffing our behaviour against the Mednafen
+oracle at the divergence:
 
-### Root mechanism (decoded over sessions 1–9)
-The game's Sega CD library calls a **BIOS disc-validity service**
-(via the system-table vector `[0x06000340]` → ROM `0x060007B0`) and spins at
-`0x0604BF02` until that service writes an async status word. The service
-requires a **stable PERIODIC CD report**: empirically (sdbg bp `0x3BAE`, the
-`0x3BA6–0x3BBA` check) it is OK *iff* `status != 0xFF && (status & 0x20) != 0`
-(i.e. a `PERIODIC`-flagged report; a paused drive yields identical `0x21`
-reports). Verdict `1` → exit to CD player; `2` → continue.
+### Fix 1 — post-FMV exit to the BIOS CD player (CD Seek 0x11 decode)
+The opening FMV (which only began playing after the SAN5 DMA-halfword-skip +
+SCU-delay-slot interrupt fixes) ran to completion, then the game tore it down and
+**bailed to the BIOS CD player** via the Saturn disc-validity convention (BIOS
+service `0x060007B0`; ROM `0x3BA6` verdict OK *iff* `status != 0xFF &&
+(status & 0x20)`). Root: our CD **Seek (0x11)** handler was a port of MAME
+`cmd_seek_disc` (FAD-vs-track keyed on `CR1 & 0x80`, track from `CR2 >> 8`) — a
+*different model* from Mednafen `COMMAND_SEEK` (cdb.cpp:2851), where the seek
+parameter is a single value `((CR1 & 0xFF) << 16) | CR2` (`0` = Stop, `0xFFFFFF`
+= Pause, else a seek whose FAD-vs-track addressing is the `0x800000` marker bit,
+resolved in `SeekStart1`). PDZ's post-FMV `Seek 1100,0200` (param `0x000200` =
+track 2) hit the bogus track arm, which set `track` but **left `cd_curfad` at the
+stale FMV head FAD** and **completed instantly** (no timed BUSY→SEEK→PAUSE), so
+the disc-validity check sampled an unsettled drive → verdict `1` → CD player.
+**Fix:** route the real-seek case through `start_seek(cmd_sp, 0x800000, 0, 0)` so
+the phase machine runs and `cd_curfad` settles at the target (a bare seek's
+`cur_play_end = 0x800000` makes `check_end_met` true on the first sector →
+PAUSE). It surfaced only now because no prior game issued a plain *track-form*
+Seek (BIOS/VF2 set the `0x800000` marker, which the buggy `CR1 & 0x80` test
+happened to satisfy). Regressions: the rewritten Seek tests in
+`crates/saturn/src/cd_block.rs`.
 
-Ours feeds the check a **COMMAND-response pair** (drive `PLAY`, status `0x03`,
-no `0x20` bit) instead of a stable periodic report → verdict `1` → exit. The
-"exit to CD player" is exactly the audio-CD/invalid-disc UX path.
-
-### The residual our-side bug (next to fix)
-At the moment of the check, our drive reports **`PLAY` with FAD frozen at 2041**
-(intro movie `Play FAD 2035 × 7868`; only ~6 sectors delivered then freed). On
-Mednafen the stream keeps buffering to full (~195 more sectors), transitions
-`BUSY → PAUSE`, and the periodic then repeats identical `0x21` reports —
-satisfying both the stability and the `0x20` requirement. **So: why does our
-read pump freeze at FAD 2041 while status stays `PLAY`?** Suspects: `sec_prebuf_in`
-stuck, `drive_counter` not re-armed after the `GetSectorData`/`EndDataXfer`/
-`GetThenDelSector` dance, or a pause-with-status-`PLAY` path
-(`crates/saturn/src/cd_block.rs`).
-
-### Evidence
-- CD delivery is **byte-perfect** through the first movie batch
-  (`disc_read_content_check`: FAD 150 security header + FAD 2035 `FILM..P1.07`
-  Sega FILM/Cinepak header match the `.bin` exactly).
-- Give-up localized with `dump_giveup_state` (`CUE=pdzwei.cue FRAMES=1500
-  CMD_LOG_TAIL=1024`), `SAT_CDSEEKLOG`, windowed master PC trace
-  (`gen_vf2_pc_trace` pattern, `PCTRACE_LO=06000000`), and chained sdbg
-  breakpoints into the BIOS service body.
-
-### Landed
-- **ResultsRead latch** (`3d8e8eb`, savestate v7) — the Mednafen-faithful
-  `cdb.cpp ResultsRead` gate (CR report stays latched between host reads so two
-  back-to-back reads match). Necessary (fixed torn CR reads that an earlier
-  read-twice stability check tripped on) but **not sufficient** — PDZ still
-  exits.
-
-### Ruled out
-CPU fault; dump quality (double-read verified); CD command protocol through
-movie batch 1; sector content; commands `0x52`/`0x53`; the "PLAY-for-1-sector
-read" Break-Point quirk (movie is a long play, PLAY is legitimate); filter
-mode-bit mapping / reset defaults / connector chain.
+### Fix 2 — dead controller input (SMPC peripheral-only INTBACK)
+At the title PDZ accepted **no** pad input while **VF2 read input fine**. Both
+poll with the same `IREG0=00, IREG1=08, COMREG=10` INTBACK, but VF2 drives the
+status+CONTINUE handshake whereas PDZ reads only OREG0 and re-issues. Our handler
+**always** ran the INTBACK status phase (OREG0 = `0x80`) and armed the staged
+CONTINUE, but INTBACK gates the two fetches independently: the status phase runs
+only `if(IREG0 & 0xF)` and `SR_NPE` ("await CONTINUE") is set only inside it
+(Mednafen `smpc.cpp:1217/1250`). A **peripheral-only INTBACK** (`IREG0 & 0xF ==
+0`, `IREG1 & 0x8`) must return the pad report **directly in OREG0.. with no
+CONTINUE** — ours put `0x80` where PDZ expects the `0xF1` port byte, so PDZ saw
+"no controller". **Fix:** honour the `IREG0 & 0xF` gate
+(`crates/saturn/src/system.rs` `drain_smpc`). Found with the new `SAT_SMPCLOG`
+register-access logger (observer-only). Regression:
+`intback_peripheral_only_returns_the_pad_directly_without_a_continue`
+(`crates/saturn/tests/smpc.rs`) + the manual `pad_input_reacts` harness.
 
 ### Reference notes
 - `mednaref/src/ss/db.cpp`: **no hack for PDZ** (boots on generic CDB fidelity).
 - Mednafen's PROBLEMATIC-GAMES list notes PD2 "relies on illegal/questionable
-  VDP2 window settings" — an **in-game rendering quirk for later**, not the boot.
+  VDP2 window settings" — an **in-game rendering quirk to watch for**, not a boot
+  blocker.
 
 ---
 

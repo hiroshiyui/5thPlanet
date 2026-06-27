@@ -365,8 +365,13 @@ command is **not instantaneous**: the SMPC holds [SF] busy for its
 execution time (a status-only request ≈ 261 µs ≈ 7475 SH-2 cycles,
 reconciled to Mednafen's 4 MHz SMPC clock) before filling OREG and
 clearing SF — the BIOS polls SF in a wait loop, and clearing it too
-early derails the boot. The full multi-port peripheral nibble-stream
-protocol is still simplified (one digital pad on port 1).
+early derails the boot. The two fetches are **independently gated**: the
+status phase runs only when `IREG0 & 0xF`, and peripheral data (requested
+by `IREG1 & 0x8`) is returned either via the CONTINUE-driven phases when
+status was also fetched, or **directly in OREG0.. with no CONTINUE** for a
+peripheral-only request. Each port reports one block per its selected
+device (none / digital pad / Shuttle Mouse); the full multi-port
+nibble-stream *timing* model is still a lump approximation.
 
 **INTC** — Interrupt Controller. Two layers: one on-chip per SH-2
 (`crates/sh2/src/onchip/intc.rs`) handles internal sources (DIVU

@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1160 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1161 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -48,8 +48,9 @@ set as chips/games surface needs.
 | On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert + image browser, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
 **Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
-Two commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
-`vf2-good-emulation`) and *Doukyuusei ~if~*.
+Four commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
+`vf2-good-emulation`), *Doukyuusei ~if~*, *Sangokushi V* (三國志V), and *Panzer
+Dragoon Zwei* — see [`compatible-game-titles.md`](compatible-game-titles.md).
 
 ## Milestone 1 — Cycle-accurate SH-2 core ✅
 
@@ -255,7 +256,8 @@ in `doc/system-architecture.md` §9, Part B.7.
 
 Output of a full per-chip architecture audit (2026-06-04). The emulator is
 "boot-complete" but not "hardware-complete": none of these block the current
-targets (three games fully playable — VF2, *Doukyuusei ~if~*, *Sangokushi V*),
+targets (four games fully playable — VF2, *Doukyuusei ~if~*, *Sangokushi V*,
+*Panzer Dragoon Zwei*),
 but together they are the path to broad
 compatibility + full cycle-accuracy. A **prioritized backlog** — tasks are
 pulled when a game or accuracy need surfaces, golden-safe throughout.
