@@ -108,7 +108,12 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      location is known, else XDG) — holding scale, fullscreen,
                      region, cartridge,
                      Shuttle Mouse (`mouse` = `off`/`1`/`2`, same vocabulary as
-                     `--mouse`), pad keymap (CLI flag > config > autodetect),
+                     `--mouse`), texture scaling (`scaling` = `sharp`
+                     nearest/default or `smooth` linear — SDL3 defaults textures
+                     to linear/blurry, so the frontend sets the mode on every
+                     streaming-texture create to restore the SDL2-era crisp look;
+                     OSD-toggled live via `UiMsg::Scaling`), pad keymap
+                     (CLI flag > config > autodetect),
                      written back on every OSD Settings change. A committed
                      `jupiter/jupiter.toml.example` documents every key. The OSD's Controller screen rebinds the
                      keyboard map press-to-bind (the SDL thread owns the
