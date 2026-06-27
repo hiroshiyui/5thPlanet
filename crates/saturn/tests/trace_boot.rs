@@ -4119,6 +4119,76 @@ fn vf2_renders_non_black() {
     );
 }
 
+/// Game-render regression guard for Panzer Dragoon Zwei — the third "game
+/// golden" (cf. [`doukyuusei_renders_non_black`], [`vf2_renders_non_black`]).
+/// Boots PDZ fresh (JP v1.01 BIOS + Japan region; it needs no `.bup`) and runs
+/// long enough to clear the opening Cinepak FMV (~frame 4847) and settle on the
+/// title screen, then asserts the master runs game code (HWRAM) AND VDP2
+/// composites a non-black 704×448 frame. This title guards two PDZ-specific
+/// fidelity fixes whose regression would NOT black the frame but WOULD break the
+/// title: the faithful CD `Seek` (0x11) decode (a stale-head seek exits to the
+/// CD player before the title) and the peripheral-only SMPC INTBACK (dead input
+/// at the title). Needs bios/ + roms/PANZER_DRAGOON_ZWEI.cue; prints "skipped"
+/// and returns if absent. Run with --release:
+///
+///   cargo test --release -p saturn --test trace_boot pdz_renders_non_black \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "needs bios/ + roms/ Panzer Dragoon Zwei; the game-render golden (run with --release)"]
+fn pdz_renders_non_black() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "PANZER_DRAGOON_ZWEI.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    // PDZ's opening FMV plays to ~frame 4847; the title settles by ~5100. Default
+    // past it so the golden captures the title, not the movie.
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5400);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut in_hwram = 0u32;
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        if f >= frames.saturating_sub(300) && (sat.master().regs.pc >> 24) == 0x06 {
+            in_hwram += 1;
+        }
+    }
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
+    println!(
+        "pdz: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
+        sat.master().regs.pc
+    );
+    assert!(
+        in_hwram >= 290,
+        "master not running game code (HWRAM) — boot/exec regression"
+    );
+    assert!(
+        nonblack > 10_000,
+        "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
+    );
+}
+
 /// Measure ours' sustained emulation frame rate vs the real-machine target
 /// (~60 fps NTSC). Loads the cached menu snapshot (a 640 hi-res Doukyuusei
 /// scene — the heavy case) and times BENCH_FRAMES (default 600) two ways:
