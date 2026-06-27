@@ -99,6 +99,12 @@ instead of 0" — while the root was a dropped cache purge two layers up.)
 - **Instrument narrowly.** Prefer env-gated probes, watchpoints, breakpoints, and
   per-subsystem traces over broad logging. Remove temporary probes once the root
   is understood.
+- **Instrument both ends of a mapping, not just the input — and never gate the
+  probe on the value you're validating.** For a coordinate/address transform
+  (screen→source, logical→physical) log the *output* next to the input. A probe
+  that prints only the source `sy` (or filters on `sy == N`) cannot reveal
+  `sy ≠ y`; it will happily confirm a faithful mapping that isn't. (The BIOS
+  Memory Manager half-screen doubling hid behind exactly this — see below.)
 - **Follow ownership boundaries.** A full CD buffer does not prove the CD block is
   wrong; repeated audio does not prove the frontend is wrong; blank graphics do
   not prove VDP rendering is wrong. Verify whether the subsystem is the cause or
@@ -138,6 +144,16 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 - **Inter-CPU handshakes.** The master/slave SH-2s wake each other via the FRT
   input-capture pin and relocate each other via SMPC `SSHON` / `SSHOFF`. Timing
   and cache state around these handoffs are a recurring blocker source.
+- **VDP2 per-layer coordinate math (scroll / zoom / line-scroll).** Each NBG/RBG
+  layer maps a screen dot to a source dot through whole-layer scroll + fractional
+  zoom (`ZMxN` coord-increment) + per-line scroll + per-column vertical cell
+  scroll. Read **every** control register — including **SCRCTL (line scroll
+  X/Y/zoom)** — before declaring the renderer faithful; one missed register sends
+  the whole layer to the wrong source row. Vertical line scroll (LSCY) supplies
+  the line's **source-Y base**, not an additive offset over the display line. A
+  symptom of "content repeats every N lines / an exact half-screen" is a ~2×
+  vertical-sampling-rate error (line-scroll/zoom), *not* VRAM duplication — verify
+  the sampling before chasing the bytes. (BIOS Memory Manager — see below.)
 - **Interrupt-acceptance timing.** The Saturn aggregate forwards SCU/CD interrupts
   to the master once per instruction; that forward must honour the SH-2 rules the
   core already enforces — above all, **never accept an interrupt inside a branch
@@ -179,6 +195,26 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   let the game's sound-submit spin-timeout expire before the 68k driver's wake,
   latching a permanent "sound wedged" flag. Found by diffing the timing model
   against the oracle, not by reading the driver.
+- **BIOS Memory Manager — line scroll is a base, not an offset (and a near-miss).**
+  A BIOS screen rendered doubled: two copies of the menu stacked in one 320×224
+  frame. A long trace *wrongly cleared the renderer* — it ruled out char-mode,
+  scroll, zoom, window (WCTLA), and interlace (TVMD), but **never read SCRCTL**
+  (the per-layer line-scroll control; `0x0E0E` here → vertical line scroll on),
+  and its bitmap probe printed the *source* `sy` while filtering on `sy == 168`,
+  so "`sy=168 → py=168`" was misread as "`sy = y`, faithful" when it was really
+  screen y=84 → sy=168. That sent the investigation chasing "who writes the VRAM
+  twice" (write-watch on the bitmap bank) when the VRAM was fine. Root (Codex):
+  VDP2 **vertical line scroll (LSCY) supplies the line's source-Y base**, but the
+  renderer added it on top of the screen-line counter, sampling `source_y ≈ 2*y`
+  and wrapping the 256-line bitmap at 128 → the half-screen repeat. Fix:
+  `y_phase = lscy ? y % interval : y` (only the residual phase within the
+  line-scroll interval advances by the Y coord-increment, per Mednafen
+  `CurYScrollIF`); regression `nbg0_line_scroll_y_replaces_the_screen_line_base`.
+  **Lessons:** enumerate *all* per-layer VDP2 control registers (line-scroll
+  included) before declaring the renderer faithful; instrument the screen
+  coordinate next to the computed source coordinate, and don't gate the probe on
+  the value you're validating; a half-screen repeat is a vertical-sampling-rate
+  bug, not VRAM duplication.
 
 ---
 
