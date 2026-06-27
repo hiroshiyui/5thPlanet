@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-06-27
+
+**Panzer Dragoon Zwei is now fully playable** — the fourth commercial game — via two
+emulation-fidelity fixes in the CD-block and SMPC, found by diffing against the
+Mednafen oracle at the point of divergence.
+
+### Added
+
+- **Panzer Dragoon Zwei** (JP, serial GS-9049, v1.01 BIOS) is **fully playable**:
+  opening Cinepak FMV → title → main menu (NEW GAME / OPTIONS) → 3D gameplay at
+  native 704×448, with controller input.
+- A **`pdz_renders_non_black` render-regression golden** (274464 px), joining the
+  Virtua Fighter 2 and Doukyuusei guards.
+- **`SAT_SMPCLOG`** — an observer-only, golden-safe SMPC register-access logger for
+  diagnosing which path a game uses to read the controller (INTBACK status vs
+  peripheral-only vs direct PDR/DDR mode).
+
+### Fixed
+
+- **CD `Seek` (0x11)** now follows Mednafen's `COMMAND_SEEK` instead of the MAME
+  `cmd_seek_disc` model: the parameter is a single value `((CR1 & 0xFF) << 16) | CR2`
+  (`0` = Stop, `0xFFFFFF` = Pause, else a **timed** seek whose FAD-vs-track
+  addressing is the `0x800000` marker bit). A track-form seek no longer leaves the
+  head FAD stale or completes instantly — which is what made Panzer Dragoon Zwei's
+  post-FMV disc-validity check bail to the BIOS CD player.
+- **SMPC peripheral-only INTBACK** (`IREG0 & 0xF == 0`, `IREG1 & 0x8`) now returns
+  the controller report directly in OREG0 with no CONTINUE handshake (the status
+  phase and its `SR_NPE` only apply when status is requested, per Mednafen
+  `smpc.cpp`). A game that polls the pad this way (Panzer Dragoon Zwei) no longer
+  reads "no controller" and ignores all input.
+
 ## [0.14.0] - 2026-06-27
 
 Frontend display polish plus a VDP2 rendering fix. Fullscreen now keeps the picture's
