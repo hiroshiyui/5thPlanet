@@ -17,13 +17,16 @@ project.
 | ----- | ------ | ------------- | ------ | ------------- |
 | **Virtua Fighter 2** | GS-9079 | JP / v1.01 | ✅ **Fully playable** — title, mode & character select with looping CD-DA BGM, full 3D fights to the K.O. screen at a steady 60 fps; balanced BGM/SFX. | 53440 px |
 | **Doukyuusei ~if~** (同級生 if) | — | JP / v1.01 | ✅ **Fully playable** — graphics, SFX, and voices; in-game record-select menu; native 640×224 hi-res; Shuttle Mouse supported. | 143341 px |
-| **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | — |
+| **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | 71680 px |
 | **Panzer Dragoon Zwei** | GS-9049 | JP / v1.01 | ✅ **Fully playable** — opening Cinepak FMV → title → main menu (NEW GAME / OPTIONS) → game, with controller input working at native 704×448 hi-res. | 274464 px |
 
 The **render-golden** column is the headless non-black pixel count asserted by
 the `#[ignore]`d render-regression tests in `crates/saturn/tests/trace_boot.rs`
-(`vf2_renders_non_black`, `doukyuusei_renders_non_black`, `pdz_renders_non_black`)
-— a guard that these titles keep rendering. Sangokushi V has no render golden yet.
+(`vf2_renders_non_black`, `doukyuusei_renders_non_black`, `pdz_renders_non_black`,
+`san5_renders_non_black`) — a guard that these titles keep rendering. All four
+fully-playable titles now have a render golden; Sangokushi V's is captured during
+its opening Cinepak FILM movie (the only no-input stable frame), guarding the
+software-decoded-movie → VDP2 path.
 
 ## Notes
 
