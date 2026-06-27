@@ -173,6 +173,9 @@ pub enum OsdAction {
     /// Toggle texture scaling Sharp (nearest) ↔ Smooth (linear); the frontend
     /// applies it live to the streaming texture and persists it.
     ToggleScaling,
+    /// Toggle fullscreen aspect Keep-ratio (letterbox) ↔ Fit-screen (stretch);
+    /// the frontend applies it live via SDL3 logical presentation and persists it.
+    ToggleAspect,
     /// Switch SMPC region (frontend applies it and resets the machine).
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
@@ -227,6 +230,9 @@ pub struct OsdCtx {
     /// Whether texture scaling is Sharp (nearest) vs Smooth (linear) — the
     /// Graphics screen shows + toggles it.
     pub sharp: bool,
+    /// Whether fullscreen keeps the aspect ratio (letterbox) vs fits-to-screen
+    /// (stretch) — the Graphics screen shows + toggles it.
+    pub keep_aspect: bool,
     /// Current SMPC region — the Region screen marks it.
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
@@ -473,6 +479,19 @@ impl Osd {
                     mk(
                         &format!("Pixels: {}", if ctx.sharp { "Sharp" } else { "Smooth" }),
                         Select::Emit(OsdAction::ToggleScaling),
+                    ),
+                    // Letterbox (Keep ratio) vs stretch (Fit screen) in fullscreen;
+                    // applied live via SDL3 logical presentation.
+                    mk(
+                        &format!(
+                            "Aspect: {}",
+                            if ctx.keep_aspect {
+                                "Keep ratio"
+                            } else {
+                                "Fit screen"
+                            }
+                        ),
+                        Select::Emit(OsdAction::ToggleAspect),
                     ),
                 ];
                 // The Shaders chooser is preview-only groundwork (gpu-preview).
@@ -898,6 +917,7 @@ mod tests {
             scale: 2,
             fullscreen: false,
             sharp: true,
+            keep_aspect: true,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
             mouse: OsdMouse::Off,
@@ -1161,6 +1181,19 @@ mod tests {
         assert_eq!(
             select_main(&mut osd, &c, "Pixels: Sharp"),
             Some(OsdAction::ToggleScaling)
+        );
+    }
+
+    #[test]
+    fn graphics_aspect_row_toggles() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // keep_aspect = true → row reads "Aspect: Keep ratio"
+        assert_eq!(select_main(&mut osd, &c, "Settings"), None);
+        assert_eq!(select_main(&mut osd, &c, "Graphics..."), None);
+        assert_eq!(
+            select_main(&mut osd, &c, "Aspect: Keep ratio"),
+            Some(OsdAction::ToggleAspect)
         );
     }
 

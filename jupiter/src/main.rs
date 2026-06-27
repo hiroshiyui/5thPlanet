@@ -310,6 +310,9 @@ fn main() -> ExitCode {
                 );
             }
             eprintln!();
+            eprintln!("  Hotkeys: Esc = menu, F5/F9 = quick save/load, F11 = fullscreen,");
+            eprintln!("           F12 = fullscreen aspect (keep ratio / fit screen).");
+            eprintln!();
             eprintln!("BIOS images are gitignored — see bios/README.md for");
             eprintln!("naming conventions and the legal situation. Each");
             eprintln!("developer supplies their own legally-obtained dump.");
@@ -651,6 +654,7 @@ fn run(
         scale: cfg.scale,
         fullscreen: cfg.fullscreen,
         sharp: !present::is_smooth(&cfg.scaling),
+        keep_aspect: present::keeps_aspect(&cfg.aspect),
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
         backend: token_to_osd_backend(&cfg.backend),
@@ -773,6 +777,17 @@ fn run(
     // on every texture re-create (resolution change) + on the live OSD toggle.
     let mut sharp = !present::is_smooth(&cfg.scaling);
     texture.set_scale_mode(present::scale_mode(sharp));
+    // Aspect handling via SDL3 logical presentation: keep-ratio (letterbox) or
+    // fit-screen (stretch). Set to the frame's native size; re-applied on every
+    // resolution change + on the OSD Aspect toggle. Only visibly differs in
+    // fullscreen (windowed already matches the picture aspect).
+    let mut keep_aspect = present::keeps_aspect(&cfg.aspect);
+    present::apply_aspect(
+        &mut canvas,
+        FRAME_WIDTH as u32,
+        FRAME_HEIGHT as u32,
+        keep_aspect,
+    );
 
     let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
@@ -1002,6 +1017,7 @@ fn run(
                     scale: sess.ui.scale,
                     fullscreen: sess.ui.fullscreen,
                     sharp: sess.ui.sharp,
+                    keep_aspect: sess.ui.keep_aspect,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
                     mouse: mouse_port_to_osd(sess.mouse_port),
@@ -1100,6 +1116,28 @@ fn run(
                                 eprintln!("no state to load at {} ({e})", path.display());
                             }
                             }
+                        }
+                        // F11/F12 reuse the menu's dispatch (updates ui state +
+                        // config + sends the UiMsg back to the SDL thread + toast).
+                        EmuIn::ToggleFullscreen => {
+                            let _ = dispatch_osd(
+                                osd::OsdAction::ToggleFullscreen,
+                                &mut osd,
+                                &mut saturn,
+                                &mut sess,
+                                &ui_tx,
+                                &audio_tx,
+                            );
+                        }
+                        EmuIn::ToggleAspect => {
+                            let _ = dispatch_osd(
+                                osd::OsdAction::ToggleAspect,
+                                &mut osd,
+                                &mut saturn,
+                                &mut sess,
+                                &ui_tx,
+                                &audio_tx,
+                            );
                         }
                         #[cfg(debug_assertions)]
                         EmuIn::PlayCdda => {
@@ -1392,6 +1430,21 @@ fn run(
                         audio_mirror.store(0, Ordering::Relaxed);
                         let _ = emu_tx.send(EmuIn::Quickload);
                     }
+                    // F11 toggles fullscreen, F12 the fullscreen aspect mode
+                    // (Keep ratio ↔ Fit screen) — both routed to the OSD dispatch
+                    // so the menu labels + config track them.
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F11),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::ToggleFullscreen);
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F12),
+                        ..
+                    } => {
+                        let _ = emu_tx.send(EmuIn::ToggleAspect);
+                    }
                     // F8 CD-audio play is a debug-build-only diagnostic (it
                     // drives CD-DA outside the BIOS path); release builds omit it.
                     #[cfg(debug_assertions)]
@@ -1638,6 +1691,11 @@ fn run(
                         sharp = on;
                         texture.set_scale_mode(present::scale_mode(sharp));
                     }
+                    UiMsg::Aspect(keep) => {
+                        keep_aspect = keep;
+                        let (w, h) = cur_dims;
+                        present::apply_aspect(&mut canvas, w as u32, h as u32, keep_aspect);
+                    }
                     UiMsg::ArmRebind(b) => rebind_target = Some(b),
                     UiMsg::ResetKeymap => {
                         keymap = std::array::from_fn(|i| {
@@ -1678,6 +1736,8 @@ fn run(
                         .expect("recreate streaming texture");
                     // A fresh texture resets to SDL3's linear default — re-apply.
                     texture.set_scale_mode(present::scale_mode(sharp));
+                    // Logical size tracks the new frame dims (keeps the aspect).
+                    present::apply_aspect(&mut canvas, dims.0 as u32, dims.1 as u32, keep_aspect);
                     cur_dims = dims;
                 }
             }
@@ -1731,6 +1791,11 @@ enum EmuIn {
     /// F5/F9 quickslot save/load.
     Quicksave,
     Quickload,
+    /// F11 / F12 display hotkeys: toggle fullscreen, or the fullscreen aspect
+    /// mode (Keep ratio ↔ Fit screen). Routed through the same OSD dispatch as
+    /// the menu rows so the Settings labels + persisted config stay in sync.
+    ToggleFullscreen,
+    ToggleAspect,
     /// F8 (debug builds only): play the disc's first CD-DA track — a diagnostic
     /// that drives CD-DA outside the BIOS path.
     #[cfg(debug_assertions)]
@@ -1766,6 +1831,9 @@ enum UiMsg {
     /// Set texture scaling Sharp (nearest, `true`) vs Smooth (linear, `false`);
     /// applied live to the streaming texture on the SDL thread.
     Scaling(bool),
+    /// Set fullscreen aspect Keep-ratio (letterbox, `true`) vs Fit-screen
+    /// (stretch, `false`); applied live via SDL3 logical presentation.
+    Aspect(bool),
     /// Capture the next host keypress for this pad button (OSD rebind).
     ArmRebind(u8),
     /// Restore the default keyboard→pad bindings.
@@ -1785,6 +1853,9 @@ struct UiState {
     /// Sharp (nearest) vs Smooth (linear) texture scaling — mirrors
     /// `cfg.scaling` for the Graphics screen's label + toggle.
     sharp: bool,
+    /// Keep-ratio (letterbox) vs fit-screen (stretch) — mirrors `cfg.aspect`
+    /// for the Graphics screen's label + toggle.
+    keep_aspect: bool,
     region: osd::OsdRegion,
     cart: osd::OsdCart,
     backend: osd::OsdBackend,
@@ -2164,6 +2235,25 @@ fn dispatch_osd(
                     "Pixels: Sharp"
                 } else {
                     "Pixels: Smooth"
+                },
+                90,
+            );
+        }
+        OsdAction::ToggleAspect => {
+            sess.ui.keep_aspect = !sess.ui.keep_aspect;
+            let _ = ui_tx.send(UiMsg::Aspect(sess.ui.keep_aspect));
+            sess.cfg.aspect = if sess.ui.keep_aspect {
+                "keep"
+            } else {
+                "stretch"
+            }
+            .to_string();
+            sess.cfg.save();
+            osd.set_toast(
+                if sess.ui.keep_aspect {
+                    "Aspect: Keep ratio"
+                } else {
+                    "Aspect: Fit screen"
                 },
                 90,
             );

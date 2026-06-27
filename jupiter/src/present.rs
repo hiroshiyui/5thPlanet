@@ -141,6 +141,33 @@ pub fn scale_mode(sharp: bool) -> sdl3::render::ScaleMode {
     }
 }
 
+/// Whether an `aspect` config token requests **keeping** the picture's aspect
+/// ratio (letterboxed) rather than stretching to fill. Default + unknown tokens
+/// keep the ratio; only `stretch`/`fit`/`fill` request a full-screen stretch.
+/// **Pure** (no SDL), so the policy is unit-testable.
+pub fn keeps_aspect(token: &str) -> bool {
+    !matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "stretch" | "fit" | "fill"
+    )
+}
+
+/// Apply SDL3 logical presentation so the `w×h` Saturn frame either keeps its
+/// aspect ratio (`LETTERBOX` — black bars, the faithful default) or stretches to
+/// fill (`STRETCH` — the historical behaviour, which distorts in fullscreen).
+/// SDL computes the letterbox; the frontend calls this on every resolution change
+/// and on the OSD Aspect toggle. Windowed mode already matches the picture
+/// aspect, so a visible difference only appears in fullscreen.
+#[cfg(feature = "sdl-frontend")]
+pub fn apply_aspect(canvas: &mut sdl3::render::WindowCanvas, w: u32, h: u32, keep: bool) {
+    let mode = if keep {
+        sdl3::sys::render::SDL_LOGICAL_PRESENTATION_LETTERBOX
+    } else {
+        sdl3::sys::render::SDL_LOGICAL_PRESENTATION_STRETCH
+    };
+    let _ = canvas.set_logical_size(w, h, mode);
+}
+
 /// Build the SDL3 window + canvas, selecting the render driver per `pref` with a
 /// fallback chain. Returns the canvas and the driver name actually in use (the
 /// canvas's `renderer_name` field, so `auto` — which sets no hint — resolves to
@@ -214,6 +241,17 @@ mod tests {
         // Aliases + case-insensitivity.
         assert_eq!(RenderBackend::from_token("GL"), RenderBackend::OpenGl);
         assert_eq!(RenderBackend::from_token("D3D"), RenderBackend::Direct3D11);
+    }
+
+    #[test]
+    fn aspect_token_defaults_to_keep() {
+        // Only stretch/fit/fill stretch; default + junk keep the ratio.
+        assert!(keeps_aspect("keep"));
+        assert!(keeps_aspect(""));
+        assert!(keeps_aspect("nonsense"));
+        assert!(!keeps_aspect("stretch"));
+        assert!(!keeps_aspect("Fit"));
+        assert!(!keeps_aspect("fill"));
     }
 
     #[test]

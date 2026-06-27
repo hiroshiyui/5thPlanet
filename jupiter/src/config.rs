@@ -85,6 +85,12 @@ pub struct Config {
     /// low-res Saturn picture; `sharp` restores the SDL2-era crisp look. The OSD
     /// Graphics screen toggles it live.
     pub scaling: String,
+    /// Fullscreen aspect handling: `keep` (default — preserve the picture's
+    /// aspect ratio, letterboxed) or `stretch` (fill the screen, distorting).
+    /// Applied via SDL3 logical presentation; the OSD Graphics screen toggles it.
+    /// (Windowed mode already matches the picture aspect, so this only shows in
+    /// fullscreen.)
+    pub aspect: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -104,6 +110,7 @@ impl Default for Config {
             // field doc above, and `jupiter/jupiter.toml.example`.
             gpu: "off".into(),
             scaling: "sharp".into(),
+            aspect: "keep".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -139,6 +146,7 @@ impl Config {
                 "backend" => cfg.backend = unquote(v),
                 "gpu" => cfg.gpu = unquote(v),
                 "scaling" => cfg.scaling = unquote(v),
+                "aspect" => cfg.aspect = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -167,6 +175,7 @@ impl Config {
         out.push_str(&format!("backend = \"{}\"\n", self.backend));
         out.push_str(&format!("gpu = \"{}\"\n", self.gpu));
         out.push_str(&format!("scaling = \"{}\"\n", self.scaling));
+        out.push_str(&format!("aspect = \"{}\"\n", self.aspect));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -267,6 +276,7 @@ mod tests {
             backend: "software".into(),
             gpu: "auto".into(),
             scaling: "smooth".into(),
+            aspect: "stretch".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -338,6 +348,15 @@ mod tests {
         assert_eq!(Config::parse("scaling = \"sharp\"\n").scaling, "sharp");
         // A missing key keeps the default; present::is_smooth treats unknown as sharp.
         assert_eq!(Config::parse("scale = 2\n").scaling, "sharp");
+    }
+
+    #[test]
+    fn aspect_token_parses_and_defaults_to_keep() {
+        assert_eq!(Config::default().aspect, "keep");
+        assert_eq!(Config::parse("aspect = \"stretch\"\n").aspect, "stretch");
+        assert_eq!(Config::parse("aspect = \"keep\"\n").aspect, "keep");
+        // A missing key keeps the default; present::keeps_aspect treats unknown as keep.
+        assert_eq!(Config::parse("scale = 2\n").aspect, "keep");
     }
 
     #[test]

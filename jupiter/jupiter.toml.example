@@ -63,6 +63,14 @@ gpu = "off"
 # Default: "sharp".
 scaling = "sharp"
 
+# Fullscreen aspect handling (via SDL3 logical presentation). Windowed mode
+# already matches the picture aspect, so this only shows in fullscreen. Toggle it
+# live in the OSD (Settings -> Graphics -> Aspect).
+#   "keep"     keep the aspect ratio, letterboxed (default)
+#   "stretch"  fit to screen, filling it (distorts a 4:3 picture on a 16:9 screen)
+# Default: "keep".
+aspect = "keep"
+
 # --- System -----------------------------------------------------------------
 
 # SMPC region token. Omit this key entirely to autodetect from the BIOS
