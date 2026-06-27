@@ -50,6 +50,19 @@ opening movie through to the in-game strategy screen, on the JP v1.01 BIOS.
 | [`sangokushi-opening.png`](sangokushi-opening.png) | The opening — Sun Jian (孫堅) and his advisor, 「184年 1月 春」. |
 | [`sangokushi-strategy.png`](sangokushi-strategy.png) | The in-game strategy screen — the 孫堅軍 command menu (君主 / 家臣 / 移動 / 戦争 / 機能), gold / rice, and the provincial map. |
 
+## Panzer Dragoon Zwei
+
+SEGA's rail-shooter (serial GS-9049, JP) — fully playable on the JP v1.01 BIOS,
+from its opening movie through the title and menus into 3D gameplay at native
+704×448 hi-res. The second title to drive the emulator's Sega FILM / Cinepak
+movie player.
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`panzer-fmv.png`](panzer-fmv.png) | The opening Cinepak FMV — the rider in the dusk wasteland (letterboxed). |
+| [`panzer-title.png`](panzer-title.png) | The title screen — the "PANZER DRAGOON II Zwei" logo over the cracked-stone background with "PRESS START BUTTON", © SEGA ENTERPRISES, LTD. 1995, 1996. |
+| [`panzer-game.png`](panzer-game.png) | In-game 3D rail-shooting — the rider on the dragon banking through a ruined canyon, with the lock-on reticle, an enemy gunship, and the health / lock-on gauges. |
+
 ## Frontend (in-window OSD)
 
 | Image | What it shows |
@@ -61,8 +74,9 @@ opening movie through to the in-game strategy screen, on the JP v1.01 BIOS.
 These screenshots are reproduced **solely to demonstrate the emulator's
 capabilities**, with **no intent to infringe** any copyright or trademark.
 
-- *SEGA*, *SEGA Saturn*, the Saturn logos, and *Virtua Fighter 2* are
-  trademarks and/or registered trademarks of **SEGA Corporation**. © SEGA.
+- *SEGA*, *SEGA Saturn*, the Saturn logos, *Virtua Fighter 2*, and *Panzer
+  Dragoon Zwei* are trademarks and/or registered trademarks of **SEGA
+  Corporation**. © SEGA.
 - *Doukyuusei ~if~* (同級生 if) is © **NEC InterChannel, Ltd.** / élf.
 - *Sangokushi V* (三國志V / *Romance of the Three Kingdoms V*) is © **KOEI Co., Ltd.** (now Koei Tecmo Games).
 - All other game titles, logos, characters, and artwork shown are the property
