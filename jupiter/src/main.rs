@@ -650,6 +650,7 @@ fn run(
     let ui = UiState {
         scale: cfg.scale,
         fullscreen: cfg.fullscreen,
+        sharp: !present::is_smooth(&cfg.scaling),
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
         backend: token_to_osd_backend(&cfg.backend),
@@ -767,6 +768,11 @@ fn run(
             FRAME_HEIGHT as u32,
         )
         .expect("create streaming texture");
+    // SDL3 defaults streaming textures to linear filtering (blurry on upscale);
+    // honour the user's Sharp/Smooth choice (default Sharp = nearest). Re-applied
+    // on every texture re-create (resolution change) + on the live OSD toggle.
+    let mut sharp = !present::is_smooth(&cfg.scaling);
+    texture.set_scale_mode(present::scale_mode(sharp));
 
     let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
@@ -995,6 +1001,7 @@ fn run(
                     slot_used: std::array::from_fn(|n| sess.slot_path(n as u8).exists()),
                     scale: sess.ui.scale,
                     fullscreen: sess.ui.fullscreen,
+                    sharp: sess.ui.sharp,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
                     mouse: mouse_port_to_osd(sess.mouse_port),
@@ -1627,6 +1634,10 @@ fn run(
                     UiMsg::Fullscreen(on) => {
                         let _ = canvas.window_mut().set_fullscreen(on);
                     }
+                    UiMsg::Scaling(on) => {
+                        sharp = on;
+                        texture.set_scale_mode(present::scale_mode(sharp));
+                    }
                     UiMsg::ArmRebind(b) => rebind_target = Some(b),
                     UiMsg::ResetKeymap => {
                         keymap = std::array::from_fn(|i| {
@@ -1665,6 +1676,8 @@ fn run(
                             dims.1 as u32,
                         )
                         .expect("recreate streaming texture");
+                    // A fresh texture resets to SDL3's linear default — re-apply.
+                    texture.set_scale_mode(present::scale_mode(sharp));
                     cur_dims = dims;
                 }
             }
@@ -1750,6 +1763,9 @@ enum AudioMsg {
 enum UiMsg {
     Scale(u8),
     Fullscreen(bool),
+    /// Set texture scaling Sharp (nearest, `true`) vs Smooth (linear, `false`);
+    /// applied live to the streaming texture on the SDL thread.
+    Scaling(bool),
     /// Capture the next host keypress for this pad button (OSD rebind).
     ArmRebind(u8),
     /// Restore the default keyboard→pad bindings.
@@ -1766,6 +1782,9 @@ enum UiMsg {
 struct UiState {
     scale: u8,
     fullscreen: bool,
+    /// Sharp (nearest) vs Smooth (linear) texture scaling — mirrors
+    /// `cfg.scaling` for the Graphics screen's label + toggle.
+    sharp: bool,
     region: osd::OsdRegion,
     cart: osd::OsdCart,
     backend: osd::OsdBackend,
@@ -2131,6 +2150,20 @@ fn dispatch_osd(
                     "Fullscreen on"
                 } else {
                     "Fullscreen off"
+                },
+                90,
+            );
+        }
+        OsdAction::ToggleScaling => {
+            sess.ui.sharp = !sess.ui.sharp;
+            let _ = ui_tx.send(UiMsg::Scaling(sess.ui.sharp));
+            sess.cfg.scaling = if sess.ui.sharp { "sharp" } else { "smooth" }.to_string();
+            sess.cfg.save();
+            osd.set_toast(
+                if sess.ui.sharp {
+                    "Pixels: Sharp"
+                } else {
+                    "Pixels: Smooth"
                 },
                 90,
             );

@@ -55,6 +55,14 @@ backend = "auto"
 # Default: "off".
 gpu = "off"
 
+# Texture scaling filter when the framebuffer is upscaled to the window.
+# SDL3 defaults textures to linear (smooth/blurry); this restores the crisp
+# SDL2-era look. Toggle it live in the OSD (Settings -> Graphics -> Pixels).
+#   "sharp"   nearest-neighbour, crisp pixel dots (default)
+#   "smooth"  bilinear filtering (softer)
+# Default: "sharp".
+scaling = "sharp"
+
 # --- System -----------------------------------------------------------------
 
 # SMPC region token. Omit this key entirely to autodetect from the BIOS

@@ -170,6 +170,9 @@ pub enum OsdAction {
     SetScale(u8),
     /// Toggle borderless-desktop fullscreen; frontend window op.
     ToggleFullscreen,
+    /// Toggle texture scaling Sharp (nearest) ↔ Smooth (linear); the frontend
+    /// applies it live to the streaming texture and persists it.
+    ToggleScaling,
     /// Switch SMPC region (frontend applies it and resets the machine).
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
@@ -221,6 +224,9 @@ pub struct OsdCtx {
     pub scale: u8,
     /// Whether the window is currently fullscreen.
     pub fullscreen: bool,
+    /// Whether texture scaling is Sharp (nearest) vs Smooth (linear) — the
+    /// Graphics screen shows + toggles it.
+    pub sharp: bool,
     /// Current SMPC region — the Region screen marks it.
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
@@ -461,6 +467,12 @@ impl Osd {
                     mk(
                         &format!("Renderer: {}", ctx.backend.label()),
                         Select::Emit(OsdAction::SetBackend(ctx.backend.next())),
+                    ),
+                    // Nearest (Sharp) vs linear (Smooth) texture filtering; applied
+                    // live, so no restart note like the renderer above.
+                    mk(
+                        &format!("Pixels: {}", if ctx.sharp { "Sharp" } else { "Smooth" }),
+                        Select::Emit(OsdAction::ToggleScaling),
                     ),
                 ];
                 // The Shaders chooser is preview-only groundwork (gpu-preview).
@@ -885,6 +897,7 @@ mod tests {
             slot_used: [false; SLOTS],
             scale: 2,
             fullscreen: false,
+            sharp: true,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
             mouse: OsdMouse::Off,
@@ -1135,6 +1148,19 @@ mod tests {
         assert_eq!(
             osd.handle(Nav::Select, &c),
             Some(OsdAction::ToggleFullscreen)
+        );
+    }
+
+    #[test]
+    fn graphics_pixels_row_toggles_scaling() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // sharp = true → row reads "Pixels: Sharp"
+        assert_eq!(select_main(&mut osd, &c, "Settings"), None);
+        assert_eq!(select_main(&mut osd, &c, "Graphics..."), None);
+        assert_eq!(
+            select_main(&mut osd, &c, "Pixels: Sharp"),
+            Some(OsdAction::ToggleScaling)
         );
     }
 

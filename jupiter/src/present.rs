@@ -117,6 +117,30 @@ fn candidates(pref: RenderBackend, available: &[&str]) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether a `scaling` config token requests **smooth** (bilinear) filtering;
+/// any other value — including the default `sharp` and unknown tokens — is
+/// nearest-neighbour. **Pure** (no SDL), so the policy is unit-testable.
+pub fn is_smooth(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "smooth" | "linear"
+    )
+}
+
+/// The SDL3 texture scale mode for a `sharp` flag: `Nearest` (crisp pixel dots)
+/// when sharp, `Linear` (bilinear, soft) otherwise. SDL3 defaults textures to
+/// `Linear` — which blurs the low-res Saturn picture — whereas SDL2 defaulted to
+/// nearest; the frontend calls this on every streaming-texture create to restore
+/// the crisp look (and honour the user's Sharp/Smooth choice).
+#[cfg(feature = "sdl-frontend")]
+pub fn scale_mode(sharp: bool) -> sdl3::render::ScaleMode {
+    if sharp {
+        sdl3::render::ScaleMode::Nearest
+    } else {
+        sdl3::render::ScaleMode::Linear
+    }
+}
+
 /// Build the SDL3 window + canvas, selecting the render driver per `pref` with a
 /// fallback chain. Returns the canvas and the driver name actually in use (the
 /// canvas's `renderer_name` field, so `auto` — which sets no hint — resolves to
@@ -190,6 +214,17 @@ mod tests {
         // Aliases + case-insensitivity.
         assert_eq!(RenderBackend::from_token("GL"), RenderBackend::OpenGl);
         assert_eq!(RenderBackend::from_token("D3D"), RenderBackend::Direct3D11);
+    }
+
+    #[test]
+    fn scaling_token_defaults_to_sharp() {
+        // Only smooth/linear are smooth; everything else (incl. the default and
+        // junk) is sharp/nearest.
+        assert!(is_smooth("smooth"));
+        assert!(is_smooth("Linear"));
+        assert!(!is_smooth("sharp"));
+        assert!(!is_smooth(""));
+        assert!(!is_smooth("nonsense"));
     }
 
     #[test]

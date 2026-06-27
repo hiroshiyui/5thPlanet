@@ -79,6 +79,12 @@ pub struct Config {
     /// planned presenter (ADR-0019); the CLI flag overrides this. **Only consumed
     /// in `gpu-preview` builds** — inert (parsed/stored but unused) otherwise.
     pub gpu: String,
+    /// Texture scaling filter when upscaling the framebuffer to the window:
+    /// `sharp` (default — nearest-neighbour, crisp pixel dots) or `smooth`
+    /// (bilinear). SDL3 defaults textures to linear/smooth, which blurs the
+    /// low-res Saturn picture; `sharp` restores the SDL2-era crisp look. The OSD
+    /// Graphics screen toggles it live.
+    pub scaling: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -97,6 +103,7 @@ impl Default for Config {
             // updating the `gpu_token_parses_and_defaults_to_off` test, the `gpu`
             // field doc above, and `jupiter/jupiter.toml.example`.
             gpu: "off".into(),
+            scaling: "sharp".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -131,6 +138,7 @@ impl Config {
                 "mouse" => cfg.mouse = unquote(v),
                 "backend" => cfg.backend = unquote(v),
                 "gpu" => cfg.gpu = unquote(v),
+                "scaling" => cfg.scaling = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -158,6 +166,7 @@ impl Config {
         out.push_str(&format!("mouse = \"{}\"\n", self.mouse));
         out.push_str(&format!("backend = \"{}\"\n", self.backend));
         out.push_str(&format!("gpu = \"{}\"\n", self.gpu));
+        out.push_str(&format!("scaling = \"{}\"\n", self.scaling));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -257,6 +266,7 @@ mod tests {
             mouse: "2".into(),
             backend: "software".into(),
             gpu: "auto".into(),
+            scaling: "smooth".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -319,6 +329,15 @@ mod tests {
         assert_eq!(Config::parse("gpu = \"on\"\n").gpu, "on");
         // A missing key keeps the default; present_gpu maps unknown tokens to off.
         assert_eq!(Config::parse("scale = 2\n").gpu, "off");
+    }
+
+    #[test]
+    fn scaling_token_parses_and_defaults_to_sharp() {
+        assert_eq!(Config::default().scaling, "sharp");
+        assert_eq!(Config::parse("scaling = \"smooth\"\n").scaling, "smooth");
+        assert_eq!(Config::parse("scaling = \"sharp\"\n").scaling, "sharp");
+        // A missing key keeps the default; present::is_smooth treats unknown as sharp.
+        assert_eq!(Config::parse("scale = 2\n").scaling, "sharp");
     }
 
     #[test]
