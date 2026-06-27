@@ -124,6 +124,8 @@ map to the mouse buttons and **Enter** doubles as the mouse's Start button.
 | Quick save (to the quick slot)    | F5 |
 | Quick load (from the quick slot)  | F9 |
 | Toggle Shuttle Mouse capture      | F10 (with `--mouse`) |
+| Toggle fullscreen                 | F11 |
+| Fullscreen aspect (keep ratio / fit screen) | F12 |
 | Quit                              | Close the window, or Esc → **Quit** |
 
 ### On-screen menu (while it is open)

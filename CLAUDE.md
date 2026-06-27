@@ -112,9 +112,19 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      nearest/default or `smooth` linear — SDL3 defaults textures
                      to linear/blurry, so the frontend sets the mode on every
                      streaming-texture create to restore the SDL2-era crisp look;
-                     OSD-toggled live via `UiMsg::Scaling`), pad keymap
+                     OSD-toggled live via `UiMsg::Scaling`), fullscreen aspect
+                     (`aspect` = `keep` letterbox/default or `stretch` fill —
+                     applied via SDL3 logical presentation
+                     `canvas.set_logical_size(w, h, LETTERBOX|STRETCH)` on every
+                     resolution change, OSD-toggled live via `UiMsg::Aspect`; only
+                     visibly differs in fullscreen), pad keymap
                      (CLI flag > config > autodetect),
-                     written back on every OSD Settings change. A committed
+                     written back on every OSD Settings change. **Frontend
+                     hotkeys** (hardcoded, like F5/F9/F10): **F11** toggles
+                     fullscreen, **F12** the fullscreen aspect mode — both routed
+                     SDL-thread → `EmuIn::ToggleFullscreen`/`ToggleAspect` →
+                     `dispatch_osd` (the same path as the menu rows, so the
+                     Settings labels + config stay in sync). A committed
                      `jupiter/jupiter.toml.example` documents every key. The OSD's Controller screen rebinds the
                      keyboard map press-to-bind (the SDL thread owns the
                      capture; `UiMsg::ArmRebind`/`EmuIn::BindResult`), and its
