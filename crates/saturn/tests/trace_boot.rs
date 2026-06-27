@@ -4189,6 +4189,79 @@ fn pdz_renders_non_black() {
     );
 }
 
+/// Game-render regression guard for Sangokushi V — the fourth "game golden"
+/// (cf. [`doukyuusei_renders_non_black`], [`vf2_renders_non_black`],
+/// [`pdz_renders_non_black`]). Boots SAN5 fresh (JP v1.01 BIOS + Japan region; no
+/// `.bup`) and runs to its opening **Cinepak FILM movie** (the 「歴史シミュレーション
+/// ゲーム」 tagline, reached with no input), then asserts the master runs game code
+/// (HWRAM) AND VDP2 composites a non-black 320×224 frame. SAN5 is the title that
+/// drives the **Sega FILM / Cinepak player → VDP2** path, so this golden uniquely
+/// guards that whole-frame software-decoded-movie render (the path the SAN5
+/// cache-coherency + SCU-delay-slot-interrupt fixes opened). Frame 2100 sits in a
+/// wide stable bright window (frames ~1800–2400 are fully filled); the movie has
+/// dark scene-cut frames elsewhere, so don't lower FRAMES into one. Needs
+/// bios/ + roms/SANGOKUSHI_V.cue; prints "skipped" and returns if absent. Run
+/// with --release:
+///
+///   cargo test --release -p saturn --test trace_boot san5_renders_non_black \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "needs bios/ + roms/ Sangokushi V; the game-render golden (run with --release)"]
+fn san5_renders_non_black() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "SANGOKUSHI_V.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    // Frame 2100 is mid opening-FMV, in a wide fully-lit window (~1800–2400). The
+    // movie has dark scene-cut frames at other points, so this target is chosen
+    // to leave generous margin over the 10k threshold.
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2100);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    let mut in_hwram = 0u32;
+    for f in 0..frames {
+        sat.run_frame(&mut fb);
+        if f >= frames.saturating_sub(300) && (sat.master().regs.pc >> 24) == 0x06 {
+            in_hwram += 1;
+        }
+    }
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
+    println!(
+        "san5: final_pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
+        sat.master().regs.pc
+    );
+    assert!(
+        in_hwram >= 290,
+        "master not running game code (HWRAM) — boot/exec regression"
+    );
+    assert!(
+        nonblack > 10_000,
+        "framebuffer is (near-)black — VDP2 whole-frame render regression (cf. b65cd18)"
+    );
+}
+
 /// Measure ours' sustained emulation frame rate vs the real-machine target
 /// (~60 fps NTSC). Loads the cached menu snapshot (a 640 hi-res Doukyuusei
 /// scene — the heavy case) and times BENCH_FRAMES (default 600) two ways:
