@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-06-27
+
+Frontend display polish plus a VDP2 rendering fix. Fullscreen now keeps the picture's
+aspect ratio by default, pixels are crisp again (the SDL3 migration had silently made
+them blurry), and the BIOS Memory Manager renders correctly.
+
+### Added
+
+- **Fullscreen aspect control** — a **Keep aspect ratio ↔ Fit to screen** toggle
+  (`aspect` config key + an OSD Graphics row), applied via SDL3 logical
+  presentation. Default keeps the ratio (letterbox) instead of stretching.
+- **Sharp/Smooth pixel scaling** — a Sharp (nearest) vs Smooth (linear) toggle
+  (`scaling` config key + an OSD Graphics row), applied live.
+- **Display hotkeys** — **F11** toggles fullscreen, **F12** toggles the fullscreen
+  aspect mode; both stay in sync with the OSD/config.
+
+### Changed
+
+- **Pixels are Sharp (nearest-neighbour) by default**, restoring the crisp look the
+  SDL2→SDL3 migration had regressed to blurry linear filtering.
+- The **SDL_GPU capability probe (`--gpu`) and the stub OSD "Shaders…" chooser are
+  gated behind an off-by-default `gpu-preview` build feature**, so normal builds
+  don't surface the not-yet-functional CRT-presenter groundwork (ADR-0019).
+
+### Fixed
+
+- **VDP2 vertical line scroll (LSCY)** was treated as an additive offset over the
+  display line; it now supplies the line's **source-Y base** (per the hardware /
+  Mednafen `CurYScrollIF`). This fixes the **BIOS Memory Manager rendering doubled**
+  (a half-screen-repeated image) and any NBG layer that drives vertical line scroll.
+
 ## [0.13.0] - 2026-06-26
 
 Keys **save states to the loaded game disc** instead of the BIOS, so each game has
