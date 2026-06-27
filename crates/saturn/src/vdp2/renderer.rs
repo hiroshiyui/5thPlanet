@@ -1330,8 +1330,13 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
         if zy != 0 {
             yinc = zy;
         }
-        // Per-line scroll deltas, plus per-line horizontal zoom — the latter,
+        // Per-line scroll values, plus per-line horizontal zoom — the latter,
         // when enabled, replaces the whole-layer X increment for this line.
+        //
+        // Vertical line scroll supplies the line's source-Y base rather than an
+        // offset added on top of the full display-line counter. Mednafen keeps
+        // CurYScrollIF from the table and advances only YCoordAccum between
+        // table entries; for interval 1 that means no extra `+ y`.
         let (dx, dy, lzoom) = line_scroll(vdp2, &nc.ls, y);
         base_x = base_x.wrapping_add(dx << 16);
         base_y = base_y.wrapping_add(dy << 16);
@@ -1347,8 +1352,9 @@ fn sample_nbg(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, x: u32, y: u32) -> Option<S
     // part. The coord is masked to the plane size downstream, so a wrapped
     // (negative-scroll) accumulator is fine.
     let step = |inc: u32, coord: u32| (coord as u64 * inc as u64) as u32;
+    let y_phase = if nc.ls.lscy { y % nc.ls.interval } else { y };
     let sx = base_x.wrapping_add(step(xinc, x)) >> 16;
-    let sy = base_y.wrapping_add(step(yinc, y)) >> 16;
+    let sy = base_y.wrapping_add(step(yinc, y_phase)) >> 16;
     if nc.bitmap {
         sample_bitmap(vdp2, nc, sx, sy)
     } else {
@@ -2848,6 +2854,33 @@ mod tests {
         assert_eq!(pixel(&buf, 0, 2), [0xFF, 0, 0, 0xFF], "line 2 scrolled");
         // Line 0 has no scroll, so screen (0,0) samples the empty (0,0).
         assert_eq!(pixel(&buf, 0, 0), [0, 0, 0, 0xFF], "line 0 unscrolled");
+    }
+
+    #[test]
+    fn nbg0_line_scroll_y_replaces_the_screen_line_base() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x09A, 0x0004); // SCRCTL.N0LSCY, LSS=0 (every line)
+        v.regs.write16(0x0A2, 0x0200); // LSTA0L → table at byte 0x400
+        // BIOS memory-manager style: the table stores source Y = display Y.
+        v.vram.write32(0x400 + 2 * 4, 2 << 16);
+        v.cram.write16(2, 0x001F); // index 1 = red
+        v.vram.write8(2 * 512, 1); // bitmap dot at source (0,2)
+
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+
+        assert_eq!(
+            pixel(&buf, 0, 2),
+            [0xFF, 0, 0, 0xFF],
+            "LSCY table value is the line's Y base, not an extra +screen_y"
+        );
+        assert_eq!(
+            pixel(&buf, 0, 4),
+            [0, 0, 0, 0xFF],
+            "old double-counted path would have sampled source y=4"
+        );
     }
 
     #[test]
