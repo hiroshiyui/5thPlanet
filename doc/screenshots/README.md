@@ -1,7 +1,7 @@
 # Screenshots
 
 Captures from the **5thPlanet** SEGA Saturn emulator, grouped by what they
-demonstrate. All are taken from the SDL2 `jupiter` frontend running on the
+demonstrate. All are taken from the SDL3 `jupiter` frontend running on the
 real-BIOS LLE path (see [`doc/roadmap.md`](../roadmap.md) and the project
 [`README`](../../README.md)).
 
@@ -68,6 +68,26 @@ movie player.
 | Image | What it shows |
 | ----- | ------------- |
 | [`osd-menu.png`](osd-menu.png) | The hand-rolled, software-composited OSD menu (Esc to open) overlaid on a paused VF2 — Resume / Save State / Load State / Reset / Eject Disc / Load Disc… / Settings / Quit. |
+
+## CRT shader (SDL_GPU presenter)
+
+The optional **SDL_GPU / Vulkan presenter** with its built-in single-pass **CRT
+post-process** — scanlines + aperture-grille (Trinitron-style) mask + gamma,
+flat geometry. It's selectable in `gpu-presenter` builds (`--gpu=on`, then
+**Settings → Graphics → Shaders → CRT** in the OSD), off by default.
+Presentation-only — the framebuffer stays bit-identical, so accuracy is untouched
+([ADR-0019](../adr/0019-gpu-is-presentation-only.md)). The scanline/mask pattern
+is easiest to see at full size.
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`crt-bios-splash.png`](crt-bios-splash.png) | The JP BIOS "SEGA SATURN" splash through the CRT filter — visible scanlines + RGB grille over the brushed-metal wordmark. |
+| [`crt-sega-logo.png`](crt-sega-logo.png) | The mandatory SEGA licence logo shown at game boot ("PRODUCED BY or UNDER LICENSE FROM SEGA ENTERPRISES, LTD."), CRT-filtered — the mask is clearest on the solid blue logo and black field. |
+| [`crt-doukyuusei-title.png`](crt-doukyuusei-title.png) | *Doukyuusei ~if~* title (同級生 if) with the CRT shader. |
+| [`crt-doukyuusei-scene.png`](crt-doukyuusei-scene.png) | *Doukyuusei ~if~* in-game scene (the bedroom + date/time/money HUD) with the CRT shader on a detailed 2D background. |
+| [`crt-vf2-title.png`](crt-vf2-title.png) | *Virtua Fighter 2* title with the CRT shader. |
+| [`crt-vf2-player-select.png`](crt-vf2-player-select.png) | *Virtua Fighter 2* PLAYER SELECT (Akira's profile + the roster) through the CRT filter. |
+| [`crt-vf2-fight.png`](crt-vf2-fight.png) | A *Virtua Fighter 2* 3D match ("READY", Akira vs Lau) with the CRT shader over the textured 3D stage. |
 
 ## Trademarks & copyright
 
