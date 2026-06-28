@@ -205,6 +205,11 @@ pub enum OsdAction {
     /// Run the built-in self-diagnostics; the frontend fills
     /// [`OsdCtx::diag_results`] for the next draw. The screen stays open.
     RunDiagnostics,
+    /// Select the built-in presentation shader: `true` = the CRT post-process,
+    /// `false` = the plain blit. The SDL_GPU backend applies it live + persists it.
+    /// Preview-only (the `gpu-preview` Shaders chooser).
+    #[cfg(feature = "gpu-preview")]
+    SetShader(bool),
 }
 
 /// One self-diagnostics result row for the Diagnostics screen. OSD-local (the
@@ -241,6 +246,10 @@ pub struct OsdCtx {
     pub mouse: OsdMouse,
     /// Current graphics-presentation backend — the Graphics screen cycles it.
     pub backend: OsdBackend,
+    /// Whether the CRT shader is selected — the Shaders screen marks it
+    /// (`gpu-preview` only; `false`/None otherwise).
+    #[cfg(feature = "gpu-preview")]
+    pub shader_crt: bool,
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
     pub pad_keys: [String; PAD_BUTTONS],
@@ -502,14 +511,20 @@ impl Osd {
             }
             #[cfg(feature = "gpu-preview")]
             Screen::Shaders => {
-                // Stub: the SDL_GPU CRT-shader presenter is a backlog item
-                // (ADR-0019; `shaders/README.md`). Read-only placeholder rows so
-                // the menu path exists; once the presenter lands this lists the
-                // presets discovered under `shaders/` (frontend-supplied, like
-                // the disc browser's `BrowseEntry` rows).
+                // CRT post-process chooser for the SDL_GPU backend (ADR-0019;
+                // `jupiter/src/shaders/`). The active option is marked '*'. Only the
+                // SDL_GPU backend applies it — under the renderer it's a no-op
+                // (the frontend toasts a hint). Future: list user presets here.
+                let row = |name: &str, crt: bool| {
+                    let mark = if ctx.shader_crt == crt { "* " } else { "  " };
+                    mk(
+                        &format!("{mark}{name}"),
+                        Select::Emit(OsdAction::SetShader(crt)),
+                    )
+                };
                 vec![
-                    mk("Shader: None (passthrough)", Select::Close),
-                    mk("(CRT shaders coming soon)", Select::Close),
+                    row("None (passthrough)", false),
+                    row("CRT (scanlines + mask)", true),
                     mk("Back", Select::Close),
                 ]
             }
@@ -922,6 +937,8 @@ mod tests {
             cart: OsdCart::None,
             mouse: OsdMouse::Off,
             backend: OsdBackend::Auto,
+            #[cfg(feature = "gpu-preview")]
+            shader_crt: false,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
             bios_active: 0,
@@ -995,22 +1012,30 @@ mod tests {
 
     #[cfg(feature = "gpu-preview")]
     #[test]
-    fn graphics_opens_shaders_chooser_stub() {
+    fn graphics_shaders_chooser_offers_none_and_crt() {
         let mut osd = Osd::new();
         osd.toggle(); // open at Main
-        let c = ctx(true);
+        let c = ctx(true); // shader_crt = false → "None" is the marked row
         // Main → Settings → Graphics... → Shaders... (each Push emits no action).
         assert_eq!(select_main(&mut osd, &c, "Settings"), None);
         assert_eq!(select_main(&mut osd, &c, "Graphics..."), None);
         assert_eq!(select_main(&mut osd, &c, "Shaders..."), None);
         assert_eq!(Osd::title(osd.screen()), "Shaders");
-        // The stub is read-only: a "None" placeholder + Back, nothing emitted.
+        // None is marked '*' (shader_crt = false), CRT unmarked, plus Back.
         let items = osd.items(osd.screen(), &c);
-        assert!(items.iter().any(|it| it.label.contains("None")));
+        assert!(items.iter().any(|it| it.label == "* None (passthrough)"));
+        assert!(
+            items
+                .iter()
+                .any(|it| it.label == "  CRT (scanlines + mask)")
+        );
         assert!(items.iter().any(|it| it.label == "Back"));
-        // Back pops to Graphics (Select::Close = pop one, no action).
-        assert_eq!(select_main(&mut osd, &c, "Back"), None);
-        assert_eq!(Osd::title(osd.screen()), "Graphics");
+        // Selecting the CRT row emits SetShader(true) (one select after the Push
+        // reset the cursor to the top).
+        assert_eq!(
+            select_main(&mut osd, &c, "  CRT (scanlines + mask)"),
+            Some(OsdAction::SetShader(true))
+        );
     }
 
     #[test]

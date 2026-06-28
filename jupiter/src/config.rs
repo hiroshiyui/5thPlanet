@@ -91,6 +91,13 @@ pub struct Config {
     /// (Applies in both windowed and fullscreen: the Saturn picture is 4:3 with
     /// non-square pixels, so the framebuffer ratio is not the display ratio.)
     pub aspect: String,
+    /// Built-in presentation shader, same vocabulary as the OSD Shaders chooser:
+    /// `none` (default — the plain blit) or `crt` (the single-pass CRT
+    /// post-process). **Only honoured by the SDL_GPU backend in `gpu-preview`
+    /// builds** (the `SDL_Renderer` blit has no shader path); parsed/stored
+    /// regardless so the config round-trips. The OSD Graphics → Shaders screen
+    /// toggles it live.
+    pub shader: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
 }
@@ -111,6 +118,7 @@ impl Default for Config {
             gpu: "off".into(),
             scaling: "sharp".into(),
             aspect: "keep".into(),
+            shader: "none".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
         }
     }
@@ -147,6 +155,7 @@ impl Config {
                 "gpu" => cfg.gpu = unquote(v),
                 "scaling" => cfg.scaling = unquote(v),
                 "aspect" => cfg.aspect = unquote(v),
+                "shader" => cfg.shader = unquote(v),
                 _ => {
                     if let Some(i) = KEY_KEYS.iter().position(|kk| *kk == k) {
                         let name = unquote(v);
@@ -176,6 +185,7 @@ impl Config {
         out.push_str(&format!("gpu = \"{}\"\n", self.gpu));
         out.push_str(&format!("scaling = \"{}\"\n", self.scaling));
         out.push_str(&format!("aspect = \"{}\"\n", self.aspect));
+        out.push_str(&format!("shader = \"{}\"\n", self.shader));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
         }
@@ -277,6 +287,7 @@ mod tests {
             gpu: "auto".into(),
             scaling: "smooth".into(),
             aspect: "stretch".into(),
+            shader: "crt".into(),
             ..Config::default()
         };
         cfg.keys[12] = "Space".into();
@@ -318,6 +329,15 @@ mod tests {
         assert_eq!(Config::parse("mouse = \"1\"\n").mouse, "1");
         // A missing key keeps the default; main.rs treats unknown tokens as off.
         assert_eq!(Config::parse("scale = 2\n").mouse, "off");
+    }
+
+    #[test]
+    fn shader_token_parses_and_defaults_to_none() {
+        assert_eq!(Config::default().shader, "none");
+        assert_eq!(Config::parse("shader = \"crt\"\n").shader, "crt");
+        assert_eq!(Config::parse("shader = \"none\"\n").shader, "none");
+        // A missing key keeps the default.
+        assert_eq!(Config::parse("scale = 2\n").shader, "none");
     }
 
     #[test]

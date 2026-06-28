@@ -88,6 +88,44 @@ pub fn should_probe(mode: GpuMode) -> bool {
     !matches!(mode, GpuMode::Off)
 }
 
+/// Which built-in presentation shader the SDL_GPU backend applies. Parsed from the
+/// `shader` config key / the OSD Shaders chooser. Only the SDL_GPU backend honours
+/// it (the `SDL_Renderer` blit has no shader path); it's parsed regardless so the
+/// config round-trips in any build. Pure — unit-testable without `gpu-preview`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderMode {
+    /// No post-process — the plain blit (default).
+    None,
+    /// The built-in single-pass CRT (scanlines + aperture-grille mask + gamma).
+    Crt,
+}
+
+impl ShaderMode {
+    /// Parse a config/OSD token (case-insensitive); unknown/empty → `None`.
+    pub fn from_token(tok: &str) -> Self {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "crt" => ShaderMode::Crt,
+            _ => ShaderMode::None,
+        }
+    }
+
+    /// The canonical config token (inverse of [`from_token`](ShaderMode::from_token)).
+    /// Today only the round-trip test consumes it (the frontend writes the token
+    /// inline), so allow it to be unused outside tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn to_token(self) -> &'static str {
+        match self {
+            ShaderMode::None => "none",
+            ShaderMode::Crt => "crt",
+        }
+    }
+
+    /// Whether this mode enables the CRT render pass.
+    pub fn is_crt(self) -> bool {
+        matches!(self, ShaderMode::Crt)
+    }
+}
+
 /// The centred destination rectangle `(x, y, w, h)` for fitting an `ar_w:ar_h`
 /// picture inside a `win_w × win_h` drawable while keeping its aspect ratio —
 /// the letterbox/pillarbox geometry the SDL_GPU blit writes into the swapchain.
@@ -211,13 +249,58 @@ fn fill_test_pattern(buf: &mut [u8], w: usize, h: usize, frame: u32) {
 
 #[cfg(feature = "gpu-preview")]
 use sdl3::gpu::{
-    BlitInfo, Device, Filter, LoadOp, Texture, TextureCreateInfo, TextureFormat, TextureRegion,
-    TextureTransferInfo, TextureType, TextureUsage, TransferBuffer, TransferBufferUsage,
+    BlitInfo, ColorTargetDescription, ColorTargetInfo, Device, Filter, GraphicsPipeline,
+    GraphicsPipelineTargetInfo, LoadOp, PrimitiveType, Sampler, SamplerAddressMode,
+    SamplerCreateInfo, ShaderFormat, ShaderStage, StoreOp, Texture, TextureCreateInfo,
+    TextureFormat, TextureRegion, TextureSamplerBinding, TextureTransferInfo, TextureType,
+    TextureUsage, TransferBuffer, TransferBufferUsage, VertexInputState, Viewport,
 };
 #[cfg(feature = "gpu-preview")]
 use sdl3::properties::{Properties, Setter};
 #[cfg(feature = "gpu-preview")]
 use sdl3::video::Window;
+
+/// CRT post-process parameters pushed to the fragment shader's `set=3, binding=0`
+/// uniform (`crt.frag.glsl`'s `Crt` block). `#[repr(C)]` + the trailing pad match
+/// the std140 layout: two `vec2` (16 bytes) then four `float` (16 bytes).
+#[cfg(feature = "gpu-preview")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CrtParams {
+    /// Frame texture size in texels (scanline count tracks this).
+    src_size: [f32; 2],
+    /// Output viewport size in pixels (mask pitch tracks this).
+    out_size: [f32; 2],
+    /// Scanline depth, mask strength, output gamma.
+    scanline: f32,
+    mask: f32,
+    gamma: f32,
+    _pad: f32,
+}
+
+/// Default CRT look (v1): a subtle, flat scanline + aperture-grille pass.
+#[cfg(feature = "gpu-preview")]
+const CRT_SCANLINE: f32 = 0.3;
+#[cfg(feature = "gpu-preview")]
+const CRT_MASK: f32 = 0.3;
+#[cfg(feature = "gpu-preview")]
+const CRT_GAMMA: f32 = 1.1;
+
+/// The compiled SPIR-V for the built-in CRT shader (committed beside the GLSL;
+/// see `shaders/README.md`). `include_bytes!` so a normal build needs no `glslc`.
+#[cfg(feature = "gpu-preview")]
+const CRT_VERT_SPV: &[u8] = include_bytes!("shaders/crt.vert.spv");
+#[cfg(feature = "gpu-preview")]
+const CRT_FRAG_SPV: &[u8] = include_bytes!("shaders/crt.frag.spv");
+
+/// The lazily-built CRT render-pass resources: the fullscreen-triangle graphics
+/// pipeline (vertex + fragment shaders baked in) and the frame sampler. Built on
+/// first CRT use so the plain-blit path keeps zero extra cost.
+#[cfg(feature = "gpu-preview")]
+struct CrtState {
+    pipeline: GraphicsPipeline,
+    sampler: Sampler,
+}
 
 /// A self-contained **SDL_GPU presenter** that posts the software-composited
 /// Saturn frame to a window via SDL's built-in `SDL_BlitGPUTexture` — the
@@ -233,11 +316,18 @@ use sdl3::video::Window;
 /// so their release is safe in any order.
 #[cfg(feature = "gpu-preview")]
 pub struct GpuPresenter {
-    /// SAMPLER texture the framebuffer uploads into; the blit source. Recreated
-    /// when the active frame resolution changes.
+    /// SAMPLER texture the framebuffer uploads into; the blit/CRT source.
+    /// Recreated when the active frame resolution changes.
     frame_tex: Texture<'static>,
     /// UPLOAD staging buffer for the per-frame texture upload; sized to the frame.
     transfer: TransferBuffer,
+    /// The CRT render-pass resources, built lazily on first CRT use (`None` until
+    /// then, and while presenting via the plain blit). Holds device-owned GPU
+    /// objects, so it drops before `device`.
+    crt: Option<CrtState>,
+    /// Whether the CRT post-process is selected (the OSD Shaders chooser). When
+    /// `false`, `present` uses the built-in blit; when `true`, the CRT render pass.
+    crt_enabled: bool,
     /// The Vulkan (SPIR-V) device whose swapchain is the claimed `window`.
     device: Device,
     /// The presenter's own window (claimed by `device`; not a renderer canvas).
@@ -313,6 +403,8 @@ impl GpuPresenter {
         Ok(Self {
             frame_tex,
             transfer,
+            crt: None,
+            crt_enabled: false,
             device,
             window,
             frame_dims: (frame_w, frame_h),
@@ -330,10 +422,84 @@ impl GpuPresenter {
         &mut self.window
     }
 
+    /// Select the CRT post-process (`true`) vs the plain blit (`false`). Wired to
+    /// the OSD Shaders chooser; the pipeline builds lazily on the next CRT present.
+    pub fn set_shader(&mut self, crt: bool) {
+        self.crt_enabled = crt;
+    }
+
+    /// Ensure the CRT graphics pipeline + sampler are built; returns whether CRT is
+    /// usable this frame. On a build failure it logs once and disables CRT (so it
+    /// doesn't retry every frame and the caller falls back to the blit). Returns
+    /// `bool` rather than a `&CrtState` so `present` can still borrow the other
+    /// `self` fields (device / frame_tex / window) for the render pass.
+    fn ensure_crt(&mut self) -> bool {
+        if self.crt.is_none() {
+            match self.build_crt() {
+                Ok(state) => self.crt = Some(state),
+                Err(e) => {
+                    eprintln!("SDL_GPU: CRT pipeline build failed ({e}); using the plain blit");
+                    self.crt_enabled = false;
+                    return false;
+                }
+            }
+        }
+        self.crt.is_some()
+    }
+
+    /// Compile the built-in CRT shaders into a fullscreen-triangle graphics
+    /// pipeline (targeting the swapchain format) + a frame sampler.
+    fn build_crt(&self) -> Result<CrtState, String> {
+        let vs = self
+            .device
+            .create_shader()
+            .with_code(ShaderFormat::SPIRV, CRT_VERT_SPV, ShaderStage::Vertex)
+            .with_entrypoint(c"main")
+            .build()
+            .map_err(|e| format!("vertex shader ({e})"))?;
+        let fs = self
+            .device
+            .create_shader()
+            .with_code(ShaderFormat::SPIRV, CRT_FRAG_SPV, ShaderStage::Fragment)
+            .with_entrypoint(c"main")
+            .with_samplers(1) // set=2, binding=0: the frame sampler
+            .with_uniform_buffers(1) // set=3, binding=0: the CrtParams block
+            .build()
+            .map_err(|e| format!("fragment shader ({e})"))?;
+        let format = self.device.get_swapchain_texture_format(&self.window);
+        let color_targets = [ColorTargetDescription::new().with_format(format)];
+        let pipeline = self
+            .device
+            .create_graphics_pipeline()
+            .with_vertex_shader(&vs)
+            .with_fragment_shader(&fs)
+            .with_primitive_type(PrimitiveType::TriangleList)
+            .with_vertex_input_state(VertexInputState::new()) // no vertex buffers
+            .with_target_info(
+                GraphicsPipelineTargetInfo::new().with_color_target_descriptions(&color_targets),
+            )
+            .build()
+            .map_err(|e| format!("graphics pipeline ({e})"))?;
+        // Linear sampling smooths the upscale; clamp so edges don't wrap.
+        let sampler = self
+            .device
+            .create_sampler(
+                SamplerCreateInfo::new()
+                    .with_min_filter(Filter::Linear)
+                    .with_mag_filter(Filter::Linear)
+                    .with_address_mode_u(SamplerAddressMode::ClampToEdge)
+                    .with_address_mode_v(SamplerAddressMode::ClampToEdge),
+            )
+            .map_err(|e| format!("sampler ({e})"))?;
+        Ok(CrtState { pipeline, sampler })
+    }
+
     /// Present one `dims.0 × dims.1` frame (tightly packed `[R, G, B, A]`, the
-    /// VDP2 framebuffer layout): upload it to the GPU texture and blit it to the
-    /// swapchain. `sharp` picks nearest vs linear filtering; `keep_aspect` letterboxes
-    /// the picture to 4:3 (else it stretches to fill the window — matching the
+    /// VDP2 framebuffer layout): upload it to the GPU texture, then post it to the
+    /// swapchain — via the **CRT render pass** when a shader is selected
+    /// ([`set_shader`](GpuPresenter::set_shader)), else the built-in blit. `sharp`
+    /// picks nearest vs linear filtering (blit path); `keep_aspect` letterboxes the
+    /// picture to 4:3 (else it stretches to fill the window — matching the
     /// renderer's logical-presentation modes). Recreates the frame resources when
     /// `dims` changes (the old ones auto-release via their `WeakDevice`). Returns
     /// `true` if the frame reached the swapchain, `false` if it was skipped (a
@@ -393,24 +559,73 @@ impl GpuPresenter {
             return false;
         }
 
-        // 2) Blit the texture into the swapchain. SDL's built-in blit supplies its
-        //    own shader — none authored. `keep_aspect` → 4:3 letterbox dst on a
-        //    black clear; otherwise the full window (stretch).
+        // Build the CRT pipeline if it's selected (lazily, once). Done before
+        // acquiring the draw command buffer so the `&mut self` borrow is free.
+        let use_crt = self.crt_enabled && self.ensure_crt();
+
+        // 2) Post the texture to the swapchain — either the CRT render pass or the
+        //    built-in blit. Both letterbox to 4:3 (`keep_aspect`) on a black clear.
         let Ok(mut draw_cmd) = self.device.acquire_command_buffer() else {
             return false;
         };
-        if let Ok(swapchain) = draw_cmd.wait_and_acquire_swapchain_texture(&self.window) {
-            let (sw, sh) = (swapchain.width(), swapchain.height());
-            let (dx, dy, dw, dh) = if keep_aspect {
-                letterbox_rect(sw, sh, 4, 3)
-            } else {
-                (0, 0, sw, sh)
-            };
-            if dw == 0 || dh == 0 {
-                // Minimised / zero-sized drawable — nothing to present this frame.
+        let Ok(swapchain) = draw_cmd.wait_and_acquire_swapchain_texture(&self.window) else {
+            draw_cmd.cancel();
+            return false;
+        };
+        let (sw, sh) = (swapchain.width(), swapchain.height());
+        let (dx, dy, dw, dh) = if keep_aspect {
+            letterbox_rect(sw, sh, 4, 3)
+        } else {
+            (0, 0, sw, sh)
+        };
+        if dw == 0 || dh == 0 {
+            // Minimised / zero-sized drawable — nothing to present this frame.
+            draw_cmd.cancel();
+            return false;
+        }
+
+        if use_crt {
+            // CRT render pass: clear the swapchain black, restrict drawing to the
+            // letterbox viewport, then run the fullscreen-triangle CRT shader over
+            // the frame texture. (`crt`/`device`/`frame_tex`/`window` are distinct
+            // shared borrows — see `ensure_crt`'s `bool` return.)
+            let crt = self.crt.as_ref().expect("ensure_crt built it");
+            let color = [ColorTargetInfo::default()
+                .with_texture(&swapchain)
+                .with_load_op(LoadOp::CLEAR)
+                .with_store_op(StoreOp::STORE)
+                .with_clear_color(sdl3::pixels::Color::RGB(0, 0, 0))];
+            let Ok(pass) = self.device.begin_render_pass(&draw_cmd, &color, None) else {
                 draw_cmd.cancel();
                 return false;
-            }
+            };
+            self.device.set_viewport(
+                &pass,
+                Viewport::new(dx as f32, dy as f32, dw as f32, dh as f32, 0.0, 1.0),
+            );
+            pass.bind_graphics_pipeline(&crt.pipeline);
+            pass.bind_fragment_samplers(
+                0,
+                &[TextureSamplerBinding::new()
+                    .with_texture(&self.frame_tex)
+                    .with_sampler(&crt.sampler)],
+            );
+            draw_cmd.push_fragment_uniform_data(
+                0,
+                &CrtParams {
+                    src_size: [dims.0 as f32, dims.1 as f32],
+                    out_size: [dw as f32, dh as f32],
+                    scanline: CRT_SCANLINE,
+                    mask: CRT_MASK,
+                    gamma: CRT_GAMMA,
+                    _pad: 0.0,
+                },
+            );
+            pass.draw_primitives(3, 1, 0, 0);
+            self.device.end_render_pass(pass);
+            draw_cmd.submit().is_ok()
+        } else {
+            // Built-in blit: SDL's `SDL_BlitGPUTexture` supplies its own shader.
             let blit = BlitInfo::default()
                 .with_source_texture(&self.frame_tex)
                 .with_source_region(0, 0, 0, dims.0, dims.1)
@@ -425,9 +640,6 @@ impl GpuPresenter {
                 });
             draw_cmd.blit_texture(blit);
             draw_cmd.submit().is_ok()
-        } else {
-            draw_cmd.cancel();
-            false
         }
     }
 }
@@ -575,6 +787,18 @@ mod tests {
         assert_eq!(map_os("freebsd"), ShaderKind::Spirv);
         // The host build resolves through the same table.
         assert_eq!(ShaderKind::for_target(), map_os(std::env::consts::OS));
+    }
+
+    #[test]
+    fn shader_mode_token_round_trips_and_defaults_to_none() {
+        for m in [ShaderMode::None, ShaderMode::Crt] {
+            assert_eq!(ShaderMode::from_token(m.to_token()), m);
+        }
+        assert_eq!(ShaderMode::from_token("CRT"), ShaderMode::Crt);
+        assert_eq!(ShaderMode::from_token(""), ShaderMode::None);
+        assert_eq!(ShaderMode::from_token("nonsense"), ShaderMode::None);
+        assert!(ShaderMode::Crt.is_crt());
+        assert!(!ShaderMode::None.is_crt());
     }
 
     #[test]

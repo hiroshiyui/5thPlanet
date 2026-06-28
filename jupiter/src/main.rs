@@ -732,6 +732,8 @@ fn run(
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
         backend: token_to_osd_backend(&cfg.backend),
+        #[cfg(feature = "gpu-preview")]
+        shader_crt: present_gpu::ShaderMode::from_token(&cfg.shader).is_crt(),
     };
     saturn.insert_cartridge(cart);
 
@@ -829,8 +831,10 @@ fn run(
                 FRAME_WIDTH as u32,
                 FRAME_HEIGHT as u32,
             ) {
-                Ok(p) => {
+                Ok(mut p) => {
                     eprintln!("presentation: SDL_GPU (Vulkan/SPIR-V blit)");
+                    // Apply the persisted shader choice (CRT pipeline builds lazily).
+                    p.set_shader(present_gpu::ShaderMode::from_token(&cfg.shader).is_crt());
                     Some(p)
                 }
                 Err(e) => {
@@ -1164,6 +1168,8 @@ fn run(
                     cart: sess.ui.cart,
                     mouse: mouse_port_to_osd(sess.mouse_port),
                     backend: sess.ui.backend,
+                    #[cfg(feature = "gpu-preview")]
+                    shader_crt: sess.ui.shader_crt,
                     // pad_keys/bios_names are read only by the Controller/BIOS
                     // settings sub-screens (via `items()`, gated on the menu
                     // being open), so skip cloning them on the gameplay hot path
@@ -1906,6 +1912,13 @@ fn run(
                         // (the grab loop is gated on `mouse_port.is_some()`).
                         mouse_port = port;
                     }
+                    #[cfg(feature = "gpu-preview")]
+                    UiMsg::SetShader(crt) => {
+                        // Apply to the live GPU backend; a no-op under the renderer.
+                        if let Some(g) = gpu.as_mut() {
+                            g.set_shader(crt);
+                        }
+                    }
                     UiMsg::Quit => quit = true,
                 }
             }
@@ -2057,6 +2070,10 @@ enum UiMsg {
     /// Move the Shuttle Mouse (or remove it): updates the SDL thread's capture
     /// gate so motion/clicks are fed only while a mouse port is active.
     SetMouse(Option<u8>),
+    /// Select the CRT shader (`true`) vs the plain blit (`false`) on the SDL_GPU
+    /// backend, applied live. Preview-only (the `gpu-preview` Shaders chooser).
+    #[cfg(feature = "gpu-preview")]
+    SetShader(bool),
     Quit,
 }
 
@@ -2075,6 +2092,10 @@ struct UiState {
     region: osd::OsdRegion,
     cart: osd::OsdCart,
     backend: osd::OsdBackend,
+    /// Whether the CRT shader is selected — mirrors `cfg.shader` for the OSD
+    /// Shaders chooser. `gpu-preview`-only (the only build with a shader path).
+    #[cfg(feature = "gpu-preview")]
+    shader_crt: bool,
 }
 
 /// Everything the emu thread's OSD dispatcher owns besides the machine: the
@@ -2470,6 +2491,23 @@ fn dispatch_osd(
                     "Aspect: Keep ratio"
                 } else {
                     "Aspect: Fit screen"
+                },
+                90,
+            );
+        }
+        #[cfg(feature = "gpu-preview")]
+        OsdAction::SetShader(crt) => {
+            // The SDL thread applies it to the live GpuPresenter (a no-op under the
+            // SDL_Renderer backend, which has no shader path — hence the toast hint).
+            sess.ui.shader_crt = crt;
+            let _ = ui_tx.send(UiMsg::SetShader(crt));
+            sess.cfg.shader = if crt { "crt" } else { "none" }.to_string();
+            sess.cfg.save();
+            osd.set_toast(
+                if crt {
+                    "Shader: CRT (SDL_GPU only)"
+                } else {
+                    "Shader: None"
                 },
                 90,
             );

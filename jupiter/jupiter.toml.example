@@ -74,6 +74,15 @@ scaling = "sharp"
 # Default: "keep".
 aspect = "keep"
 
+# Built-in presentation shader. **Only applied by the SDL_GPU backend** (needs a
+# `gpu-preview` build with `--gpu=on|auto`); under the default SDL_Renderer blit
+# it is parsed but inert. Presentation-only — the picture stays bit-identical
+# (ADR-0019). Toggle live in the OSD (Settings -> Graphics -> Shaders).
+#   "none"     no post-process (default)
+#   "crt"      single-pass CRT: scanlines + aperture-grille mask + gamma (flat)
+# Default: "none".
+shader = "none"
+
 # --- System -----------------------------------------------------------------
 
 # SMPC region token. Omit this key entirely to autodetect from the BIOS
