@@ -25,10 +25,18 @@
 //! emulator), a standalone one-shot validating the upload → blit → present pipeline
 //! on real hardware. It shares the exact present path the real backend uses.
 //!
-//! sdl3-rs 0.18.4 doesn't safely wrap `SDL_GetGPUDeviceDriver`, so we can't yet
-//! read back *which* backend (vulkan/d3d12/metal) was chosen and hence can't reject
-//! a slow software Vulkan such as llvmpipe/lavapipe — a documented follow-up
-//! (ADR-0019).
+//! ## Rejecting software Vulkan
+//!
+//! Vulkan device enumeration includes software drivers (Lavapipe/llvmpipe), so a
+//! naïve `Device::new` could land `--gpu=auto` on a slow CPU renderer. We build
+//! the device through `Properties` with `requirehardwareacceleration = true`
+//! (`PROP_REQUIRE_HW_ACCEL`), so SDL refuses a software-only host at creation —
+//! `GpuPresenter::new` returns `Err` and `main.rs` falls back to `SDL_Renderer`.
+//! This is the property SDL documents for exactly this case ("if you can provide
+//! your own fallback renderer"). The whole path stays `unsafe`-free — sdl3-rs's
+//! `Setter`/`new_with_properties` wrap the FFI — so the workspace `forbid` holds.
+//! (We still can't *label* the chosen backend: `SDL_GetGPUDeviceDriver` isn't
+//! safe-wrapped in sdl3-rs 0.18.4 — a cosmetic follow-up, ADR-0019.)
 
 /// Whether to present via the SDL_GPU backend. Parsed from the `gpu` config key /
 /// `--gpu` flag (the CLI flag wins, like `--backend`).
@@ -131,20 +139,32 @@ impl ShaderKind {
     fn for_target() -> Self {
         map_os(std::env::consts::OS)
     }
-}
 
-/// The matching `sdl3::gpu::ShaderFormat` flag for this kind.
-#[cfg(feature = "gpu-preview")]
-impl ShaderKind {
-    fn to_sdl(self) -> sdl3::gpu::ShaderFormat {
-        use sdl3::gpu::ShaderFormat;
+    /// The SDL_GPU device-create property key that opts this binary's shader
+    /// format in (set `true` on the create `Properties`, in lieu of the
+    /// `Device::new` format flags, so we can also set other create properties).
+    /// These are SDL's stable ABI strings — the `&str` value of sdl3-sys's
+    /// `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_*_BOOLEAN` (read via `&str` so no
+    /// `unsafe` CStr conversion of the raw `c_char` constant is needed). Pure, so
+    /// it's unit-testable without the `gpu-preview` feature.
+    fn create_prop_key(self) -> &'static str {
         match self {
-            ShaderKind::Spirv => ShaderFormat::SPIRV,
-            ShaderKind::Dxil => ShaderFormat::DXIL,
-            ShaderKind::Msl => ShaderFormat::MSL,
+            ShaderKind::Spirv => "SDL.gpu.device.create.shaders.spirv",
+            ShaderKind::Dxil => "SDL.gpu.device.create.shaders.dxil",
+            ShaderKind::Msl => "SDL.gpu.device.create.shaders.msl",
         }
     }
 }
+
+/// The SDL_GPU device-create property that requires a **hardware** Vulkan device.
+/// Vulkan enumeration otherwise includes software drivers (Lavapipe/llvmpipe), so
+/// without it `--gpu=auto` could silently land on a slow CPU renderer. We have a
+/// real fallback (the `SDL_Renderer` blit), so we require hardware accel and let
+/// creation fail when only software Vulkan exists. SDL's stable ABI string (the
+/// `&str` value of `SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN`);
+/// it only affects the Vulkan backend (ignored by D3D12/Metal). See ADR-0019.
+#[cfg(feature = "gpu-preview")]
+const PROP_REQUIRE_HW_ACCEL: &str = "SDL.gpu.device.create.vulkan.requirehardwareacceleration";
 
 /// Saturn lo-res frame shape the self-test uploads (mirrors the real
 /// framebuffer's 320×224 native layout and `[R, G, B, A]` byte order).
@@ -194,6 +214,8 @@ use sdl3::gpu::{
     BlitInfo, Device, Filter, LoadOp, Texture, TextureCreateInfo, TextureFormat, TextureRegion,
     TextureTransferInfo, TextureType, TextureUsage, TransferBuffer, TransferBufferUsage,
 };
+#[cfg(feature = "gpu-preview")]
+use sdl3::properties::{Properties, Setter};
 #[cfg(feature = "gpu-preview")]
 use sdl3::video::Window;
 
@@ -273,10 +295,20 @@ impl GpuPresenter {
             .resizable()
             .build()
             .map_err(|e| format!("window create failed ({e})"))?;
+        // Create the device through `Properties` (not `Device::new`'s format
+        // flags) so we can also set `requirehardwareacceleration` — making SDL
+        // reject a software Vulkan (Lavapipe/llvmpipe) at creation. The `unsafe`
+        // is inside sdl3-rs's `Setter`/`new_with_properties`, so our crate stays
+        // `forbid`. On a software-only host this `Err`s and the caller falls back.
         let shader = ShaderKind::for_target();
-        let device = Device::new(shader.to_sdl(), false)
+        let props = Properties::new().map_err(|e| format!("GPU device properties ({e:?})"))?;
+        props
+            .set(shader.create_prop_key(), true)
+            .and_then(|()| props.set(PROP_REQUIRE_HW_ACCEL, true))
+            .map_err(|e| format!("GPU device properties ({e:?})"))?;
+        let device = Device::new_with_properties(props)
             .and_then(|d| d.with_window(&window))
-            .map_err(|e| format!("no GPU device for {shader:?} ({e})"))?;
+            .map_err(|e| format!("no hardware GPU device for {shader:?} ({e})"))?;
         let (frame_tex, transfer) = Self::make_frame_resources(&device, frame_w, frame_h)?;
         Ok(Self {
             frame_tex,
@@ -543,5 +575,22 @@ mod tests {
         assert_eq!(map_os("freebsd"), ShaderKind::Spirv);
         // The host build resolves through the same table.
         assert_eq!(ShaderKind::for_target(), map_os(std::env::consts::OS));
+    }
+
+    #[test]
+    fn shader_kind_maps_to_the_sdl_create_property_key() {
+        // The SDL_GPU device-create boolean keys (stable ABI), one per format.
+        assert_eq!(
+            ShaderKind::Spirv.create_prop_key(),
+            "SDL.gpu.device.create.shaders.spirv"
+        );
+        assert_eq!(
+            ShaderKind::Dxil.create_prop_key(),
+            "SDL.gpu.device.create.shaders.dxil"
+        );
+        assert_eq!(
+            ShaderKind::Msl.create_prop_key(),
+            "SDL.gpu.device.create.shaders.msl"
+        );
     }
 }
