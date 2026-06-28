@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-06-28
+
+An **SDL_GPU / Vulkan presentation backend** with a built-in **CRT-filter shader**,
+behind the off-by-default `gpu-presenter` build feature. Presentation-only — the
+software-composited framebuffer stays bit-identical, so accuracy (and the
+`bios_boot` + per-title render goldens) is untouched (ADR-0019). The default
+presentation path (`SDL_Renderer`) is unchanged.
+
+### Added
+
+- **SDL_GPU / Vulkan presenter** — with `--gpu=auto|on` (in `gpu-presenter`
+  builds) the finished frame is posted to the window via an SDL_GPU Vulkan device
+  instead of the `SDL_Renderer` blit. The two are mutually exclusive; on failure
+  (or a non-Vulkan host) it falls back to the renderer. A **software Vulkan**
+  (Lavapipe/llvmpipe) is rejected at device creation via the
+  `requirehardwareacceleration` property, so `--gpu=auto` never lands on a slow CPU
+  rasteriser. Stays `unsafe`-free (the workspace `forbid` holds).
+- **Built-in CRT shader** — a single-pass, flat CRT post-process (scanlines +
+  aperture-grille mask + gamma), selectable via the OSD **Settings → Graphics →
+  Shaders** chooser (None / CRT) and the `shader` config key. Project-authored
+  GLSL → SPIR-V, committed beside the source (`jupiter/src/shaders/`).
+- **`jupiter --gpu-selftest`** — a contained one-shot that presents an animated
+  test pattern via the SDL_GPU Vulkan blit, proving the presenter on real hardware.
+- New config key **`shader`** (`none` default / `crt`).
+
+### Changed
+
+- The **`gpu`** config key / **`--gpu`** flag now *selects the presentation
+  backend* (`off` default / `auto` / `on`) instead of being a probe-only stub.
+- **Renamed the build feature `gpu-preview` → `gpu-presenter`** (the gated code is
+  a working presenter, not a non-functional preview). Build with
+  `cargo build --features gpu-presenter`.
+- `build_crt` is shader-format-agnostic (selects SPIR-V/DXIL/MSL per host), so
+  DXIL/MSL for non-Vulkan hosts is a drop-in follow-up; today only SPIR-V (Vulkan)
+  ships and a non-Vulkan host falls back to the blit.
+
 ## [0.15.1] - 2026-06-28
 
 A frontend-only patch fixing windowed-mode aspect handling. No core change, so
