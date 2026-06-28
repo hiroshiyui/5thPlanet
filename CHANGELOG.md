@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-06-28
+
+A frontend-only patch fixing windowed-mode aspect handling. No core change, so
+the `bios_boot` and per-title render goldens are unaffected.
+
+### Fixed
+
+- **Windowed display aspect** — "Keep aspect" letterboxed to the raw framebuffer
+  ratio (e.g. 640:224 ≈ 2.86:1 for Doukyuusei hi-res) instead of the Saturn's
+  **4:3 display aspect**, squishing the picture vertically with black bars top and
+  bottom. Saturn pixels are non-square — every mode (320/352/640/704 ×
+  224/240/256) displays at 4:3 — so the framebuffer ratio is not the display
+  ratio. `present::logical_size` now derives a 4:3 logical rect from the native
+  width.
+
+### Changed
+
+- **Windowed mode is now aspect-locked to 4:3** (`present::window_aspect_lock` +
+  `snap_window_to_4_3`): the window snaps to 4:3 at startup, on scale change, on
+  user resize, and when leaving fullscreen, so the picture fills it with neither
+  black bars nor distortion. The Keep/Stretch aspect toggle now only takes effect
+  in fullscreen, where the display shape is fixed. The snap is idempotent (±1px)
+  so the re-fired resize event converges instead of looping.
+
 ## [0.15.0] - 2026-06-27
 
 **Panzer Dragoon Zwei is now fully playable** — the fourth commercial game — via two
