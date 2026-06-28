@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1165 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1166 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -455,9 +455,15 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   borrows its creator), the renderer canvas/creator/texture stay safe + auto-drop
   **sibling `Option` locals** beside `Option<GpuPresenter>`, and the sites branch.
   **Default stays `off`** -- a GPU-vs-renderer pixel-path swap is user-visible, so
-  per the per-field-interlace lesson it is **not** auto-defaulted to `auto`. Follow-up:
-  read the chosen backend (`SDL_GetGPUDeviceDriver`, also unwrapped) to label it +
-  reject a software Vulkan. **Device entry point:**
+  per the per-field-interlace lesson it is **not** auto-defaulted to `auto`.
+  **Software-Vulkan rejection: DONE** (`feat 496fe67`) — `GpuPresenter::new`
+  builds the device through `Properties` with `requirehardwareacceleration = true`,
+  so SDL refuses a software Vulkan (Lavapipe/llvmpipe) at creation and the caller
+  falls back to the renderer (`unsafe`-free via sdl3-rs's `Setter` +
+  `new_with_properties`; verified with `VK_DRIVER_FILES=lavapipe`). Remaining
+  follow-up: read the chosen backend (`SDL_GetGPUDeviceDriver`, still unwrapped in
+  sdl3-rs 0.18.4 → needs `unsafe`) only to **label** it in the log — cosmetic.
+  **Device entry point:**
   `SDL_CreateGPUDevice(format_flags, debug_mode, name)` /
   `SDL_CreateGPUDeviceWithProperties` (safe-wrapped by `sdl3::gpu` — no `unsafe`
   despite the workspace `forbid`). The `name` picks the **backend**

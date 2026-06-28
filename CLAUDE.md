@@ -199,11 +199,17 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      + window-control sites branch via the `backend_window*`
                      accessors. The OSD is composited into the framebuffer on the
                      emu thread, so the GPU path gets it (and toasts/menus) for
-                     free. **`run_selftest`** (`jupiter --gpu-selftest`) drives a
-                     `GpuPresenter` with an animated test pattern — the standalone
-                     proof, sharing the exact real present path. Not yet wrapped:
-                     `SDL_GetGPUDeviceDriver` (so we can't read back the chosen
-                     backend to reject a software Vulkan; ADR-0019 follow-up).
+                     free. **Software Vulkan is rejected:** `new` builds the device
+                     through `Properties` with `requirehardwareacceleration = true`
+                     (`PROP_REQUIRE_HW_ACCEL`), so SDL refuses a Lavapipe/llvmpipe
+                     host at creation → `Err` → renderer fallback (still
+                     `unsafe`-free; sdl3-rs's `Setter`/`new_with_properties` wrap the
+                     FFI; verified with `VK_DRIVER_FILES=lavapipe`). **`run_selftest`**
+                     (`jupiter --gpu-selftest`) drives a `GpuPresenter` with an
+                     animated test pattern — the standalone proof, sharing the exact
+                     real present path. Cosmetic follow-up: `SDL_GetGPUDeviceDriver`
+                     (still unwrapped in sdl3-rs 0.18.4) to *label* the chosen
+                     backend in the log (ADR-0019).
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```
