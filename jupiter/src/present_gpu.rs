@@ -305,6 +305,24 @@ const CRT_VERT_SPV: &[u8] = include_bytes!("shaders/crt.vert.spv");
 #[cfg(feature = "gpu-preview")]
 const CRT_FRAG_SPV: &[u8] = include_bytes!("shaders/crt.frag.spv");
 
+#[cfg(feature = "gpu-preview")]
+impl ShaderKind {
+    /// The compiled `(vertex, fragment)` CRT bytecode + its `ShaderFormat` for this
+    /// host's SDL_GPU backend — or `None` if the shader isn't compiled for this
+    /// backend yet. Only **SPIR-V** (Vulkan) is shipped today; **DXIL** (D3D12) and
+    /// **MSL** (Metal) are drop-in follow-ups — cross-compile with `SDL_shadercross`,
+    /// commit the `.dxil`/`.msl` beside the `.spv`, `include_bytes!` them, and add the
+    /// match arm (they can't be verified without a Windows/macOS host). A `None`
+    /// makes [`build_crt`](GpuPresenter::build_crt) fail gracefully → the caller
+    /// blits, so a non-Vulkan host still gets the GPU backend, just no CRT.
+    fn crt_shaders(self) -> Option<(ShaderFormat, &'static [u8], &'static [u8])> {
+        match self {
+            ShaderKind::Spirv => Some((ShaderFormat::SPIRV, CRT_VERT_SPV, CRT_FRAG_SPV)),
+            ShaderKind::Dxil | ShaderKind::Msl => None,
+        }
+    }
+}
+
 /// The lazily-built CRT render-pass resources: the fullscreen-triangle graphics
 /// pipeline (vertex + fragment shaders baked in) and the frame sampler. Built on
 /// first CRT use so the plain-blit path keeps zero extra cost.
@@ -460,19 +478,25 @@ impl GpuPresenter {
     }
 
     /// Compile the built-in CRT shaders into a fullscreen-triangle graphics
-    /// pipeline (targeting the swapchain format) + a frame sampler.
+    /// pipeline (targeting the swapchain format) + a frame sampler. The shader
+    /// bytecode + format is chosen per host ([`ShaderKind::crt_shaders`]); an
+    /// uncompiled backend (DXIL/MSL today) yields `Err` → the caller blits.
     fn build_crt(&self) -> Result<CrtState, String> {
+        let host = ShaderKind::for_target();
+        let (fmt, vert_code, frag_code) = host
+            .crt_shaders()
+            .ok_or_else(|| format!("no built-in CRT shader compiled for {host:?} yet"))?;
         let vs = self
             .device
             .create_shader()
-            .with_code(ShaderFormat::SPIRV, CRT_VERT_SPV, ShaderStage::Vertex)
+            .with_code(fmt, vert_code, ShaderStage::Vertex)
             .with_entrypoint(c"main")
             .build()
             .map_err(|e| format!("vertex shader ({e})"))?;
         let fs = self
             .device
             .create_shader()
-            .with_code(ShaderFormat::SPIRV, CRT_FRAG_SPV, ShaderStage::Fragment)
+            .with_code(fmt, frag_code, ShaderStage::Fragment)
             .with_entrypoint(c"main")
             .with_samplers(1) // set=2, binding=0: the frame sampler
             .with_uniform_buffers(1) // set=3, binding=0: the CrtParams block
@@ -799,6 +823,19 @@ mod tests {
         assert_eq!(map_os("freebsd"), ShaderKind::Spirv);
         // The host build resolves through the same table.
         assert_eq!(ShaderKind::for_target(), map_os(std::env::consts::OS));
+    }
+
+    #[cfg(feature = "gpu-preview")]
+    #[test]
+    fn crt_shaders_ship_for_spirv_and_are_pending_for_dxil_msl() {
+        // SPIR-V (Vulkan) is shipped; DXIL/MSL are drop-in follow-ups, so they
+        // return None and the CRT pipeline build fails gracefully → blit fallback.
+        assert!(ShaderKind::Spirv.crt_shaders().is_some());
+        assert!(ShaderKind::Dxil.crt_shaders().is_none());
+        assert!(ShaderKind::Msl.crt_shaders().is_none());
+        // The shipped SPIR-V blobs are non-empty.
+        let (_, vs, fs) = ShaderKind::Spirv.crt_shaders().unwrap();
+        assert!(!vs.is_empty() && !fs.is_empty());
     }
 
     #[test]
