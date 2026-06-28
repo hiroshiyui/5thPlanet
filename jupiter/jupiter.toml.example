@@ -63,11 +63,12 @@ gpu = "off"
 # Default: "sharp".
 scaling = "sharp"
 
-# Fullscreen aspect handling (via SDL3 logical presentation). Windowed mode
-# already matches the picture aspect, so this only shows in fullscreen. Toggle it
-# live in the OSD (Settings -> Graphics -> Aspect).
-#   "keep"     keep the aspect ratio, letterboxed (default)
-#   "stretch"  fit to screen, filling it (distorts a 4:3 picture on a 16:9 screen)
+# Aspect handling (via SDL3 logical presentation), applied in both windowed and
+# fullscreen modes. The Saturn picture is 4:3 with non-square pixels, so its raw
+# framebuffer ratio (e.g. 640x224) is NOT the display ratio. Toggle it live in
+# the OSD (Settings -> Graphics -> Aspect).
+#   "keep"     keep the 4:3 display aspect, letterboxed (default)
+#   "stretch"  fit to the window/screen, filling it (distorts the 4:3 picture)
 # Default: "keep".
 aspect = "keep"
 

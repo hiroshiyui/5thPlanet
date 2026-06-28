@@ -602,6 +602,17 @@ fn set_window_icon(window: &mut sdl3::video::Window) {
     window.set_icon(surface);
 }
 
+/// Snap a windowed window to the 4:3 display aspect (keep width, derive height),
+/// so the Saturn picture fills it with no black bars. A no-op when already 4:3.
+/// Only call in windowed mode (in fullscreen the size is the display's).
+#[cfg(feature = "sdl-frontend")]
+fn snap_window_to_4_3(canvas: &mut sdl3::render::WindowCanvas) {
+    let (w, h) = canvas.window().size();
+    if let Some((nw, nh)) = present::window_aspect_lock(w, h) {
+        let _ = canvas.window_mut().set_size(nw, nh);
+    }
+}
+
 #[cfg(feature = "sdl-frontend")]
 fn run(
     bios: Vec<u8>,
@@ -613,7 +624,7 @@ fn run(
     cfg: config::Config,
 ) -> ExitCode {
     use sdl3::audio::{AudioFormat, AudioSpec};
-    use sdl3::event::Event;
+    use sdl3::event::{Event, WindowEvent};
     use sdl3::keyboard::{Keycode, Scancode};
     use sdl3::pixels::PixelFormat;
 
@@ -777,10 +788,11 @@ fn run(
     // on every texture re-create (resolution change) + on the live OSD toggle.
     let mut sharp = !present::is_smooth(&cfg.scaling);
     texture.set_scale_mode(present::scale_mode(sharp));
-    // Aspect handling via SDL3 logical presentation: keep-ratio (letterbox) or
-    // fit-screen (stretch). Set to the frame's native size; re-applied on every
-    // resolution change + on the OSD Aspect toggle. Only visibly differs in
-    // fullscreen (windowed already matches the picture aspect).
+    // Aspect handling via SDL3 logical presentation: keep-ratio (letterbox to
+    // the 4:3 display aspect) or fit-screen (stretch). Re-applied on every
+    // resolution change + on the OSD Aspect toggle, in windowed and fullscreen
+    // alike (the Saturn picture is 4:3 with non-square pixels, so its native
+    // framebuffer ratio is not the display ratio — see present::logical_size).
     let mut keep_aspect = present::keeps_aspect(&cfg.aspect);
     present::apply_aspect(
         &mut canvas,
@@ -788,6 +800,16 @@ fn run(
         FRAME_HEIGHT as u32,
         keep_aspect,
     );
+    // Windowed mode is always aspect-locked to 4:3: we own the window, so snap it
+    // to 4:3 (no bars, no distortion) rather than letterboxing inside a mismatched
+    // window. The keep/stretch toggle then only takes effect in fullscreen (where
+    // the display shape is fixed). `fullscreen` mirrors the window state so the
+    // resize-snap is skipped while fullscreen (its Resized events are the display
+    // size, not a user request). See `present::window_aspect_lock`.
+    let mut fullscreen = cfg.fullscreen;
+    if !fullscreen {
+        snap_window_to_4_3(&mut canvas);
+    }
 
     let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
@@ -1374,6 +1396,17 @@ fn run(
             for ev in events.poll_iter() {
                 match ev {
                     Event::Quit { .. } => break 'main,
+                    // Windowed mode is aspect-locked to 4:3: when the user resizes
+                    // the window, snap it back so the picture never letterboxes.
+                    // The snap is idempotent (no-op once 4:3), so the re-fired
+                    // Resized event converges instead of looping. Skipped while
+                    // fullscreen (those Resized events are the display size).
+                    Event::Window {
+                        win_event: WindowEvent::Resized(..),
+                        ..
+                    } if !fullscreen => {
+                        snap_window_to_4_3(&mut canvas);
+                    }
                     // An armed rebind owns the next keypress (before the OSD
                     // nav arm — the menu is open during capture). Esc cancels.
                     Event::KeyDown {
@@ -1683,9 +1716,18 @@ fn run(
                             FRAME_WIDTH as u32 * sc as u32,
                             FRAME_HEIGHT as u32 * sc as u32,
                         );
+                        // The scale grid is 320x224 (10:7); snap to the 4:3 lock.
+                        if !fullscreen {
+                            snap_window_to_4_3(&mut canvas);
+                        }
                     }
                     UiMsg::Fullscreen(on) => {
                         let _ = canvas.window_mut().set_fullscreen(on);
+                        fullscreen = on;
+                        // Returning to windowed re-asserts the 4:3 lock.
+                        if !on {
+                            snap_window_to_4_3(&mut canvas);
+                        }
                     }
                     UiMsg::Scaling(on) => {
                         sharp = on;

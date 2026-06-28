@@ -85,11 +85,11 @@ pub struct Config {
     /// low-res Saturn picture; `sharp` restores the SDL2-era crisp look. The OSD
     /// Graphics screen toggles it live.
     pub scaling: String,
-    /// Fullscreen aspect handling: `keep` (default — preserve the picture's
-    /// aspect ratio, letterboxed) or `stretch` (fill the screen, distorting).
+    /// Aspect handling: `keep` (default — preserve the picture's 4:3 display
+    /// aspect, letterboxed) or `stretch` (fill the window/screen, distorting).
     /// Applied via SDL3 logical presentation; the OSD Graphics screen toggles it.
-    /// (Windowed mode already matches the picture aspect, so this only shows in
-    /// fullscreen.)
+    /// (Applies in both windowed and fullscreen: the Saturn picture is 4:3 with
+    /// non-square pixels, so the framebuffer ratio is not the display ratio.)
     pub aspect: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],

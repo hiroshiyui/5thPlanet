@@ -152,12 +152,53 @@ pub fn keeps_aspect(token: &str) -> bool {
     )
 }
 
+/// The Saturn picture displays at a **4:3** aspect on a TV regardless of the
+/// internal dot-clock resolution: every standard mode (320/352/640/704 wide ×
+/// 224/240/256 tall) drives the same 4:3 active raster with **non-square**
+/// pixels. So the framebuffer pixel ratio is NOT the display ratio.
+const DISPLAY_ASPECT_W: u32 = 4;
+const DISPLAY_ASPECT_H: u32 = 3;
+
+/// Logical-presentation size for a `w×h` Saturn frame. When **keeping** the
+/// aspect ratio the logical rect must carry the 4:3 *display* ratio, NOT the raw
+/// framebuffer dims — letterboxing to the framebuffer ratio (e.g. 640:224 ≈
+/// 2.86:1) squishes the picture vertically (the InterChannel/Doukyuusei
+/// "vertically compressed" bug). We keep the native width and derive a 4:3
+/// height, so the non-square pixels are corrected by the vertical stretch when
+/// the texture is drawn across the full logical rect. When **stretching**, the
+/// logical rect fills the window regardless of ratio, so the native dims pass
+/// through unchanged. **Pure** (no SDL), so the policy is unit-testable.
+pub fn logical_size(w: u32, h: u32, keep: bool) -> (u32, u32) {
+    if keep {
+        (w, (w * DISPLAY_ASPECT_H).div_ceil(DISPLAY_ASPECT_W))
+    } else {
+        (w, h)
+    }
+}
+
+/// Aspect-lock a **windowed** window to the 4:3 display ratio: given the current
+/// window size, return the size it should be snapped to (keep the width as the
+/// master dimension, derive a 4:3 height) — or `None` when it is already 4:3 (to
+/// within 1px, so re-applying the snap can't feedback-loop). In windowed mode we
+/// own the window, so making it exactly 4:3 means the picture fills it with
+/// neither black bars nor distortion, regardless of the keep/stretch setting
+/// (which then only matters in fullscreen, where the display shape is fixed).
+/// **Pure** (no SDL), so the policy is unit-testable.
+pub fn window_aspect_lock(win_w: u32, win_h: u32) -> Option<(u32, u32)> {
+    let target_h = (win_w * DISPLAY_ASPECT_H).div_ceil(DISPLAY_ASPECT_W);
+    if win_h.abs_diff(target_h) <= 1 {
+        None
+    } else {
+        Some((win_w, target_h))
+    }
+}
+
 /// Apply SDL3 logical presentation so the `w×h` Saturn frame either keeps its
-/// aspect ratio (`LETTERBOX` — black bars, the faithful default) or stretches to
-/// fill (`STRETCH` — the historical behaviour, which distorts in fullscreen).
-/// SDL computes the letterbox; the frontend calls this on every resolution change
-/// and on the OSD Aspect toggle. Windowed mode already matches the picture
-/// aspect, so a visible difference only appears in fullscreen.
+/// 4:3 display aspect (`LETTERBOX` — black bars where the window isn't 4:3, the
+/// faithful default) or stretches to fill (`STRETCH` — the historical behaviour,
+/// which distorts). SDL computes the letterbox from the [`logical_size`] rect;
+/// the frontend calls this on every resolution change and on the OSD Aspect
+/// toggle, in both windowed and fullscreen modes.
 #[cfg(feature = "sdl-frontend")]
 pub fn apply_aspect(canvas: &mut sdl3::render::WindowCanvas, w: u32, h: u32, keep: bool) {
     let mode = if keep {
@@ -165,7 +206,8 @@ pub fn apply_aspect(canvas: &mut sdl3::render::WindowCanvas, w: u32, h: u32, kee
     } else {
         sdl3::sys::render::SDL_LOGICAL_PRESENTATION_STRETCH
     };
-    let _ = canvas.set_logical_size(w, h, mode);
+    let (lw, lh) = logical_size(w, h, keep);
+    let _ = canvas.set_logical_size(lw, lh, mode);
 }
 
 /// Build the SDL3 window + canvas, selecting the render driver per `pref` with a
@@ -252,6 +294,37 @@ mod tests {
         assert!(!keeps_aspect("stretch"));
         assert!(!keeps_aspect("Fit"));
         assert!(!keeps_aspect("fill"));
+    }
+
+    #[test]
+    fn keep_aspect_logical_size_is_4_3_not_the_framebuffer_ratio() {
+        // Keeping the aspect must letterbox to the 4:3 *display* ratio, not the
+        // raw framebuffer dims — else 640×224 (Doukyuusei hi-res) letterboxes to
+        // 640:224 ≈ 2.86:1 and the picture is squished vertically.
+        for &(w, h) in &[(320, 224), (352, 240), (640, 224), (704, 256)] {
+            let (lw, lh) = logical_size(w, h, true);
+            assert_eq!(lw, w, "keep preserves native width");
+            assert_eq!(lw * 3, lh * 4, "keep logical rect is exactly 4:3");
+        }
+        // The buggy old behaviour (logical == framebuffer) was NOT 4:3 for 640×224.
+        assert_ne!(640 * 3, 224 * 4);
+        // Stretch passes the native dims through (the rect fills the window anyway).
+        assert_eq!(logical_size(640, 224, false), (640, 224));
+    }
+
+    #[test]
+    fn windowed_aspect_lock_snaps_height_to_4_3_and_is_idempotent() {
+        // A too-short window (wide) snaps taller to 4:3 by deriving height.
+        assert_eq!(window_aspect_lock(1080, 700), Some((1080, 810)));
+        // A too-tall window snaps shorter.
+        assert_eq!(window_aspect_lock(640, 700), Some((640, 480)));
+        // An already-4:3 window is left alone — so re-applying can't loop.
+        assert_eq!(window_aspect_lock(640, 480), None);
+        assert_eq!(window_aspect_lock(1080, 810), None);
+        // The +/-1px tolerance absorbs rounding so it converges, not oscillates.
+        assert_eq!(window_aspect_lock(641, 480), None);
+        // Default scaled window (320*2 x 224*2) snaps from 10:7 to 4:3 (480 tall).
+        assert_eq!(window_aspect_lock(640, 448), Some((640, 480)));
     }
 
     #[test]
