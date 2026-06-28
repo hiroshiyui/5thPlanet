@@ -1,52 +1,47 @@
-//! SDL_GPU capability detection — groundwork for the planned CRT-shader
-//! presenter (ADR-0019, `shaders/README.md`).
+//! SDL_GPU presentation backend — an alternative to the `SDL_Renderer` blit, and
+//! groundwork for the planned CRT-shader presenter (ADR-0019, `shaders/README.md`).
 //!
 //! The Saturn picture is always composited in software (the accuracy-first core);
-//! a future `SDL_GPU` presenter would only post-process the finished frame (CRT
-//! filters), falling back to the plain `SDL_Renderer` blit when the host can't
-//! support it. Before that presenter is wired, the frontend needs to answer one
-//! question at startup: *can this machine create an SDL_GPU device for the shader
-//! format we'd ship?* This module is that probe — today it only **logs** its
-//! verdict; when the full presenter lands it becomes the gate the presenter
-//! consults.
+//! this module only posts the finished frame to the window via SDL_GPU instead of
+//! the 2D renderer, so accuracy is untouched. It's **opt-in** and gated behind the
+//! off-by-default `gpu-preview` feature (the future CRT passes aren't written yet):
+//! the `gpu` config key / `--gpu` flag (`off` default / `auto` / `on`) selects it.
 //!
-//! ## The Vulkan presenter self-test ([`run_selftest`], `gpu-preview` only)
+//! ## [`GpuPresenter`] — the real backend (no shaders authored)
 //!
-//! Ahead of the full presenter, `jupiter --gpu-selftest` is a **contained proof**
-//! that SDL_GPU works as an *alternative* presenter to the `SDL_Renderer` blit —
-//! **with no shaders authored**. It claims a Vulkan (SPIR-V) device for a fresh
-//! window and, each frame, uploads an animated test pattern to a GPU texture and
-//! posts it to the swapchain via SDL's built-in `SDL_BlitGPUTexture` (which
-//! carries its own blit shader), letterboxed to 4:3. The normal presentation path
-//! is untouched; this is a standalone one-shot that validates the upload → blit →
-//! present pipeline on real hardware before the CRT-shader work (ADR-0019).
+//! `GpuPresenter` owns its own window + a Vulkan (SPIR-V) `Device` and presents a
+//! frame each call: upload the `[R, G, B, A]` framebuffer to a GPU texture, then
+//! post it to the swapchain via SDL's built-in `SDL_BlitGPUTexture` (which carries
+//! its own blit shader — so **no SPIR-V is authored**), letterboxed to 4:3 on a
+//! black clear. `main.rs` selects it over the renderer canvas when `--gpu=auto|on`
+//! succeeds (the two are mutually exclusive — an SDL_GPU device claims the window
+//! its swapchain owns), falling back to the `SDL_Renderer` blit otherwise. The
+//! constructor *is* the capability check: `unsafe`-free because `Device::new`
+//! returns a `Result`, so a host with no usable backend simply yields `Err`.
 //!
-//! ## Why the probe creates a device (and why it's opt-in)
+//! ## [`run_selftest`] — the contained proof (`jupiter --gpu-selftest`)
 //!
-//! The workspace forbids `unsafe`, and in sdl3-rs 0.18.4 the cheap, non-allocating
-//! probes (`SDL_GPUSupportsShaderFormats`, `SDL_GetNumGPUDrivers`) have **no safe
-//! wrapper** — only `sdl3::gpu::Device::new` (which returns a `Result`) is safe.
-//! So the only `unsafe`-free way to detect support is to *try to create a device*
-//! and treat `Err` as "fall back". Because that allocates a real GPU device, the
-//! probe is **opt-in** (the `gpu` config key / `--gpu` flag default to `off`); the
-//! default flips to `auto` once a presenter actually consumes the result.
+//! `--gpu-selftest` drives a `GpuPresenter` with an animated test pattern (no
+//! emulator), a standalone one-shot validating the upload → blit → present pipeline
+//! on real hardware. It shares the exact present path the real backend uses.
 //!
-//! Likewise, sdl3-rs 0.18.4 doesn't safely wrap `SDL_GetGPUDeviceDriver`, so we
-//! can report only *whether* a device was created — not *which* backend
-//! (vulkan/d3d12/metal) it chose, and hence we can't reject a slow software
-//! Vulkan such as llvmpipe/lavapipe. That readback is a documented follow-up
+//! sdl3-rs 0.18.4 doesn't safely wrap `SDL_GetGPUDeviceDriver`, so we can't yet
+//! read back *which* backend (vulkan/d3d12/metal) was chosen and hence can't reject
+//! a slow software Vulkan such as llvmpipe/lavapipe — a documented follow-up
 //! (ADR-0019).
 
-/// Whether to attempt the startup SDL_GPU capability probe. Parsed from the `gpu`
-/// config key / `--gpu` flag (the CLI flag wins, like `--backend`).
+/// Whether to present via the SDL_GPU backend. Parsed from the `gpu` config key /
+/// `--gpu` flag (the CLI flag wins, like `--backend`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuMode {
-    /// Never probe (default). Zero startup cost; the `SDL_Renderer` blit is the
-    /// only presentation path.
+    /// Never use SDL_GPU (default). Zero startup cost; the `SDL_Renderer` blit is
+    /// the only presentation path.
     Off,
-    /// Probe and report; a failure is informational (the host simply can't).
+    /// Use SDL_GPU if a device can be created, else fall back to the renderer
+    /// quietly (the host simply can't).
     Auto,
-    /// Probe and report; a failure warns loudly (the user explicitly forced it).
+    /// Use SDL_GPU; if a device can't be created, warn loudly then fall back (the
+    /// user explicitly forced it).
     On,
 }
 
@@ -78,7 +73,9 @@ impl GpuMode {
     }
 }
 
-/// Whether `mode` asks for a probe at all (everything but [`Off`](GpuMode::Off)).
+/// Whether `mode` asks for the SDL_GPU backend at all (everything but
+/// [`Off`](GpuMode::Off)). The caller still falls back to the renderer if the
+/// device can't be created.
 pub fn should_probe(mode: GpuMode) -> bool {
     !matches!(mode, GpuMode::Off)
 }
@@ -136,23 +133,6 @@ impl ShaderKind {
     }
 }
 
-/// The verdict of the startup probe.
-///
-/// There is intentionally **no chosen-backend name** here: sdl3-rs 0.18.4 doesn't
-/// safely wrap `SDL_GetGPUDeviceDriver`, so we can report only whether a device
-/// for the host's shader format could be created. The fields are written by
-/// [`probe`] and read by the future CRT-shader presenter (ADR-0019); until that
-/// lands nothing consumes them, hence the `dead_code` allowance.
-#[cfg(feature = "gpu-preview")]
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GpuCapability {
-    /// A device supporting the host's shader format was created.
-    pub available: bool,
-    /// The shader format probed for (what the presenter would load).
-    pub shader: ShaderKind,
-}
-
 /// The matching `sdl3::gpu::ShaderFormat` flag for this kind.
 #[cfg(feature = "gpu-preview")]
 impl ShaderKind {
@@ -162,51 +142,6 @@ impl ShaderKind {
             ShaderKind::Spirv => ShaderFormat::SPIRV,
             ShaderKind::Dxil => ShaderFormat::DXIL,
             ShaderKind::Msl => ShaderFormat::MSL,
-        }
-    }
-}
-
-/// Run the capability probe for `mode`, logging the verdict.
-///
-/// For [`Off`](GpuMode::Off) this is a no-op returning "unavailable". Otherwise it
-/// attempts `sdl3::gpu::Device::new` for the host's shader format: `Ok` (with the
-/// format confirmed in the device's supported set) is "available"; `Err` logs the
-/// SDL error and reports "unavailable" so the caller keeps the `SDL_Renderer`
-/// path. The created device is dropped immediately — nothing consumes it until the
-/// presenter lands (see the module docs for why we must allocate to probe).
-#[cfg(feature = "gpu-preview")]
-pub fn probe(mode: GpuMode) -> GpuCapability {
-    let shader = ShaderKind::for_target();
-    if !should_probe(mode) {
-        return GpuCapability {
-            available: false,
-            shader,
-        };
-    }
-    let fmt = shader.to_sdl();
-    match sdl3::gpu::Device::new(fmt, false) {
-        Ok(dev) => {
-            // Confirm the format we'd ship is actually in the device's set.
-            let ok = (dev.get_shader_formats() & fmt) == fmt;
-            eprintln!(
-                "SDL_GPU: device available ({shader:?} shaders {}); \
-                 CRT-shader presenter not yet wired (ADR-0019)",
-                if ok { "supported" } else { "MISSING" }
-            );
-            GpuCapability {
-                available: ok,
-                shader,
-            }
-        }
-        Err(e) => {
-            // `On` = the user explicitly forced it, so a failure is worth a louder
-            // line than an `auto` host that simply has no GPU backend.
-            let tag = if mode == GpuMode::On { "WARN" } else { "note" };
-            eprintln!("SDL_GPU: {tag}: unavailable ({e}); presenting via the SDL_Renderer blit");
-            GpuCapability {
-                available: false,
-                shader,
-            }
         }
     }
 }
@@ -254,28 +189,230 @@ fn fill_test_pattern(buf: &mut [u8], w: usize, h: usize, frame: u32) {
     }
 }
 
+#[cfg(feature = "gpu-preview")]
+use sdl3::gpu::{
+    BlitInfo, Device, Filter, LoadOp, Texture, TextureCreateInfo, TextureFormat, TextureRegion,
+    TextureTransferInfo, TextureType, TextureUsage, TransferBuffer, TransferBufferUsage,
+};
+#[cfg(feature = "gpu-preview")]
+use sdl3::video::Window;
+
+/// A self-contained **SDL_GPU presenter** that posts the software-composited
+/// Saturn frame to a window via SDL's built-in `SDL_BlitGPUTexture` — the
+/// alternative to the `SDL_Renderer` blit, **with no shaders authored**. It owns
+/// its own bare window (an SDL_GPU device claims a window for its swapchain, so it
+/// can't share the renderer's canvas-owned window) plus a Vulkan device, a SAMPLER
+/// frame texture, and an UPLOAD transfer buffer. The same path the self-test
+/// proves and the real `--gpu` backend uses.
+///
+/// **Field order is the drop order** (struct fields drop top-to-bottom): the
+/// device must be destroyed *before* its claimed window, so `device` precedes
+/// `window`. The GPU resources (`frame_tex`/`transfer`) hold only a `WeakDevice`,
+/// so their release is safe in any order.
+#[cfg(feature = "gpu-preview")]
+pub struct GpuPresenter {
+    /// SAMPLER texture the framebuffer uploads into; the blit source. Recreated
+    /// when the active frame resolution changes.
+    frame_tex: Texture<'static>,
+    /// UPLOAD staging buffer for the per-frame texture upload; sized to the frame.
+    transfer: TransferBuffer,
+    /// The Vulkan (SPIR-V) device whose swapchain is the claimed `window`.
+    device: Device,
+    /// The presenter's own window (claimed by `device`; not a renderer canvas).
+    window: Window,
+    /// The frame resolution `frame_tex`/`transfer` are currently sized for; a
+    /// change triggers their recreation in [`present`](GpuPresenter::present).
+    frame_dims: (u32, u32),
+}
+
+#[cfg(feature = "gpu-preview")]
+impl GpuPresenter {
+    /// Build the SAMPLER frame texture + matching UPLOAD transfer buffer for a
+    /// `w × h` frame. Split out so `new` and the resolution-change path share it.
+    fn make_frame_resources(
+        device: &Device,
+        w: u32,
+        h: u32,
+    ) -> Result<(Texture<'static>, TransferBuffer), String> {
+        let tex = device
+            .create_texture(
+                TextureCreateInfo::new()
+                    .with_type(TextureType::_2D)
+                    .with_format(TextureFormat::R8g8b8a8Unorm)
+                    .with_width(w)
+                    .with_height(h)
+                    .with_layer_count_or_depth(1)
+                    .with_num_levels(1)
+                    .with_usage(TextureUsage::SAMPLER),
+            )
+            .map_err(|e| format!("frame texture create failed ({e})"))?;
+        let transfer = device
+            .create_transfer_buffer()
+            .with_size(w * h * 4)
+            .with_usage(TransferBufferUsage::UPLOAD)
+            .build()
+            .map_err(|e| format!("transfer buffer create failed ({e})"))?;
+        Ok((tex, transfer))
+    }
+
+    /// Open a `win_w × win_h` resizable window, claim a Vulkan (SPIR-V) SDL_GPU
+    /// device for it, and allocate the `frame_w × frame_h` upload resources.
+    /// `Err` (no usable SDL_GPU backend, or allocation failure) lets the caller
+    /// fall back to the `SDL_Renderer` path.
+    pub fn new(
+        video: &sdl3::VideoSubsystem,
+        title: &str,
+        win_w: u32,
+        win_h: u32,
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<Self, String> {
+        let window = video
+            .window(title, win_w, win_h)
+            .position_centered()
+            .resizable()
+            .build()
+            .map_err(|e| format!("window create failed ({e})"))?;
+        let shader = ShaderKind::for_target();
+        let device = Device::new(shader.to_sdl(), false)
+            .and_then(|d| d.with_window(&window))
+            .map_err(|e| format!("no GPU device for {shader:?} ({e})"))?;
+        let (frame_tex, transfer) = Self::make_frame_resources(&device, frame_w, frame_h)?;
+        Ok(Self {
+            frame_tex,
+            transfer,
+            device,
+            window,
+            frame_dims: (frame_w, frame_h),
+        })
+    }
+
+    /// The presenter's window, for the shared window controls (size / fullscreen /
+    /// icon / relative-mouse). Both backends expose `&Window`/`&mut Window`.
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    /// Mutable window accessor (see [`window`](GpuPresenter::window)).
+    pub fn window_mut(&mut self) -> &mut Window {
+        &mut self.window
+    }
+
+    /// Present one `dims.0 × dims.1` frame (tightly packed `[R, G, B, A]`, the
+    /// VDP2 framebuffer layout): upload it to the GPU texture and blit it to the
+    /// swapchain. `sharp` picks nearest vs linear filtering; `keep_aspect` letterboxes
+    /// the picture to 4:3 (else it stretches to fill the window — matching the
+    /// renderer's logical-presentation modes). Recreates the frame resources when
+    /// `dims` changes (the old ones auto-release via their `WeakDevice`). Returns
+    /// `true` if the frame reached the swapchain, `false` if it was skipped (a
+    /// transient acquire failure or a minimised window) — the caller treats a skip
+    /// as a dropped frame, never a fatal error.
+    pub fn present(
+        &mut self,
+        framebuffer: &[u8],
+        dims: (u32, u32),
+        sharp: bool,
+        keep_aspect: bool,
+    ) -> bool {
+        if dims != self.frame_dims {
+            match Self::make_frame_resources(&self.device, dims.0, dims.1) {
+                Ok((tex, transfer)) => {
+                    self.frame_tex = tex;
+                    self.transfer = transfer;
+                    self.frame_dims = dims;
+                }
+                Err(e) => {
+                    eprintln!("SDL_GPU: frame-resource resize failed ({e}); skipping frame");
+                    return false;
+                }
+            }
+        }
+        let frame_bytes = (dims.0 * dims.1 * 4) as usize;
+        if framebuffer.len() < frame_bytes {
+            return false;
+        }
+
+        // 1) Upload the frame into the GPU texture via a copy pass.
+        {
+            let mut map = self.transfer.map::<u8>(&self.device, true);
+            map.mem_mut().copy_from_slice(&framebuffer[..frame_bytes]);
+            map.unmap();
+        }
+        let Ok(mut copy_cmd) = self.device.acquire_command_buffer() else {
+            return false;
+        };
+        let Ok(copy_pass) = self.device.begin_copy_pass(&copy_cmd) else {
+            copy_cmd.cancel();
+            return false;
+        };
+        copy_pass.upload_to_gpu_texture(
+            TextureTransferInfo::new()
+                .with_transfer_buffer(&self.transfer)
+                .with_offset(0),
+            TextureRegion::new()
+                .with_texture(&self.frame_tex)
+                .with_width(dims.0)
+                .with_height(dims.1)
+                .with_depth(1),
+            false,
+        );
+        self.device.end_copy_pass(copy_pass);
+        if copy_cmd.submit().is_err() {
+            return false;
+        }
+
+        // 2) Blit the texture into the swapchain. SDL's built-in blit supplies its
+        //    own shader — none authored. `keep_aspect` → 4:3 letterbox dst on a
+        //    black clear; otherwise the full window (stretch).
+        let Ok(mut draw_cmd) = self.device.acquire_command_buffer() else {
+            return false;
+        };
+        if let Ok(swapchain) = draw_cmd.wait_and_acquire_swapchain_texture(&self.window) {
+            let (sw, sh) = (swapchain.width(), swapchain.height());
+            let (dx, dy, dw, dh) = if keep_aspect {
+                letterbox_rect(sw, sh, 4, 3)
+            } else {
+                (0, 0, sw, sh)
+            };
+            if dw == 0 || dh == 0 {
+                // Minimised / zero-sized drawable — nothing to present this frame.
+                draw_cmd.cancel();
+                return false;
+            }
+            let blit = BlitInfo::default()
+                .with_source_texture(&self.frame_tex)
+                .with_source_region(0, 0, 0, dims.0, dims.1)
+                .with_destination_texture(&swapchain)
+                .with_destination_region(0, dx, dy, dw, dh)
+                .with_load_op(LoadOp::CLEAR)
+                .with_clear_color(sdl3::pixels::Color::RGB(0, 0, 0))
+                .with_filter(if sharp {
+                    Filter::Nearest
+                } else {
+                    Filter::Linear
+                });
+            draw_cmd.blit_texture(blit);
+            draw_cmd.submit().is_ok()
+        } else {
+            draw_cmd.cancel();
+            false
+        }
+    }
+}
+
 /// **SDL_GPU Vulkan presenter self-test** (`jupiter --gpu-selftest`, `gpu-preview`
 /// builds only). A contained proof that SDL_GPU works as an *alternative*
-/// presenter to the `SDL_Renderer` blit, with **no shaders authored**: it claims
-/// a Vulkan (SPIR-V) device for a fresh window, then each frame uploads an
-/// animated test pattern to a GPU texture and posts it to the swapchain via
-/// SDL's built-in `SDL_BlitGPUTexture` (which carries its own blit shader),
-/// letterboxed to 4:3. The main `SDL_Renderer` presentation path is untouched —
-/// this is a standalone one-shot. Esc/close or ~1800 frames exits.
+/// presenter to the `SDL_Renderer` blit, with **no shaders authored**: it drives a
+/// [`GpuPresenter`] (the exact path the real `--gpu` backend uses), feeding it an
+/// animated test pattern each frame. Esc/close or ~1800 frames exits.
 ///
 /// Returns `FAILURE` if no GPU device can be created (the host has no Vulkan
 /// backend, or only a rejected one), `SUCCESS` after a clean present run.
 #[cfg(feature = "gpu-preview")]
 pub fn run_selftest() -> std::process::ExitCode {
     use sdl3::event::Event;
-    use sdl3::gpu::{
-        BlitInfo, Device, Filter, LoadOp, TextureCreateInfo, TextureFormat, TextureRegion,
-        TextureTransferInfo, TextureType, TextureUsage, TransferBufferUsage,
-    };
     use sdl3::keyboard::Keycode;
-    use sdl3::pixels::Color;
 
-    let shader = ShaderKind::for_target();
     let Ok(sdl) = sdl3::init() else {
         eprintln!("SDL_GPU self-test: SDL3 init failed");
         return std::process::ExitCode::FAILURE;
@@ -287,67 +424,26 @@ pub fn run_selftest() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    // Window first, device second — so the device (and its swapchain claim) drops
-    // before the window it claimed (locals drop in reverse declaration order).
-    let window = match video
-        .window("5thPlanet — SDL_GPU Vulkan self-test", 640, 480)
-        .position_centered()
-        .resizable()
-        .build()
-    {
-        Ok(w) => w,
+    let mut presenter = match GpuPresenter::new(
+        &video,
+        "5thPlanet — SDL_GPU Vulkan self-test",
+        640,
+        480,
+        SELFTEST_W as u32,
+        SELFTEST_H as u32,
+    ) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("SDL_GPU self-test: window create failed ({e})");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let device = match Device::new(shader.to_sdl(), false).and_then(|d| d.with_window(&window)) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "SDL_GPU self-test: no GPU device for {shader:?} ({e}); \
-                 the host has no usable SDL_GPU backend"
-            );
+            eprintln!("SDL_GPU self-test: {e}; the host has no usable SDL_GPU backend");
             return std::process::ExitCode::FAILURE;
         }
     };
     eprintln!(
-        "SDL_GPU self-test: device created for {shader:?} shaders \
-         (Vulkan on Linux); presenting an animated test pattern. \
-         Resize to see the 4:3 letterbox; Esc/close to exit."
+        "SDL_GPU self-test: device created ({:?} shaders, Vulkan on Linux); \
+         presenting an animated test pattern. Resize to see the 4:3 letterbox; \
+         Esc/close to exit.",
+        ShaderKind::for_target()
     );
-
-    // A persistent SAMPLER texture (blit source) + an UPLOAD transfer buffer, both
-    // sized to the lo-res frame; re-filled and re-uploaded every frame.
-    let frame_bytes = SELFTEST_W * SELFTEST_H * 4;
-    let frame_tex = match device.create_texture(
-        TextureCreateInfo::new()
-            .with_type(TextureType::_2D)
-            .with_format(TextureFormat::R8g8b8a8Unorm)
-            .with_width(SELFTEST_W as u32)
-            .with_height(SELFTEST_H as u32)
-            .with_layer_count_or_depth(1)
-            .with_num_levels(1)
-            .with_usage(TextureUsage::SAMPLER),
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("SDL_GPU self-test: texture create failed ({e})");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let transfer = match device
-        .create_transfer_buffer()
-        .with_size(frame_bytes as u32)
-        .with_usage(TransferBufferUsage::UPLOAD)
-        .build()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("SDL_GPU self-test: transfer buffer failed ({e})");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
 
     let mut event_pump = match sdl.event_pump() {
         Ok(p) => p,
@@ -356,7 +452,7 @@ pub fn run_selftest() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let mut pattern = vec![0u8; frame_bytes];
+    let mut pattern = vec![0u8; SELFTEST_W * SELFTEST_H * 4];
     let mut presented: u32 = 0;
     // Safety cap so a headless/CI invocation can't hang forever (~30 s at 60 Hz).
     const MAX_FRAMES: u32 = 1800;
@@ -373,61 +469,8 @@ pub fn run_selftest() -> std::process::ExitCode {
         }
 
         fill_test_pattern(&mut pattern, SELFTEST_W, SELFTEST_H, frame);
-
-        // 1) Upload the frame into the GPU texture via a copy pass.
-        {
-            let mut map = transfer.map::<u8>(&device, true);
-            map.mem_mut().copy_from_slice(&pattern);
-            map.unmap();
-        }
-        let Ok(mut copy_cmd) = device.acquire_command_buffer() else {
-            continue;
-        };
-        let Ok(copy_pass) = device.begin_copy_pass(&copy_cmd) else {
-            copy_cmd.cancel();
-            continue;
-        };
-        copy_pass.upload_to_gpu_texture(
-            TextureTransferInfo::new()
-                .with_transfer_buffer(&transfer)
-                .with_offset(0),
-            TextureRegion::new()
-                .with_texture(&frame_tex)
-                .with_width(SELFTEST_W as u32)
-                .with_height(SELFTEST_H as u32)
-                .with_depth(1),
-            false,
-        );
-        device.end_copy_pass(copy_pass);
-        if copy_cmd.submit().is_err() {
-            continue;
-        }
-
-        // 2) Blit the texture into the swapchain, letterboxed to 4:3, on a black
-        //    clear. SDL's built-in blit supplies its own shader — none authored.
-        let Ok(mut draw_cmd) = device.acquire_command_buffer() else {
-            continue;
-        };
-        if let Ok(swapchain) = draw_cmd.wait_and_acquire_swapchain_texture(&window) {
-            let (dx, dy, dw, dh) = letterbox_rect(swapchain.width(), swapchain.height(), 4, 3);
-            if dw == 0 || dh == 0 {
-                // Minimised / zero-sized drawable — nothing to present this frame.
-                draw_cmd.cancel();
-                continue;
-            }
-            let blit = BlitInfo::default()
-                .with_source_texture(&frame_tex)
-                .with_source_region(0, 0, 0, SELFTEST_W as u32, SELFTEST_H as u32)
-                .with_destination_texture(&swapchain)
-                .with_destination_region(0, dx, dy, dw, dh)
-                .with_load_op(LoadOp::CLEAR)
-                .with_clear_color(Color::RGB(0, 0, 0))
-                .with_filter(Filter::Nearest);
-            draw_cmd.blit_texture(blit);
-            let _ = draw_cmd.submit();
+        if presenter.present(&pattern, (SELFTEST_W as u32, SELFTEST_H as u32), true, true) {
             presented += 1;
-        } else {
-            draw_cmd.cancel();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(16));

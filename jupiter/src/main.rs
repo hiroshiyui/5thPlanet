@@ -28,7 +28,7 @@ mod config;
 mod osd;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod present;
-// Preview-only groundwork (the `--gpu` SDL_GPU probe); compiled only with the
+// The SDL_GPU presentation backend (`--gpu`); compiled only with the
 // `gpu-preview` feature, or in tests for its pure unit tests.
 #[cfg(any(feature = "gpu-preview", test))]
 mod present_gpu;
@@ -319,10 +319,10 @@ fn main() -> ExitCode {
             #[cfg(feature = "gpu-preview")]
             {
                 eprintln!(
-                    "  --gpu[=off|auto|on]    probe SDL_GPU support at startup (off = default;"
+                    "  --gpu[=off|auto|on]    present via SDL_GPU (Vulkan) instead of SDL_Renderer"
                 );
                 eprintln!(
-                    "                         groundwork for the planned CRT-shader presenter)"
+                    "                         (off = default; auto falls back if unavailable)"
                 );
                 eprintln!(
                     "  --gpu-selftest         present an animated test pattern via the SDL_GPU"
@@ -367,7 +367,7 @@ fn main() -> ExitCode {
     if let Some(b) = backend_override {
         cfg.backend = b;
     }
-    // `--gpu[=…]` overrides the config's SDL_GPU probe mode (CLI > file);
+    // `--gpu[=…]` overrides the config's SDL_GPU backend mode (CLI > file);
     // preview-only (the `gpu-preview` feature).
     #[cfg(feature = "gpu-preview")]
     if let Some(g) = gpu_override {
@@ -626,13 +626,54 @@ fn set_window_icon(window: &mut sdl3::video::Window) {
 
 /// Snap a windowed window to the 4:3 display aspect (keep width, derive height),
 /// so the Saturn picture fills it with no black bars. A no-op when already 4:3.
-/// Only call in windowed mode (in fullscreen the size is the display's).
+/// Only call in windowed mode (in fullscreen the size is the display's). Takes a
+/// bare `Window` so it serves both presentation backends (renderer canvas + GPU).
 #[cfg(feature = "sdl-frontend")]
-fn snap_window_to_4_3(canvas: &mut sdl3::render::WindowCanvas) {
-    let (w, h) = canvas.window().size();
+fn snap_window_to_4_3(window: &mut sdl3::video::Window) {
+    let (w, h) = window.size();
     if let Some((nw, nh)) = present::window_aspect_lock(w, h) {
-        let _ = canvas.window_mut().set_size(nw, nh);
+        let _ = window.set_size(nw, nh);
     }
+}
+
+/// The live presentation backend's window, for the shared window controls (icon,
+/// size, fullscreen, mouse grab). Exactly one of the renderer canvas / GPU
+/// presenter is active, so one of the `Option`s is always `Some`. The `gpu`
+/// parameter is `gpu-preview`-only; without that feature the renderer canvas is
+/// the only backend.
+#[cfg(feature = "sdl-frontend")]
+// The `'a` ties both args to the result; without `gpu-preview` the `gpu` param is
+// cfg'd out, leaving `'a` elidable — so silence the lint that only fires there.
+#[allow(clippy::needless_lifetimes)]
+fn backend_window_mut<'a>(
+    canvas: &'a mut Option<sdl3::render::WindowCanvas>,
+    #[cfg(feature = "gpu-preview")] gpu: &'a mut Option<present_gpu::GpuPresenter>,
+) -> &'a mut sdl3::video::Window {
+    if let Some(c) = canvas.as_mut() {
+        return c.window_mut();
+    }
+    #[cfg(feature = "gpu-preview")]
+    if let Some(g) = gpu.as_mut() {
+        return g.window_mut();
+    }
+    panic!("a presentation backend is always active");
+}
+
+/// Shared (immutable) window accessor — see [`backend_window_mut`].
+#[cfg(feature = "sdl-frontend")]
+#[allow(clippy::needless_lifetimes)]
+fn backend_window<'a>(
+    canvas: &'a Option<sdl3::render::WindowCanvas>,
+    #[cfg(feature = "gpu-preview")] gpu: &'a Option<present_gpu::GpuPresenter>,
+) -> &'a sdl3::video::Window {
+    if let Some(c) = canvas.as_ref() {
+        return c.window();
+    }
+    #[cfg(feature = "gpu-preview")]
+    if let Some(g) = gpu.as_ref() {
+        return g.window();
+    }
+    panic!("a presentation backend is always active");
 }
 
 #[cfg(feature = "sdl-frontend")]
@@ -767,61 +808,107 @@ fn run(
     // let the device drain from t=0 while the queue is still empty during boot,
     // which under-runs exactly once on a cold start (the "first-play buzz").
     // Presentation backend: the framebuffer is rendered in software (for
-    // accuracy); this only selects which SDL3 render driver blits it, with a
-    // fallback chain (see the `present` module). `--backend=` / `cfg.backend`
-    // choose; the default lets SDL3 pick.
-    let backend_pref = present::RenderBackend::from_token(&cfg.backend);
-    let (mut canvas, active_driver) = present::build_canvas(
-        &video,
-        "5thPlanet",
-        FRAME_WIDTH as u32 * cfg.scale as u32,
-        FRAME_HEIGHT as u32 * cfg.scale as u32,
-        backend_pref,
-    );
-    eprintln!(
-        "render backend: {active_driver} (requested {})",
-        backend_pref.to_token()
-    );
-    // SDL_GPU capability probe — preview-only groundwork (the `gpu-preview`
-    // feature; absent from normal builds). Logs whether the host could drive the
-    // planned CRT-shader presenter; `_gpu_cap` is the verdict the presenter will
-    // consume once it's wired (ADR-0019).
+    // accuracy); this only selects how the finished frame reaches the window.
+    // Default = the SDL_Renderer streaming-texture blit (which render driver it
+    // picks is `--backend=` / `cfg.backend`, with a fallback chain — see the
+    // `present` module). With the `gpu-preview` feature, `--gpu=auto|on` instead
+    // presents via an SDL_GPU (Vulkan/SPIR-V) device. The two are **mutually
+    // exclusive**: an SDL_GPU device claims the window its swapchain owns, so the
+    // renderer canvas can't also own it. Exactly one backend is `Some`; window
+    // controls + presentation route through whichever is live (`backend_window*`
+    // and the present block).
     #[cfg(feature = "gpu-preview")]
-    let _gpu_cap = present_gpu::probe(present_gpu::GpuMode::from_token(&cfg.gpu));
-    set_window_icon(canvas.window_mut());
-    if cfg.fullscreen {
-        let _ = canvas.window_mut().set_fullscreen(true);
+    let mut gpu: Option<present_gpu::GpuPresenter> = {
+        let mode = present_gpu::GpuMode::from_token(&cfg.gpu);
+        if present_gpu::should_probe(mode) {
+            match present_gpu::GpuPresenter::new(
+                &video,
+                "5thPlanet",
+                FRAME_WIDTH as u32 * cfg.scale as u32,
+                FRAME_HEIGHT as u32 * cfg.scale as u32,
+                FRAME_WIDTH as u32,
+                FRAME_HEIGHT as u32,
+            ) {
+                Ok(p) => {
+                    eprintln!("presentation: SDL_GPU (Vulkan/SPIR-V blit)");
+                    Some(p)
+                }
+                Err(e) => {
+                    // `on` = the user forced it, so a failure warrants a louder line
+                    // than an `auto` host that simply has no GPU backend.
+                    let tag = if mode == present_gpu::GpuMode::On {
+                        "WARN"
+                    } else {
+                        "note"
+                    };
+                    eprintln!("SDL_GPU: {tag}: {e}; presenting via the SDL_Renderer blit");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    // The renderer backend runs whenever the GPU backend isn't active.
+    #[cfg(feature = "gpu-preview")]
+    let use_renderer = gpu.is_none();
+    #[cfg(not(feature = "gpu-preview"))]
+    let use_renderer = true;
+
+    let mut canvas: Option<sdl3::render::WindowCanvas> = None;
+    if use_renderer {
+        let backend_pref = present::RenderBackend::from_token(&cfg.backend);
+        let (c, active_driver) = present::build_canvas(
+            &video,
+            "5thPlanet",
+            FRAME_WIDTH as u32 * cfg.scale as u32,
+            FRAME_HEIGHT as u32 * cfg.scale as u32,
+            backend_pref,
+        );
+        eprintln!(
+            "render backend: {active_driver} (requested {})",
+            backend_pref.to_token()
+        );
+        canvas = Some(c);
     }
-    let creator = canvas.texture_creator();
+    // Renderer streaming texture (None in GPU mode). `creator` is owned (holds an
+    // Rc to the window context, not a borrow of the canvas), so `texture`
+    // borrowing it sits fine beside the canvas as a sibling local.
     // ABGR8888 is the SDL packed format whose in-memory byte order on
-    // little-endian hosts (which is everything that matters in 2026)
-    // is exactly [R, G, B, A] — what `Saturn::run_frame` writes.
-    // RGBA8888 has the opposite byte order on LE; we'd have to swap
-    // every pixel for no benefit.
-    let mut texture = creator
-        .create_texture_streaming(
+    // little-endian hosts (everything that matters in 2026) is exactly
+    // [R, G, B, A] — what `Saturn::run_frame` writes. RGBA8888 has the opposite
+    // byte order on LE; we'd have to swap every pixel for no benefit.
+    let creator = canvas.as_ref().map(|c| c.texture_creator());
+    let mut texture = creator.as_ref().map(|cr| {
+        cr.create_texture_streaming(
             PixelFormat::ABGR8888,
             FRAME_WIDTH as u32,
             FRAME_HEIGHT as u32,
         )
-        .expect("create streaming texture");
+        .expect("create streaming texture")
+    });
     // SDL3 defaults streaming textures to linear filtering (blurry on upscale);
     // honour the user's Sharp/Smooth choice (default Sharp = nearest). Re-applied
     // on every texture re-create (resolution change) + on the live OSD toggle.
+    // The GPU backend applies the same choice per-frame in `GpuPresenter::present`.
     let mut sharp = !present::is_smooth(&cfg.scaling);
-    texture.set_scale_mode(present::scale_mode(sharp));
-    // Aspect handling via SDL3 logical presentation: keep-ratio (letterbox to
-    // the 4:3 display aspect) or fit-screen (stretch). Re-applied on every
-    // resolution change + on the OSD Aspect toggle, in windowed and fullscreen
-    // alike (the Saturn picture is 4:3 with non-square pixels, so its native
-    // framebuffer ratio is not the display ratio — see present::logical_size).
+    if let Some(t) = texture.as_mut() {
+        t.set_scale_mode(present::scale_mode(sharp));
+    }
+    // Aspect handling: keep-ratio (letterbox to the 4:3 display aspect) or
+    // fit-screen (stretch). The renderer uses SDL logical presentation; the GPU
+    // backend computes the blit destination rect per frame. The Saturn picture is
+    // 4:3 with non-square pixels, so its native framebuffer ratio is not the
+    // display ratio — see present::logical_size.
     let mut keep_aspect = present::keeps_aspect(&cfg.aspect);
-    present::apply_aspect(
+    if let Some(c) = canvas.as_mut() {
+        present::apply_aspect(c, FRAME_WIDTH as u32, FRAME_HEIGHT as u32, keep_aspect);
+    }
+    set_window_icon(backend_window_mut(
         &mut canvas,
-        FRAME_WIDTH as u32,
-        FRAME_HEIGHT as u32,
-        keep_aspect,
-    );
+        #[cfg(feature = "gpu-preview")]
+        &mut gpu,
+    ));
     // Windowed mode is always aspect-locked to 4:3: we own the window, so snap it
     // to 4:3 (no bars, no distortion) rather than letterboxing inside a mismatched
     // window. The keep/stretch toggle then only takes effect in fullscreen (where
@@ -829,8 +916,19 @@ fn run(
     // resize-snap is skipped while fullscreen (its Resized events are the display
     // size, not a user request). See `present::window_aspect_lock`.
     let mut fullscreen = cfg.fullscreen;
-    if !fullscreen {
-        snap_window_to_4_3(&mut canvas);
+    if fullscreen {
+        let _ = backend_window_mut(
+            &mut canvas,
+            #[cfg(feature = "gpu-preview")]
+            &mut gpu,
+        )
+        .set_fullscreen(true);
+    } else {
+        snap_window_to_4_3(backend_window_mut(
+            &mut canvas,
+            #[cfg(feature = "gpu-preview")]
+            &mut gpu,
+        ));
     }
 
     let event_subsystem = sdl.event().expect("SDL event subsystem");
@@ -1427,7 +1525,11 @@ fn run(
                         win_event: WindowEvent::Resized(..),
                         ..
                     } if !fullscreen => {
-                        snap_window_to_4_3(&mut canvas);
+                        snap_window_to_4_3(backend_window_mut(
+                            &mut canvas,
+                            #[cfg(feature = "gpu-preview")]
+                            &mut gpu,
+                        ));
                     }
                     // An armed rebind owns the next keypress (before the OSD
                     // nav arm — the menu is open during capture). Esc cancels.
@@ -1636,8 +1738,14 @@ fn run(
                 let want_grab = mouse_capture_enabled && !osd_open.load(Ordering::Relaxed);
                 if want_grab != mouse_grabbed {
                     mouse_grabbed = want_grab;
-                    sdl.mouse()
-                        .set_relative_mouse_mode(canvas.window(), mouse_grabbed);
+                    sdl.mouse().set_relative_mouse_mode(
+                        backend_window(
+                            &canvas,
+                            #[cfg(feature = "gpu-preview")]
+                            &gpu,
+                        ),
+                        mouse_grabbed,
+                    );
                 }
                 let ms = events.mouse_state();
                 let mut buttons = 0u8;
@@ -1734,31 +1842,57 @@ fn run(
             while let Ok(m) = ui_rx.try_recv() {
                 match m {
                     UiMsg::Scale(sc) => {
-                        let _ = canvas.window_mut().set_size(
+                        let _ = backend_window_mut(
+                            &mut canvas,
+                            #[cfg(feature = "gpu-preview")]
+                            &mut gpu,
+                        )
+                        .set_size(
                             FRAME_WIDTH as u32 * sc as u32,
                             FRAME_HEIGHT as u32 * sc as u32,
                         );
                         // The scale grid is 320x224 (10:7); snap to the 4:3 lock.
                         if !fullscreen {
-                            snap_window_to_4_3(&mut canvas);
+                            snap_window_to_4_3(backend_window_mut(
+                                &mut canvas,
+                                #[cfg(feature = "gpu-preview")]
+                                &mut gpu,
+                            ));
                         }
                     }
                     UiMsg::Fullscreen(on) => {
-                        let _ = canvas.window_mut().set_fullscreen(on);
+                        let _ = backend_window_mut(
+                            &mut canvas,
+                            #[cfg(feature = "gpu-preview")]
+                            &mut gpu,
+                        )
+                        .set_fullscreen(on);
                         fullscreen = on;
                         // Returning to windowed re-asserts the 4:3 lock.
                         if !on {
-                            snap_window_to_4_3(&mut canvas);
+                            snap_window_to_4_3(backend_window_mut(
+                                &mut canvas,
+                                #[cfg(feature = "gpu-preview")]
+                                &mut gpu,
+                            ));
                         }
                     }
                     UiMsg::Scaling(on) => {
                         sharp = on;
-                        texture.set_scale_mode(present::scale_mode(sharp));
+                        // Renderer: set the texture filter now. GPU: read `sharp`
+                        // per-frame in present (its blit picks the filter).
+                        if let Some(t) = texture.as_mut() {
+                            t.set_scale_mode(present::scale_mode(sharp));
+                        }
                     }
                     UiMsg::Aspect(keep) => {
                         keep_aspect = keep;
-                        let (w, h) = cur_dims;
-                        present::apply_aspect(&mut canvas, w as u32, h as u32, keep_aspect);
+                        // Renderer: re-apply logical presentation. GPU: read
+                        // `keep_aspect` per-frame in present (its blit dst rect).
+                        if let Some(c) = canvas.as_mut() {
+                            let (w, h) = cur_dims;
+                            present::apply_aspect(c, w as u32, h as u32, keep_aspect);
+                        }
                     }
                     UiMsg::ArmRebind(b) => rebind_target = Some(b),
                     UiMsg::ResetKeymap => {
@@ -1791,28 +1925,46 @@ fn run(
                 let old = std::mem::replace(&mut framebuffer, buf);
                 let _ = recycle_tx.send(old);
                 if dims != cur_dims {
-                    texture = creator
-                        .create_texture_streaming(
-                            PixelFormat::ABGR8888,
-                            dims.0 as u32,
-                            dims.1 as u32,
-                        )
-                        .expect("recreate streaming texture");
-                    // A fresh texture resets to SDL3's linear default — re-apply.
-                    texture.set_scale_mode(present::scale_mode(sharp));
-                    // Logical size tracks the new frame dims (keeps the aspect).
-                    present::apply_aspect(&mut canvas, dims.0 as u32, dims.1 as u32, keep_aspect);
+                    // Renderer: recreate the streaming texture + re-apply filter and
+                    // aspect. GPU: `GpuPresenter::present` recreates its own frame
+                    // texture on a dims change, so nothing to do here.
+                    if let (Some(cr), Some(c)) = (creator.as_ref(), canvas.as_mut()) {
+                        let mut t = cr
+                            .create_texture_streaming(
+                                PixelFormat::ABGR8888,
+                                dims.0 as u32,
+                                dims.1 as u32,
+                            )
+                            .expect("recreate streaming texture");
+                        // A fresh texture resets to SDL3's linear default — re-apply.
+                        t.set_scale_mode(present::scale_mode(sharp));
+                        texture = Some(t);
+                        // Logical size tracks the new frame dims (keeps the aspect).
+                        present::apply_aspect(c, dims.0 as u32, dims.1 as u32, keep_aspect);
+                    }
                     cur_dims = dims;
                 }
             }
             let t = std::time::Instant::now();
-            let (w, _) = cur_dims;
-            texture
-                .update(None, &framebuffer, w * 4)
-                .expect("upload framebuffer");
-            canvas.clear();
-            canvas.copy(&texture, None, None).expect("blit to canvas");
-            canvas.present(); // audio-paced (see the burst loop / idle sleep)
+            let w = cur_dims.0;
+            if let (Some(c), Some(tex)) = (canvas.as_mut(), texture.as_mut()) {
+                tex.update(None, &framebuffer, w * 4)
+                    .expect("upload framebuffer");
+                c.clear();
+                c.copy(&*tex, None, None).expect("blit to canvas");
+                c.present(); // audio-paced (see the burst loop / idle sleep)
+            }
+            #[cfg(feature = "gpu-preview")]
+            if let Some(g) = gpu.as_mut() {
+                // GPU backend: upload + blit to the swapchain (OSD already
+                // composited into `framebuffer`). Reads `sharp`/`keep_aspect` live.
+                g.present(
+                    &framebuffer,
+                    (cur_dims.0 as u32, cur_dims.1 as u32),
+                    sharp,
+                    keep_aspect,
+                );
+            }
             pl_present += t.elapsed();
             pl_iters += 1;
             if perflog && pl_last.elapsed().as_secs() >= 1 && pl_iters > 0 {
