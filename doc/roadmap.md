@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1168 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -408,8 +408,10 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   The two gotchas were real and fixed: SDL_GPU's fixed SPIR-V descriptor sets
   (fragment sampler `set=2`, uniforms `set=3` — wrong set = silent black) and the
   swapchain Y-down flip (`crt.vert.glsl` flips V). Follow-ups: multi-pass
-  bloom/halation, barrel curvature, DXIL/MSL for non-Vulkan hosts, and loading
-  user `.spv`/preset shaders. SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
+  bloom/halation, barrel curvature, **DXIL/MSL for non-Vulkan hosts** (`build_crt`
+  is already format-agnostic via `ShaderKind::crt_shaders` — cross-compile the GLSL
+  with `SDL_shadercross`, commit the `.dxil`/`.msl` + a match arm; a non-Vulkan host
+  meanwhile falls back to the blit), and loading user `.spv`/preset shaders. SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
   multi-pass render targets, SPIR-V shaders — exposed by `sdl3::gpu`, *no new
   dependency* now that the frontend is on SDL3) makes a high-quality CRT filter
   feasible: Sony Trinitron-style aperture grille + scanline beam + bloom/halation
