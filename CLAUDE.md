@@ -204,7 +204,21 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      (`PROP_REQUIRE_HW_ACCEL`), so SDL refuses a Lavapipe/llvmpipe
                      host at creation → `Err` → renderer fallback (still
                      `unsafe`-free; sdl3-rs's `Setter`/`new_with_properties` wrap the
-                     FFI; verified with `VK_DRIVER_FILES=lavapipe`). **`run_selftest`**
+                     FFI; verified with `VK_DRIVER_FILES=lavapipe`). **CRT
+                     post-process (`ShaderMode::Crt`, `jupiter/src/shaders/`):**
+                     optionally `present` runs a fullscreen-triangle render pass
+                     (lazily-built `GraphicsPipeline` + `Sampler`) over the frame
+                     instead of the blit — a single-pass, flat CRT (scanlines +
+                     aperture-grille mask + gamma; v1, no curvature),
+                     project-authored GLSL → SPIR-V (`include_bytes!`). Selected via
+                     the `shader` config key / OSD **Settings → Graphics → Shaders**
+                     (None / CRT), wired like Aspect/Scaling
+                     (`OsdAction::SetShader` → `UiMsg` → `set_shader`). **Two
+                     load-bearing gotchas:** SDL_GPU's SPIR-V descriptor sets are
+                     fixed — fragment sampler `set=2`, uniforms `set=3` (wrong set =
+                     silent black) — and the swapchain is **Y-down** vs the
+                     framebuffer upload, so `crt.vert.glsl` flips V (else
+                     upside-down). Still presentation-only (ADR-0019). **`run_selftest`**
                      (`jupiter --gpu-selftest`) drives a `GpuPresenter` with an
                      animated test pattern — the standalone proof, sharing the exact
                      real present path. Cosmetic follow-up: `SDL_GetGPUDeviceDriver`

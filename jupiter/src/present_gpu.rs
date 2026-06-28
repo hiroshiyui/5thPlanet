@@ -19,6 +19,18 @@
 //! constructor *is* the capability check: `unsafe`-free because `Device::new`
 //! returns a `Result`, so a host with no usable backend simply yields `Err`.
 //!
+//! ## CRT post-process ([`ShaderMode::Crt`], `jupiter/src/shaders/`)
+//!
+//! Optionally the frame is run through a single-pass CRT shader (scanlines +
+//! aperture-grille mask + gamma; v1 is flat — no curvature) instead of the blit:
+//! [`set_shader`](GpuPresenter::set_shader) flips a flag and `present` runs a
+//! fullscreen-triangle render pass (lazily built `GraphicsPipeline` + `Sampler`)
+//! over the frame texture. The shader is project-authored GLSL compiled to SPIR-V
+//! and `include_bytes!`'d. **Gotchas baked in:** SDL_GPU's fixed SPIR-V descriptor
+//! sets (fragment sampler `set=2`, uniforms `set=3` — wrong set = silent black),
+//! and the swapchain's Y-down orientation (the vertex shader flips V, else the
+//! picture is upside-down). Still presentation-only — the frame is unchanged.
+//!
 //! ## [`run_selftest`] — the contained proof (`jupiter --gpu-selftest`)
 //!
 //! `--gpu-selftest` drives a `GpuPresenter` with an animated test pattern (no

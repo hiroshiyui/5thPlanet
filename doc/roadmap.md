@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1166 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1168 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -398,7 +398,18 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   - Archive contents: the `jupiter` binary (optionally `sdbg`), README,
     LICENSE (MIT) + bundled SDL3 zlib licence, the BIOS-not-included note,
     SHA256SUMS.
-- **CRT-shader presentation via SDL_GPU.** SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
+- **CRT-shader presentation via SDL_GPU.** **CRT shader v1: DONE** (`feat f635aea`,
+  user-verified on the SEGA/SATURN splashes + Doukyuusei) — a single-pass, **flat**
+  CRT (scanlines + aperture-grille mask + gamma; no curvature) on the SDL_GPU
+  backend, selectable via the OSD Shaders chooser (None / CRT) + the `shader`
+  config key. Project-authored GLSL → SPIR-V in `jupiter/src/shaders/` (committed
+  `.spv` + `include_bytes!`, so normal builds need no `glslc`); `present` runs a
+  fullscreen-triangle render pass over the frame when CRT is on, else the blit.
+  The two gotchas were real and fixed: SDL_GPU's fixed SPIR-V descriptor sets
+  (fragment sampler `set=2`, uniforms `set=3` — wrong set = silent black) and the
+  swapchain Y-down flip (`crt.vert.glsl` flips V). Follow-ups: multi-pass
+  bloom/halation, barrel curvature, DXIL/MSL for non-Vulkan hosts, and loading
+  user `.spv`/preset shaders. SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
   multi-pass render targets, SPIR-V shaders — exposed by `sdl3::gpu`, *no new
   dependency* now that the frontend is on SDL3) makes a high-quality CRT filter
   feasible: Sony Trinitron-style aperture grille + scanline beam + bloom/halation
