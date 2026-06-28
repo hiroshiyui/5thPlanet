@@ -73,11 +73,12 @@ pub struct Config {
     /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL3
     /// render driver presents the framebuffer; the CLI flag overrides this.
     pub backend: String,
-    /// SDL_GPU capability-probe mode, same vocabulary as `--gpu`: `off` (default
-    /// *until the CRT-shader presenter lands* — no probe, the only presentation
-    /// path is the `SDL_Renderer` blit), `auto`, or `on`. Groundwork for the
-    /// planned presenter (ADR-0019); the CLI flag overrides this. **Only consumed
-    /// in `gpu-presenter` builds** — inert (parsed/stored but unused) otherwise.
+    /// SDL_GPU presentation-backend mode, same vocabulary as `--gpu`: `off`
+    /// (default — present via the `SDL_Renderer` blit), `auto` (use the SDL_GPU
+    /// Vulkan presenter if a hardware device can be created, else fall back), or
+    /// `on` (use it; warn + fall back if it can't). Presentation-only (ADR-0019);
+    /// the CLI flag overrides this. **Only consumed in `gpu-presenter` builds** —
+    /// inert (parsed/stored but unused) otherwise.
     pub gpu: String,
     /// Texture scaling filter when upscaling the framebuffer to the window:
     /// `sharp` (default — nearest-neighbour, crisp pixel dots) or `smooth`

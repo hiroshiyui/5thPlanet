@@ -9,12 +9,13 @@
 //!
 //! ```text
 //!   0x0000_0000..0x000F_FFFF   BIOS ROM (mirrored)
-//!   0x0010_0000..0x0017_FFFF   SMPC / system registers (stub)
+//!   0x0010_0000..0x0017_FFFF   SMPC (System Manager & Peripheral Control)
 //!   0x0018_0000..0x001F_FFFF   Backup RAM (32 KiB, mirrored)
 //!   0x0020_0000..0x002F_FFFF   Low work RAM (1 MiB)
-//!   0x0040_0000..0x004F_FFFF   Sound area (stub)
-//!   0x0500_0000..0x05FF_FFFF   A-Bus + B-Bus (stub for M2; VDP1/2/SCSP
-//!                              get subdivided in M3+)
+//!   0x0040_0000..0x004F_FFFF   Sound area (still a stub register bank)
+//!   0x0500_0000..0x05FF_FFFF   A-Bus / B-Bus: VDP1, VDP2 and SCSP (sound RAM
+//!                              + regs) routed to their own sub-regions; the
+//!                              leftover A/B-bus space is an open/stub bank
 //!   0x0600_0000..0x06FF_FFFF   High work RAM (1 MiB)
 //!   everything else            open bus (0 on read, drop writes)
 //! ```
