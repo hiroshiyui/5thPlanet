@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1161 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1165 workspace-wide, 0 failures** (default features; +1 with `--features gpu-preview`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -418,9 +418,24 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   `sdl3::gpu::Device::new` for its shader format (SPIR-V/DXIL/MSL) and logs the
   verdict (`GpuCapability`), falling back to the `SDL_Renderer` blit; `unsafe`-free
   because `Device::new` returns a `Result` (the cheap pre-probes aren't safe-wrapped
-  in sdl3-rs 0.18.4). **Next — passthrough-shader spike (PLANNED, do later;
-  integrated selectable-backend approach):** evolve `gpu=auto/on` from probe-and-drop
-  into a real **SDL_GPU passthrough presenter** that uploads the software-composited
+  in sdl3-rs 0.18.4). **Vulkan presenter self-test: DONE** (`feat d108bb6`,
+  `gpu-preview` only) — `jupiter --gpu-selftest` is a contained one-shot that proves
+  SDL_GPU works as an alternative presenter to the `SDL_Renderer` blit **with no
+  shaders authored**: it claims a Vulkan (SPIR-V) device for a fresh window, then each
+  frame uploads an animated test pattern to an `R8G8B8A8` GPU texture (transfer buffer
+  + copy pass) and posts it to the swapchain via SDL's built-in `SDL_BlitGPUTexture`
+  (which carries its own blit shader), letterboxed to 4:3. This validates the riskiest
+  plumbing — `with_window` swapchain claim → `map`/`upload_to_gpu_texture` →
+  `wait_and_acquire_swapchain_texture` → `blit_texture` → `submit`, all `unsafe`-free
+  in sdl3-rs 0.18.4 — on real hardware (verified NVIDIA RTX 3060: device created, 311
+  frames presented, clean exit). The built-in blit sidesteps shader authoring entirely
+  for the proof; the full CRT presenter below still needs the authored multi-pass
+  shaders. The normal `SDL_Renderer` path is untouched (the self-test returns before
+  `run()`). New pure helpers + unit tests: `letterbox_rect` (4:3 centred-fit geometry)
+  and `fill_test_pattern` (animated opaque RGBA). **Next — passthrough-shader spike
+  (PLANNED, do later; integrated selectable-backend approach):** evolve `gpu=auto/on`
+  from probe-and-drop into a real **SDL_GPU passthrough presenter** that uploads the
+  software-composited
   frame to a GPU texture and draws it 1:1 to the swapchain — the foundation the CRT
   passes slot into; `SDL_Renderer` stays default/fallback. Design (exploration-
   verified, **zero `unsafe` blockers** — templates `sdl3` `examples/gpu-triangle.rs`

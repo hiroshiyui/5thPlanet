@@ -167,20 +167,32 @@ jupiter/           — SDL3 frontend binary (window + framebuffer upload +
                      hint + builds the canvas. The VDP stays software — this is
                      presentation only; no Vulkan (SDL3's 2D renderer has none).
                      The `present_gpu` module (`present_gpu.rs`, also sdl-free
-                     pure parts) is the **SDL_GPU capability probe** — groundwork
-                     for the planned CRT-shader presenter (ADR-0019), gated behind
-                     the **off-by-default `gpu-preview` build feature** (the probe
-                     is non-practical until a presenter consumes it, so it's hidden
-                     from normal builds; `cargo build --features gpu-preview` to
-                     work on it): the `gpu`
-                     config key / `--gpu` flag (`off` default / `auto` / `on`)
-                     attempts `sdl3::gpu::Device::new` for the host's shader
-                     format (SPIR-V/DXIL/MSL) and logs the verdict
-                     (`GpuCapability`), falling back to the `SDL_Renderer` blit.
-                     `unsafe`-free because `Device::new` returns a `Result` (the
-                     cheap pre-probes + the `SDL_GetGPUDeviceDriver` backend-name
-                     readback aren't safe-wrapped in sdl3-rs 0.18.4 — so it can't
-                     yet reject a software Vulkan; ADR-0019 follow-up).
+                     pure parts) is the **SDL_GPU capability probe + Vulkan
+                     presenter self-test** — groundwork for the planned
+                     CRT-shader presenter (ADR-0019), gated behind the
+                     **off-by-default `gpu-preview` build feature** (non-practical
+                     until a full presenter consumes them, so hidden from normal
+                     builds; `cargo build --features gpu-preview` to work on it).
+                     The **probe**: the `gpu` config key / `--gpu` flag (`off`
+                     default / `auto` / `on`) attempts `sdl3::gpu::Device::new`
+                     for the host's shader format (SPIR-V/DXIL/MSL) and logs the
+                     verdict (`GpuCapability`), falling back to the `SDL_Renderer`
+                     blit. `unsafe`-free because `Device::new` returns a `Result`
+                     (the cheap pre-probes + the `SDL_GetGPUDeviceDriver`
+                     backend-name readback aren't safe-wrapped in sdl3-rs 0.18.4 —
+                     so it can't yet reject a software Vulkan; ADR-0019 follow-up).
+                     The **self-test** (`run_selftest`, `jupiter --gpu-selftest`)
+                     is a contained one-shot proving SDL_GPU works as an
+                     *alternative* presenter to the `SDL_Renderer` blit **with no
+                     shaders authored**: it claims a Vulkan (SPIR-V) device for a
+                     fresh window and each frame uploads an animated test pattern
+                     to an `R8G8B8A8` GPU texture (transfer buffer + copy pass),
+                     then posts it to the swapchain via SDL's built-in
+                     `SDL_BlitGPUTexture` (which carries its own blit shader),
+                     letterboxed to 4:3 (`letterbox_rect`). It validates the
+                     upload → blit → present pipeline (all safe-wrapped in
+                     sdl3-rs 0.18.4) on real hardware; the normal `SDL_Renderer`
+                     path is untouched (the self-test returns before `run()`).
 doc/roadmap.md     — Milestone tracker. Update task status as work lands.
 bios/              — Saturn BIOS images. Gitignored; see bios/README.md.
 ```
