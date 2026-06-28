@@ -246,7 +246,16 @@ fn main() -> ExitCode {
     let mut backend_override: Option<String> = None;
     #[cfg(feature = "gpu-preview")]
     let mut gpu_override: Option<String> = None;
+    #[cfg(feature = "gpu-preview")]
+    let mut gpu_selftest = false;
     for arg in env::args().skip(1) {
+        // `--gpu-selftest` runs the contained SDL_GPU Vulkan presenter proof and
+        // exits (preview-only; see `present_gpu::run_selftest`).
+        #[cfg(feature = "gpu-preview")]
+        if arg == "--gpu-selftest" {
+            gpu_selftest = true;
+            continue;
+        }
         // `--gpu[=off|auto|on]` is preview-only groundwork (off by default);
         // recognised only in `gpu-preview` builds — otherwise it falls through as
         // an unknown argument.
@@ -278,6 +287,13 @@ fn main() -> ExitCode {
         return run_doctor(positionals.get(1).cloned(), positionals.get(2).cloned());
     }
 
+    // `jupiter --gpu-selftest` — prove the SDL_GPU Vulkan presenter works (a
+    // contained one-shot; the normal SDL_Renderer path is untouched) and exit.
+    #[cfg(feature = "gpu-preview")]
+    if gpu_selftest {
+        return present_gpu::run_selftest();
+    }
+
     let bios_path = match positionals.first() {
         Some(p) => p.clone(),
         None => {
@@ -307,6 +323,12 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "                         groundwork for the planned CRT-shader presenter)"
+                );
+                eprintln!(
+                    "  --gpu-selftest         present an animated test pattern via the SDL_GPU"
+                );
+                eprintln!(
+                    "                         Vulkan blit and exit (proves the alternative presenter)"
                 );
             }
             eprintln!();
