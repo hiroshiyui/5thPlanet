@@ -8,7 +8,7 @@ referenced below. Commercial titles that run are listed in
 [`doc/compatible-game-titles.md`](compatible-game-titles.md); boot-blocker
 investigations — currently all resolved, with new blockers added as they
 surface — live in
-[`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
+[`doc/boot-blocker-investigations.md`](boot-blocker-investigations.md).
 
 Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).

@@ -285,5 +285,5 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 ---
 
 See also: CLAUDE.md (Developer tools + the per-crate gotchas), ADR-0017 (the
-behavioral-oracle policy), [`wip-compatibility-titles.md`](wip-compatibility-titles.md),
+behavioral-oracle policy), [`boot-blocker-investigations.md`](boot-blocker-investigations.md),
 and [`compatible-game-titles.md`](compatible-game-titles.md).

@@ -3,7 +3,7 @@
 Commercial SEGA Saturn titles brought up on **5thPlanet**, with their current
 playability. This is the "what runs" list; boot-blocker investigations
 (currently all resolved) live in
-[`wip-compatibility-titles.md`](wip-compatibility-titles.md), the milestone view
+[`boot-blocker-investigations.md`](boot-blocker-investigations.md), the milestone view
 is in [`roadmap.md`](roadmap.md), and captures are in
 [`screenshots/`](screenshots/README.md).
 
@@ -46,7 +46,7 @@ software-decoded-movie → VDP2 path.
   DMA-end interrupts must not be forwarded while the master SH-2 is executing a
   delay slot. Full chain in the commit messages, the
   [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study, and the
-  closed SAN5 entry in [`wip-compatibility-titles.md`](wip-compatibility-titles.md).
+  closed SAN5 entry in [`boot-blocker-investigations.md`](boot-blocker-investigations.md).
 - **Panzer Dragoon Zwei** is the second Sega FILM / Cinepak title, and the first
   to expose two distinct gaps that the other titles never exercised: a CD **Seek
   (0x11)** command decoded on the MAME track/FAD model instead of Mednafen's
@@ -66,9 +66,10 @@ software-decoded-movie → VDP2 path.
 
 ## Under investigation
 
-See [`wip-compatibility-titles.md`](wip-compatibility-titles.md) — e.g. *Panzer
-Dragoon Zwei* (paused: enters the FILM movie player after the license screens,
-then returns to the BIOS).
+No titles are currently under active investigation. Resolved boot-blocker case
+studies (e.g. *Sangokushi V*, *Panzer Dragoon Zwei*) are kept as resume points /
+methodology references in
+[`boot-blocker-investigations.md`](boot-blocker-investigations.md).
 
 ---
 
