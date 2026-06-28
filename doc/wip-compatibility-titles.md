@@ -1,8 +1,10 @@
-# WIP compatibility — titles under investigation
+# Compatibility — boot-blocker investigations
 
-A working tracker for commercial titles that **do not yet boot/run correctly**
-in 5thPlanet, with the symptoms, findings, evidence, and ruled-out hypotheses
-gathered so far. Each entry is a resume point, not a closed case.
+The working tracker for commercial titles whose boot/run had to be investigated:
+symptoms, findings, evidence, and ruled-out hypotheses. It holds **both** active
+blockers and **resolved** cases retained as resume points / methodology
+references; new blockers get added here as they surface. **Every entry below is
+currently a ✅ resolved case — there are no titles actively under investigation.**
 
 For the fully-working titles see
 [`compatible-game-titles.md`](compatible-game-titles.md): *Virtua Fighter 2*,
@@ -18,9 +20,6 @@ FILM files) was the first title to drive it through to gameplay, and *Panzer
 Dragoon Zwei* is the second. (VF2's opening movie is **Duck TrueMotion**, a
 different codec; all of these decoders are the games' own SH-2 software run by
 LLE — no decoder to implement either way.)
-
-There are currently **no titles actively under investigation** — the entries
-below are resolved cases retained as resume points / methodology references.
 
 ---
 

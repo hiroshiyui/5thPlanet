@@ -1,8 +1,8 @@
 # Compatible game titles
 
 Commercial SEGA Saturn titles brought up on **5thPlanet**, with their current
-playability. This is the "what runs" list; titles still under active
-investigation live in
+playability. This is the "what runs" list; boot-blocker investigations
+(currently all resolved) live in
 [`wip-compatibility-titles.md`](wip-compatibility-titles.md), the milestone view
 is in [`roadmap.md`](roadmap.md), and captures are in
 [`screenshots/`](screenshots/README.md).

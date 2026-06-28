@@ -5,8 +5,9 @@ the foundation is solid before the next chip is added. This file is a status
 tracker; blow-by-blow investigation history lives in the git log,
 `doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
 referenced below. Commercial titles that run are listed in
-[`doc/compatible-game-titles.md`](compatible-game-titles.md); the ones that don't
-yet boot/run correctly (the active boot-blocker investigations) are tracked in
+[`doc/compatible-game-titles.md`](compatible-game-titles.md); boot-blocker
+investigations — currently all resolved, with new blockers added as they
+surface — live in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
 Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
