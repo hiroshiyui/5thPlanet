@@ -77,7 +77,7 @@ pub struct Config {
     /// *until the CRT-shader presenter lands* — no probe, the only presentation
     /// path is the `SDL_Renderer` blit), `auto`, or `on`. Groundwork for the
     /// planned presenter (ADR-0019); the CLI flag overrides this. **Only consumed
-    /// in `gpu-preview` builds** — inert (parsed/stored but unused) otherwise.
+    /// in `gpu-presenter` builds** — inert (parsed/stored but unused) otherwise.
     pub gpu: String,
     /// Texture scaling filter when upscaling the framebuffer to the window:
     /// `sharp` (default — nearest-neighbour, crisp pixel dots) or `smooth`
@@ -93,7 +93,7 @@ pub struct Config {
     pub aspect: String,
     /// Built-in presentation shader, same vocabulary as the OSD Shaders chooser:
     /// `none` (default — the plain blit) or `crt` (the single-pass CRT
-    /// post-process). **Only honoured by the SDL_GPU backend in `gpu-preview`
+    /// post-process). **Only honoured by the SDL_GPU backend in `gpu-presenter`
     /// builds** (the `SDL_Renderer` blit has no shader path); parsed/stored
     /// regardless so the config round-trips. The OSD Graphics → Shaders screen
     /// toggles it live.

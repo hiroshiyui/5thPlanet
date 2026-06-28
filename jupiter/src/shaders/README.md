@@ -1,7 +1,7 @@
 # Built-in presentation shaders
 
 The project's own CRT post-process shader for the SDL_GPU presenter
-(`present_gpu::GpuPresenter`, `gpu-preview` feature). Unlike the repo-root
+(`present_gpu::GpuPresenter`, `gpu-presenter` feature). Unlike the repo-root
 `shaders/` directory (gitignored — third-party preset drop-zone), these are
 **tracked, project-authored (MIT), and committed alongside their compiled
 SPIR-V**, so a normal build needs no shader toolchain (`include_bytes!` the

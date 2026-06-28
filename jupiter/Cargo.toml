@@ -30,9 +30,9 @@ sdl-frontend = ["dep:sdl3", "dep:png"]
 physical-disc = ["physdisc/libcdio"]
 # Not-yet-functional SDL_GPU / CRT-shader presenter groundwork — the `--gpu`
 # probe + the OSD "Shaders…" stub chooser. OFF by default so normal builds don't
-# surface these non-practical preview features; build with `--features gpu-preview`
+# surface these non-practical preview features; build with `--features gpu-presenter`
 # to work on them. Implies `sdl-frontend` (the probe needs SDL3). See ADR-0019.
-gpu-preview = ["sdl-frontend"]
+gpu-presenter = ["sdl-frontend"]
 
 [lints]
 workspace = true

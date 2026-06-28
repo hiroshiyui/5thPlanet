@@ -207,8 +207,8 @@ pub enum OsdAction {
     RunDiagnostics,
     /// Select the built-in presentation shader: `true` = the CRT post-process,
     /// `false` = the plain blit. The SDL_GPU backend applies it live + persists it.
-    /// Preview-only (the `gpu-preview` Shaders chooser).
-    #[cfg(feature = "gpu-preview")]
+    /// Preview-only (the `gpu-presenter` Shaders chooser).
+    #[cfg(feature = "gpu-presenter")]
     SetShader(bool),
 }
 
@@ -247,8 +247,8 @@ pub struct OsdCtx {
     /// Current graphics-presentation backend — the Graphics screen cycles it.
     pub backend: OsdBackend,
     /// Whether the CRT shader is selected — the Shaders screen marks it
-    /// (`gpu-preview` only; `false`/None otherwise).
-    #[cfg(feature = "gpu-preview")]
+    /// (`gpu-presenter` only; `false`/None otherwise).
+    #[cfg(feature = "gpu-presenter")]
     pub shader_crt: bool,
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
@@ -287,8 +287,8 @@ enum Screen {
     /// Stub chooser for the (planned) SDL_GPU CRT-shader presenter — see
     /// ADR-0019 + `shaders/README.md`. Currently a read-only placeholder; it
     /// will list the presets from `shaders/` once the presenter lands.
-    /// Preview-only groundwork (the `gpu-preview` feature; absent by default).
-    #[cfg(feature = "gpu-preview")]
+    /// Preview-only groundwork (the `gpu-presenter` feature; absent by default).
+    #[cfg(feature = "gpu-presenter")]
     Shaders,
     Controller,
     Region,
@@ -503,13 +503,13 @@ impl Osd {
                         Select::Emit(OsdAction::ToggleAspect),
                     ),
                 ];
-                // The Shaders chooser is preview-only groundwork (gpu-preview).
-                #[cfg(feature = "gpu-preview")]
+                // The Shaders chooser is preview-only groundwork (gpu-presenter).
+                #[cfg(feature = "gpu-presenter")]
                 v.push(mk("Shaders...", Select::Push(Screen::Shaders)));
                 v.push(mk("Back", Select::Close));
                 v
             }
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             Screen::Shaders => {
                 // CRT post-process chooser for the SDL_GPU backend (ADR-0019;
                 // `jupiter/src/shaders/`). The active option is marked '*'. Only the
@@ -695,7 +695,7 @@ impl Osd {
             Screen::Slots { saving: false } => "Load State",
             Screen::Settings => "Settings",
             Screen::Graphics => "Graphics",
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             Screen::Shaders => "Shaders",
             Screen::Controller => "Controller",
             Screen::Region => "Region",
@@ -937,7 +937,7 @@ mod tests {
             cart: OsdCart::None,
             mouse: OsdMouse::Off,
             backend: OsdBackend::Auto,
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             shader_crt: false,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::Quit));
     }
 
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     #[test]
     fn graphics_shaders_chooser_offers_none_and_crt() {
         let mut osd = Osd::new();

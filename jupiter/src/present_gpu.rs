@@ -3,11 +3,13 @@
 //!
 //! The Saturn picture is always composited in software (the accuracy-first core);
 //! this module only posts the finished frame to the window via SDL_GPU instead of
-//! the 2D renderer, so accuracy is untouched. It's **opt-in** and gated behind the
-//! off-by-default `gpu-preview` feature (the future CRT passes aren't written yet):
-//! the `gpu` config key / `--gpu` flag (`off` default / `auto` / `on`) selects it.
+//! the 2D renderer, so accuracy is untouched. It's **opt-in** — gated behind the
+//! off-by-default `gpu-presenter` build feature (it's not the default presentation
+//! path and is still maturing: one CRT shader, SPIR-V/Vulkan only, no backend-name
+//! readback) — and selected at runtime via the `gpu` config key / `--gpu` flag
+//! (`off` default / `auto` / `on`).
 //!
-//! ## [`GpuPresenter`] — the real backend (no shaders authored)
+//! ## [`GpuPresenter`] — the SDL_GPU backend
 //!
 //! `GpuPresenter` owns its own window + a Vulkan (SPIR-V) `Device` and presents a
 //! frame each call: upload the `[R, G, B, A]` framebuffer to a GPU texture, then
@@ -103,7 +105,7 @@ pub fn should_probe(mode: GpuMode) -> bool {
 /// Which built-in presentation shader the SDL_GPU backend applies. Parsed from the
 /// `shader` config key / the OSD Shaders chooser. Only the SDL_GPU backend honours
 /// it (the `SDL_Renderer` blit has no shader path); it's parsed regardless so the
-/// config round-trips in any build. Pure — unit-testable without `gpu-preview`.
+/// config round-trips in any build. Pure — unit-testable without `gpu-presenter`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaderMode {
     /// No post-process — the plain blit (default).
@@ -196,7 +198,7 @@ impl ShaderKind {
     /// These are SDL's stable ABI strings — the `&str` value of sdl3-sys's
     /// `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_*_BOOLEAN` (read via `&str` so no
     /// `unsafe` CStr conversion of the raw `c_char` constant is needed). Pure, so
-    /// it's unit-testable without the `gpu-preview` feature.
+    /// it's unit-testable without the `gpu-presenter` feature.
     fn create_prop_key(self) -> &'static str {
         match self {
             ShaderKind::Spirv => "SDL.gpu.device.create.shaders.spirv",
@@ -213,14 +215,14 @@ impl ShaderKind {
 /// creation fail when only software Vulkan exists. SDL's stable ABI string (the
 /// `&str` value of `SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN`);
 /// it only affects the Vulkan backend (ignored by D3D12/Metal). See ADR-0019.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const PROP_REQUIRE_HW_ACCEL: &str = "SDL.gpu.device.create.vulkan.requirehardwareacceleration";
 
 /// Saturn lo-res frame shape the self-test uploads (mirrors the real
 /// framebuffer's 320×224 native layout and `[R, G, B, A]` byte order).
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const SELFTEST_W: usize = 320;
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const SELFTEST_H: usize = 224;
 
 /// Fill an `w × h` RGBA buffer with an animated SMPTE-style colour-bar pattern
@@ -228,7 +230,7 @@ const SELFTEST_H: usize = 224;
 /// presenter shows *live* frames (not a frozen blit), and the bars prove the
 /// pixel byte order is correct end-to-end. **Pure** so it's testable without a
 /// GPU; the bytes are laid out `[R, G, B, A]` to match `TextureFormat::R8g8b8a8`.
-#[cfg(any(feature = "gpu-preview", test))]
+#[cfg(any(feature = "gpu-presenter", test))]
 fn fill_test_pattern(buf: &mut [u8], w: usize, h: usize, frame: u32) {
     // SMPTE-ish bars: white, yellow, cyan, green, magenta, red, blue, near-black.
     const BARS: [(u8, u8, u8); 8] = [
@@ -259,7 +261,7 @@ fn fill_test_pattern(buf: &mut [u8], w: usize, h: usize, frame: u32) {
     }
 }
 
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 use sdl3::gpu::{
     BlitInfo, ColorTargetDescription, ColorTargetInfo, Device, Filter, GraphicsPipeline,
     GraphicsPipelineTargetInfo, LoadOp, PrimitiveType, Sampler, SamplerAddressMode,
@@ -267,15 +269,15 @@ use sdl3::gpu::{
     TextureFormat, TextureRegion, TextureSamplerBinding, TextureTransferInfo, TextureType,
     TextureUsage, TransferBuffer, TransferBufferUsage, VertexInputState, Viewport,
 };
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 use sdl3::properties::{Properties, Setter};
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 use sdl3::video::Window;
 
 /// CRT post-process parameters pushed to the fragment shader's `set=3, binding=0`
 /// uniform (`crt.frag.glsl`'s `Crt` block). `#[repr(C)]` + the trailing pad match
 /// the std140 layout: two `vec2` (16 bytes) then four `float` (16 bytes).
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CrtParams {
@@ -291,21 +293,21 @@ struct CrtParams {
 }
 
 /// Default CRT look (v1): a subtle, flat scanline + aperture-grille pass.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const CRT_SCANLINE: f32 = 0.3;
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const CRT_MASK: f32 = 0.3;
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const CRT_GAMMA: f32 = 1.1;
 
 /// The compiled SPIR-V for the built-in CRT shader (committed beside the GLSL;
 /// see `shaders/README.md`). `include_bytes!` so a normal build needs no `glslc`.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const CRT_VERT_SPV: &[u8] = include_bytes!("shaders/crt.vert.spv");
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 const CRT_FRAG_SPV: &[u8] = include_bytes!("shaders/crt.frag.spv");
 
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 impl ShaderKind {
     /// The compiled `(vertex, fragment)` CRT bytecode + its `ShaderFormat` for this
     /// host's SDL_GPU backend — or `None` if the shader isn't compiled for this
@@ -326,7 +328,7 @@ impl ShaderKind {
 /// The lazily-built CRT render-pass resources: the fullscreen-triangle graphics
 /// pipeline (vertex + fragment shaders baked in) and the frame sampler. Built on
 /// first CRT use so the plain-blit path keeps zero extra cost.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 struct CrtState {
     pipeline: GraphicsPipeline,
     sampler: Sampler,
@@ -344,7 +346,7 @@ struct CrtState {
 /// device must be destroyed *before* its claimed window, so `device` precedes
 /// `window`. The GPU resources (`frame_tex`/`transfer`) hold only a `WeakDevice`,
 /// so their release is safe in any order.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 pub struct GpuPresenter {
     /// SAMPLER texture the framebuffer uploads into; the blit/CRT source.
     /// Recreated when the active frame resolution changes.
@@ -367,7 +369,7 @@ pub struct GpuPresenter {
     frame_dims: (u32, u32),
 }
 
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 impl GpuPresenter {
     /// Build the SAMPLER frame texture + matching UPLOAD transfer buffer for a
     /// `w × h` frame. Split out so `new` and the resolution-change path share it.
@@ -680,7 +682,7 @@ impl GpuPresenter {
     }
 }
 
-/// **SDL_GPU Vulkan presenter self-test** (`jupiter --gpu-selftest`, `gpu-preview`
+/// **SDL_GPU Vulkan presenter self-test** (`jupiter --gpu-selftest`, `gpu-presenter`
 /// builds only). A contained proof that SDL_GPU works as an *alternative*
 /// presenter to the `SDL_Renderer` blit, with **no shaders authored**: it drives a
 /// [`GpuPresenter`] (the exact path the real `--gpu` backend uses), feeding it an
@@ -688,7 +690,7 @@ impl GpuPresenter {
 ///
 /// Returns `FAILURE` if no GPU device can be created (the host has no Vulkan
 /// backend, or only a rejected one), `SUCCESS` after a clean present run.
-#[cfg(feature = "gpu-preview")]
+#[cfg(feature = "gpu-presenter")]
 pub fn run_selftest() -> std::process::ExitCode {
     use sdl3::event::Event;
     use sdl3::keyboard::Keycode;
@@ -825,7 +827,7 @@ mod tests {
         assert_eq!(ShaderKind::for_target(), map_os(std::env::consts::OS));
     }
 
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     #[test]
     fn crt_shaders_ship_for_spirv_and_are_pending_for_dxil_msl() {
         // SPIR-V (Vulkan) is shipped; DXIL/MSL are drop-in follow-ups, so they

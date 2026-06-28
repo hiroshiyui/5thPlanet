@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 yet boot/run correctly (the active boot-blocker investigations) are tracked in
 [`doc/wip-compatibility-titles.md`](wip-compatibility-titles.md).
 
-Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-preview`), ~85% line coverage
+Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -423,9 +423,9 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   GLSL → SPIR-V (precompiled, or `SDL_shadercross`; DXIL/MSL for non-Vulkan
   hosts). De-risk with a passthrough-shader spike first; the `--backend`
   render-driver selector is the groundwork. **Capability detection: DONE** (behind
-  the off-by-default **`gpu-preview`** build feature — the GPU code + the OSD
+  the off-by-default **`gpu-presenter`** build feature — the GPU code + the OSD
   "Shaders…" stub are preview-only until the CRT passes exist, so they're hidden
-  from normal builds; `cargo build --features gpu-preview` to work on them)
+  from normal builds; `cargo build --features gpu-presenter` to work on them)
   (`jupiter/src/present_gpu.rs`) — the `gpu` config key / `--gpu` flag
   (`off` default / `auto` / `on`) attempts `sdl3::gpu::Device::new` for the host's
   shader format (SPIR-V/DXIL/MSL), falling back to the `SDL_Renderer` blit;
@@ -433,7 +433,7 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   its `GpuCapability` verdict were later folded into the presenter's constructor —
   building a `GpuPresenter` *is* the capability check.) **Vulkan presenter
   self-test: DONE** (`feat d108bb6`,
-  `gpu-preview` only) — `jupiter --gpu-selftest` is a contained one-shot that proves
+  `gpu-presenter` only) — `jupiter --gpu-selftest` is a contained one-shot that proves
   SDL_GPU works as an alternative presenter to the `SDL_Renderer` blit **with no
   shaders authored**: it claims a Vulkan (SPIR-V) device for a fresh window, then each
   frame uploads an animated test pattern to an `R8G8B8A8` GPU texture (transfer buffer
@@ -447,7 +447,7 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   shaders. The normal `SDL_Renderer` path is untouched (the self-test returns before
   `run()`). New pure helpers + unit tests: `letterbox_rect` (4:3 centred-fit geometry)
   and `fill_test_pattern` (animated opaque RGBA). **Alternative presenter backend: DONE**
-  (`feat e7c119f`, user-verified on Doukyuusei + VF2; **stays behind `gpu-preview`**)
+  (`feat e7c119f`, user-verified on Doukyuusei + VF2; **stays behind `gpu-presenter`**)
   -- `gpu=auto/on` now presents the **live emulator** via `GpuPresenter` (a
   Vulkan/SPIR-V `Device` + a SAMPLER frame texture + an UPLOAD transfer buffer)
   instead of the `SDL_Renderer` canvas: per frame it maps the transfer buffer,

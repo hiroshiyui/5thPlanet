@@ -49,7 +49,7 @@ backend = "auto"
 # (Vulkan/SPIR-V) device instead of the default SDL_Renderer blit. The GPU is
 # presentation-only — the picture stays bit-identical (ADR-0019); this is the
 # groundwork the planned CRT-shader presenter slots into. **Only active in
-# `gpu-preview` builds** (`cargo build --features gpu-preview`); in a normal build
+# `gpu-presenter` builds** (`cargo build --features gpu-presenter`); in a normal build
 # this key + the `--gpu` flag are inert. Valid values:
 #   "off"   present via SDL_Renderer (default)
 #   "auto"  present via SDL_GPU if a device can be created, else fall back quietly
@@ -75,7 +75,7 @@ scaling = "sharp"
 aspect = "keep"
 
 # Built-in presentation shader. **Only applied by the SDL_GPU backend** (needs a
-# `gpu-preview` build with `--gpu=on|auto`); under the default SDL_Renderer blit
+# `gpu-presenter` build with `--gpu=on|auto`); under the default SDL_Renderer blit
 # it is parsed but inert. Presentation-only — the picture stays bit-identical
 # (ADR-0019). Toggle live in the OSD (Settings -> Graphics -> Shaders).
 #   "none"     no post-process (default)

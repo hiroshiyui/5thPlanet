@@ -29,8 +29,8 @@ mod osd;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod present;
 // The SDL_GPU presentation backend (`--gpu`); compiled only with the
-// `gpu-preview` feature, or in tests for its pure unit tests.
-#[cfg(any(feature = "gpu-preview", test))]
+// `gpu-presenter` feature, or in tests for its pure unit tests.
+#[cfg(any(feature = "gpu-presenter", test))]
 mod present_gpu;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod render_pipe;
@@ -244,22 +244,22 @@ fn main() -> ExitCode {
     let mut cart_spec: Option<String> = None;
     let mut mouse_port: Option<u8> = None;
     let mut backend_override: Option<String> = None;
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     let mut gpu_override: Option<String> = None;
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     let mut gpu_selftest = false;
     for arg in env::args().skip(1) {
         // `--gpu-selftest` runs the contained SDL_GPU Vulkan presenter proof and
         // exits (preview-only; see `present_gpu::run_selftest`).
-        #[cfg(feature = "gpu-preview")]
+        #[cfg(feature = "gpu-presenter")]
         if arg == "--gpu-selftest" {
             gpu_selftest = true;
             continue;
         }
         // `--gpu[=off|auto|on]` is preview-only groundwork (off by default);
-        // recognised only in `gpu-preview` builds — otherwise it falls through as
+        // recognised only in `gpu-presenter` builds — otherwise it falls through as
         // an unknown argument.
-        #[cfg(feature = "gpu-preview")]
+        #[cfg(feature = "gpu-presenter")]
         if arg == "--gpu" || arg.starts_with("--gpu=") {
             gpu_override = Some(
                 arg.strip_prefix("--gpu=")
@@ -289,7 +289,7 @@ fn main() -> ExitCode {
 
     // `jupiter --gpu-selftest` — prove the SDL_GPU Vulkan presenter works (a
     // contained one-shot; the normal SDL_Renderer path is untouched) and exit.
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     if gpu_selftest {
         return present_gpu::run_selftest();
     }
@@ -316,7 +316,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "                         opengles | direct3d11 | direct3d12 | metal | software"
             );
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             {
                 eprintln!(
                     "  --gpu[=off|auto|on]    present via SDL_GPU (Vulkan) instead of SDL_Renderer"
@@ -368,8 +368,8 @@ fn main() -> ExitCode {
         cfg.backend = b;
     }
     // `--gpu[=…]` overrides the config's SDL_GPU backend mode (CLI > file);
-    // preview-only (the `gpu-preview` feature).
-    #[cfg(feature = "gpu-preview")]
+    // preview-only (the `gpu-presenter` feature).
+    #[cfg(feature = "gpu-presenter")]
     if let Some(g) = gpu_override {
         cfg.gpu = g;
     }
@@ -639,20 +639,20 @@ fn snap_window_to_4_3(window: &mut sdl3::video::Window) {
 /// The live presentation backend's window, for the shared window controls (icon,
 /// size, fullscreen, mouse grab). Exactly one of the renderer canvas / GPU
 /// presenter is active, so one of the `Option`s is always `Some`. The `gpu`
-/// parameter is `gpu-preview`-only; without that feature the renderer canvas is
+/// parameter is `gpu-presenter`-only; without that feature the renderer canvas is
 /// the only backend.
 #[cfg(feature = "sdl-frontend")]
-// The `'a` ties both args to the result; without `gpu-preview` the `gpu` param is
+// The `'a` ties both args to the result; without `gpu-presenter` the `gpu` param is
 // cfg'd out, leaving `'a` elidable — so silence the lint that only fires there.
 #[allow(clippy::needless_lifetimes)]
 fn backend_window_mut<'a>(
     canvas: &'a mut Option<sdl3::render::WindowCanvas>,
-    #[cfg(feature = "gpu-preview")] gpu: &'a mut Option<present_gpu::GpuPresenter>,
+    #[cfg(feature = "gpu-presenter")] gpu: &'a mut Option<present_gpu::GpuPresenter>,
 ) -> &'a mut sdl3::video::Window {
     if let Some(c) = canvas.as_mut() {
         return c.window_mut();
     }
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     if let Some(g) = gpu.as_mut() {
         return g.window_mut();
     }
@@ -664,12 +664,12 @@ fn backend_window_mut<'a>(
 #[allow(clippy::needless_lifetimes)]
 fn backend_window<'a>(
     canvas: &'a Option<sdl3::render::WindowCanvas>,
-    #[cfg(feature = "gpu-preview")] gpu: &'a Option<present_gpu::GpuPresenter>,
+    #[cfg(feature = "gpu-presenter")] gpu: &'a Option<present_gpu::GpuPresenter>,
 ) -> &'a sdl3::video::Window {
     if let Some(c) = canvas.as_ref() {
         return c.window();
     }
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     if let Some(g) = gpu.as_ref() {
         return g.window();
     }
@@ -732,7 +732,7 @@ fn run(
         region: region_code_to_osd(region),
         cart: cartridge_to_osd(&cart),
         backend: token_to_osd_backend(&cfg.backend),
-        #[cfg(feature = "gpu-preview")]
+        #[cfg(feature = "gpu-presenter")]
         shader_crt: present_gpu::ShaderMode::from_token(&cfg.shader).is_crt(),
     };
     saturn.insert_cartridge(cart);
@@ -813,13 +813,13 @@ fn run(
     // accuracy); this only selects how the finished frame reaches the window.
     // Default = the SDL_Renderer streaming-texture blit (which render driver it
     // picks is `--backend=` / `cfg.backend`, with a fallback chain — see the
-    // `present` module). With the `gpu-preview` feature, `--gpu=auto|on` instead
+    // `present` module). With the `gpu-presenter` feature, `--gpu=auto|on` instead
     // presents via an SDL_GPU (Vulkan/SPIR-V) device. The two are **mutually
     // exclusive**: an SDL_GPU device claims the window its swapchain owns, so the
     // renderer canvas can't also own it. Exactly one backend is `Some`; window
     // controls + presentation route through whichever is live (`backend_window*`
     // and the present block).
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     let mut gpu: Option<present_gpu::GpuPresenter> = {
         let mode = present_gpu::GpuMode::from_token(&cfg.gpu);
         if present_gpu::should_probe(mode) {
@@ -854,9 +854,9 @@ fn run(
         }
     };
     // The renderer backend runs whenever the GPU backend isn't active.
-    #[cfg(feature = "gpu-preview")]
+    #[cfg(feature = "gpu-presenter")]
     let use_renderer = gpu.is_none();
-    #[cfg(not(feature = "gpu-preview"))]
+    #[cfg(not(feature = "gpu-presenter"))]
     let use_renderer = true;
 
     let mut canvas: Option<sdl3::render::WindowCanvas> = None;
@@ -910,7 +910,7 @@ fn run(
     }
     set_window_icon(backend_window_mut(
         &mut canvas,
-        #[cfg(feature = "gpu-preview")]
+        #[cfg(feature = "gpu-presenter")]
         &mut gpu,
     ));
     // Windowed mode is always aspect-locked to 4:3: we own the window, so snap it
@@ -923,14 +923,14 @@ fn run(
     if fullscreen {
         let _ = backend_window_mut(
             &mut canvas,
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             &mut gpu,
         )
         .set_fullscreen(true);
     } else {
         snap_window_to_4_3(backend_window_mut(
             &mut canvas,
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             &mut gpu,
         ));
     }
@@ -1168,7 +1168,7 @@ fn run(
                     cart: sess.ui.cart,
                     mouse: mouse_port_to_osd(sess.mouse_port),
                     backend: sess.ui.backend,
-                    #[cfg(feature = "gpu-preview")]
+                    #[cfg(feature = "gpu-presenter")]
                     shader_crt: sess.ui.shader_crt,
                     // pad_keys/bios_names are read only by the Controller/BIOS
                     // settings sub-screens (via `items()`, gated on the menu
@@ -1533,7 +1533,7 @@ fn run(
                     } if !fullscreen => {
                         snap_window_to_4_3(backend_window_mut(
                             &mut canvas,
-                            #[cfg(feature = "gpu-preview")]
+                            #[cfg(feature = "gpu-presenter")]
                             &mut gpu,
                         ));
                     }
@@ -1747,7 +1747,7 @@ fn run(
                     sdl.mouse().set_relative_mouse_mode(
                         backend_window(
                             &canvas,
-                            #[cfg(feature = "gpu-preview")]
+                            #[cfg(feature = "gpu-presenter")]
                             &gpu,
                         ),
                         mouse_grabbed,
@@ -1850,7 +1850,7 @@ fn run(
                     UiMsg::Scale(sc) => {
                         let _ = backend_window_mut(
                             &mut canvas,
-                            #[cfg(feature = "gpu-preview")]
+                            #[cfg(feature = "gpu-presenter")]
                             &mut gpu,
                         )
                         .set_size(
@@ -1861,7 +1861,7 @@ fn run(
                         if !fullscreen {
                             snap_window_to_4_3(backend_window_mut(
                                 &mut canvas,
-                                #[cfg(feature = "gpu-preview")]
+                                #[cfg(feature = "gpu-presenter")]
                                 &mut gpu,
                             ));
                         }
@@ -1869,7 +1869,7 @@ fn run(
                     UiMsg::Fullscreen(on) => {
                         let _ = backend_window_mut(
                             &mut canvas,
-                            #[cfg(feature = "gpu-preview")]
+                            #[cfg(feature = "gpu-presenter")]
                             &mut gpu,
                         )
                         .set_fullscreen(on);
@@ -1878,7 +1878,7 @@ fn run(
                         if !on {
                             snap_window_to_4_3(backend_window_mut(
                                 &mut canvas,
-                                #[cfg(feature = "gpu-preview")]
+                                #[cfg(feature = "gpu-presenter")]
                                 &mut gpu,
                             ));
                         }
@@ -1912,7 +1912,7 @@ fn run(
                         // (the grab loop is gated on `mouse_port.is_some()`).
                         mouse_port = port;
                     }
-                    #[cfg(feature = "gpu-preview")]
+                    #[cfg(feature = "gpu-presenter")]
                     UiMsg::SetShader(crt) => {
                         // Apply to the live GPU backend; a no-op under the renderer.
                         if let Some(g) = gpu.as_mut() {
@@ -1967,7 +1967,7 @@ fn run(
                 c.copy(&*tex, None, None).expect("blit to canvas");
                 c.present(); // audio-paced (see the burst loop / idle sleep)
             }
-            #[cfg(feature = "gpu-preview")]
+            #[cfg(feature = "gpu-presenter")]
             if let Some(g) = gpu.as_mut() {
                 // GPU backend: upload + blit to the swapchain (OSD already
                 // composited into `framebuffer`). Reads `sharp`/`keep_aspect` live.
@@ -2071,8 +2071,8 @@ enum UiMsg {
     /// gate so motion/clicks are fed only while a mouse port is active.
     SetMouse(Option<u8>),
     /// Select the CRT shader (`true`) vs the plain blit (`false`) on the SDL_GPU
-    /// backend, applied live. Preview-only (the `gpu-preview` Shaders chooser).
-    #[cfg(feature = "gpu-preview")]
+    /// backend, applied live. Preview-only (the `gpu-presenter` Shaders chooser).
+    #[cfg(feature = "gpu-presenter")]
     SetShader(bool),
     Quit,
 }
@@ -2093,8 +2093,8 @@ struct UiState {
     cart: osd::OsdCart,
     backend: osd::OsdBackend,
     /// Whether the CRT shader is selected — mirrors `cfg.shader` for the OSD
-    /// Shaders chooser. `gpu-preview`-only (the only build with a shader path).
-    #[cfg(feature = "gpu-preview")]
+    /// Shaders chooser. `gpu-presenter`-only (the only build with a shader path).
+    #[cfg(feature = "gpu-presenter")]
     shader_crt: bool,
 }
 
@@ -2495,7 +2495,7 @@ fn dispatch_osd(
                 90,
             );
         }
-        #[cfg(feature = "gpu-preview")]
+        #[cfg(feature = "gpu-presenter")]
         OsdAction::SetShader(crt) => {
             // The SDL thread applies it to the live GpuPresenter (a no-op under the
             // SDL_Renderer backend, which has no shader path — hence the toast hint).
