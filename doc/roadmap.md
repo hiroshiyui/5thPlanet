@@ -411,7 +411,11 @@ clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
   bloom/halation, barrel curvature, **DXIL/MSL for non-Vulkan hosts** (`build_crt`
   is already format-agnostic via `ShaderKind::crt_shaders` — cross-compile the GLSL
   with `SDL_shadercross`, commit the `.dxil`/`.msl` + a match arm; a non-Vulkan host
-  meanwhile falls back to the blit), and loading user `.spv`/preset shaders. SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
+  meanwhile falls back to the blit), and loading user `.spv`/preset shaders. The
+  presenter stays behind the off-by-default **`gpu-presenter`** build feature
+  because it's verified Linux/Vulkan-only; the gate comes off (compiled into
+  default builds + `--gpu` made first-class) once DXIL/MSL land and it's tested on
+  Windows/macOS — rationale + removal criterion in ADR-0019. SDL3's `SDL_GPU` (Vulkan/Metal/D3D12,
   multi-pass render targets, SPIR-V shaders — exposed by `sdl3::gpu`, *no new
   dependency* now that the frontend is on SDL3) makes a high-quality CRT filter
   feasible: Sony Trinitron-style aperture grille + scanline beam + bloom/halation

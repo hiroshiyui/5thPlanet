@@ -81,6 +81,29 @@ documented escape hatch if running the full corpus verbatim ever outweighs the
 copyleft + dep-weight costs. The full research backing this is in the
 `shaders/README.md` route discussion. (See the updated "Alternatives" bullet.)
 
+### Feature gating — why `gpu-presenter` stays opt-in (added 2026-06-28)
+
+The SDL_GPU presenter has since **landed and is verified** (Vulkan blit + a
+single-pass CRT shader, software-Vulkan rejected at device creation, user-verified
+on four games). It nonetheless **stays behind the off-by-default `gpu-presenter`
+build feature** (renamed from `gpu-preview`, which had implied "non-functional
+teaser"). The original gating reason — *the code was non-functional groundwork* —
+is now dead; the **current** reason is different and still valid: the presenter is
+**verified only on Linux/Vulkan and is incomplete elsewhere**. DXIL (D3D12) and MSL
+(Metal) shaders aren't built, so on Windows/macOS the CRT silently falls back to
+the blit, and nothing is tested on those hosts (no Windows/macOS CI). A build
+feature is the right fence for a half-cross-platform backend, and **default users
+lose nothing**: the default presentation path is `--gpu=off` → `SDL_Renderer`
+regardless of whether the feature is compiled in.
+
+**Removal criterion:** drop the gate — compile the presenter into default builds
+and make `--gpu` a first-class flag (today it isn't even parsed without the
+feature) — **once DXIL/MSL land and the presenter is tested on Windows/macOS**.
+Until then the gate is justified; its name (`gpu-presenter`) describes *what* it
+gates, not a maturity claim. If simplification is wanted sooner, the alternative
+is to un-gate now and document the non-Vulkan CRT gap as a runtime fallback — a
+deliberate trade of cross-platform completeness for fewer `#[cfg]`s.
+
 ## Consequences
 
 - **Easier:** cross-platform presentation comes for free (SDL's backends); the
