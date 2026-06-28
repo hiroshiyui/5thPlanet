@@ -1,9 +1,9 @@
 # Compatible game titles
 
 Commercial SEGA Saturn titles brought up on **5thPlanet**, with their current
-playability. This is the "what runs" list; boot-blocker investigations
-(currently all resolved) live in
-[`boot-blocker-investigations.md`](boot-blocker-investigations.md), the milestone view
+playability. This is the "what runs" list; the boot-blocker case studies +
+forensic case files live in the
+[`debugging-playbook.md`](debugging-playbook.md), the milestone view
 is in [`roadmap.md`](roadmap.md), and captures are in
 [`screenshots/`](screenshots/README.md).
 
@@ -44,9 +44,9 @@ software-decoded-movie → VDP2 path.
   cache/bus fidelity fixes for the startup FMV and menus, plus an SCU
   interrupt-timing fix for the former intermittent per-scenario movie stall:
   DMA-end interrupts must not be forwarded while the master SH-2 is executing a
-  delay slot. Full chain in the commit messages, the
-  [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study, and the
-  closed SAN5 entry in [`boot-blocker-investigations.md`](boot-blocker-investigations.md).
+  delay slot. Full chain in the commit messages and the
+  [`debugging-playbook.md`](debugging-playbook.md) SAN5 case study (with the full
+  forensic record under "Boot-blocker case files").
 - **Panzer Dragoon Zwei** is the second Sega FILM / Cinepak title, and the first
   to expose two distinct gaps that the other titles never exercised: a CD **Seek
   (0x11)** command decoded on the MAME track/FAD model instead of Mednafen's
@@ -67,9 +67,9 @@ software-decoded-movie → VDP2 path.
 ## Under investigation
 
 No titles are currently under active investigation. Resolved boot-blocker case
-studies (e.g. *Sangokushi V*, *Panzer Dragoon Zwei*) are kept as resume points /
-methodology references in
-[`boot-blocker-investigations.md`](boot-blocker-investigations.md).
+studies (e.g. *Sangokushi V*, *Panzer Dragoon Zwei*) are kept as methodology
+references in the [`debugging-playbook.md`](debugging-playbook.md) ("Case studies"
++ "Boot-blocker case files").
 
 ---
 

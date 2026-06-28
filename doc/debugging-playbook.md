@@ -206,7 +206,8 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   symptom was the downstream victim; the root was one interrupt landing one
   instruction early. **Lesson: a "random" timing bug is still a fixed,
   deterministic instance once captured — and the symptom subsystem is rarely the
-  buggy one.**
+  buggy one.** (Full forensic record — the deterministic-repro recipe and the
+  ruled-out evidence table — in *Boot-blocker case files* below.)
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
@@ -284,6 +285,80 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 
 ---
 
+## Boot-blocker case files
+
+The case studies above distill the *lesson* from each blocker; this chapter keeps
+the fuller forensic records — the exact deterministic-repro recipe and the
+ruled-out hypothesis table — for the investigations where that detail is worth
+retaining. It is also where an **active** blocker would be tracked as a resume
+point: **there are none currently** — all four commercial titles are fully
+playable ([`compatible-game-titles.md`](compatible-game-titles.md)). References are
+diffed against the never-committed local oracles (Mednafen, MAME, Yabause;
+[ADR-0017](adr/0017-reference-oracle-policy.md)).
+
+The **Cinepak FILM** path is well-exercised: *Sangokushi V* (eighteen Cinepak FILM
+files) drove it through to gameplay first, *Panzer Dragoon Zwei* second. (VF2's
+opening movie is **Duck TrueMotion**, a different codec; all are the games' own
+SH-2 software run under LLE — no decoder to implement either way.)
+
+### Sangokushi V — scenario-opening movie stall (full record)
+
+Root cause is the *"Sangokushi V — interrupt in a delay slot"* case study above;
+the value retained here is the forensic trail — how an interactively-"random"
+stall was made deterministic, and how the field of suspects was cleared.
+
+**Symptom.** The per-scenario opening movie *sometimes* fails to play and **stalls
+the emulation**; **resetting usually bypasses it**. The startup intro FMV, title,
+and menus all run — this is the per-scenario movie specifically. (`roms/SANGOKUSHI_V.cue`,
+KOEI, JP, serial **T-7623G**, BIOS v1.01; no per-game hack in Mednafen → our-side
+fidelity gap.)
+
+**Deterministic repro.** The core is deterministic given (RTC seed + pad stream),
+both captured by the jupiter `SAT_INPUT_REC` movie — so a recording of a *stalling*
+session reproduces it on every headless replay. The interactive "intermittency" is
+**not** core non-determinism: it is purely between-session variation in the RTC
+seed (host wall-clock at boot) + human pad timing (the only entropy the
+single-threaded, `rand`-free core sees).
+- `sdbg replay <stall.rec>` parks at `master 002D6B04, CD status=01 fad=52005
+  free_blocks=0 parts=[0:200]` — bit-identical to the interactive freeze.
+- Fast repro: a savestate ~frame 4300 (just before the read) + ~140 frames with
+  **no input** develops the stall; loading it + 400 frames was bit-identical
+  **4/4 times** (master PC `002DF042`, slave `002D8E3E`, CD `fad=52005 free=0
+  hirq=0FCD`).
+- Post-fix: the same pre-stall savestate now crosses the freeze, reaching
+  `fad=52604` with the buffer draining normally (`free=175`, `parts=[0:25]`).
+
+**Ruled out (each with evidence).**
+| Hypothesis | Verdict | Evidence |
+| --- | --- | --- |
+| Frontend pacing stall | ❌ | Audio watchdogs (`8ac18cb`) self-heal ≤1.5 s analytically; `SDLMOVIE` frames keep advancing *during* the stall |
+| CD read-pump deadlock | ❌ | Buffer-full pause re-arms `sec_prebuf_in` at `cd_block.rs:1648`; resumes once the game frees a block |
+| CD protocol gap after `CalcActualSize` | ❌ | The game stopped issuing `EndDataXfer` only after the DMA-end interrupt landed in the `rte` delay slot; delaying SCU interrupt delivery past the slot fixes the same repro |
+| BFUL HIRQ latch (`a4df618`) | ❌ | `SAT_BFUL_READ_CLEAR=1` A/B — identical stall |
+| **Cache coherency** (SAN5's usual signature) | ❌ | `sdbg caudit`: **0 stale lines on both CPUs**; the game's 182,942 associative purges are all honored |
+| SCU DMA-halt removal (`64237d7`) | ❌ | Clean savestate bisection — the DMA-halt-restored build stalls identically |
+
+**Discriminator** — does `SDLMOVIE f=…` keep printing when it stalls? Frames
+advancing while `fad`/`parts`/PC stay stuck ⇒ a core CD/game wedge (what happens
+here); if `SDLMOVIE` also stopped it would be a frontend pacing/thread stall;
+input dying only after a load is the SMPC port-restore (`2a33f47`, addressed). The
+fix leaves the SCU edge pending while `next_is_delay_slot()` is true and forwards
+it at the next instruction boundary; `IST` stays software-visible until the guest
+write-0-clears it. The SH-2 core's `interrupt_not_accepted_inside_delay_slot`
+invariant now extends to the SCU forwarding layer.
+
+### Panzer Dragoon Zwei — reference notes
+
+Both fixes are case studies above (the CD **Seek (0x11)** decode and the
+peripheral-only **INTBACK**). Notes worth keeping:
+- `mednaref/src/ss/db.cpp`: **no per-game hack for PDZ** — it boots on generic
+  CD-block fidelity, so both blockers were our-side gaps.
+- Mednafen's PROBLEMATIC-GAMES list flags PD2 as "relies on illegal/questionable
+  VDP2 window settings" — an in-game rendering quirk to watch for, not a boot
+  blocker.
+
+---
+
 See also: CLAUDE.md (Developer tools + the per-crate gotchas), ADR-0017 (the
-behavioral-oracle policy), [`boot-blocker-investigations.md`](boot-blocker-investigations.md),
-and [`compatible-game-titles.md`](compatible-game-titles.md).
+behavioral-oracle policy), and
+[`compatible-game-titles.md`](compatible-game-titles.md).
