@@ -1,5 +1,5 @@
-//! SDL_GPU presentation backend — an alternative to the `SDL_Renderer` blit, and
-//! groundwork for the planned CRT-shader presenter (ADR-0019, `shaders/README.md`).
+//! SDL_GPU presentation backend — an alternative to the `SDL_Renderer` blit, with
+//! an optional CRT-shader post-process (ADR-0019, `jupiter/src/shaders/`).
 //!
 //! The Saturn picture is always composited in software (the accuracy-first core);
 //! this module only posts the finished frame to the window via SDL_GPU instead of

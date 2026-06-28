@@ -76,6 +76,11 @@ cargo test -p sh2 -- decoder::tests::decodes_branches
 # frame is presented; the picture itself is always rendered in software.
 cargo run -p jupiter -- "bios/Sega Saturn BIOS (USA).bin"
 
+# Optional: an SDL_GPU/Vulkan presenter with a built-in CRT-filter shader
+# (scanlines + aperture mask), behind a build feature + off by default. Enable
+# with `--gpu=on` and pick it in the OSD (Settings -> Graphics -> Shaders -> CRT):
+cargo run -p jupiter --features gpu-presenter -- --gpu=on "bios/Sega Saturn BIOS (USA).bin"
+
 # Built-in self-diagnostics (no window): exits 0 if all checks pass.
 # Add a BIOS (+ disc) to also run boot/compatibility checks.
 cargo run -p jupiter -- doctor

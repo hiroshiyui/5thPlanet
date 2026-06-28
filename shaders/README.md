@@ -13,23 +13,24 @@ arm's length (same separation as `bios/`, `roms/`, and the reference emulators �
 see the README Acknowledgements); and the compiled outputs (`.spv` / `.dxil` /
 `.metallib`) are **build artifacts**.
 
-> **Status:** the SDL_GPU CRT presenter is **not yet wired up**. It is a backlog
-> item in [`../doc/roadmap.md`](../doc/roadmap.md) ("CRT-shader presentation via
-> SDL_GPU"); this directory + guide is the groundwork. Until the `Presenter`
-> lands, nothing here is loaded — the frontend presents through the plain
-> `SDL_Renderer` blit (the `--backend` render-driver selector). This README will
-> graduate to the real load paths / config keys when the feature ships.
+> **Status:** the SDL_GPU presenter **has landed** — a Vulkan/SPIR-V alternative
+> to the `SDL_Renderer` blit, with a **built-in CRT shader** (scanlines +
+> aperture-grille mask + gamma; v1, flat). It's behind the **off-by-default
+> `gpu-presenter` build feature** (`cargo build --features gpu-presenter`),
+> selected at runtime via the `gpu` config key / `--gpu` flag (`off` default /
+> `auto` / `on`) and toggled in the OSD (Settings → Graphics → Shaders → None /
+> CRT). A software Vulkan (Lavapipe/llvmpipe) is rejected at device creation, so
+> `--gpu=auto` falls back to the renderer rather than a slow CPU rasteriser. See
+> [`../doc/roadmap.md`](../doc/roadmap.md) ("CRT-shader presentation via SDL_GPU")
+> and [ADR-0019](../doc/adr/0019-gpu-is-presentation-only.md).
 >
-> The one piece already built is the **capability probe** (`jupiter/src/present_gpu.rs`),
-> behind the **off-by-default `gpu-presenter` build feature** (`cargo build --features
-> gpu-presenter`) since it's non-practical until a presenter consumes it:
-> the `gpu` config key / `--gpu` flag (`off` default / `auto` / `on`) makes the
-> frontend try to create an `SDL_GPU` device for this host's shader format
-> (SPIR-V / DXIL / MSL, per the table below) and log whether it's available —
-> the gate the presenter will consult. It's `off` by default (the safe probe
-> allocates a device); see [ADR-0019](../doc/adr/0019-gpu-is-presentation-only.md)
-> "Capability detection" for why, and for the known limitation (no backend-name
-> readback, so no software-rasterizer rejection yet).
+> **The built-in CRT shader is project-authored (MIT) and lives — tracked — in
+> [`../jupiter/src/shaders/`](../jupiter/src/shaders/), not here.** *This*
+> directory is the drop-zone for **your own / third-party preset shaders**
+> (gitignored, bring your own license). **Loading user shaders from here is not
+> wired yet** — a follow-up; today only the built-in CRT is selectable. Other
+> follow-ups: multi-pass effects (bloom/halation), barrel curvature, and DXIL/MSL
+> for non-Vulkan hosts (`build_crt` is already format-agnostic).
 
 ## The bundled collection: `slang-shaders/`
 
@@ -48,8 +49,9 @@ format, not raw `SDL_GPU`**. SDL_GPU consumes compiled SPIR-V/DXIL/MSL (see
 [Shader formats](#shader-formats) below), so two routes to actually run them:
 take the **librashader** path (roadmap alternative) to load these presets verbatim,
 or **hand-port** a chosen preset's GLSL passes to SPIR-V via `SDL_shadercross` for
-the in-dependency SDL_GPU presenter. Until the presenter lands, this collection is
-reference/source material — nothing in the build loads it yet.
+the in-dependency SDL_GPU presenter. The build doesn't load these `.slangp` presets
+(loading user shaders from this directory is a follow-up); the collection is
+reference/source material — e.g. for hand-porting a look into the built-in shader.
 
 ## The accuracy contract (what a shader must NOT touch)
 
