@@ -1229,13 +1229,18 @@ impl Saturn {
                 // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
                 // per-source vector (0x40 + index) is latched, not the 64+level
                 // auto-vector.
-                let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
-                let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
-                let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
-                let in_delay_slot = scheduler.entity(*master_id).sh2().cpu.next_is_delay_slot();
+                // One borrow of the master entity per instruction for the two
+                // gating reads (imask + delay-slot). `pc`/`cycle` are only needed
+                // for the interrupt-fire trace, so they're read inside that (rare)
+                // branch — not on every instruction.
+                let master = scheduler.entity(*master_id).sh2();
+                let imask = master.cpu.regs.sr.imask();
+                let in_delay_slot = master.cpu.next_is_delay_slot();
                 if !in_delay_slot
                     && let Some((source, level)) = bus.scu.take_pending_interrupt(imask)
                 {
+                    let master = scheduler.entity(*master_id).sh2();
+                    let (pc, cycle) = (master.cpu.regs.pc, master.cpu.pipeline.cycles);
                     trace_scu_interrupt(
                         "run",
                         source,
