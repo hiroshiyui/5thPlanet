@@ -1904,7 +1904,12 @@ impl Saturn {
         // The framebuffer is snapshotted at the frame boundary; the VDP state
         // a game commits at VBlank is what it intends to display.
         self.run_for(CYCLES_PER_FRAME);
-        crate::vdp2::render_frame(&self.bus.vdp2, Some(self.bus.vdp1.display_fb()), out)
+        crate::vdp2::render_frame_weave(
+            &self.bus.vdp2,
+            Some(self.bus.vdp1.display_fb()),
+            self.bus.vdp1.weave_source(),
+            out,
+        )
     }
 
     /// Take the SCSP's generated audio for this period (interleaved L,R at

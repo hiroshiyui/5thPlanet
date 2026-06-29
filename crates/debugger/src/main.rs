@@ -536,6 +536,80 @@ impl Dbg {
         }
     }
 
+    /// Dump the VDP1 control + status registers and the two double-buffer
+    /// stats — read directly from `vdp1.regs`/`fb`/`display_fb` (the register
+    /// bank is write-only over the bus, reads as 0). The sprite-engine
+    /// companion to `vdp2regs`; observer-only. Decodes the draw/swap mode
+    /// (PTMR.PTM auto-vs-by-request, FBCR.FCM/FCT auto-vs-manual swap) that
+    /// drives the double buffer, plus each buffer's non-black-pixel count +
+    /// FNV checksum so a strobing sprite layer's buffer divergence is visible.
+    fn dump_vdp1regs(&self) {
+        let v = &self.sat.bus.vdp1;
+        let r = &v.regs;
+        let tvmr = r.read16(0x00);
+        let fbcr = r.read16(0x02);
+        let ptmr = r.read16(0x04);
+        let edsr = r.read16(0x10);
+        let ewlr = r.read16(0x08);
+        let ewrr = r.read16(0x0A);
+        println!(
+            "TVMR={tvmr:04X} (8bpp={} VBE={})  FBCR={fbcr:04X} (FCM/manual-swap={} FCT/trigger={} DIE={} DIL={})",
+            tvmr & 1,
+            (tvmr >> 3) & 1,
+            (fbcr >> 1) & 1,
+            fbcr & 1,
+            (fbcr >> 3) & 1,
+            (fbcr >> 2) & 1,
+        );
+        println!(
+            "PTMR={ptmr:04X} PTM={:02b} ({})",
+            ptmr & 3,
+            match ptmr & 3 {
+                0 => "idle (draw only on explicit PTMR write w/ this mode)",
+                1 => "by-request: one-shot plot on each PTMR write",
+                2 => "automatic: redraw the whole list at every frame-buffer swap",
+                _ => "reserved",
+            },
+        );
+        println!(
+            "EWDR(erase colour)={:04X}  EWLR={ewlr:04X} (X1={} Y1={})  EWRR={ewrr:04X} (X3={} Y3={})",
+            r.read16(0x06),
+            ((ewlr >> 9) & 0x3F) * 8,
+            ewlr & 0x1FF,
+            ((ewrr >> 9) & 0x7F) * 8,
+            ewrr & 0x1FF,
+        );
+        println!(
+            "EDSR={edsr:04X} (CEF={} BEF={})  COPR={:04X} LOPR={:04X} MODR={:04X}  is_drawing={}",
+            (edsr >> 1) & 1,
+            edsr & 1,
+            r.read16(0x14),
+            r.read16(0x12),
+            r.read16(0x16),
+            v.is_drawing(),
+        );
+        // Per-buffer non-black-pixel count + FNV-1a checksum. The plotter draws
+        // into `fb`; VDP2 composites `display_fb()`. A strobing sprite layer
+        // shows as the two checksums alternating frame-to-frame.
+        let stats = |s: &[u8]| -> (usize, u64) {
+            let nb = s.chunks_exact(2).filter(|p| (p[0] | p[1]) != 0).count();
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &b in s {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (nb, h)
+        };
+        let (dnb, dh) = stats(v.fb.as_slice());
+        let (fnb, fh) = stats(v.display_fb().as_slice());
+        println!(
+            "draw buffer    (fb,      plotter writes): {dnb:>6} non-black px  cksum={dh:016X}"
+        );
+        println!(
+            "display buffer (front, VDP2 composites):  {fnb:>6} non-black px  cksum={fh:016X}"
+        );
+    }
+
     /// Dump VDP2 CRAM as RGB hex — `cram [start-index] [count]` (default 0,256).
     /// Decodes through the live CRAM mode so the bytes match what the renderer
     /// looks up. Observer-only; CRAM is otherwise hard to inspect (the `m`
@@ -1629,6 +1703,7 @@ impl Dbg {
                 self.sat.bus.vdp1.is_drawing(),
             ),
             "vdp2regs" | "v2r" => self.dump_vdp2regs(),
+            "vdp1regs" | "v1r" => self.dump_vdp1regs(),
             "cram" => self.dump_cram(
                 a1.and_then(parse_num).unwrap_or(0) as usize,
                 a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(256),
@@ -1888,6 +1963,7 @@ sdbg commands:
   ftcsr           arm master FTCSR (FRT status/ICF) byte-access trace; ftcsrdump prints+drains
   vdp             VDP display state
   vdp2regs        full VDP2 register dump (decoded per layer + raw)  [alias v2r]
+  vdp1regs        VDP1 control/status regs + double-buffer stats     [alias v1r]
   cram [s] [n]    dump VDP2 CRAM as RGB888 (mode-decoded), n entries from index s
   scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)

@@ -29,6 +29,10 @@ use saturn::vdp2::Vdp2;
 struct Job {
     vdp2: Vdp2,
     sprite_fb: Framebuffer,
+    /// DIE field-weave source (back buffer + DIL), cloned when `SAT_VDP1_WEAVE`
+    /// is on and the frame is double-interlaced; `None` otherwise (no extra
+    /// clone). See [`saturn::vdp1::Vdp1::weave_source`].
+    sprite_weave: Option<(Framebuffer, u8)>,
     out: Vec<u8>,
 }
 
@@ -63,8 +67,12 @@ impl RenderPipe {
             .name("render".into())
             .spawn(move || {
                 while let Ok(mut job) = job_rx.recv() {
-                    let dims =
-                        saturn::vdp2::render_frame(&job.vdp2, Some(&job.sprite_fb), &mut job.out);
+                    let dims = saturn::vdp2::render_frame_weave(
+                        &job.vdp2,
+                        Some(&job.sprite_fb),
+                        job.sprite_weave.as_ref().map(|(fb, dil)| (fb, *dil)),
+                        &mut job.out,
+                    );
                     if done_tx.send(Done { out: job.out, dims }).is_err() {
                         break; // main thread gone
                     }
@@ -91,6 +99,11 @@ impl RenderPipe {
         let job = Job {
             vdp2: sat.bus.vdp2.clone(),
             sprite_fb: sat.bus.vdp1.display_fb().clone(),
+            sprite_weave: sat
+                .bus
+                .vdp1
+                .weave_source()
+                .map(|(fb, dil)| (fb.clone(), dil)),
             out,
         };
         match self.job_tx.send(job) {

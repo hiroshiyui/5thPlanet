@@ -517,6 +517,21 @@ pub fn render_frame(
     sprite_fb: Option<&Framebuffer>,
     out: &mut [u8],
 ) -> (usize, usize) {
+    render_frame_weave(vdp2, sprite_fb, None, out)
+}
+
+/// [`render_frame`] plus the optional VDP1 DIE field-weave source (back buffer +
+/// `DIL`). `sprite_weave = None` is identical to [`render_frame`]; `Some` weaves
+/// the two interlace fields into one full-height sprite layer (see
+/// [`crate::vdp1::Vdp1::weave_source`], gated by `SAT_VDP1_WEAVE`). The two live
+/// callers (`Saturn::run_frame`, the frontend render worker) use this; tests and
+/// benches use the 3-arg [`render_frame`].
+pub fn render_frame_weave(
+    vdp2: &Vdp2,
+    sprite_fb: Option<&Framebuffer>,
+    sprite_weave: Option<(&Framebuffer, u8)>,
+    out: &mut [u8],
+) -> (usize, usize) {
     // Active resolution from TVMD (320/352/640/704 × 224/240/256[×2]). The
     // content is packed tightly with row stride = `w`, so the caller uploads
     // `w × h` with a `w × 4` pitch.
@@ -559,7 +574,15 @@ pub fn render_frame(
             let ctx = &ctx;
             sc.spawn(move || {
                 for (dy, row) in band.chunks_exact_mut(w * 4).enumerate() {
-                    render_line(vdp2, ctx, sprite_fb, i * band_rows + dy, w, row);
+                    render_line(
+                        vdp2,
+                        ctx,
+                        sprite_fb,
+                        sprite_weave,
+                        i * band_rows + dy,
+                        w,
+                        row,
+                    );
                 }
             });
         }
@@ -573,10 +596,24 @@ fn render_line(
     vdp2: &Vdp2,
     ctx: &FrameCtx,
     sprite_fb: Option<&Framebuffer>,
+    sprite_weave: Option<(&Framebuffer, u8)>,
     y: usize,
     w: usize,
     row: &mut [u8],
 ) {
+    // DIE field-weave (SAT_VDP1_WEAVE — see [`Vdp1::weave_source`]). In
+    // double-interlace mode VDP1 rasterizes the even/odd fields into its two
+    // framebuffers on alternating frames; the back buffer holds field `dil`
+    // (this frame), the front (`sprite_fb`) holds field `!dil`. Select the
+    // field-`(y&1)` buffer for THIS display line, so consecutive lines read
+    // opposite fields and the two interleave into one full-height image —
+    // instead of line-doubling whichever field is current (which strobes as
+    // `dil` flips). The downstream `y >> 1` fb read is unchanged: each field
+    // buffer is half-height and a display line maps to packed fb line `y >> 1`.
+    let sprite_fb = match sprite_weave {
+        Some((back, dil)) if (y as u8 & 1) == dil => Some(back),
+        _ => sprite_fb,
+    };
     let backdrop = back_color(vdp2, y);
     for x in 0..w {
         let (sx, sy) = (x as u32, y as u32);
@@ -2364,6 +2401,55 @@ mod tests {
             pixel(&buf, 11, 10),
             [0, 0, 0, 0xFF],
             "zero byte transparent"
+        );
+    }
+
+    /// VDP1 DIE field-weave (`render_frame_weave`, the `SAT_VDP1_WEAVE` path).
+    /// In double-density interlace VDP1 rasterizes the even/odd fields into its
+    /// two framebuffers on alternating frames; the compositor must read the
+    /// field-`(y&1)` buffer per display line (front = field `!DIL`, back =
+    /// field `DIL`) so the two interleave into one full-height image. With
+    /// `DIL=1`, even display lines come from the front buffer, odd from the
+    /// back. Without the weave, the front field is line-doubled (both display
+    /// lines read it) — the source of the GN98 menu's per-frame field strobe.
+    #[test]
+    fn vdp1_die_field_weave_interleaves_the_two_framebuffers() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x80C0); // DISP, 320 dots, double-density interlace (TVMD[7:6]=3)
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x11 * 2, 0x001F); // sprite code 0x11 → red   (front field)
+        v.cram.write16(0x12 * 2, 0x03E0); // sprite code 0x12 → green (back field)
+        // Each buffer carries its dot on fb line 0 (→ display lines 0 and 1 via y>>1).
+        let front = sprite_fb_with(10, 0, 0x0011); // red
+        let back = sprite_fb_with(10, 0, 0x0012); // green
+
+        // Weave, DIL=1: even display line ← front (red), odd ← back (green).
+        let mut buf = fresh_buf();
+        render_frame_weave(&v, Some(&front), Some((&back, 1)), &mut buf);
+        assert_eq!(
+            pixel(&buf, 10, 0),
+            [0xFF, 0, 0, 0xFF],
+            "even line ← front field"
+        );
+        assert_eq!(
+            pixel(&buf, 10, 1),
+            [0, 0xFF, 0, 0xFF],
+            "odd line ← back field"
+        );
+
+        // No weave (the strobe source): the front field is line-doubled, so both
+        // display lines read it (red) — the back field is never woven in.
+        let mut buf2 = fresh_buf();
+        render_frame(&v, Some(&front), &mut buf2);
+        assert_eq!(
+            pixel(&buf2, 10, 0),
+            [0xFF, 0, 0, 0xFF],
+            "no weave: line 0 = front"
+        );
+        assert_eq!(
+            pixel(&buf2, 10, 1),
+            [0xFF, 0, 0, 0xFF],
+            "no weave: line 1 = front (doubled)"
         );
     }
 

@@ -43,6 +43,45 @@ pub const FB_END: u32 = 0x05CB_FFFF;
 pub const REGS_BASE: u32 = 0x05D0_0000;
 pub const REGS_END: u32 = 0x05D0_0017;
 
+/// Debug (`SAT_VDP1FB`): trace the double-buffer machinery per frame —
+/// `frame_change` (swap + automatic-redraw), `begin_plot` and the manual
+/// `PTMR`/`FBCR` register writes — so a strobing sprite layer's buffer
+/// divergence (which buffer the game draws into vs. which VDP2 composites)
+/// is observable. Read once and cached; observer-only, golden-safe.
+#[inline]
+fn vdp1fb() -> bool {
+    use std::sync::OnceLock;
+    static VDP1FB: OnceLock<bool> = OnceLock::new();
+    *VDP1FB.get_or_init(|| std::env::var_os("SAT_VDP1FB").is_some())
+}
+
+/// A/B flag (`SAT_VDP1_WEAVE`): when set, the VDP2 compositor weaves VDP1's two
+/// double-interlace fields (`FBCR.DIE=1`) into one full-height sprite layer
+/// instead of showing the current field line-doubled. Fixes the per-frame field
+/// strobe of static interlaced content (e.g. GN98's main menu; matches
+/// Mednafen's per-field scanline placement, `vdp2.cpp`). Off by default → render
+/// goldens unchanged; pixel-visible when on (see [`Vdp1::weave_source`]).
+#[inline]
+fn weave_enabled() -> bool {
+    use std::sync::OnceLock;
+    static WEAVE: OnceLock<bool> = OnceLock::new();
+    *WEAVE.get_or_init(|| std::env::var_os("SAT_VDP1_WEAVE").is_some())
+}
+
+/// Debug: `(non-black 16-bit pixels, FNV-1a checksum)` of a frame buffer, for
+/// the `SAT_VDP1FB` trace. A strobing layer shows as the checksum alternating
+/// between two values frame-to-frame.
+fn fb_stats(fb: &Framebuffer) -> (usize, u64) {
+    let s = fb.as_slice();
+    let nb = s.chunks_exact(2).filter(|p| (p[0] | p[1]) != 0).count();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (nb, h)
+}
+
 /// The VDP1 sprite/polygon engine: VRAM + the double-buffered frame buffer +
 /// the register bank, driving the command-list plotter. A `PTMR` write runs
 /// the list and latches draw-end status.
@@ -177,6 +216,28 @@ impl Vdp1 {
         &self.display
     }
 
+    /// DIE field-weave source for the VDP2 compositor: `Some((back_buffer, dil))`
+    /// when the `SAT_VDP1_WEAVE` A/B flag is set AND the frame is double-density
+    /// interlaced (`FBCR.DIE`=1). In DIE mode VDP1 rasterizes the even/odd fields
+    /// into the two framebuffers on alternating frames (`DIL` toggles each
+    /// frame): the front (`display`) holds field `!DIL` (drawn last frame), the
+    /// back (`fb`) holds field `DIL` (drawn this frame). The compositor reads the
+    /// field-`(y&1)` buffer per display line so the two fields interleave into
+    /// one full-height image (matching Mednafen's per-field scanline placement)
+    /// rather than line-doubling whichever field is current — which strobes as
+    /// `DIL` flips. `None` (default, flag off or non-DIE) → the compositor shows
+    /// the front field line-doubled, unchanged → render goldens hold.
+    pub fn weave_source(&self) -> Option<(&Framebuffer, u8)> {
+        if !weave_enabled() {
+            return None;
+        }
+        let fbcr = self.regs.read16(0x02);
+        if fbcr & 0x08 == 0 {
+            return None; // DIE=0 → not double-interlace; nothing to weave
+        }
+        Some((&self.fb, ((fbcr >> 2) & 1) as u8)) // (back buffer, current DIL)
+    }
+
     /// Refresh the cycle hint and complete any in-flight plot that is now due.
     /// The bus calls this on every VDP1 access (mirroring SMPC's INTBACK
     /// settle), so CPU polling of `EDSR` advances the draw clock.
@@ -233,14 +294,39 @@ impl Vdp1 {
         let manual = fbcr & 0x02 != 0; // FCM
         let trigger = fbcr & 0x01 != 0; // FCT
         let changed = !manual || trigger;
+        let trace = vdp1fb();
+        let (pre_fb, pre_disp) = if trace {
+            (fb_stats(&self.fb), fb_stats(&self.display))
+        } else {
+            ((0, 0), (0, 0))
+        };
         if changed {
             core::mem::swap(&mut self.fb, &mut self.display);
             self.regs.write16(0x02, fbcr & !0x01); // clear the one-shot FCT
         }
         // Automatic-draw mode: redraw the list into the back buffer each time
         // the buffers change (MAME gates `vdp1_process_list` on the swap).
-        if changed && self.regs.ptmr() & 0x03 == 0x02 {
+        let auto_draw = self.regs.ptmr() & 0x03 == 0x02;
+        if changed && auto_draw {
             self.begin_plot();
+        }
+        if trace {
+            let ((pfb_nb, pfb_h), (pd_nb, pd_h)) = (pre_fb, pre_disp);
+            let (fb_nb, fb_h) = fb_stats(&self.fb);
+            let (d_nb, d_h) = fb_stats(&self.display);
+            eprintln!(
+                "[VDP1FB] frame_change now={now} FBCR={fbcr:04X}(FCM={} FCT={}) PTM={:02b} swap={changed} auto_redraw={}",
+                manual as u8,
+                trigger as u8,
+                self.regs.ptmr() & 3,
+                changed && auto_draw,
+            );
+            eprintln!(
+                "         pre : draw_fb {pfb_nb:>6}px {pfb_h:016X}  display {pd_nb:>6}px {pd_h:016X}"
+            );
+            eprintln!(
+                "         post: draw_fb {fb_nb:>6}px {fb_h:016X}  display {d_nb:>6}px {d_h:016X}  <- VDP2 composites display"
+            );
         }
     }
 
@@ -328,6 +414,24 @@ impl Vdp1 {
     /// [`Self::frame_change`]), not on the register write. `ENDR` (0x0C)
     /// force-terminates the current draw, completing it immediately.
     fn after_reg_write(&mut self, off: u32) {
+        // Trace the game's writes to the double-buffer control registers so we
+        // can place a manual PTMR draw kick / FBCR swap-mode change relative to
+        // the frame_change swap (SAT_VDP1FB). `self.now` is fresh — the bus
+        // ticks VDP1 before the register write.
+        if vdp1fb() && matches!(off, 0x02 | 0x04 | 0x0C) {
+            let name = match off {
+                0x02 => "FBCR",
+                0x04 => "PTMR",
+                _ => "ENDR",
+            };
+            eprintln!(
+                "[VDP1FB] game writes {name}(0x{off:02X})={:04X} now={} (PTM={:02b} is_drawing={})",
+                self.regs.read16(off),
+                self.now,
+                self.regs.ptmr() & 3,
+                self.is_drawing(),
+            );
+        }
         match off {
             0x04 if self.regs.ptmr() & 0x03 == 0x01 => self.begin_plot(),
             0x0C => self.finish_draw(),
@@ -373,6 +477,8 @@ impl Vdp1 {
     /// proportional to the plot's commands + dots. The bus refreshes `now`
     /// before this runs (see [`Self::tick`]).
     pub fn begin_plot(&mut self) {
+        let trace = vdp1fb();
+        let pre = if trace { fb_stats(&self.fb) } else { (0, 0) };
         let r = self.render_list();
         // Duration from the Mednafen-faithful draw-cycle walk (M12 task #6):
         // the boot animation runs ~26k cycles, the BIOS CD-player panel
@@ -380,6 +486,14 @@ impl Vdp1 {
         // so EDSR.CEF and the sprite-draw-end interrupt land when its do.
         let duration = r.cycles;
         self.busy_until = Some(self.now + duration);
+        if trace {
+            let (pre_nb, pre_h) = pre;
+            let (post_nb, post_h) = fb_stats(&self.fb);
+            eprintln!(
+                "[VDP1FB]   begin_plot now={} cmds={} pixels={} dur={duration} | draw_fb {pre_nb}px {pre_h:016X} -> {post_nb}px {post_h:016X}",
+                self.now, r.command_count, r.pixels,
+            );
+        }
         self.dbg_plots.0 += 1;
         self.dbg_plots.1 += duration;
         if duration > self.dbg_plots.2 {
