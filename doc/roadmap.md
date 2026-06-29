@@ -345,8 +345,8 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 
 | # | Lever | Status |
 |---|-------|--------|
-| P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
-| P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
+| P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. **Step-dispatch source micro-opts investigated 2026-06-29 (4-agent fan-out) and found to be a DEAD END** — see the dated note below; the unanimous top pick measured as noise. Remaining (codegen-only): PGO (P4); fastmap-style bus page table |
+| P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`). **Fat LTO measured-neutral 2026-06-29** (thin already captures the cross-crate inlining). **★ PGO measured 2026-06-29 = the BIG single-core win** (`tools/pgo/run_pgo.sh`): **+31% VF2 fight, +56% Doukyuusei menu** trained-on; **+39% Doukyuusei held-out** (trained on VF2 only → generalises across games). Build-time only, bit-identical (golden `0x0B1BA6E5180766F7` + savestate pass under `profile-use`), thermal-controlled (interleaved A/B). **Remaining: an adoption recipe** — bake a reproducible profile at release/packaging time, NOT a checked-in `RUSTFLAGS` every `cargo build` pays |
 | P6 | Hoist redundant per-instruction entity borrows in `step_cpus` | 📋 candidate, bit-identical: `imask`/`pc`/`cycle`/`delay-slot` are 4 separate `scheduler.entity(*master_id).sh2()` lookups per master instruction (`system.rs:1222-1225`) — collapse to one. Free, ~10 min, golden-invariant by construction. Magnitude small/unverified (<1–2%) |
 | P7 | Batch-invariant per-instruction scaffolding in `step_cpus` | 📋 candidate, **perf-gated + accuracy-sensitive**: `cd_block.irq_active()`+`set_cd_int` and the SCU interrupt sample run every master instruction even when state can't change between CD-timer ticks (part of the ~15% scaffolding self-time in VF2 3D). Biggest single-core lever left, but must preserve per-instruction interrupt-acceptance timing — the class that black-screened games when mishandled (`b65cd18`). Needs a `perf` capture to size + prove edge timing unchanged |
 
@@ -388,6 +388,52 @@ is **not** a lever: 99.903% hit, cold line-fill ~0.1%, and the hit-path whole-li
 copy is already eliminated (`probe`/`line_at`/`extract_u*`, copy-free). Hotspot
 attribution (P7 sizing) is blocked until `kernel.perf_event_paranoid ≤ 2` — `perf`
 sampling was denied at the host's default `=3`.
+
+#### Interpreter micro-opt investigation — measured DEAD ENDS (2026-06-29)
+
+A 4-agent fan-out (tracing-thoroughly skill) catalogued every bit-identical
+source/codegen micro-opt in the SH-2 `step`/dispatch hot path. The two
+highest-ranked were **implemented and measured** (the only way to attribute with
+`perf` blocked) and **both are noise** — do NOT re-chase:
+
+- **Decode-LUT fixed-array** (`decode_lut: Box<[Op]>` → `Box<[Op; 65536]>` to elide
+  the per-fetch bounds check on the hottest line) — the unanimous #1 pick across all
+  four agents. Proven bit-identical (boot golden `0x0B1BA6E5180766F7` + savestate
+  round-trip unchanged), but **zero measurable fps movement** (VF2 fight 70.1→69.7–
+  70.1 compute / 64.5→63.9–64.4 pipeline; Doukyuusei 82.8→81.2–82.3). The never-taken
+  bounds check is perfectly predicted → free. Reverted.
+- **Fat LTO** (`lto = "thin"` → `true`) — full-workspace rebuild, **no reliable gain**
+  (all scenes inside run-to-run variance; Doukyuusei +~1% but overlapping
+  distributions). Thin already captures the `sh2→saturn` cross-crate inlining the hot
+  path needs. Reverted.
+
+**Generalised verdict:** the remaining per-instruction source micro-opts (register-
+file `& 0xF` bounds-check elision, front-loading `if addr < 0x2000_0000` in `mem_*`,
+gating `Cache::probe`'s `dbg_stats++`, a scoreboard-predicate LUT, `run_dma` arming)
+are all the **same class** — removing a well-predicted branch or a store-buffer-
+absorbed store — so they are strongly predicted to be noise too, and are **not worth
+the churn on accuracy-critical core code**. The interpreter core is, as documented,
+largely inherent and already tuned — at the *source* level.
+
+#### ★ PGO is the win (2026-06-29)
+
+The single-core headroom the source micro-opts couldn't find lives in **block
+layout**, and PGO unlocks it. `tools/pgo/run_pgo.sh` (manual `-Cprofile-generate` →
+representative run → `llvm-profdata merge` → `-Cprofile-use`) measured, A/B against
+the thin-LTO baseline, interleaved to control thermals:
+
+- **VF2 fight compute-only 69.7 → 92.1 fps (+31%)**, in-vivo pipeline 63.3 → 82.3 (+30%).
+- **Doukyuusei menu compute-only 82.2 → 128.5 fps (+56%)** trained-on.
+- **Held-out: train on VF2 only, the never-seen Doukyuusei menu still hits 114 fps
+  (+39%)** — the profile generalises across games (over-fit inflation is modest).
+
+PGO is **build-time only and bit-identical** — the boot golden `0x0B1BA6E5180766F7`
+and the savestate round-trip both pass under `profile-use`, so it stays inside the
+accuracy-first/no-JIT charter (it reorders the 143-arm `execute()` match + the
+`mem_*`/`classify` chains by measured opcode frequency; neither thin nor fat LTO can
+do this without a profile). This is **by far the biggest single-core lever in the
+whole investigation** and touches zero source. Open work = an adoption recipe (a
+reproducible release-time profile, not a checked-in `RUSTFLAGS`).
 
 ## Later milestones (queued)
 
