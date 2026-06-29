@@ -520,12 +520,8 @@ impl Smpc {
     /// `0x06004A7E` self-loop).
     fn queue_command(&mut self, raw: u8) {
         match Command::from_raw(raw) {
-            Some(cmd) => {
-                self.pending = Some(cmd);
-            }
-            None => {
-                self.last_unknown_command = Some(raw);
-            }
+            Some(cmd) => self.pending = Some(cmd),
+            None => self.last_unknown_command = Some(raw),
         }
     }
 
