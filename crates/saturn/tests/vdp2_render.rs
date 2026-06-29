@@ -716,6 +716,40 @@ fn vram_cycle_pattern_gates_a_tile_layers_character_fetch() {
     );
 }
 
+#[test]
+fn nbg_8bpp_two_word_pn_palette_field_selects_the_256_colour_bank() {
+    // 256-colour (8bpp): a 2-word pattern name's 7-bit palette field selects the
+    // CRAM bank from bits [6:4] ONLY (a 256-entry palette spans CRAM addr [7:0],
+    // so the low 4 bits are ignored) — the bank lands at CRAM addr [10:8].
+    // Greatest Nine '98 regression: with palette field 0x10 the dot must read
+    // CRAM bank 1 (entry 0x100 + index); the old code used the full field as
+    // `<<8`, giving 0x1000 which folds (mod 0x1000 in CRAM mode 0) back to bank 0
+    // — the scrambled team-flag previews. No prior test exercised a non-zero
+    // 8bpp palette bank, which is how this slipped through.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(0x05F8_000E, 0x0300, AccessKind::Data); // RAMCTL: VRAM mode 3, CRAM mode 0
+    sat.bus.write16(REG_BGON, 0x0001, AccessKind::Data); // NBG0
+    sat.bus.write16(REG_CHCTLA, 0x0010, AccessKind::Data); // NBG0 tile, 8bpp, 8×8 char
+    sat.bus.write16(0x05F8_00F8, 0x0001, AccessKind::Data); // PRINA N0PRIN = 1
+    sat.bus.write16(0x05F8_0010, 0x0400, AccessKind::Data); // CYCA0 grant NBG0 NT + CG
+    // Decoy in bank 0 (the address the over-shift wrongly folds to): green.
+    sat.bus.vdp2.cram.write16(7 * 2, 0x03E0); // CRAM[7] = green (WRONG bank)
+    // The correct 256-colour bank for palette field 0x10 is bank 1 → CRAM[0x107].
+    sat.bus.vdp2.cram.write16((0x100 + 7) * 2, 0x001F); // CRAM[0x107] = red (RIGHT bank)
+    // 2-word PN (0,0): char 2 (8bpp byte base 2×0x20=64), palette field 0x10.
+    sat.bus.vdp2.vram.write32(0, (0x10 << 16) | 2);
+    sat.bus.vdp2.vram.write8(64, 7); // pixel (0,0) = colour index 7
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[0..4],
+        &[255, 0, 0, 0xFF],
+        "8bpp 2-word PN palette 0x10 → CRAM bank 1 (red), not the folded bank 0 (green)"
+    );
+}
+
 /// Per-dot rotation coefficients (VF2's fight floor): with a VRAM bank
 /// RDBS-granted for coefficient reads, the coefficient address walks
 /// `DKAx` per dot — here two dots of one line read different table

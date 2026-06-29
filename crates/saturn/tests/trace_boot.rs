@@ -4133,6 +4133,7 @@ fn vf2_renders_non_black() {
 ///      `SMPC_Write` 0x0F is just `PendingCommand = V`). GN98 issues SNDOFF with
 ///      no SF pre-write, then a read-once-or-spin SF check (the `0x06004A7E`
 ///      `bt -2`); a spurious SF=1 wedged it forever.
+///
 /// Needs bios/ + roms/GREATEST_NINE98.cue; prints "skipped" and returns if
 /// absent. ~6000 frames to reach the title; run with --release:
 ///

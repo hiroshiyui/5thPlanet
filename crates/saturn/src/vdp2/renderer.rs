@@ -476,6 +476,37 @@ impl FrameCtx {
     }
 }
 
+/// Observer-only, env-gated per-layer suppression for render isolation —
+/// "which layer draws this on-screen object?". Read **once** from the
+/// environment and cached, so production renders never consult it and the golden
+/// hashes don't move: every field is `false` unless its variable is set, and a
+/// suppressed layer is then skipped in the compositor exactly as if `BGON` / the
+/// sprite type had disabled it.
+///
+/// Variables (presence = on, value ignored): `SAT_NO_SPRITE` drops the VDP1
+/// sprite layer; `SAT_NO_NBG0`..`SAT_NO_NBG3` drop the named NBG; `SAT_NO_RBG0` /
+/// `SAT_NO_RBG1` drop the rotation backgrounds. Used by `sdbg` to bisect a
+/// render bug down to its source layer.
+struct LayerSuppress {
+    sprite: bool,
+    nbg: [bool; 4],
+    rbg: [bool; 2],
+}
+
+impl LayerSuppress {
+    fn get() -> &'static LayerSuppress {
+        static CELL: std::sync::OnceLock<LayerSuppress> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            let on = |k: &str| std::env::var_os(k).is_some();
+            LayerSuppress {
+                sprite: on("SAT_NO_SPRITE"),
+                nbg: core::array::from_fn(|n| on(&format!("SAT_NO_NBG{n}"))),
+                rbg: core::array::from_fn(|l| on(&format!("SAT_NO_RBG{l}"))),
+            }
+        })
+    }
+}
+
 /// Composite the whole VDP2 scene (NBG0–3, RBG0/1, and the optional VDP1 sprite
 /// layer `sprite_fb`) into `out` as RGBA8888, returning the active
 /// `(width, height)` decoded from TVMD. `out` must hold at least
@@ -1131,7 +1162,7 @@ fn nbg_layer(
     y: u32,
 ) -> Option<Dot> {
     let nc = &ctx.nbg[n];
-    if !nc.enabled {
+    if !nc.enabled || LayerSuppress::get().nbg[n] {
         return None;
     }
     if !window_allows(vdp2, ctx, sprite_fb, nc.winctl, x, y) {
@@ -1172,7 +1203,7 @@ fn rbg_layer(
     y: u32,
 ) -> Option<Dot> {
     let rc = &ctx.rbg[which];
-    if !rc.enabled {
+    if !rc.enabled || LayerSuppress::get().rbg[which] {
         return None;
     }
     // RBG0 has its own window control byte; RBG1 (sharing NBG0's slot) is
@@ -1497,10 +1528,19 @@ fn decode_pattern(vdp2: &Vdp2, pn_addr: u32, fmt: PnFormat, two_cells: bool, dep
             };
             (c, data & 0x400 != 0, data & 0x800 != 0)
         };
-        let palette = if depth != 0 {
-            (data >> 12) & 0x7 // 8bpp colour bank
-        } else {
+        let palette = if depth == 1 {
+            // 8bpp (256-colour): a 1-word pattern name supplies a 3-bit colour
+            // bank in PN bits [14:12]. Normalise it into bits [6:4] so it lines
+            // up with the 2-word PN palette field (`(data>>16)&0x7F`) and the
+            // CRAM-index path ([`sample_pattern_cell`]) can decode both widths
+            // uniformly — in 256-colour mode only palette bits [6:4] select the
+            // 256-entry bank.
+            ((data >> 12) & 0x7) << 4
+        } else if depth == 0 {
             ((data >> 12) & 0xF) + (fmt.splt << 4)
+        } else {
+            // Higher colour depths (2048/RGB) — preserve prior behaviour.
+            (data >> 12) & 0x7
         };
         Pattern {
             cell,
@@ -1565,9 +1605,15 @@ fn sample_pattern_cell(
     let (code, idx) = if cg_blocked {
         (0, coff)
     } else if depth == 1 {
-        // 8bpp cell: 0x40 bytes, one byte/pixel; palette is the colour bank.
+        // 8bpp cell: 0x40 bytes, one byte/pixel. In 256-colour mode the CRAM
+        // bank comes from palette bits [6:4] ONLY (a 256-entry palette spans
+        // CRAM addr [7:0], so the palette number's low 4 bits are ignored) and
+        // lands at CRAM addr [10:8]. Both 1- and 2-word pattern names carry the
+        // bank in bits [6:4] (see `decode`). Using the full palette field here
+        // over-shifted a 2-word PN's 7-bit field, folding the bank back to 0 —
+        // GN98's scrambled team-flag previews.
         let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
-        (byte, coff | (pat.palette as usize) << 8 | byte)
+        (byte, coff | (((pat.palette as usize) & 0x70) << 4) | byte)
     } else {
         // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
         let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
@@ -1704,6 +1750,9 @@ fn sprite_cc(vdp2: &Vdp2, pri: u8, ccidx: usize) -> Option<(u8, bool)> {
 /// Returns `None` for a transparent / priority-0 dot, or a [`SpriteDot`]
 /// (colour or MSB shadow).
 fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<SpriteDot> {
+    if LayerSuppress::get().sprite {
+        return None;
+    }
     let mut pix = sprite_fb_word(vdp2, fb, x, y);
     if pix == 0 {
         return None; // nothing plotted here

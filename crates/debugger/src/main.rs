@@ -386,6 +386,173 @@ impl Dbg {
         }
     }
 
+    /// Dump the full VDP2 register set — decoded per layer plus a raw 512-byte
+    /// hex window — read directly from `vdp2.regs` (the bank is write-only on the
+    /// bus). The "win by completeness" instrument: enumerate every control
+    /// register of a layer before declaring it faithful. Observer-only.
+    fn dump_vdp2regs(&self) {
+        let r = &self.sat.bus.vdp2.regs;
+        let (w, h) = r.screen_dims();
+        println!(
+            "TVMD={:04X} DISP={} dims={w}x{h} HRES={} VRES={} LSMD(interlace)={}",
+            r.tvmd(),
+            r.display_enabled(),
+            r.h_resolution(),
+            r.v_resolution(),
+            (r.tvmd() >> 6) & 3,
+        );
+        println!(
+            "RAMCTL={:04X} CRAM_mode={} ({}) VRAM_partition={:02b} CRKTE(coeff-in-CRAM)={}",
+            r.ramctl(),
+            r.cram_mode(),
+            match r.cram_mode() {
+                0 => "RGB555 1024w",
+                1 => "RGB555 2048w",
+                _ => "RGB888 1024w",
+            },
+            r.vram_partition_mode(),
+            r.coeff_in_cram(),
+        );
+        let bgon = r.bgon();
+        println!(
+            "BGON={bgon:04X}  NBG0={} NBG1={} NBG2={} NBG3={} RBG0={} RBG1={}  TPON(N0..3,R0)={}{}{}{}{}",
+            r.nbg_enabled(0) as u8,
+            r.nbg_enabled(1) as u8,
+            r.nbg_enabled(2) as u8,
+            r.nbg_enabled(3) as u8,
+            r.rbg_enabled(0) as u8,
+            r.rbg_enabled(1) as u8,
+            r.nbg_transparent_pen_solid(0) as u8,
+            r.nbg_transparent_pen_solid(1) as u8,
+            r.nbg_transparent_pen_solid(2) as u8,
+            r.nbg_transparent_pen_solid(3) as u8,
+            r.rbg_transparent_pen_solid(0) as u8,
+        );
+        println!("CHCTLA={:04X} CHCTLB={:04X}", r.chctla(), r.chctlb());
+        let cmode = |m: u8| match m {
+            0 => "4bpp/16",
+            1 => "8bpp/256",
+            2 => "2048",
+            3 => "RGB555",
+            _ => "RGB888",
+        };
+        for n in 0..4usize {
+            println!(
+                "  NBG{n}: en={} prio={} bitmap={} (size={} base={:05X}) char2x2={} cmode={}({}) plsz={} mapoff={} planes={:05X?}",
+                r.nbg_enabled(n) as u8,
+                r.nbg_priority(n),
+                r.nbg_bitmap_enabled(n) as u8,
+                r.nbg_bitmap_size(n),
+                r.nbg_bitmap_base(n),
+                r.nbg_char_size_2x2(n) as u8,
+                r.nbg_color_mode(n),
+                cmode(r.nbg_color_mode(n)),
+                r.nbg_plane_size(n),
+                r.nbg_map_offset(n),
+                core::array::from_fn::<u32, 4, _>(|p| r.nbg_plane_page(n, p)),
+            );
+            println!(
+                "        CRAOFA_off=0x{:03X} scroll={:?} coordinc={:08X?} PNCN={:04X} winctl={:02X} cc={:?} SFPRMD={} SFCCMD={}",
+                r.nbg_color_ram_offset(n),
+                r.nbg_scroll(n),
+                r.nbg_coord_inc(n),
+                r.nbg_pncn(n),
+                r.nbg_window_control(n),
+                r.nbg_color_calc(n),
+                r.special_priority_mode(n),
+                r.special_color_calc_mode(n),
+            );
+        }
+        println!(
+            "SCRCTL={:04X} (NBG0 lscx={} lscy={} lzmx={} vcsc={}  NBG1 lscx={} lscy={} lzmx={} vcsc={})",
+            r.scrctl(),
+            r.nbg_line_scroll_x(0) as u8,
+            r.nbg_line_scroll_y(0) as u8,
+            r.nbg_line_zoom_x(0) as u8,
+            r.nbg_vcell_scroll(0) as u8,
+            r.nbg_line_scroll_x(1) as u8,
+            r.nbg_line_scroll_y(1) as u8,
+            r.nbg_line_zoom_x(1) as u8,
+            r.nbg_vcell_scroll(1) as u8,
+        );
+        for which in 0..2usize {
+            println!(
+                "  RBG{which}: en={} prio={} bitmap={} (size={}) cmode={}({}) CRAOFB_off=0x{:03X} cc={:?} RPMD={} coeff_en={} winctl={:02X}",
+                r.rbg_enabled(which) as u8,
+                r.rbg_priority(which),
+                r.rbg_bitmap_enabled() as u8,
+                r.rbg_bitmap_size(),
+                r.rbg_color_mode(),
+                cmode(r.rbg_color_mode()),
+                r.rbg_color_ram_offset(which),
+                r.rbg_color_calc(which),
+                r.rotation_param_mode(),
+                r.rbg_coeff_enabled(which) as u8,
+                if which == 0 {
+                    r.rbg0_window_control()
+                } else {
+                    0
+                },
+            );
+        }
+        println!(
+            "SPCTL={:04X} sprite_type={:X} RGB_mode(SPCLMD)={} SPWINEN={} SPCAOS_off=0x{:03X} SPCCN={} SPCCCS={} SPCCEN={}",
+            r.spctl(),
+            r.sprite_type(),
+            r.sprite_rgb_mode() as u8,
+            r.sprite_window_enabled() as u8,
+            r.sprite_color_ram_offset(),
+            r.sprite_cc_condition(),
+            r.sprite_cc_mode(),
+            r.sprite_color_calc_enabled() as u8,
+        );
+        print!("  sprite prio[0..8]=");
+        for i in 0..8 {
+            print!("{} ", r.sprite_priority(i));
+        }
+        println!();
+        println!(
+            "CCCTL={:04X} add_mode={} ext_cc_active={}  CLOFEN={:02X} CLOFSL={:02X} offA={:?} offB={:?}",
+            r.ccctl(),
+            r.color_calc_add_mode() as u8,
+            r.extended_color_calc_active() as u8,
+            r.color_offset_enable(),
+            r.color_offset_select(),
+            r.color_offset(0),
+            r.color_offset(1),
+        );
+        // Raw 512-byte register window (offset on the left, 16 bytes/row) — the
+        // completeness backstop in case a decode above missed a field.
+        println!("--- raw VDP2 regs 0x000..0x200 ---");
+        for row in 0..0x20u32 {
+            print!("  {:03X}:", row * 16);
+            for col in 0..16u32 {
+                if col % 2 == 0 {
+                    print!(" ");
+                }
+                print!("{:02X}", r.read8(row * 16 + col));
+            }
+            println!();
+        }
+    }
+
+    /// Dump VDP2 CRAM as RGB hex — `cram [start-index] [count]` (default 0,256).
+    /// Decodes through the live CRAM mode so the bytes match what the renderer
+    /// looks up. Observer-only; CRAM is otherwise hard to inspect (the `m`
+    /// command's bus path doesn't expose the mode-decoded colour).
+    fn dump_cram(&self, start: usize, count: usize) {
+        let mode = self.sat.bus.vdp2.regs.cram_mode();
+        println!("CRAM mode={mode}  index: rrggbb (RGB888-decoded)");
+        for base in (start..start + count).step_by(8) {
+            print!("  {base:03X}:");
+            for i in base..(base + 8).min(start + count) {
+                let (r, g, b) = self.sat.bus.vdp2.cram.color_rgb888(i & 0x7FF, mode);
+                print!(" {r:02X}{g:02X}{b:02X}");
+            }
+            println!();
+        }
+    }
+
     /// Dump both SH-2s' free-running-timer (FRT) state — the inter-CPU FTI
     /// input-capture handshake lives here (FTCSR.ICF bit 7 = input captured,
     /// TIER.ICIE bit 7 = capture-interrupt enabled). Lets a deadlock between
@@ -1461,6 +1628,11 @@ impl Dbg {
                 self.sat.bus.vdp2.regs.display_enabled(),
                 self.sat.bus.vdp1.is_drawing(),
             ),
+            "vdp2regs" | "v2r" => self.dump_vdp2regs(),
+            "cram" => self.dump_cram(
+                a1.and_then(parse_num).unwrap_or(0) as usize,
+                a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(256),
+            ),
             "fbdump" => {
                 // Render the current VDP state to a PPM (one run_frame; a stable
                 // hang leaves the screen unchanged) + report dims and non-black px.
@@ -1715,6 +1887,8 @@ sdbg commands:
   hirqlog [n]     last n HIRQ-edge changes (old->new +set -clr, cause) [CD-timing]
   ftcsr           arm master FTCSR (FRT status/ICF) byte-access trace; ftcsrdump prints+drains
   vdp             VDP display state
+  vdp2regs        full VDP2 register dump (decoded per layer + raw)  [alias v2r]
+  cram [s] [n]    dump VDP2 CRAM as RGB888 (mode-decoded), n entries from index s
   scsp            SCSP sound state (SNDON running + active slots)
   save <file>     write a save state (snapshot)
   load <file>     restore a save state (rewind; re-enables cdlog)
