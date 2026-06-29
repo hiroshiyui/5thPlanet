@@ -7,8 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-29
+
+**Greatest Nine '98** (Sega's baseball title) becomes the next fully-playable
+commercial game — it boots through its "Now Loading" loader to the title, team
+select, and into a match — unblocked by four distinct emulation fixes. The
+**VDP1 double-interlace (DIE) field-weave** now defaults on, steadying
+interlaced output (Virtua Fighter 2 is smoother; Greatest Nine '98's menu no
+longer strobes). And **Profile-Guided Optimization** ships as a documented,
+bit-identical release recipe.
+
 ### Added
 
+- **Greatest Nine '98 — fully playable.** Boots to title and plays; see *Fixed*
+  for the four gaps it exercised (VDP1 draw-end timing, SMPC SF, the 8bpp
+  palette bank, and the inter-CPU FRT input-capture width gate).
+- **VDP1 double-interlace (DIE) field-weave.** In double-interlace mode the
+  compositor weaves the even/odd fields from the two frame buffers into one
+  full-height image (matching Mednafen's per-field scanline placement) instead
+  of line-doubling the current field — which strobed on static interlaced
+  content. On by default; opt-out with `SAT_VDP1_NOWEAVE`.
+- **`sdbg` VDP inspection + render isolation** (observer-only, golden-safe):
+  `vdp2regs` / `vdp1regs` / `cram` decode dumps, the `SAT_NO_NBG0..3` /
+  `SAT_NO_SPRITE` / `SAT_NO_RBG0..1` per-layer compositor suppressors (to bisect
+  which layer draws an object), and the `SAT_VDP1FB` double-buffer swap/draw
+  trace.
 - **Profile-Guided Optimization (PGO) tooling** — `tools/pgo/run_pgo.sh`
   (measures the baseline-vs-PGO A/B on the heavy benches) and
   `tools/pgo/build_release.sh` (the release recipe: instrument a headless
@@ -24,9 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The **VDP1 field-weave** defaulting on changes interlaced-game output
+  (steadier VF2; no GN98 menu strobe). Software-composited pixels are otherwise
+  unchanged, so the `bios_boot` and per-title render goldens hold.
 - `tools/dump_game_disc.sh` now moves a finished image into `roms/` and deletes
   redumper's intermediate files on a successful dump (`--keep` to opt out,
   `--roms DIR` to choose the destination).
+
+### Fixed
+
+- **VDP1 frame-change deferred to the first active scanline** (not the
+  VBlank-OUT edge), matching Mednafen's `SetHBVB`, so a VBlank-OUT ISR that gates
+  on the VDP1 draw-end flag (EDSR.CEF) reads the draw that just completed — fixed
+  Greatest Nine '98's "Now Loading" hang.
+- **SMPC SF is software-set / hardware-cleared.** A COMREG write only latches the
+  command and no longer raises SF; spuriously setting it hung GN98's SNDOFF poll
+  (and any no-pre-write one-shot SF check).
+- **VDP2 8bpp 2-word pattern-name palette bank** now selects the CRAM bank from
+  palette bits [6:4] (it was over-shifted, folding every non-zero bank to 0) —
+  fixed GN98's scrambled team-flag previews.
+- **SH-2 FRT status flags re-protected on a hardware set** — honours the SH7604
+  "write-0-after-read-1" protocol, so a flag re-set after a read but before the
+  clearing write now survives it.
+- **Inter-CPU FRT input-capture (FTI)** pulses only on 16/32-bit writes, not byte
+  writes (Mednafen gates on `sizeof(T) != 1`).
+- **`sdbg cram`** guarded against a `usize` bound-overflow panic on a hostile or
+  mistyped index.
 
 ## [0.16.0] - 2026-06-28
 
