@@ -167,6 +167,21 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   layer with the env-gated `SAT_NO_NBG*`/`SAT_NO_SPRITE` suppressors + sdbg
   `vdp2regs`/`cram`. A non-zero 8bpp palette bank is an easy test gap. (GN98's
   team-flag previews — see below.)
+- **VDP1 double-interlace (DIE) deinterlace.** A foreground layer that *jitters*
+  (oscillates frame-to-frame on a strict 2-frame period, ~tens-of-k px toggling
+  while the non-black count barely moves) with a steady background = an interlace
+  deinterlace gap, not a swap-timing or content bug. In `FBCR.DIE=1` mode VDP1
+  rasterizes the even/odd fields into its two framebuffers on alternating frames
+  (the game flips `DIL` each frame), so the two buffers legitimately hold opposite
+  fields; the compositor must **weave** them (display line y ← the field-`(y&1)`
+  buffer, even field → rows 0,2,4…, odd → 1,3,5…) into one full-height image, not
+  line-double whichever field is current. Classify with the `SAT_NO_SPRITE` /
+  `SAT_NO_NBG*` suppressors (which layer?), `SAT_VDP1LOG` (does the game submit
+  identical commands each frame? → our display, not its content), and sdbg
+  `vdp1regs` + `SAT_VDP1FB` (DIE/DIL, per-frame swap/draw). **Pixel-visible →
+  needs user motion play-test sign-off** (a static-frame combing preview
+  over-predicts motion artifacts). (GN98 menu — see below; cf.
+  `p5-per-field-interlace-reverted`.)
 - **Interrupt-acceptance timing.** The Saturn aggregate forwards SCU/CD interrupts
   to the master once per instruction; that forward must honour the SH-2 rules the
   core already enforces — above all, **never accept an interrupt inside a branch
@@ -293,6 +308,28 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   "wrong colours, right shape" = a palette/CRAM-bank decode bug; the layer's
   registers were all correct — the bug was the per-depth/per-PN-width CRAM-index
   math. (See the "VDP2 colour / CRAM-bank decode" fertile-gap class above.)
+- **Greatest Nine '98 — VDP1 double-interlace field strobe** (`33ccf8a` gated →
+  `b1bb3ce` default-on, user-verified). The main menu's foreground (title + menu
+  bars) jittered every frame; the VDP2 background was steady. Classified as a
+  *temporal* render bug: `fbdump` of consecutive frames showed a strict 2-frame
+  toggle (~71412 px change, non-black count barely moving), `SAT_NO_SPRITE`
+  localised it to the VDP1 sprite layer, and `SAT_VDP1LOG` showed the game
+  submits *identical* commands each frame (→ our display, not its content). Root:
+  GN98 runs VDP1 in `FBCR.DIE=1` double-interlace and flips `DIL` each frame, so
+  VDP1 rasterizes the even/odd fields into its two framebuffers alternately; our
+  compositor line-doubled only the front buffer, so the displayed field
+  alternated → strobe. Fix: weave the two fields per display line in
+  `render_line` (field-`(y&1)` buffer), matching Mednafen `vdp2.cpp:329`. **My
+  first hypothesis — the recent `9b91689` CEF swap-timing fix caused it — was
+  FALSIFIED by a revert test (both swap edges strobe); a 4-agent fan-out then
+  proved it PRE-EXISTING (bisect to v0.16.0), with the mechanism + oracle agents
+  converging on the deinterlace gap.** Lessons: (1) a strict 2-frame toggle with
+  a near-constant non-black count = a field/deinterlace bug, not present/absent
+  flicker; (2) it's pixel-visible → I gated it, showed before/after, and got the
+  user's **motion** play-test before defaulting on (the user found VF2 *smoother*,
+  not combed — a static-frame combing preview over-predicts motion). (See the
+  "VDP1 double-interlace (DIE) deinterlace" fertile-gap class above; cf. the
+  reverted P5 per-field *rendering*, a different, broader mechanism.)
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.

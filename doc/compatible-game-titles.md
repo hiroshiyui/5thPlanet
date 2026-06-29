@@ -19,14 +19,15 @@ project.
 | **Doukyuusei ~if~** (同級生 if) | — | JP / v1.01 | ✅ **Fully playable** — graphics, SFX, and voices; in-game record-select menu; native 640×224 hi-res; Shuttle Mouse supported. | 143341 px |
 | **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | 71680 px |
 | **Panzer Dragoon Zwei** | GS-9049 | JP / v1.01 | ✅ **Fully playable** — opening Cinepak FMV → title → main menu (NEW GAME / OPTIONS) → game, with controller input working at native 704×448 hi-res. | 274464 px |
+| **Greatest Nine '98** (グレイテストナイン'98) | GS-9185 | JP / v1.01 | ✅ **Fully playable** — boots to title, game-menu, and team-select; the interlaced foreground (titles, menu items, team-flag previews) renders steady and full-resolution at native 704×480 via the VDP1 DIE field-weave. | 146336 px |
 
 The **render-golden** column is the headless non-black pixel count asserted by
 the `#[ignore]`d render-regression tests in `crates/saturn/tests/trace_boot.rs`
 (`vf2_renders_non_black`, `doukyuusei_renders_non_black`, `pdz_renders_non_black`,
-`san5_renders_non_black`) — a guard that these titles keep rendering. All four
-fully-playable titles now have a render golden; Sangokushi V's is captured during
-its opening Cinepak FILM movie (the only no-input stable frame), guarding the
-software-decoded-movie → VDP2 path.
+`san5_renders_non_black`, and `gn98_boots_to_title`) — a guard that these titles
+keep rendering. All five fully-playable titles now have a render golden;
+Sangokushi V's is captured during its opening Cinepak FILM movie (the only
+no-input stable frame), guarding the software-decoded-movie → VDP2 path.
 
 ## Notes
 
@@ -57,6 +58,16 @@ software-decoded-movie → VDP2 path.
   without it the game read "no controller" and ignored all input while other
   titles, which drive the status+continue handshake, worked. Both are in the
   [`debugging-playbook.md`](debugging-playbook.md) case studies.
+- **Greatest Nine '98** needed a four-fix chain, each a distinct fidelity gap:
+  a VDP1 draw-end-flag (`EDSR.CEF`) timing fix to clear its "Now Loading" stall;
+  dropping a spurious SMPC `SF` busy on a COMREG write (a black-screen self-loop);
+  an 8bpp 2-word pattern-name palette-bank decode fix (scrambled team-flag
+  previews); and the **VDP1 double-interlace (DIE) field-weave** — the game
+  rasterizes its even/odd interlace fields into the two VDP1 framebuffers on
+  alternating frames, which we were line-doubling one field at a time (a per-frame
+  field strobe of the whole foreground) instead of weaving into a full-height
+  image. All four are in the [`debugging-playbook.md`](debugging-playbook.md) case
+  studies.
 
 ## Also runs
 

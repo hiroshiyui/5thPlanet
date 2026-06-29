@@ -48,9 +48,10 @@ set as chips/games surface needs.
 | On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert + image browser, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
 **Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
-Four commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
-`vf2-good-emulation`), *Doukyuusei ~if~*, *Sangokushi V* (三國志V), and *Panzer
-Dragoon Zwei* — see [`compatible-game-titles.md`](compatible-game-titles.md).
+Five commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
+`vf2-good-emulation`), *Doukyuusei ~if~*, *Sangokushi V* (三國志V), *Panzer
+Dragoon Zwei*, and *Greatest Nine '98* — see
+[`compatible-game-titles.md`](compatible-game-titles.md).
 
 ## Milestone 1 — Cycle-accurate SH-2 core ✅
 
@@ -256,8 +257,8 @@ in `doc/system-architecture.md` §9, Part B.7.
 
 Output of a full per-chip architecture audit (2026-06-04). The emulator is
 "boot-complete" but not "hardware-complete": none of these block the current
-targets (four games fully playable — VF2, *Doukyuusei ~if~*, *Sangokushi V*,
-*Panzer Dragoon Zwei*),
+targets (five games fully playable — VF2, *Doukyuusei ~if~*, *Sangokushi V*,
+*Panzer Dragoon Zwei*, *Greatest Nine '98*),
 but together they are the path to broad
 compatibility + full cycle-accuracy. A **prioritized backlog** — tasks are
 pulled when a game or accuracy need surfaces, golden-safe throughout.

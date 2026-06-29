@@ -39,7 +39,8 @@ playable** (graphics, sound effects, and voices), including Shuttle Mouse
 support. **Koei's strategy title *Sangokushi V* (三國志V) is fully playable** too —
 from its per-scenario opening movie through to the in-game strategy map — and
 ***Panzer Dragoon Zwei* is fully playable**, from its opening movie through the
-title and menus into the game. Games load from disc images
+title and menus into the game. The baseball game ***Greatest Nine '98* is fully
+playable** too, at native 704×480 interlaced resolution. Games load from disc images
 (CUE/BIN, ISO, CloneCD) or straight from
 an original disc in a host optical drive; save
 states, the console's battery-backed save memory, expansion cartridges, and an
