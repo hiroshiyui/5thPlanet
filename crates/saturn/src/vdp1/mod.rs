@@ -55,17 +55,16 @@ fn vdp1fb() -> bool {
     *VDP1FB.get_or_init(|| std::env::var_os("SAT_VDP1FB").is_some())
 }
 
-/// A/B flag (`SAT_VDP1_WEAVE`): when set, the VDP2 compositor weaves VDP1's two
-/// double-interlace fields (`FBCR.DIE=1`) into one full-height sprite layer
-/// instead of showing the current field line-doubled. Fixes the per-frame field
-/// strobe of static interlaced content (e.g. GN98's main menu; matches
-/// Mednafen's per-field scanline placement, `vdp2.cpp`). Off by default → render
-/// goldens unchanged; pixel-visible when on (see [`Vdp1::weave_source`]).
+/// Escape hatch (`SAT_VDP1_NOWEAVE`): VDP1 double-interlace field-weave is **on
+/// by default** (the faithful behaviour — see [`Vdp1::weave_source`]); set this
+/// env var to disable it and fall back to line-doubling the current field (the
+/// old behaviour that strobes on static interlaced content), for debugging or
+/// A/B comparison. Read once and cached.
 #[inline]
-fn weave_enabled() -> bool {
+fn weave_disabled() -> bool {
     use std::sync::OnceLock;
-    static WEAVE: OnceLock<bool> = OnceLock::new();
-    *WEAVE.get_or_init(|| std::env::var_os("SAT_VDP1_WEAVE").is_some())
+    static NOWEAVE: OnceLock<bool> = OnceLock::new();
+    *NOWEAVE.get_or_init(|| std::env::var_os("SAT_VDP1_NOWEAVE").is_some())
 }
 
 /// Debug: `(non-black 16-bit pixels, FNV-1a checksum)` of a frame buffer, for
@@ -217,8 +216,9 @@ impl Vdp1 {
     }
 
     /// DIE field-weave source for the VDP2 compositor: `Some((back_buffer, dil))`
-    /// when the `SAT_VDP1_WEAVE` A/B flag is set AND the frame is double-density
-    /// interlaced (`FBCR.DIE`=1). In DIE mode VDP1 rasterizes the even/odd fields
+    /// whenever the frame is double-density interlaced (`FBCR.DIE`=1) — on by
+    /// default, unless disabled via `SAT_VDP1_NOWEAVE`. In DIE mode VDP1
+    /// rasterizes the even/odd fields
     /// into the two framebuffers on alternating frames (`DIL` toggles each
     /// frame): the front (`display`) holds field `!DIL` (drawn last frame), the
     /// back (`fb`) holds field `DIL` (drawn this frame). The compositor reads the
@@ -228,8 +228,8 @@ impl Vdp1 {
     /// `DIL` flips. `None` (default, flag off or non-DIE) → the compositor shows
     /// the front field line-doubled, unchanged → render goldens hold.
     pub fn weave_source(&self) -> Option<(&Framebuffer, u8)> {
-        if !weave_enabled() {
-            return None;
+        if weave_disabled() {
+            return None; // SAT_VDP1_NOWEAVE escape hatch
         }
         let fbcr = self.regs.read16(0x02);
         if fbcr & 0x08 == 0 {
