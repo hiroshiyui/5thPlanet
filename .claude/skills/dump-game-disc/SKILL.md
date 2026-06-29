@@ -17,11 +17,16 @@ the cdrdao MSB-first byte-swap gotcha (below) **disappear entirely**. Use
 cdrdao only as a fallback when redumper is unavailable.
 
 **Automation:** `tools/dump_game_disc.sh` runs the whole pipeline in one command
-(`redumper disc` → verify), e.g.
+(`redumper disc` → verify → install), e.g.
 `tools/dump_game_disc.sh --bios bios/saturn_bios.bin` (auto-names the image from
 the disc's own Saturn title; `-n NAME` overrides, `--retries N`/`--speed N` tune
-the rip). Run `tools/dump_game_disc.sh --help` for options. Use it for the happy
-path; fall back to the manual steps when a stage needs hands-on attention.
+the rip). On a **successful** dump it **moves the finished image** (the `.cue`
+plus its `(Track N).bin` files — they travel together so the cue's relative
+paths stay valid) **into `roms/` and deletes redumper's intermediate files**
+(`.log`, `.state`, `.scram`, `.subcode`, `.fulltoc`, …); `--keep` leaves
+everything in the work dir (the old behaviour), `--roms DIR` picks the
+destination. Run `tools/dump_game_disc.sh --help` for options. Use it for the
+happy path; fall back to the manual steps when a stage needs hands-on attention.
 
 Do all intermediate I/O under the project's `tmp/` subdirectory (never `/tmp`).
 **Always pass real paths, never `<placeholder>`** in commands you give the user
@@ -98,11 +103,13 @@ Use only when redumper isn't available. cdrdao on many drives reads audio
    with cdrdao, if it does, return to the cdrdao byte-swap step. The acceptance
    bar is: boots to the game, and audio-track BGM sounds correct.
 
-6. **Place the result and clean up.** Move the verified `.cue` + `.bin`(s) to the
-   user's chosen library path; leave nothing stray in `tmp/`. Point the frontend
-   at the `.cue`. The emulator reads `.cue`/`.iso`/`.ccd` only — **CHD support was
-   dropped** (commit `302a43d`), so convert any existing `.chd` back to CUE-BIN
-   with `chdman extractcd`.
+6. **Place the result and clean up.** The automation script does this for you on
+   success (moves the `.cue` + `.bin`(s) into `roms/`, deletes the intermediates);
+   for the **manual** path here, move the verified `.cue` + `.bin`(s) to the
+   user's chosen library path (`roms/` by default) and leave nothing stray in
+   `tmp/`. Point the frontend at the `.cue`. The emulator reads
+   `.cue`/`.iso`/`.ccd` only — **CHD support was dropped** (commit `302a43d`), so
+   convert any existing `.chd` back to CUE-BIN with `chdman extractcd`.
 
 Notes:
 - This skill is **observer-only on the codebase** — it dumps and fixes disc
