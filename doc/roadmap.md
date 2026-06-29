@@ -288,7 +288,7 @@ empty-status, DAC18B/MEM4MB faithful no-ops).
 | C3 | Line-colour screen + back-screen register | ✅ (simplified line-colour model) |
 | C4 | Special priority + special colour-calc (SFPRMD/SFCCMD, all modes) | ✅ (2026-06-08) |
 | C5 | Windows + rotation edge cases | 🟡 sprite window, CRAM mode 3, RPMD 0–3, per-dot coefficients (DKAx walk, RDBS bank grants, CRKTE CRAM tables, mode-3 Xp) all done (`5ee3ecb`+`ac712a8`, VF2's floor; in DD interlace the rotation accumulators advance per *field* line). Deferred: dual-parameter window selection, screen-over mode 1 |
-| C6 | VDP1 framebuffer TVM modes | 🟡 8bpp + DIE interlace done (`0dd3ddd`); TVM=3 (8bpp+rotate layout) deferred |
+| C6 | VDP1 framebuffer TVM modes | 🟡 8bpp + DIE-interlace plotting done (`0dd3ddd`); display-side **DIE field-weave** — the VDP2 compositor weaves the even/odd fields into one full-height image instead of line-doubling the current field (Mednafen per-field placement; default-on, opt-out `SAT_VDP1_NOWEAVE`) — done (`33ccf8a`→`b1bb3ce`, v0.17.0; fixed GN98's menu strobe, smoother VF2); TVM=3 (8bpp+rotate layout) deferred |
 | C7 | Colour offset (CLOFEN/COA*/COB*) | ✅ (deliberate golden re-baseline → `0x0B1BA6E5180766F7`; validated by Doukyuusei's logo fade) |
 | C8 | NBG0/1 reduction (ZMXN/ZMYN) + fractional scroll | ✅ |
 | C9 | Extended colour calc (3-layer) | 🟡 non-line EXCC done; line-colour variants + gradient blend deferred |
