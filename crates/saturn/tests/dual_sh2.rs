@@ -245,24 +245,16 @@ fn word_write_to_fti_region_pulses_target_frt_input_capture() {
     assert_eq!(sat.master().onchip.frt.ftcsr & 0x80, 0x80, "master ICF set");
 }
 
-/// The FTI pin is wired to the bus, so a write of *any* width triggers it — not
-/// only the 16-bit form. The byte/long paths originally dropped the FTI region
-/// (`_ => {}`), a latent lost-wakeup for a game that pulses via `MOV.B`/`MOV.L`.
-/// Verifies both widths set the target FRT's ICF, same as the word write.
+/// FTI pulse-width gating (Mednafen `ss.cpp:309`, `sizeof(T) != 1`): a 16- or
+/// 32-bit write to the FTI region pulses the target FRT's input capture, but a
+/// BYTE write does NOT — it is an ordinary dropped access. An earlier model
+/// pulsed on byte writes too (over-pulsing vs the oracle); no game wakes a
+/// sibling SH-2 with a `MOV.B`, or it would hang on Mednafen.
 #[test]
-fn byte_and_long_writes_to_fti_region_also_pulse_input_capture() {
+fn long_write_pulses_fti_but_byte_write_does_not() {
     use sh2::bus::{AccessKind, Bus};
 
-    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
-    sat.reset();
-    sat.bus.write8(0x0100_0000, 0x12, AccessKind::Data); // byte -> slave FTI
-    sat.run_for(512);
-    assert_eq!(
-        sat.slave().onchip.frt.ftcsr & 0x80,
-        0x80,
-        "byte write set slave ICF"
-    );
-
+    // 32-bit write DOES pulse (sizeof != 1).
     let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
     sat.reset();
     sat.bus.write32(0x0180_0000, 0x1234_5678, AccessKind::Data); // long -> master FTI
@@ -270,7 +262,18 @@ fn byte_and_long_writes_to_fti_region_also_pulse_input_capture() {
     assert_eq!(
         sat.master().onchip.frt.ftcsr & 0x80,
         0x80,
-        "long write set master ICF"
+        "long (32-bit) write pulses the FTI"
+    );
+
+    // BYTE write does NOT pulse.
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    sat.reset();
+    sat.bus.write8(0x0100_0000, 0x12, AccessKind::Data); // byte -> slave FTI
+    sat.run_for(512);
+    assert_eq!(
+        sat.slave().onchip.frt.ftcsr & 0x80,
+        0,
+        "byte write does NOT pulse the FTI (Mednafen sizeof != 1)"
     );
 }
 

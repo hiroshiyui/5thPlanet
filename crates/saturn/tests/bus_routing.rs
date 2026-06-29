@@ -225,13 +225,14 @@ fn master_fti_write16_sets_master_capture_flag() {
 #[test]
 fn fti_regions_are_open_bus_on_read() {
     // The FTI trigger regions are write-only; reads fall through to open bus
-    // (0). Writes of any width pulse the target input-capture line.
+    // (0). A 16/32-bit write pulses the target input-capture line; a BYTE write
+    // does NOT (Mednafen gates the pulse on `sizeof(T) != 1`, `ss.cpp:309`).
     use saturn::bus::{MASTER_FTI_BASE, SLAVE_FTI_BASE};
     let mut bus = fresh();
     assert_eq!(bus.read32(SLAVE_FTI_BASE, AccessKind::Data).0, 0);
     assert_eq!(bus.read32(MASTER_FTI_BASE, AccessKind::Data).0, 0);
     bus.write8(SLAVE_FTI_BASE, 0xFF, AccessKind::Data);
-    assert!(bus.slave_input_capture, "8-bit writes also pulse FTI");
+    assert!(!bus.slave_input_capture, "byte writes do NOT pulse FTI");
 }
 
 #[test]
