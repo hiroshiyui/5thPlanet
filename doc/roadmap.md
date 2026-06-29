@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 investigations (case studies + the full forensic case files) live in the
 [`doc/debugging-playbook.md`](debugging-playbook.md).
 
-Current test count: **1168 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
+Current test count: **1169 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
