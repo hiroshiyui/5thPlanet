@@ -347,6 +347,8 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 |---|-------|--------|
 | P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. Remaining: `step` dispatch, fastmap-style bus page table |
 | P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`); PGO/LTO remaining |
+| P6 | Hoist redundant per-instruction entity borrows in `step_cpus` | 📋 candidate, bit-identical: `imask`/`pc`/`cycle`/`delay-slot` are 4 separate `scheduler.entity(*master_id).sh2()` lookups per master instruction (`system.rs:1222-1225`) — collapse to one. Free, ~10 min, golden-invariant by construction. Magnitude small/unverified (<1–2%) |
+| P7 | Batch-invariant per-instruction scaffolding in `step_cpus` | 📋 candidate, **perf-gated + accuracy-sensitive**: `cd_block.irq_active()`+`set_cd_int` and the SCU interrupt sample run every master instruction even when state can't change between CD-timer ticks (part of the ~15% scaffolding self-time in VF2 3D). Biggest single-core lever left, but must preserve per-instruction interrupt-acceptance timing — the class that black-screened games when mishandled (`b65cd18`). Needs a `perf` capture to size + prove edge timing unchanged |
 
 (Other levers were catalogued and dropped 2026-06-12 — accuracy-affecting
 sync/model shortcuts, and the Mednafen-style video-output levers, of which
@@ -370,6 +372,22 @@ the same time: a per-frame CRAM→RGB888 LUT in the compositor — bit-identical
 it did cut `color_rgb888` self-time 2.3→0.1%, but the end-to-end fps gain was
 within noise since render is the band-parallel edge and both heavy scenes already
 clear 60 fps; re-land only for a heavier-NBG/bitmap game or a low-core host.)
+
+### Profile baseline (2026-06-29, 12-core host)
+
+`bench_vf2_fight` (704×448 DD, worst case): compute-only 70.1 fps, compute+render
+37.1 fps (render share 47%), **in-vivo overlapped `bench_vf2_pipeline` 64.5 fps**
+(advance avg 15.41 ms vs the 16.67 ms budget → ~8% headroom); audio 742 samples/
+frame, zero shortfalls. `bench_fps` (640×224 Doukyuusei menu): compute-only 82.8
+fps, compute+render 62.3 fps (render share 25%). **Both heavy scenes already clear
+60 fps real-time**, so the catalogued P6/P7 levers are *thin-margin / low-core-host
+robustness*, not a current deficit — accuracy stays the default and no change is
+required for raw speed. Render-thread sweep confirmed the default band count (4 on
+12 cores) is optimal (2 → 48.8 fps render-starved, 6 → 62.9 oversubscribed). Cache
+is **not** a lever: 99.903% hit, cold line-fill ~0.1%, and the hit-path whole-line
+copy is already eliminated (`probe`/`line_at`/`extract_u*`, copy-free). Hotspot
+attribution (P7 sizing) is blocked until `kernel.perf_event_paranoid ≤ 2` — `perf`
+sampling was denied at the host's default `=3`.
 
 ## Later milestones (queued)
 
