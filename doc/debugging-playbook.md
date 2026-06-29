@@ -162,6 +162,17 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   edge: the SCU `IST` latch is **guest-cleared, not auto-cleared on vector fetch**
   (the ISR reads IST to identify the source). (Sangokushi V's movie stall lived
   here — see below.)
+- **VDP status-flag observability vs the ISR that reads it.** A game's VBlank
+  handler often gates on a VDP flag that a frame-boundary event also mutates —
+  e.g. **VDP1 EDSR.CEF** (draw-end). The mutation (the VDP1 frame-buffer swap +
+  automatic-draw restart, which *clears* CEF for the next draw) must land at the
+  raster point the reference uses, relative to the interrupt: Mednafen `SetHBVB`
+  defers it to the **first HBLANK after leaving VBLANK** — *after* the VBlank-OUT
+  ISR has read CEF, not on the VBlank-OUT edge itself. Doing it on the edge
+  clears the flag before the ISR observes it, every frame. When a flag-gated
+  loop never advances, check *who clears the flag and when* relative to the
+  handler — and instrument the flag's value **at the read PC**, not just at the
+  edge. (Greatest Nine '98's "Now Loading" lived here — see below.)
 - **SMPC INTBACK acquisition modes (status vs peripheral).** INTBACK is two
   independent, separately-gated fetches: the **status** phase runs only if
   `IREG0 & 0xF` (RTC/region/SMEM, OREG0 = `0x80`-style status byte), and the
@@ -208,6 +219,24 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   deterministic instance once captured — and the symptom subsystem is rarely the
   buggy one.** (Full forensic record — the deterministic-repro recipe and the
   ruled-out evidence table — in *Boot-blocker case files* below.)
+- **Greatest Nine '98 — VDP1 draw-end flag cleared before the ISR read it**
+  (`9b91689`). Wedged forever at "Now Loading": its CD-loader's VBlank-OUT ISR
+  gates on **EDSR.CEF** (VDP1 draw-end). We cleared CEF (via `vdp1.frame_change`
+  → `render_list`) on the **VBlank-OUT edge** in `update_video_timing`, but that
+  edge's own ISR runs *at* VBlank-OUT — so it read CEF=0 every frame and the
+  loader spun (both SH-2s deadlocked; the slave's FTI/ICF poll + the
+  un-installed worker callback were **downstream victims**). Mednafen `SetHBVB`
+  defers the swap + CEF-clear to the **first HBLANK after leaving VBLANK**
+  (`vbcdpending` consumed on the next HBLANK edge); ported as moving
+  `frame_change` to the first active scanline (`prev_line==0 && line==1`).
+  Golden-safe (same displayed buffer at render time). Found by a 3-agent fan-out
+  that converged on the CEF mechanism; a first fix (move to the VBlank-OUT edge)
+  "should have worked" but a **windowed EDSR probe** showed the ISR runs at
+  VBlank-OUT — a new race against the same ISR — so it took one more line of
+  deferral. **Lesson: a 2-CPU flag-wait deadlock — trace UPSTREAM to what stops
+  driving the flag (the FTI deadlock was the victim); and when a fix "should
+  work" but doesn't, instrument the value AT THE READ SITE.** (A separate
+  downstream GN98 blocker remains — a black-screen spin at `0x06004A7E`.)
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
