@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-06-29
+
+A maintenance release: one bit-identical hot-loop optimization plus
+documentation polish. No emulation behaviour changes — the `bios_boot` golden
+`0x0B1BA6E5180766F7` is unchanged.
+
+### Changed
+
+- **`step_cpus` hot loop** (M13 Performance lever **P6**) — the
+  per-master-instruction interrupt scaffolding now takes a single
+  scheduler-entity borrow for its two gating reads (`imask` + delay-slot)
+  instead of four, and defers `pc`/`cycle` to the rare interrupt-fire branch
+  that actually consumes them. Pure read reordering — **bit-identical** (golden
+  unchanged; full `saturn` suite, including savestate determinism, green).
+- **Docs** — the README lists the five fully-playable titles as a bulleted
+  compatible-games list, and the roadmap records the v0.17.0 display-side VDP1
+  DIE field-weave under C6.
+
 ## [0.17.0] - 2026-06-29
 
 **Greatest Nine '98** (Sega's baseball title) becomes the next fully-playable
