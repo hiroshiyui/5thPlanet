@@ -593,6 +593,28 @@ mod tests {
     }
 
     #[test]
+    fn weave_source_reflects_fbcr_die_and_dil() {
+        // The DIE field-weave accessor the VDP2 compositor consults: `Some((back,
+        // DIL))` only when FBCR.DIE=1 (double-interlace), carrying the current DIL
+        // field bit; `None` when DIE=0 (line-double, render goldens hold). The
+        // weave *render* is covered via `render_frame_weave`; this pins the
+        // accessor's FBCR decode (DIE = bit 3, DIL = bit 2).
+        let mut v = Vdp1::new();
+        v.regs.write16(0x02, 0x0000); // FBCR DIE=0
+        assert!(v.weave_source().is_none(), "DIE=0 → no weave");
+        v.regs.write16(0x02, 0x0008); // DIE=1, DIL=0
+        assert!(
+            matches!(v.weave_source(), Some((_, 0))),
+            "DIE=1, DIL=0 → weave field 0"
+        );
+        v.regs.write16(0x02, 0x000C); // DIE=1, DIL=1
+        assert!(
+            matches!(v.weave_source(), Some((_, 1))),
+            "DIE=1, DIL=1 → weave field 1"
+        );
+    }
+
+    #[test]
     fn aggregate_dispatch_routes_each_window() {
         let mut v = Vdp1::new();
         v.write32(VRAM_BASE + 0x100, 0xDEAD_BEEF);
