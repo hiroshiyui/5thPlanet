@@ -5,12 +5,14 @@
 # WHY: with `perf` blocked (kernel.perf_event_paranoid=3 on the dev host) and
 # the per-instruction *source* micro-opts measured as noise (decode-LUT
 # fixed-array, fat LTO — see doc/roadmap.md "Interpreter micro-opt
-# investigation"), PGO is the one untested lever with plausibly non-noise
-# magnitude. It does frequency-based block layout over the 143-arm `execute()`
-# match and the branchy `mem_*`/`classify` chains — the kind of win neither thin
-# nor fat LTO can do without a profile. PGO is **build-time only and
-# bit-identical** (no source/semantics change), so it stays inside the
-# accuracy-first charter.
+# investigation"), PGO was the one remaining lever with plausibly non-noise
+# magnitude — and it WON: measured ≈+30–56% on the heavy scenes (2026-06-29),
+# generalising across games. It does frequency-based block layout over the
+# 143-arm `execute()` match and the branchy `mem_*`/`classify` chains — the kind
+# of win neither thin nor fat LTO can do without a profile. PGO is **build-time
+# only and bit-identical** (no source/semantics change), so it stays inside the
+# accuracy-first charter. This script reproduces that A/B; `build_release.sh`
+# bakes the profile into a shipping binary.
 #
 # METHOD (manual PGO, no cargo-pgo dependency):
 #   1. baseline   — build normally (thin LTO), measure the heavy scenes.

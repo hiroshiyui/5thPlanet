@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Profile-Guided Optimization (PGO) tooling** — `tools/pgo/run_pgo.sh`
+  (measures the baseline-vs-PGO A/B on the heavy benches) and
+  `tools/pgo/build_release.sh` (the release recipe: instrument a headless
+  `jupiter`, boot+attract-train over `roms/*.cue`, merge the profile, and build
+  the shipping binary with `-Cprofile-use`). PGO is **build-time only and
+  bit-identical** — it reorders the interpreter's block layout, never its
+  behaviour (the `bios_boot` golden + savestate round-trip pass under
+  `profile-use`), so accuracy is untouched. Measured ≈+30–56% on the emulation
+  core and it generalises across games (a profile trained on one title still
+  sped up an unseen one by +39%). Not wired into the normal build — a deliberate
+  packaging step, never a checked-in `RUSTFLAGS`. Wired into the
+  `release-engineering` skill for producing downloadable binaries.
+
+### Changed
+
+- `tools/dump_game_disc.sh` now moves a finished image into `roms/` and deletes
+  redumper's intermediate files on a successful dump (`--keep` to opt out,
+  `--roms DIR` to choose the destination).
+
 ## [0.16.0] - 2026-06-28
 
 An **SDL_GPU / Vulkan presentation backend** with a built-in **CRT-filter shader**,

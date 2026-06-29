@@ -84,6 +84,12 @@ cargo run -p jupiter --features gpu-presenter -- --gpu=on "bios/Sega Saturn BIOS
 # Built-in self-diagnostics (no window): exits 0 if all checks pass.
 # Add a BIOS (+ disc) to also run boot/compatibility checks.
 cargo run -p jupiter -- doctor
+
+# Optional: build a faster release binary with Profile-Guided Optimization.
+# Same accuracy (it only changes code layout, not behaviour) but a markedly
+# faster emulation core. Needs a BIOS + a game disc in roms/ to train on;
+# without them it just falls back to a plain release build.
+tools/pgo/build_release.sh        # -> target/release/jupiter
 ```
 
 ## Controls

@@ -31,6 +31,8 @@ cargo llvm-cov --workspace --summary-only  # coverage (~85% line; re-report
 
 Run the binary with `cargo run -p jupiter -- <bios.bin>` — the SDL3 frontend (default-on `sdl-frontend` feature) opens a window and runs the BIOS; `--no-default-features` runs headless.
 
+**Performance — PGO is the one sanctioned speed lever.** Since accuracy is subordinate to fidelity (no JIT/dynarec/approximate cycles), the only blessed way to make the core faster is **Profile-Guided Optimization**, which is **build-time only and bit-identical** (it reorders the interpreter's block layout, never its behaviour — the `bios_boot` golden + savestate gates pass under `profile-use`). It is by far the biggest single-core lever measured (≈+30–56%, generalises across games). It is **not** wired into the normal build (no checked-in `RUSTFLAGS`): `tools/pgo/run_pgo.sh` measures the A/B and `tools/pgo/build_release.sh` produces the optimized release binary (a packaging step). The per-instruction *source* micro-opts (decode-LUT fixed-array, fat LTO, …) were investigated and measured as noise — see the roadmap Performance section + `tools/pgo/README.md`. Don't re-chase them; the headroom is in PGO's block layout, not source.
+
 ## Architecture
 
 ### Workspace layout
