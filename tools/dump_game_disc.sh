@@ -14,22 +14,32 @@
 # image (`Disc::from_cue`), so the result loads directly.
 #
 # Pipeline:  redumper disc (dump -> refine -> split + hash) -> [verify]
+#            -> install (move image to roms/, delete intermediates)
+#
+# On a *successful* dump the loadable image (the .cue + its `(Track N).bin`
+# files — they travel together so the cue's relative FILE paths stay valid) is
+# moved into ./roms, and redumper's working/intermediate files (.log, .state,
+# .scram, .subcode, .fulltoc, .toc, .cdtext, …) are deleted from the work dir.
 #
 # Usage:
 #   tools/dump_game_disc.sh [options]
 #
 # Options:
 #   -d, --device DEV    optical drive (default: /dev/sr0)
-#   -o, --out DIR       output directory (default: tmp)
+#   -o, --out DIR       working/output directory for the dump (default: tmp)
 #   -n, --name NAME     base name for the image (default: auto — the disc's own
 #                       Saturn game title, slug-ified; falls back to "game")
 #       --retries N     sector re-read retries on a SCSI/C2 error (default: 50)
 #       --speed N       drive read speed (default: redumper picks the optimal)
 #       --bios PATH     after ripping, smoke-load the image in jupiter (headless)
 #                       and report whether the audio still looks byte-swapped
+#       --roms DIR      where to install the finished image (default: roms)
+#       --keep          skip the install step: leave the image + all
+#                       intermediate files in the work dir (the old behaviour)
 #   -h, --help          show this help
 #
-# Per project convention, default output lands in ./tmp (never /tmp).
+# Per project convention, default output lands in ./tmp (never /tmp); the
+# finished image is then moved to ./roms.
 set -euo pipefail
 
 DEVICE="/dev/sr0"
@@ -39,6 +49,8 @@ NAME_EXPLICIT=0
 RETRIES=50
 SPEED=""
 BIOS=""
+ROMSDIR="roms"
+KEEP=0
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -72,6 +84,8 @@ while [ $# -gt 0 ]; do
         --retries)    RETRIES="${2:?}"; shift 2;;
         --speed)      SPEED="${2:?}"; shift 2;;
         --bios)       BIOS="${2:?}"; shift 2;;
+        --roms)       ROMSDIR="${2:?}"; shift 2;;
+        --keep)       KEEP=1; shift;;
         -h|--help)    usage; exit 0;;
         *) die "unknown argument: $1 (try --help)";;
     esac
@@ -100,7 +114,7 @@ CUE="$OUTDIR/$NAME.cue"
 LOG="$OUTDIR/$NAME.log"
 
 # --- step 1: redumper disc (dump + refine + split + hash) -----------------
-echo ">> [1/2] redumper: dumping $DEVICE -> $OUTDIR/$NAME.* (raw, all tracks) ..."
+echo ">> [1/3] redumper: dumping $DEVICE -> $OUTDIR/$NAME.* (raw, all tracks) ..."
 RD_ARGS=(disc --drive="$DEVICE" --retries="$RETRIES"
          --image-path="$OUTDIR" --image-name="$NAME" --overwrite)
 [ -n "$SPEED" ] && RD_ARGS+=(--speed="$SPEED")
@@ -123,7 +137,7 @@ fi
 
 # --- step 2: verify (optional) -------------------------------------------
 if [ -n "$BIOS" ]; then
-    echo ">> [2/2] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
+    echo ">> [2/3] smoke-loading in jupiter (headless, ~15s) to check byte order ..."
     VLOG="$OUTDIR/$NAME.verify.log"
     # The loader prints a warning when the audio tracks look MSB-first
     # (Disc::audio_looks_msb_first). Run briefly and scrape stderr.
@@ -136,8 +150,56 @@ if [ -n "$BIOS" ]; then
         echo "        no byte-swap warning — audio byte order looks correct."
     fi
 else
-    echo ">> [2/2] skipping verify (no --bios given)."
+    echo ">> [2/3] skipping verify (no --bios given)."
+fi
+
+# --- step 3: install image to roms/ + clean intermediates ----------------
+# Only reached on a successful dump: `set -e` aborts on any earlier failure and
+# the `[ -f "$CUE" ]` guard above bails if redumper produced no cue. The verify
+# step is `|| true`, so a verify miss does not block the install.
+if [ "$KEEP" -eq 1 ]; then
+    echo ">> install: skipped (--keep); image + intermediates left in $OUTDIR/"
+else
+    echo ">> install: moving image -> $ROMSDIR/ and cleaning intermediates ..."
+    mkdir -p "$ROMSDIR"
+
+    # Don't move onto ourselves if the work dir already *is* the roms dir.
+    src_real=$(cd "$OUTDIR" && pwd -P)
+    dst_real=$(cd "$ROMSDIR" && pwd -P)
+
+    if [ "$src_real" = "$dst_real" ]; then
+        echo "        work dir is the roms dir; image already in place."
+    else
+        # The image = the cue + every BIN it references. Pull the BIN names
+        # straight from the cue's FILE lines (relative names) so the cue and
+        # its bins move together and the relative paths stay valid.
+        n_bin=0
+        while IFS= read -r bin; do
+            [ -n "$bin" ] || continue
+            if [ -f "$OUTDIR/$bin" ]; then
+                mv -f -- "$OUTDIR/$bin" "$ROMSDIR/"
+                n_bin=$((n_bin + 1))
+            fi
+        done < <(sed -nE 's/^[[:space:]]*FILE[[:space:]]+"([^"]+)".*/\1/Ip' "$CUE")
+        mv -f -- "$CUE" "$ROMSDIR/"
+        CUE="$ROMSDIR/$NAME.cue"
+        echo "        image -> $CUE (+ $n_bin track bin file(s))"
+    fi
+
+    # Delete redumper's working/intermediate artifacts for this dump. These are
+    # the descrambling/state/subchannel/TOC side-files plus our own logs; the
+    # .cue/.bin image has already been moved out, so it's never at risk.
+    n_rm=0
+    for ext in log state scram scrap subcode subchannel fulltoc toc cdtext \
+               atip pma asus skeleton hash verify.log; do
+        f="$OUTDIR/$NAME.$ext"
+        if [ -f "$f" ]; then
+            rm -f -- "$f"
+            n_rm=$((n_rm + 1))
+        fi
+    done
+    echo "        removed $n_rm intermediate file(s) from $OUTDIR/"
 fi
 
 echo
-echo "done. load it with:  cargo run -p jupiter -- <BIOS.bin> $CUE"
+echo "done. load it with:  cargo run -p jupiter -- <BIOS.bin> \"$CUE\""
