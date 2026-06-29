@@ -9,7 +9,7 @@ referenced below. Commercial titles that run are listed in
 investigations (case studies + the full forensic case files) live in the
 [`doc/debugging-playbook.md`](debugging-playbook.md).
 
-Current test count: **1169 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
+Current test count: **1173 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
 (`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
 
 **Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
@@ -355,8 +355,12 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 sync/model shortcuts, and the Mednafen-style video-output levers, of which
 per-field interlace rendering (P5) was implemented and reverted by user
 choice: the bare weave showed ghosting in play-testing; see `4284c1c`/
-`fe70809` and the git history of this section. Current performance is
-sufficient without them.)
+`fe70809` and the git history of this section. (A *distinct* full-resolution
+display-side **field-weave** for VDP1 double-interlace did later land and
+**was** user play-test-accepted — `b1bb3ce`, *smoother* in VF2 — but as a
+fidelity feature, not a perf lever; see the VDP1 DIE field-weave in
+`CLAUDE.md` / `doc/glossary.md`.) Current performance is sufficient without
+them.)
 
 Plus the accuracy-neutral frontend lever already landed: the render-pipeline
 worker thread (`757f164`) overlaps VDP2 compositing onto a second core
