@@ -184,6 +184,12 @@ written as part of a 32-bit `D*EN` store — byte/halfword writes
 deliberately don't fire (software builds the register up piece-by-
 piece and we'd otherwise trigger mid-construction).
 
+**DIE / DIL** — [VDP1] [FBCR] double-interlace bits: DIE (bit 3) enables
+double-density interlace plotting; DIL (bit 2) selects which field
+(even/odd) the plotter targets this frame. Games flip DIL each frame to
+draw alternating fields into the two framebuffers — the display-side
+deinterlace is the field-weave under [FBCR].
+
 **DIV0S / DIV0U / DIV1** — SH-2 hardware-divide instructions
 implementing non-restoring division across 32 cycles of `DIV1`
 iterations after `DIV0S` (signed) or `DIV0U` (unsigned). See the
@@ -227,6 +233,16 @@ on-chip peripherals.
 
 ## E
 
+**EDSR** — [VDP1] draw-end status register (read-only at `0x05D0_0010`).
+Bit 1 **CEF** (Current End Flag) latches when the command list finishes
+drawing and clears when the next list starts; bit 0 **BEF** (Before End
+Flag). Draw-end also raises the SCU sprite-draw-end interrupt. A
+CD-streaming loader can gate frame advance on CEF, so *when* the
+[framebuffer] swap clears it matters: deferring the swap + CEF-clear from
+the VBlank-OUT edge to the first active line (Mednafen `SetHBVB`) keeps CEF
+observable to a VBlank-OUT ISR — the fix that unblocked *Greatest Nine
+'98*'s "Now Loading" (`9b91689`). `EDSR_CEF` in `vdp1/regs.rs`.
+
 **EXCC** — Extended Colour Calculation. VDP2 colour-calc control register
 CCCTL bit 10 (EXCEN): a **three-layer** blend (top + 2nd + 3rd colour)
 instead of the normal two-layer ratio mix, for translucency/gradients over
@@ -259,6 +275,17 @@ reports carry FADs.
 A **filter** matches read sectors (FAD range, Mode-2 subheader: file/channel
 /submode/coding-info) and routes them to a true- or false-connector
 **partition** (output buffer); 24 of each, over a shared 200-block pool.
+
+**FBCR** — [VDP1] Frame Buffer Change Mode register (`0x05D0_0002`). FCM
+(bit 1) + FCT (bit 0) drive the manual / automatic [framebuffer] swap (the
+automatic path swaps and restarts the draw at the VBlank boundary); DIE
+(bit 3) + DIL (bit 2) select **double-interlace** plotting. *Field-weave:*
+in DIE mode a game rasterizes the even/odd interlace fields into the two
+framebuffers on alternating frames (DIL toggles each frame); the VDP2
+compositor **weaves** them — display line `y` reads the field-`(y&1)`
+buffer — instead of line-doubling one field, which strobes as DIL flips
+(was *Greatest Nine '98*'s menu jitter). On by default, opt-out
+`SAT_VDP1_NOWEAVE`; `Vdp1::weave_source` (Mednafen `vdp2.cpp:329`).
 
 **Framebuffer** — VDP1 has a 256 KiB dual framebuffer at
 `0x05C8_0000`: the plotter draws into the *draw* buffer while VDP2
@@ -717,8 +744,9 @@ VRAM (512 KiB at `0x05C0_0000`), the dual frame buffer (`0x05C8_0000`),
 11 registers at `0x05D0_0000`, and a command-list rasteriser
 (`plotter.rs`) for textured / scaled / distorted sprites, polygons and
 lines with gouraud shading and the colour-calc modes. Draw is kicked by
-[PTMR]; draw-end latches `EDSR.CEF` and raises the SCU sprite-draw-end
-interrupt.
+[PTMR]; draw-end latches [EDSR]`.CEF` and raises the SCU sprite-draw-end
+interrupt. The dual [framebuffer] is managed through [FBCR] (swap mode +
+the double-interlace field-weave).
 
 **VDP2** — Video Display Processor 2. Background generator with 4
 [NBG] + 2 [RBG] layers, [VDP1] sprite-layer compositing, and the final
