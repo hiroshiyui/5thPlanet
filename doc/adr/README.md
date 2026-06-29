@@ -59,16 +59,22 @@ We use Michael Nygard's lightweight format — see
 | [0018](0018-save-state-design.md) | Whole-machine bincode save states; external media referenced, not embedded | Accepted |
 | [0019](0019-gpu-is-presentation-only.md) | Frontend graphics are software-composited; the GPU is for presentation only | Accepted |
 | [0020](0020-migrate-sdl2-to-sdl3.md) | Migrate the SDL frontend from SDL2 to SDL3 | Accepted |
-| [0021](0021-per-access-bsc-bus-timing.md) | Per-access BSC bus-timing model (faithful Mednafen port) | Accepted |
+| [0021](0021-per-access-bsc-bus-timing.md) | Per-access BSC bus-timing model (faithful Mednafen port) | Accepted (DMA-halt part superseded by 0025) |
 | [0022](0022-event-driven-onchip-timers.md) | Event-driven SH-2 on-chip FRT/WDT timers + INTC (lazy materialize) | Accepted |
 | [0023](0023-save-file-keying.md) | Save-file keying: save states per game disc, internal backup RAM per BIOS | Accepted |
+| [0024](0024-pgo-sanctioned-performance-lever.md) | PGO is the one sanctioned performance lever (build-time only, bit-identical) | Accepted |
+| [0025](0025-scu-dma-no-cpu-halt.md) | The SCU DMA halts neither SH-2 (synchronous copy at the trigger) | Accepted |
+| [0026](0026-cores-are-no-std-libraries.md) | Processor cores are `no_std`, library-shaped, dependency-free | Accepted |
+| [0027](0027-golden-fingerprint-regression-guards.md) | Regression correctness pinned to deterministic golden fingerprints | Accepted |
 
 ### Decisions worth recording (backlog)
 
 Significant choices already made in code/`CLAUDE.md` that are good
 candidates for retroactive ADRs:
 
-- _(none currently — the M12 per-access bus-timing model and the M13
-  event-driven on-chip timers were recorded as
-  [0021](0021-per-access-bsc-bus-timing.md) and
-  [0022](0022-event-driven-onchip-timers.md).)_
+- **Config file location is portable-first** — a `jupiter.toml` beside the
+  executable wins over `$XDG_CONFIG_HOME` (for self-contained release
+  archives; `jupiter/src/config.rs`, `Config::path`). A real
+  distribution-strategy decision with a clear undo risk (a contributor
+  preferring XDG-only or Windows-AppData-first), but lower-stakes than the
+  core ADRs — promote it to a full ADR if the precedence is ever questioned.
