@@ -1,6 +1,8 @@
 # 0021. Per-access BSC bus-timing model (faithful Mednafen port)
 
-- **Status:** Accepted
+- **Status:** Accepted — except the **both-CPU DMA-halt** sub-decision, which was
+  superseded by [0025](0025-scu-dma-no-cpu-halt.md) (the SCU DMA now halts neither
+  SH-2; the rest of this model stands).
 - **Date:** 2026-06-12
 
 ## Context
@@ -46,13 +48,16 @@ We will port Mednafen's BSC bus-timing model faithfully into `SaturnBus`
   on the DMA engines' own timeline at Mednafen's `dma_time_thing` values, and a
   **C-bus-endpoint SCU DMA halts both SH-2s** for its paced duration
   (`RecalcDMAHalt`/`SetExtHalt`; `a101f15`) while a pure A↔B transfer halts
-  neither. Serialized since save-state v6 (v9 adds `bbus_write_finish`).
+  neither. ⚠ **Superseded by [0025](0025-scu-dma-no-cpu-halt.md):** the SCU DMA
+  now halts *neither* SH-2 — `drain_dma` copies synchronously and charges 0
+  CPU-halt cost. Serialized since save-state v6 (v9 adds `bbus_write_finish`).
 
 ## Consequences
 
 - **Easier / fixed:** whole-system phase to within ~1% of the oracle; the
   permanent-SFX-mute bug (the B-bus SCSP read cost was load-bearing); correct DMA
-  pacing + the both-CPU halt.
+  pacing + the both-CPU halt (the halt was later removed for cycle-accounting
+  correctness — see [0025](0025-scu-dma-no-cpu-halt.md)).
 - **Cost we accept:** per-access charging is part of the per-instruction fidelity
   overhead, notable in poll-heavy scenes (the timer half of that cost is addressed
   in [0022](0022-event-driven-onchip-timers.md)). Save-state format bumps (v6, v9).
