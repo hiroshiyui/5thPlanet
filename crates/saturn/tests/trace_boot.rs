@@ -4119,6 +4119,64 @@ fn vf2_renders_non_black() {
     );
 }
 
+/// Boot regression for Greatest Nine '98 (GS-9185): its CD-streaming loader's
+/// VBlank-OUT handler gates on the VDP1 draw-end flag (EDSR.CEF). The VDP1
+/// frame-buffer swap + automatic-draw restart (which clears CEF for the next
+/// draw) must be DEFERRED to the first active scanline — after the VBlank-OUT
+/// ISR reads CEF — matching Mednafen `SetHBVB` (the swap runs on the first
+/// HBLANK after leaving VBLANK, not on the VBlank-OUT edge). Doing it on the
+/// edge cleared CEF before the ISR every frame, so the loader read CEF=0
+/// forever and wedged at "Now Loading" (master spinning at 0x0600D852..0x85C).
+/// This asserts the master is NOT parked in that loader spin after enough
+/// frames to clear the loading phase. Needs bios/ + roms/GREATEST_NINE98.cue;
+/// prints "skipped" and returns if absent. Run with --release:
+///
+///   cargo test --release -p saturn --test trace_boot gn98_boots_past_now_loading \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "needs bios/ + roms/ GN98; the GN98 Now-Loading boot regression (run with --release)"]
+fn gn98_boots_past_now_loading() {
+    let root = workspace_root();
+    let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
+        println!("no JP BIOS; skipped");
+        return;
+    };
+    let cue_name = std::env::var("CUE").unwrap_or_else(|_| "GREATEST_NINE98.cue".into());
+    let Ok(cue) = std::fs::read_to_string(root.join("roms").join(&cue_name)) else {
+        println!("no roms/{cue_name}; skipped");
+        return;
+    };
+    let Ok(disc) =
+        saturn::disc::Disc::from_cue(&cue, |n| std::fs::read(root.join("roms").join(n)).ok())
+    else {
+        println!("cue parse failed; skipped");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    sat.set_region(saturn::smpc::region::JAPAN);
+    sat.set_rtc_unix(1_700_000_000);
+    sat.insert_disc(disc);
+    let frames: u32 = std::env::var("FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1200);
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..frames {
+        sat.run_frame(&mut fb);
+    }
+    let pc = sat.master().regs.pc;
+    println!("gn98: final master pc={pc:08X}");
+    // The "Now Loading" loader spins at 0x0600D852..0x0600D85C (jsr stub, read
+    // [GBR+0x13] = CEF-driven byte, loop while bit7 clear). Escaping it means the
+    // CEF handshake advanced past the loading phase.
+    assert!(
+        !(0x0600_D840..=0x0600_D860).contains(&pc),
+        "GN98 still wedged in the Now-Loading loader spin at {pc:08X} — \
+         VDP1 CEF/frame-change timing regression"
+    );
+}
+
 /// Game-render regression guard for Panzer Dragoon Zwei — the third "game
 /// golden" (cf. [`doukyuusei_renders_non_black`], [`vf2_renders_non_black`]).
 /// Boots PDZ fresh (JP v1.01 BIOS + Japan region; it needs no `.bup`) and runs

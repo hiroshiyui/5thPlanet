@@ -957,10 +957,6 @@ impl Saturn {
             self.bus.scu.raise(crate::scu::Source::VBlankIn);
             // VBlank-IN is SCU DMA start factor 0.
             self.bus.scu.trigger_dma_factor(0);
-            // VDP1 swaps its draw/display buffers at the frame boundary and,
-            // in automatic-draw mode, re-renders the command list into the
-            // back buffer.
-            self.bus.vdp1.frame_change(now);
         }
         // VBlank-OUT edge (VBLANK → active, i.e. the start of the next frame's
         // active display): raise the SCU VBlank-OUT interrupt and fire SCU DMA
@@ -975,6 +971,20 @@ impl Saturn {
             if std::env::var_os("SAT_INTC_TRACE").is_some() && now > 130_000_000 {
                 eprintln!("RAISE VBlankOut now={now} IMS={:08X}", self.bus.scu.ims);
             }
+        }
+
+        // VDP1 frame-buffer swap + automatic-draw restart — at the first active
+        // scanline (the line 0→1 edge), NOT the VBlank-OUT edge above. Mednafen
+        // `SetHBVB` runs the swap + `EDSR>>1` (CEF→BEF) + `StartDrawing` (which
+        // clears EDSR.CEF) only at the first HBLANK *after* leaving VBLANK
+        // (`vbcdpending` consumed on the next HBLANK edge, vdp1.cpp:922/1010), i.e.
+        // ~one line into active display — *after* the VBlank-OUT ISR has run. A
+        // game whose VBlank-OUT handler gates on EDSR.CEF (the VDP1 draw-end flag
+        // — e.g. GN98's "Now Loading" loader) must read the CEF of the draw that
+        // completed during the just-ended active frame; clearing it on the
+        // VBlank-OUT edge (before the ISR reads it) wedged that loader.
+        if prev_line == 0 && line == 1 {
+            self.bus.vdp1.frame_change(now);
         }
 
         // SCU Timer 0 — a per-frame line compare. When the timer is enabled
