@@ -32,20 +32,25 @@ foundation stays solid.
 | M12       | Whole-system cycle accuracy vs the reference emulator        | ✅ complete  |
 | M13       | Hardware completeness & fidelity-gap backlog                 | 📋 in progress |
 
-**What works today:** a real Saturn BIOS boots to its splash screen, and
-commercial games run — **Virtua Fighter 2 is fully playable** (steady 60 fps,
-3D fights with CD music and sound effects), and ***Doukyuusei ~if~* is fully
-playable** (graphics, sound effects, and voices), including Shuttle Mouse
-support. **Koei's strategy title *Sangokushi V* (三國志V) is fully playable** too —
-from its per-scenario opening movie through to the in-game strategy map — and
-***Panzer Dragoon Zwei* is fully playable**, from its opening movie through the
-title and menus into the game. The baseball game ***Greatest Nine '98* is fully
-playable** too, at native 704×480 interlaced resolution. Games load from disc images
-(CUE/BIN, ISO, CloneCD) or straight from
-an original disc in a host optical drive; save
-states, the console's battery-backed save memory, expansion cartridges, and an
-in-window menu (Esc — save slots, controller rebinding, region/cartridge/BIOS
-switching, all persisted to a config file) are all in place.
+**What works today:** a real Saturn BIOS boots to its splash screen, and the
+following commercial games are **fully playable** on the real-BIOS LLE path:
+
+- **Virtua Fighter 2** — steady 60 fps, full 3D fights with CD music and sound
+  effects.
+- ***Doukyuusei ~if~*** — graphics, sound effects, and voices, including Shuttle
+  Mouse support, at native 640×224 hi-res.
+- **Sangokushi V** (三國志V) — Koei's strategy title, from its per-scenario opening
+  movie through to the in-game strategy map.
+- ***Panzer Dragoon Zwei*** — from its opening Cinepak movie through the title
+  and menus into the game, at native 704×448 hi-res.
+- ***Greatest Nine '98*** — the baseball game, at native 704×480 interlaced
+  resolution (VDP1 field-weave).
+
+Games load from disc images (CUE/BIN, ISO, CloneCD) or straight from an original
+disc in a host optical drive; save states, the console's battery-backed save
+memory, expansion cartridges, and an in-window menu (Esc — save slots, controller
+rebinding, region/cartridge/BIOS switching, all persisted to a config file) are
+all in place.
 
 Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md), and
 the per-title compatibility list in
