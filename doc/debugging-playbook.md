@@ -185,6 +185,21 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   `0x80`) and always arming the staged CONTINUE makes such a game read "no
   controller" and ignore all input. (Panzer Dragoon Zwei lived here; `SAT_SMPCLOG`
   shows the per-frame `IREG0=00 IREG1=08 COMREG=10` poll.)
+- **SMPC SF (status flag) is software-set / hardware-cleared — a COMREG write
+  must NOT set it.** On real hardware and in Mednafen (`smpc.cpp`: `SMPC_Write`
+  case `0x0F` is just `PendingCommand = V`), a COMREG write only *latches* the
+  command; SF is set **only** by the guest writing the SF port (the "pre-write"
+  idiom), and the SMPC only ever *clears* SF, at command completion. A guest
+  that wants to poll for completion sets SF=1 first; a fast fire-and-forget
+  command (SNDON/SNDOFF/SSHON/…) skips the pre-write and SF stays 0. Spuriously
+  raising SF on the COMREG write makes such a command read back "busy" — and a
+  guest that does a **read-once-or-spin** SF check (a `bt .` self-loop that never
+  re-reads, not a re-reading poll) latches forever. (Greatest Nine '98 issues
+  SNDOFF with no pre-write, then the `0x06004A7E bt -2` self-loop; `SAT_SMPCLOG`
+  shows `COMREG <- 07` immediately followed by `SF -> 01`.) Note SF *busy
+  durations* are a separate faithfulness axis — Mednafen models 92 base + per-
+  command SMPC clocks, cleared cycle-exactly; ours clears at the next
+  between-batch drain (fine for re-reading polls).
 - **CD-block command decode — MAME model vs Mednafen oracle.** Some CD-block
   command handlers were first written against MAME `saturn_cd_hle.cpp`, but the
   project oracle is Mednafen `cdb.cpp` (LLE↔LLE). For position/timing-sensitive
@@ -235,8 +250,19 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   VBlank-OUT — a new race against the same ISR — so it took one more line of
   deferral. **Lesson: a 2-CPU flag-wait deadlock — trace UPSTREAM to what stops
   driving the flag (the FTI deadlock was the victim); and when a fix "should
-  work" but doesn't, instrument the value AT THE READ SITE.** (A separate
-  downstream GN98 blocker remains — a black-screen spin at `0x06004A7E`.)
+  work" but doesn't, instrument the value AT THE READ SITE.**
+- **Greatest Nine '98 — SMPC SF spuriously set on a COMREG write** (`e1a7401`,
+  the second GN98 blocker). After the CEF fix, GN98 wedged in a black-screen
+  self-loop at `0x06004A7E` (a read-once-or-spin SMPC **SF** check). Root: our
+  `queue_command` set `sf=1` on every COMREG write, but SF is software-managed
+  (Mednafen `SMPC_Write 0x0F` is just `PendingCommand = V`); GN98 issues SNDOFF
+  with no SF pre-write, so the spurious busy made its one-shot check spin
+  forever. Fix: drop the `sf=1` from `queue_command`. **GN98 now boots to its
+  title.** Found by a 3-agent fan-out (SF-lifecycle + oracle + path-trace) — and
+  a cautionary note: one agent ran on the already-fixed tree and concluded "the
+  premise is stale," a **concurrency confound** when agents both edit and
+  observe; trust the agent that *made* the change + the oracle model, and re-run
+  the repro yourself. (See the "SMPC SF is software-set" fertile-gap class above.)
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
