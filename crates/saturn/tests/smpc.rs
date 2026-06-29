@@ -117,9 +117,13 @@ fn settime_sets_the_clock_reported_by_intback() {
     ] {
         sat.bus.write8(0x0010_0000 + off, val, AccessKind::Data);
     }
+    // The command-issue idiom: software pre-writes SF=1 (a COMREG write alone
+    // does NOT raise SF — that's software-managed, matching Mednafen), then the
+    // host clears it once the command is processed.
+    sat.bus.write8(SF, 0x01, AccessKind::Data); // software pre-write SF=1
     sat.bus.write8(COMREG, 0x16, AccessKind::Data); // SETTIME
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
-    assert_eq!(sf, 1, "SF goes busy on queue");
+    assert_eq!(sf, 1, "SF busy from the software pre-write");
     sat.run_for(512);
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF drops after SETTIME");

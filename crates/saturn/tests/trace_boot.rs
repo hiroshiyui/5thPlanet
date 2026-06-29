@@ -4119,23 +4119,28 @@ fn vf2_renders_non_black() {
     );
 }
 
-/// Boot regression for Greatest Nine '98 (GS-9185): its CD-streaming loader's
-/// VBlank-OUT handler gates on the VDP1 draw-end flag (EDSR.CEF). The VDP1
-/// frame-buffer swap + automatic-draw restart (which clears CEF for the next
-/// draw) must be DEFERRED to the first active scanline — after the VBlank-OUT
-/// ISR reads CEF — matching Mednafen `SetHBVB` (the swap runs on the first
-/// HBLANK after leaving VBLANK, not on the VBlank-OUT edge). Doing it on the
-/// edge cleared CEF before the ISR every frame, so the loader read CEF=0
-/// forever and wedged at "Now Loading" (master spinning at 0x0600D852..0x85C).
-/// This asserts the master is NOT parked in that loader spin after enough
-/// frames to clear the loading phase. Needs bios/ + roms/GREATEST_NINE98.cue;
-/// prints "skipped" and returns if absent. Run with --release:
+/// Full-boot regression for Greatest Nine '98 (GS-9185): boots fresh and asserts
+/// it renders a non-black screen — which requires clearing BOTH of GN98's boot
+/// blockers, so it guards against a regression in either:
+///   1. **VDP1 draw-end flag (EDSR.CEF) timing.** The CD-loader's VBlank-OUT ISR
+///      gates on CEF; the VDP1 frame-buffer swap + automatic-draw restart (which
+///      clears CEF) must be DEFERRED to the first active scanline — after that
+///      ISR reads CEF — matching Mednafen `SetHBVB`. Doing it on the VBlank-OUT
+///      edge cleared CEF before the ISR every frame, wedging "Now Loading"
+///      (master spinning at 0x0600D852).
+///   2. **SMPC SF (status flag) on a COMREG write.** A COMREG write must NOT set
+///      SF (it only latches the command; SF is software-managed — Mednafen
+///      `SMPC_Write` 0x0F is just `PendingCommand = V`). GN98 issues SNDOFF with
+///      no SF pre-write, then a read-once-or-spin SF check (the `0x06004A7E`
+///      `bt -2`); a spurious SF=1 wedged it forever.
+/// Needs bios/ + roms/GREATEST_NINE98.cue; prints "skipped" and returns if
+/// absent. ~6000 frames to reach the title; run with --release:
 ///
-///   cargo test --release -p saturn --test trace_boot gn98_boots_past_now_loading \
+///   cargo test --release -p saturn --test trace_boot gn98_boots_to_title \
 ///     -- --ignored --nocapture
 #[test]
-#[ignore = "needs bios/ + roms/ GN98; the GN98 Now-Loading boot regression (run with --release)"]
-fn gn98_boots_past_now_loading() {
+#[ignore = "needs bios/ + roms/ GN98; the GN98 full-boot regression (run with --release)"]
+fn gn98_boots_to_title() {
     let root = workspace_root();
     let Ok(bios) = std::fs::read(root.join("bios/Sega Saturn BIOS v1.01 (JAP).bin")) else {
         println!("no JP BIOS; skipped");
@@ -4160,20 +4165,34 @@ fn gn98_boots_past_now_loading() {
     let frames: u32 = std::env::var("FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1200);
+        .unwrap_or(6000);
     let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
-    for _ in 0..frames {
+    let mut in_hwram = 0u32;
+    for f in 0..frames {
         sat.run_frame(&mut fb);
+        if f >= frames.saturating_sub(300) && (sat.master().regs.pc >> 24) == 0x06 {
+            in_hwram += 1;
+        }
     }
-    let pc = sat.master().regs.pc;
-    println!("gn98: final master pc={pc:08X}");
-    // The "Now Loading" loader spins at 0x0600D852..0x0600D85C (jsr stub, read
-    // [GBR+0x13] = CEF-driven byte, loop while bit7 clear). Escaping it means the
-    // CEF handshake advanced past the loading phase.
+    let nonblack = fb
+        .chunks_exact(4)
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
+    println!(
+        "gn98: final master pc={:08X} in_hwram={in_hwram}/300 nonblack_px={nonblack}",
+        sat.master().regs.pc
+    );
     assert!(
-        !(0x0600_D840..=0x0600_D860).contains(&pc),
-        "GN98 still wedged in the Now-Loading loader spin at {pc:08X} — \
-         VDP1 CEF/frame-change timing regression"
+        in_hwram >= 290,
+        "master not running game code (HWRAM) — boot/exec regression"
+    );
+    // A black frame here means GN98 is wedged at one of its two boot blockers
+    // (the loader's CEF spin or the SMPC-SF self-loop) — it never reaches a
+    // drawn screen.
+    assert!(
+        nonblack > 10_000,
+        "GN98 framebuffer is (near-)black — boot wedged before the title \
+         (VDP1 CEF timing and/or SMPC SF-on-COMREG regression)"
     );
 }
 

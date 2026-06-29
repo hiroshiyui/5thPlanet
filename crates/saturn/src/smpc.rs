@@ -6,8 +6,14 @@
 //! is reserved). The general flow for a command is:
 //!
 //! 1. Software writes any required inputs to IREG0..IREG6.
-//! 2. Software writes the command code to COMREG.
-//! 3. SMPC sets SF (status flag) to 1 to indicate "busy".
+//! 2. Software *itself* writes SF (status flag) = 1 to mark "busy" — the
+//!    "pre-write" idiom. SF is a **software-managed** flag: the COMREG write
+//!    does *not* set it (Mednafen `smpc.cpp` `SMPC_Write` case 0x0F is only
+//!    `PendingCommand = V`); the SMPC only ever *clears* SF when a command
+//!    finishes. A guest that wants to poll for completion sets SF=1 first; a
+//!    "fast" fire-and-forget command (e.g. SNDOFF) may skip the pre-write, in
+//!    which case SF stays 0 throughout.
+//! 3. Software writes the command code to COMREG.
 //! 4. The host (Saturn aggregate) picks up the queued command via
 //!    [`Smpc::take_pending`] and performs the side effect — releasing
 //!    the slave CPU, hold the slave, etc. — then clears SF to 0.
@@ -498,12 +504,24 @@ impl Smpc {
         self.write8(offset + 3, val as u8);
     }
 
-    /// Called from the COMREG write path: decode + enqueue + raise SF.
+    /// Called from the COMREG write path: decode + enqueue. **Does not touch
+    /// SF.** On real hardware — and in the Mednafen LLE oracle (`smpc.cpp`
+    /// `SMPC_Write` case 0x0F is just `PendingCommand = V`) — a COMREG write
+    /// only latches the command; it never *sets* SF. SF is a software-managed
+    /// busy flag: the guest writes SF=1 itself (the "pre-write" idiom, the
+    /// `0x63 => self.sf = val` path) before a command it intends to poll, and
+    /// the SMPC only ever *clears* SF when the command finishes
+    /// ([`mark_command_done`](Self::mark_command_done) /
+    /// [`settle_intback`](Self::settle_intback), mirroring Mednafen's lone
+    /// `SF = false` at command completion). Spuriously raising SF here made a
+    /// command issued *without* a pre-write read back "busy", hanging a guest
+    /// that polls SF once and assumes completion (Greatest Nine '98 issues
+    /// SNDOFF with no pre-write, then a two-read-or-spin check — the
+    /// `0x06004A7E` self-loop).
     fn queue_command(&mut self, raw: u8) {
         match Command::from_raw(raw) {
             Some(cmd) => {
                 self.pending = Some(cmd);
-                self.sf = 1;
             }
             None => {
                 self.last_unknown_command = Some(raw);
@@ -627,12 +645,45 @@ mod tests {
     }
 
     #[test]
-    fn known_comreg_writes_queue_pending_command_and_raise_sf() {
+    fn known_comreg_writes_queue_pending_command_without_touching_sf() {
+        // A COMREG write only latches the command; it must NOT set SF (which is
+        // software-managed — Mednafen `SMPC_Write` case 0x0F is just
+        // `PendingCommand = V`). A guest that polls writes SF=1 itself first.
         let mut s = Smpc::new();
-        s.write8(0x1F, 0x02); // SSHON
-        assert_eq!(s.sf, 1, "SF goes busy on command queue");
+        assert_eq!(s.sf, 0, "SF starts clear");
+        s.write8(0x1F, 0x02); // SSHON, no pre-write
+        assert_eq!(
+            s.sf, 0,
+            "COMREG write leaves SF untouched (no spurious busy)"
+        );
         assert_eq!(s.take_pending(), Some(Command::SshOn));
         assert!(s.take_pending().is_none(), "pending is one-shot");
+    }
+
+    #[test]
+    fn comreg_write_after_a_software_pre_write_keeps_sf_busy() {
+        // The pollable path: the guest sets SF=1, then issues the command. SF
+        // stays busy (from the pre-write) until the host clears it.
+        let mut s = Smpc::new();
+        s.write8(0x63, 0x01); // software pre-write SF=1
+        s.write8(0x1F, 0x10); // INTBACK
+        assert_eq!(
+            s.sf, 1,
+            "SF stays busy from the pre-write across the command"
+        );
+        assert_eq!(s.take_pending(), Some(Command::IntBack));
+    }
+
+    #[test]
+    fn comreg_without_pre_write_leaves_sf_clear_for_a_one_shot_poll() {
+        // Greatest Nine '98 regression: it issues SNDOFF with NO SF pre-write,
+        // then does a read-once-or-spin SF check (PC 0x06004A7E `bt -2` on
+        // SF==1). If a COMREG write spuriously set SF=1, that check would spin
+        // forever; SF must remain 0 so the one-shot check passes.
+        let mut s = Smpc::new();
+        s.write8(0x1F, 0x07); // SNDOFF, no pre-write
+        assert_eq!(s.sf, 0, "no pre-write ⇒ SF stays 0 (one-shot poll exits)");
+        assert_eq!(s.take_pending(), Some(Command::SndOff));
     }
 
     #[test]
@@ -647,11 +698,12 @@ mod tests {
     #[test]
     fn mark_command_done_drops_sf() {
         let mut s = Smpc::new();
+        s.write8(0x63, 0x01); // software pre-write SF=1 (the pollable idiom)
         s.write8(0x1F, 0x16); // SETTIME
-        assert_eq!(s.sf, 1);
+        assert_eq!(s.sf, 1, "busy from the pre-write");
         let _ = s.take_pending();
         s.mark_command_done();
-        assert_eq!(s.sf, 0);
+        assert_eq!(s.sf, 0, "host clears SF on completion");
     }
 
     #[test]
