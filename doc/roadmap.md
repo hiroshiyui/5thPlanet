@@ -346,7 +346,7 @@ Levers catalogued from how Mednafen stays LLE at full speed:
 | # | Lever | Status |
 |---|-------|--------|
 | P2 | Optimized interpreter dispatch | 🟢 partly landed, bit-identical: decode LUT, INTC O(1) cache, interrupt re-arm early-out, cache hit-path copy elimination. **Step-dispatch source micro-opts investigated 2026-06-29 (4-agent fan-out) and found to be a DEAD END** — see the dated note below; the unanimous top pick measured as noise. Remaining (codegen-only): PGO (P4); fastmap-style bus page table |
-| P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`). **Fat LTO measured-neutral 2026-06-29** (thin already captures the cross-crate inlining). **★ PGO measured 2026-06-29 = the BIG single-core win** (`tools/pgo/run_pgo.sh`): **+31% VF2 fight, +56% Doukyuusei menu** trained-on; **+39% Doukyuusei held-out** (trained on VF2 only → generalises across games). Build-time only, bit-identical (golden `0x0B1BA6E5180766F7` + savestate pass under `profile-use`), thermal-controlled (interleaved A/B). **Remaining: an adoption recipe** — bake a reproducible profile at release/packaging time, NOT a checked-in `RUSTFLAGS` every `cargo build` pays |
+| P4 | Build & profile | 🟢 profiled (`bench_fps`/`bench_stages`/`bench_cache`/`bench_vf2_fight`). **Fat LTO measured-neutral 2026-06-29** (thin already captures the cross-crate inlining). **★ PGO measured 2026-06-29 = the BIG single-core win** (`tools/pgo/run_pgo.sh`): **+31% VF2 fight, +56% Doukyuusei menu** trained-on; **+39% Doukyuusei held-out** (trained on VF2 only → generalises across games). Build-time only, bit-identical (golden `0x0B1BA6E5180766F7` + savestate pass under `profile-use`), thermal-controlled (interleaved A/B). **Adoption recipe LANDED: `tools/pgo/build_release.sh`** — instruments a headless `jupiter`, boot+attract-trains over `roms/*.cue`, merges, builds the shipping SDL binary with `-Cprofile-use`, runs the gates; falls back to a plain build if assets are absent (a release/packaging step, NOT a checked-in `RUSTFLAGS`) |
 | P6 | Hoist redundant per-instruction entity borrows in `step_cpus` | 📋 candidate, bit-identical: `imask`/`pc`/`cycle`/`delay-slot` are 4 separate `scheduler.entity(*master_id).sh2()` lookups per master instruction (`system.rs:1222-1225`) — collapse to one. Free, ~10 min, golden-invariant by construction. Magnitude small/unverified (<1–2%) |
 | P7 | Batch-invariant per-instruction scaffolding in `step_cpus` | 📋 candidate, **perf-gated + accuracy-sensitive**: `cd_block.irq_active()`+`set_cd_int` and the SCU interrupt sample run every master instruction even when state can't change between CD-timer ticks (part of the ~15% scaffolding self-time in VF2 3D). Biggest single-core lever left, but must preserve per-instruction interrupt-acceptance timing — the class that black-screened games when mishandled (`b65cd18`). Needs a `perf` capture to size + prove edge timing unchanged |
 
@@ -432,8 +432,11 @@ and the savestate round-trip both pass under `profile-use`, so it stays inside t
 accuracy-first/no-JIT charter (it reorders the 143-arm `execute()` match + the
 `mem_*`/`classify` chains by measured opcode frequency; neither thin nor fat LTO can
 do this without a profile). This is **by far the biggest single-core lever in the
-whole investigation** and touches zero source. Open work = an adoption recipe (a
-reproducible release-time profile, not a checked-in `RUSTFLAGS`).
+whole investigation** and touches zero source. **Adoption recipe landed**
+(`tools/pgo/build_release.sh`): instrument a headless `jupiter`, boot+attract-train
+over representative discs, merge, build the shipping SDL binary with `-Cprofile-use`,
+run the golden + savestate gates — a release-time step, not a checked-in `RUSTFLAGS`
+(falls back to a plain build when assets are absent).
 
 ## Later milestones (queued)
 
