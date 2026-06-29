@@ -29,9 +29,9 @@ use saturn::vdp2::Vdp2;
 struct Job {
     vdp2: Vdp2,
     sprite_fb: Framebuffer,
-    /// DIE field-weave source (back buffer + DIL), cloned when `SAT_VDP1_WEAVE`
-    /// is on and the frame is double-interlaced; `None` otherwise (no extra
-    /// clone). See [`saturn::vdp1::Vdp1::weave_source`].
+    /// DIE field-weave source (back buffer + DIL), cloned when the frame is
+    /// double-interlaced (and weave isn't disabled via `SAT_VDP1_NOWEAVE`);
+    /// `None` otherwise (no extra clone). See [`saturn::vdp1::Vdp1::weave_source`].
     sprite_weave: Option<(Framebuffer, u8)>,
     out: Vec<u8>,
 }

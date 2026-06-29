@@ -523,9 +523,9 @@ pub fn render_frame(
 /// [`render_frame`] plus the optional VDP1 DIE field-weave source (back buffer +
 /// `DIL`). `sprite_weave = None` is identical to [`render_frame`]; `Some` weaves
 /// the two interlace fields into one full-height sprite layer (see
-/// [`crate::vdp1::Vdp1::weave_source`], gated by `SAT_VDP1_WEAVE`). The two live
-/// callers (`Saturn::run_frame`, the frontend render worker) use this; tests and
-/// benches use the 3-arg [`render_frame`].
+/// [`crate::vdp1::Vdp1::weave_source`] — on by default, opt-out via
+/// `SAT_VDP1_NOWEAVE`). The two live callers (`Saturn::run_frame`, the frontend
+/// render worker) use this; tests and benches use the 3-arg [`render_frame`].
 pub fn render_frame_weave(
     vdp2: &Vdp2,
     sprite_fb: Option<&Framebuffer>,
@@ -601,7 +601,8 @@ fn render_line(
     w: usize,
     row: &mut [u8],
 ) {
-    // DIE field-weave (SAT_VDP1_WEAVE — see [`Vdp1::weave_source`]). In
+    // DIE field-weave (on by default, opt-out `SAT_VDP1_NOWEAVE`; see
+    // [`Vdp1::weave_source`]). In
     // double-interlace mode VDP1 rasterizes the even/odd fields into its two
     // framebuffers on alternating frames; the back buffer holds field `dil`
     // (this frame), the front (`sprite_fb`) holds field `!dil`. Select the
@@ -2404,7 +2405,8 @@ mod tests {
         );
     }
 
-    /// VDP1 DIE field-weave (`render_frame_weave`, the `SAT_VDP1_WEAVE` path).
+    /// VDP1 DIE field-weave (`render_frame_weave`; on by default, opt-out
+    /// `SAT_VDP1_NOWEAVE`).
     /// In double-density interlace VDP1 rasterizes the even/odd fields into its
     /// two framebuffers on alternating frames; the compositor must read the
     /// field-`(y&1)` buffer per display line (front = field `!DIL`, back =

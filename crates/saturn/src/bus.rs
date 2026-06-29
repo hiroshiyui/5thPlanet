@@ -899,7 +899,8 @@ impl Bus for SaturnBus {
             SCSP_REGS_BASE..=SCSP_REGS_END => self.scsp.ctrl.write32(addr - SCSP_REGS_BASE, val),
             ABUS_BBUS_BASE..=ABUS_BBUS_END => self.abus_bbus.write32(addr - ABUS_BBUS_BASE, val),
             HIGH_WRAM_BASE..=HIGH_WRAM_END => self.high_wram.write32(addr - HIGH_WRAM_BASE, val),
-            // Inter-CPU FTI trigger — any-width write pulses it (see `write8`).
+            // Inter-CPU FTI trigger — a 16/32-bit write pulses it; a byte write
+            // does NOT (Mednafen gates on `sizeof(T) != 1`). See the NB in `write8`.
             SLAVE_FTI_BASE..=SLAVE_FTI_END => {
                 self.slave_input_capture = true;
                 if ftilog() {
