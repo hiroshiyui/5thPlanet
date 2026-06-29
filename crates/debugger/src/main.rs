@@ -617,9 +617,9 @@ impl Dbg {
     fn dump_cram(&self, start: usize, count: usize) {
         let mode = self.sat.bus.vdp2.regs.cram_mode();
         println!("CRAM mode={mode}  index: rrggbb (RGB888-decoded)");
-        for base in (start..start + count).step_by(8) {
+        for base in (start..start.saturating_add(count)).step_by(8) {
             print!("  {base:03X}:");
-            for i in base..(base + 8).min(start + count) {
+            for i in base..(base + 8).min(start.saturating_add(count)) {
                 let (r, g, b) = self.sat.bus.vdp2.cram.color_rgb888(i & 0x7FF, mode);
                 print!(" {r:02X}{g:02X}{b:02X}");
             }
