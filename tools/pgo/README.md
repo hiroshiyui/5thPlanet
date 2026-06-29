@@ -34,11 +34,47 @@ spread** on the same scene. A delta inside that spread is noise. The host's
 `perf` is blocked (`perf_event_paranoid=3`), so this end-to-end fps A/B is the
 attribution method — believe the benches, not a structural estimate.
 
-## If PGO wins
+## Adoption recipe — `build_release.sh`
 
-It is **not** wired into the normal build (no checked-in `RUSTFLAGS` that every
-`cargo build` would pay). Adopting it means a documented release recipe that
-bakes a reproducible profile at packaging time. Gate before adopting:
+PGO is **not** wired into the normal build (no checked-in `RUSTFLAGS` that every
+`cargo build` would pay). It's a deliberate **release/packaging step**:
+`build_release.sh` bakes a fresh profile and produces the optimized shipping
+binary:
+
+```bash
+tools/pgo/build_release.sh        # -> target/release/jupiter (PGO)
+```
+
+What it does:
+
+1. Builds an **instrumented headless** `jupiter` (`--no-default-features
+   -Cprofile-generate`).
+2. **Boot-trains** it over representative discs (auto-discovered from `roms/*.cue`,
+   or `PGO_TRAIN_DISCS=a.cue:b.cue`), `PGO_FRAMES` (default 3000 ≈ title +
+   attract; most games auto-play gameplay in attract, so the 3D/2D interpreter
+   hot paths get covered with no scripted input).
+3. `llvm-profdata merge` → one profile.
+4. Builds the **shipping (SDL) `jupiter`** with `-Cprofile-use`.
+5. Runs the accuracy gates (`bios_boot` golden + `savestate`) under
+   `profile-use` and reports.
+
+**Headless-train, SDL-ship is sound:** the hot code (`sh2::Cpu::step`, the
+`execute()` match, `saturn` bus/cache) compiles identically in both, so the
+profile matches by function hash; the SDL frontend glue legitimately isn't in
+the profile (`-pgo-warn-missing-function=0` silences the expected misses). This
+keeps training reproducible in CI (no window/audio). Cross-binary
+generalisation is empirically validated (the held-out result above).
+
+**No assets? It falls back** to a plain `cargo build --release -p jupiter` with a
+warning, so packaging never breaks — you just don't get PGO.
+
+**Knobs:** `PGO_BIOS`, `PGO_TRAIN_DISCS` (colon-separated), `PGO_FRAMES`.
+**Extending training** (gameplay-targeted / byte-stable): instrument as above,
+then drive the instrumented binary with the matching disc **and** a save-state
+(`SAT_LOADSTATE=<snap> SAT_FRAMES=<n> jupiter <bios> <disc>`) or a recorded input
+movie, before the merge.
+
+Final gate before shipping a PGO build (the script runs the first two):
 
 ```bash
 cargo test -p saturn --test bios_boot   # golden unchanged
