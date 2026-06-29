@@ -63,6 +63,21 @@ movie player.
 | [`panzer-title.png`](panzer-title.png) | The title screen — the "PANZER DRAGOON II Zwei" logo over the cracked-stone background with "PRESS START BUTTON", © SEGA ENTERPRISES, LTD. 1995, 1996. |
 | [`panzer-game.png`](panzer-game.png) | In-game 3D rail-shooting — the rider on the dragon banking through a ruined canyon, with the lock-on reticle, an enemy gunship, and the health / lock-on gauges. |
 
+## Greatest Nine '98 (グレイテストナイン'98)
+
+SEGA's pro-baseball game (serial GS-9185, JP) — fully playable on the JP v1.01
+BIOS, from the title through the menus into 3D gameplay, at native 704×480
+double-density interlace. Its menus drive VDP1 in double-interlace (DIE) mode,
+which the compositor field-weaves; the per-frame foreground strobe this fixed is
+the GN98 case study in the [`debugging-playbook.md`](../debugging-playbook.md).
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`gn98-title.png`](gn98-title.png) | The title screen — the 「プロ野球 GREATEST NINE 98」 logo over the ballpark, "Press Start Button", © SEGA ENTERPRISES, LTD., 1997, 1998. |
+| [`gn98-menu.png`](gn98-menu.png) | The "Game Menu Select" mode menu (オープン戦 / ペナントレース / なりきりモード / ホームラン競争 / チームエディット / オプション). Its interlaced foreground previously strobed every frame — now steady and full-resolution via the VDP1 double-interlace (DIE) field-weave. |
+| [`gn98-matchup.png`](gn98-matchup.png) | The pre-game matchup for an exhibition game (オープン戦) — the Seibu Lions vs Yakult Swallows team flags at Meiji Jingu Stadium (明治神宮野球場). The flags exercise the VDP2 8bpp 2-word pattern-name palette-bank fix. |
+| [`gn98-game.png`](gn98-game.png) | In-game 3D baseball — the top of the 1st (1回表), the batter (松井, AVG .309) facing the pitcher (石井), with the S-B-O count diamond, the batting reticle, and the pad guide. |
+
 ## Frontend (in-window OSD)
 
 | Image | What it shows |
