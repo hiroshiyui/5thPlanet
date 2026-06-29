@@ -154,6 +154,19 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   symptom of "content repeats every N lines / an exact half-screen" is a ~2×
   vertical-sampling-rate error (line-scroll/zoom), *not* VRAM duplication — verify
   the sampling before chasing the bytes. (BIOS Memory Manager — see below.)
+- **VDP2 colour / CRAM-bank decode (per colour-depth, per pattern-name width).**
+  "Wrong colours, right shape" on one layer = a palette/CRAM-bank decode bug, not
+  geometry or a dropped transfer. The palette→CRAM-index math differs by colour
+  depth AND pattern-name width: 16-colour (4bpp) uses the full palette field
+  `<<4`; **256-colour (8bpp) selects the bank from palette bits [6:4] ONLY** (a
+  256-entry palette spans CRAM addr [7:0]) → `(palette & 0x70) << 4`; and a
+  1-word PN pre-extracts a 3-bit bank while a 2-word PN carries the full 7-bit
+  field — so a branch that's correct for one width/depth silently over- or
+  under-shifts another. Confirm the bug is in the *decode* (not the source) by
+  reconstructing the tile from VRAM + the intended CRAM bank, and isolate the
+  layer with the env-gated `SAT_NO_NBG*`/`SAT_NO_SPRITE` suppressors + sdbg
+  `vdp2regs`/`cram`. A non-zero 8bpp palette bank is an easy test gap. (GN98's
+  team-flag previews — see below.)
 - **Interrupt-acceptance timing.** The Saturn aggregate forwards SCU/CD interrupts
   to the master once per instruction; that forward must honour the SH-2 rules the
   core already enforces — above all, **never accept an interrupt inside a branch
@@ -263,6 +276,23 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   premise is stale," a **concurrency confound** when agents both edit and
   observe; trust the agent that *made* the change + the oracle model, and re-run
   the repro yourself. (See the "SMPC SF is software-set" fertile-gap class above.)
+- **Greatest Nine '98 — 8bpp 2-word pattern-name palette over-shift** (`ff6e7a4`,
+  an in-game render bug, GN98 now fully playable). The team-select menu's two
+  LARGE preview flags (NBG1, 8bpp/256-colour, 2-word PN) rendered as scrambled
+  rainbow palettes; the small grid flags (NBG3, 4bpp) were fine — **wrong colours,
+  right shape**. Root: `sample_pattern_cell` used the full palette field as
+  `<< 8`; for a 2-word PN that field is the full 7 bits, so 0x10 → bank 0x1000,
+  which folds (`% 0x1000` in CRAM mode 0) back to bank 0 (a garbage palette). In
+  256-colour mode only palette bits [6:4] select the bank → `(palette & 0x70) << 4`
+  (bit-identical to Mednafen `vdp2_render.cpp:443` `(palno<<4) & ~((1<<bpp)-1)`).
+  Fix: normalise the 1-word 8bpp bank into [6:4] so the CRAM-index path is
+  width-uniform. **3-agent fan-out: layer-id (the `SAT_NO_NBG*` toggles proved
+  NBG1, not a sprite), source (reconstructed the clean logo from intact VRAM ⇒
+  render bug not DMA), oracle (Mednafen renders it correctly; cited the formula)
+  — all three independently verified the fix renders the Lions logo.** Lesson:
+  "wrong colours, right shape" = a palette/CRAM-bank decode bug; the layer's
+  registers were all correct — the bug was the per-depth/per-PN-width CRAM-index
+  math. (See the "VDP2 colour / CRAM-bank decode" fertile-gap class above.)
 - **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
