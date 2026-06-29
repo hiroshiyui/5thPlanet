@@ -34,9 +34,15 @@ pub struct Frt {
     pub tcr: u8,
     pub tocr: u8,
     pub ficr: u16,
-    /// SH7604 status flags clear only when software writes 0 after reading that
-    /// same flag as 1. Do not serialize: it is only a tiny read/modify/write
-    /// latch, and older save states must keep decoding with the same layout.
+    /// Per status flag (ICF/OCFA/OCFB/OVF): set when software has read that flag
+    /// as 1, so a subsequent write-0 may clear it. The inverse of Mednafen's
+    /// `FTCSRM` "set-by-hardware-but-not-yet-read" shadow (`sh7095.h:369`): our
+    /// bit 1 = clearable ⇔ Mednafen's bit 0 = unprotected. A hardware *set*
+    /// ([`Self::raise_status`]/[`Self::input_capture`]) drops the bit back to
+    /// protected (Mednafen `FTCSRM |= bit`); a *read* marks all set flags
+    /// clearable (Mednafen `FTCSRM = 0`). Do not serialize: a tiny RMW latch, and
+    /// older save states must keep decoding with the same layout — loading 0
+    /// (nothing read yet ⇒ nothing clearable) is the safe, conservative default.
     #[cfg_attr(feature = "serde", serde(skip))]
     ftcsr_read_ones: u8,
 }
@@ -70,11 +76,11 @@ impl Frt {
         let (new_frc, overflowed) = self.frc.overflowing_add(1);
         self.frc = new_frc;
         if overflowed {
-            self.ftcsr |= 0x02; // OVF
+            self.raise_status(0x02); // OVF
             flagged = true;
         }
         if self.frc == self.ocra {
-            self.ftcsr |= 0x08; // OCFA
+            self.raise_status(0x08); // OCFA
             flagged = true;
             // CCLRA (FTCSR bit 0): clear the counter on an OCRA match, so
             // OCRA + the OCIA interrupt give a periodic timer.
@@ -83,10 +89,23 @@ impl Frt {
             }
         }
         if self.frc == self.ocrb {
-            self.ftcsr |= 0x04; // OCFB
+            self.raise_status(0x04); // OCFB
             flagged = true;
         }
         flagged
+    }
+
+    /// Raise an FTCSR status flag from hardware and re-protect it from a write-0
+    /// clear until the next FTCSR read observes it. Mirrors Mednafen setting the
+    /// `FTCSRM` shadow alongside the flag (`sh7095.inc:1068-1069`): because our
+    /// [`Self::ftcsr_read_ones`] is the *inverse* (set ⇒ clearable), a fresh
+    /// hardware set must drop the bit back to protected (`&= !bit`). Without
+    /// this, a flag set again *after* software read it but *before* it wrote the
+    /// clearing 0 was wrongly clearable — diverging from the SH7604/Mednafen
+    /// "write-0-after-read-1" protocol.
+    fn raise_status(&mut self, bit: u8) {
+        self.ftcsr |= bit;
+        self.ftcsr_read_ones &= !bit;
     }
 
     /// Trigger a free-running-timer input capture (FTI edge): latch FRC into
@@ -96,8 +115,15 @@ impl Frt {
     /// `SaturnBus`/`Saturn::drain_input_capture`. Returns whether the input-
     /// capture interrupt is enabled (TIER.ICIE, bit 7) so the caller can raise it.
     pub fn input_capture(&mut self) -> bool {
+        // FICR latches the counter on every capture edge (Mednafen
+        // `sh7095.inc:1065`), but ICF + its write-0 protection re-arm only on a
+        // *fresh* set — Mednafen guards with `if(!(FTCSR & 0x80))`
+        // (`sh7095.inc:1066`) so a second edge while ICF is still pending does
+        // not re-protect an already-asserted flag.
         self.ficr = self.frc;
-        self.ftcsr |= 0x80; // ICF
+        if self.ftcsr & 0x80 == 0 {
+            self.raise_status(0x80); // ICF (+ re-protect from write-0)
+        }
         self.tier & 0x80 != 0
     }
 
@@ -263,6 +289,48 @@ mod tests {
             g.ftcsr & 0x80,
             0x80,
             "new ICF pulse survives a zero write when ICF was not read as one"
+        );
+    }
+
+    #[test]
+    fn hardware_reset_after_read_re_protects_a_flag_from_write_zero() {
+        // SH7604/Mednafen "write-0-after-read-1": a status flag set AGAIN by
+        // hardware after software observed it (read 1) but before software wrote
+        // the clearing 0 must SURVIVE that write — the fresh set re-protects it
+        // (Mednafen `FTCSRM |= bit`). Regression for the sticky `ftcsr_read_ones`
+        // that cleared the re-set flag.
+        let mut f = Frt::new();
+        f.ocra = 0xFFFF; // park both output compares so only OVF fires on the wrap
+        f.ocrb = 0xFFFF;
+        f.frc = 0xFFFF;
+        clock(&mut f, 1); // wrap → OVF set
+        assert_eq!(f.ftcsr & 0x02, 0x02, "OVF set on the first wrap");
+        assert_eq!(
+            f.read8(0x01) & 0x02,
+            0x02,
+            "software reads OVF=1 (now clearable)"
+        );
+        f.frc = 0xFFFF;
+        clock(&mut f, 1); // wrap again → OVF re-set before the clearing write
+        f.write8(0x01, 0x00); // software's read/modify/write status clear
+        assert_eq!(
+            f.ftcsr & 0x02,
+            0x02,
+            "the re-set OVF is re-protected and survives the write-0"
+        );
+
+        // The same for ICF via an input-capture edge after a read.
+        let mut g = Frt::new();
+        g.input_capture(); // ICF set
+        assert_eq!(g.read8(0x01) & 0x80, 0x80, "software reads ICF=1");
+        // A second edge while ICF is STILL set must not re-protect (Mednafen
+        // guard): the in-flight read/clear of the original pulse still clears it.
+        g.input_capture();
+        g.write8(0x01, 0x00);
+        assert_eq!(
+            g.ftcsr & 0x80,
+            0x00,
+            "an unguarded re-pulse does not block the clear"
         );
     }
 
