@@ -605,9 +605,13 @@ and is reported as BCD date/time in [INTBACK]'s OREG1–7.
 **SETSMEM** — SMPC command 0x17. Stores the four SMEM bytes from
 IREG0–3; they are echoed back in [INTBACK]'s OREG12–15.
 
-**SF** — SMPC Status Flag at `0x0010_0063`. Goes to 1 when COMREG is
-written and queues a command; drops to 0 once the command is
-processed. Polling SF is how software waits for SMPC to finish.
+**SF** — SMPC Status Flag at `0x0010_0063`. **Software-set /
+hardware-cleared**: a COMREG write latches the command but does **not**
+raise SF — a guest that wants to poll for completion pre-writes `SF=1`
+itself, and the SMPC only ever *clears* it (to 0) once the command is
+processed. Polling SF is how software waits for the SMPC to finish.
+(Spuriously raising SF on the COMREG write wedged a game's no-pre-write,
+read-once poll — see `e1a7401`.)
 
 **SFPRMD / SFCCMD** — VDP2 Special-Function Priority / Colour-Calculation
 Mode registers (`0x05F8_00EA` / `0x00EE`, 2 bits per layer). Let a layer

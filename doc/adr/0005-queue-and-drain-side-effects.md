@@ -28,9 +28,11 @@ scheduler batches in `run_for` (and in `run_frame`).
 
 Concretely:
 
-- **SMPC** — a COMREG write sets `pending: Option<Command>` and raises SF;
-  `drain_smpc` calls `take_pending()`, performs the effect (release slave,
-  raise NMI, schedule INTBACK), then `mark_command_done()` drops SF.
+- **SMPC** — a COMREG write sets `pending: Option<Command>` (the command latch
+  only — SF is software-set / hardware-cleared, so the write itself does not
+  raise it); `drain_smpc` calls `take_pending()`, performs the effect (release
+  slave, raise NMI, schedule INTBACK), then `mark_command_done()` clears SF
+  (which a polling guest had pre-written to 1).
   INTBACK additionally records `intback_complete_at` and is finished by a
   later drain once its execution time elapses.
 - **SCU** — a triggering `D*EN` write records a `DmaRequest`;
