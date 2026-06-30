@@ -876,7 +876,7 @@ fn alu_overflow_flag_is_sticky() {
 #[test]
 fn dma_count_zero_transfers_256_words() {
     let mut d = Dsp::new();
-    let dma = (0b11u32 << 30) | 0; // size field 0 → 256
+    let dma = 0b11u32 << 30; // class 11 DMA, size field 0 → 256 words
     d.load_program(0, &[dma, END]);
     d.start(0);
     d.step();
