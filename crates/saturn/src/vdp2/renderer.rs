@@ -1099,8 +1099,13 @@ fn blend(t: (u8, u8, u8), b: (u8, u8, u8), ratio: u8, add: bool) -> (u8, u8, u8)
             t.2.saturating_add(b.2),
         )
     } else {
-        let alpha = (0x1F - ratio as u32) * 255 / 0x1F;
-        let mix = |t: u8, b: u8| ((t as u32 * alpha + b as u32 * (255 - alpha)) / 255) as u8;
+        // Hardware blend (Mednafen `T_MixIt`): foreground weight (31 - ratio)
+        // and below weight (1 + ratio) sum to 32, so the mix is
+        // `(fore*fr + below*sr) >> 5` (÷32, not ÷31). A fully-"opaque" blend
+        // (ratio 0) still leaks 1/32 of the layer below.
+        let fr = 0x1F - ratio as u32; // foreground weight 0..31
+        let sr = 0x20 - fr; // below weight 1..32
+        let mix = |t: u8, b: u8| (((t as u32 * fr) + (b as u32 * sr)) >> 5) as u8;
         (mix(t.0, b.0), mix(t.1, b.1), mix(t.2, b.2))
     }
 }
@@ -2970,8 +2975,30 @@ mod tests {
         v.vram.write8(0x2_0000, 2);
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
-        // alpha = (31-15)*255/31 = 131; red·131 over blue·124.
-        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF]);
+        // ratio 15 → fore weight 16, below weight 16 (÷32): red·16 + blue·16.
+        assert_eq!(pixel(&buf, 0, 0), [127, 0, 127, 0xFF]);
+    }
+
+    #[test]
+    fn colour_calc_ratio_zero_still_leaks_one_thirtysecond_of_below() {
+        // ratio 0 → fore weight 31, below weight 1 (÷32): a fully-"opaque"
+        // blend still mixes 1/32 of the layer below (the ÷32 vs old ÷31 fix).
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000);
+        v.regs.write16(0x020, 0x0003);
+        v.regs.write16(0x028, 0x1212);
+        v.regs.write16(0x0F8, 0x0205);
+        v.regs.write16(0x03C, 0x0010);
+        v.regs.write16(0x0EC, 0x0001); // N0CCEN, ratio mode
+        v.regs.write16(0x108, 0x0000); // CCRNA.N0CCRT = 0 (max foreground)
+        v.cram.write16(2, 0x001F); // red (front)
+        v.cram.write16(4, 0x7C00); // blue (below)
+        v.vram.write8(0, 1);
+        v.vram.write8(0x2_0000, 2);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        // red·31/32 = 247, blue·1/32 = 7.
+        assert_eq!(pixel(&buf, 0, 0), [247, 0, 7, 0xFF]);
     }
 
     /// With CCMD=1 the front and below colours add (saturating).
@@ -3050,7 +3077,7 @@ mod tests {
         render_frame(&v, None, &mut buf);
         assert_eq!(
             pixel(&buf, 3, 0),
-            [131, 0, 124, 0xFF],
+            [127, 0, 127, 0xFF],
             "inside CC window → blended"
         );
         assert_eq!(
@@ -3526,7 +3553,7 @@ mod tests {
         // red·131 over blue·124 = (131,0,124).
         assert_eq!(
             pixel(&buf, 0, 0),
-            [131, 0, 124, 0xFF],
+            [127, 0, 127, 0xFF],
             "sprite cc ratio blend"
         );
     }
@@ -3761,7 +3788,7 @@ mod tests {
         let fb = sprite_fb_with(0, 0, 0x0012);
         let mut buf = fresh_buf();
         render_frame(&v, Some(&fb), &mut buf);
-        assert_eq!(pixel(&buf, 0, 0), [131, 0, 124, 0xFF], "mode-0 ≤ → blend");
+        assert_eq!(pixel(&buf, 0, 0), [127, 0, 127, 0xFF], "mode-0 ≤ → blend");
     }
 
     /// Rotation TILE screen-over mode 2: transparent outside the 4×4-plane
