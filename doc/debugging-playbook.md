@@ -241,6 +241,28 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 
 ## Case studies (scrubbed)
 
+- **Wachenröder — white 3D-battle floor (the unread KTCTL register).** The RBG0
+  rotating floor washed near-white. Confirmed it was RBG0 (layer isolation), and
+  that *disabling* its additive colour-calc fixed it — but the contradiction was
+  that Mednafen's identical additive blend should wash too. Resolution: the
+  per-dot line-colour CRAM index for a rotation layer comes from the **coefficient
+  word's top byte (bits 30:24) when KTCTL bit 4/12 is set** (Mednafen
+  `vdp2_render.cpp:1989` `LB.lc=(coeff>>24)&0x7F`), *not* the LCTA table — and we
+  only ever read LCTA (all-zero here → CRAM[0]=light-grey → additive wash). The
+  floor coeff `0x34333323` → index 52 → CRAM[52]=dark. Fix: a `CoeffCtx.line_colour`
+  bit + `Dot.lc` carrying the per-dot index into the compositor's line-colour
+  partner; regression `rbg0_coefficient_table_supplies_the_line_colour_index`;
+  golden-safe. **Lessons:** (1) *the trap was an unread control register* — KTCTL
+  was never in the register dump, so a faithful blend looked like a bug elsewhere
+  (cf. SCRCTL in the BIOS-Memory-Manager miss); enumerate **every** control reg of
+  the suspect layer, coefficient-table control included. (2) `sdbg poke` to the
+  SH-2 cache-through alias (`0x25F8xxxx`) is **silently dropped** — pokes must use
+  the real bus base (`0x05F8xxxx`); always re-dump the reg to confirm a poke landed
+  before trusting a poke-based negative. (3) A full-screen wash makes the non-black
+  pixel count useless — byte-diff PPMs (`cmp -l`). (4) Three fan-out agents proposed
+  three different roots; all but the right one were falsified by live register/poke
+  data — adjudicate every agent claim against the oracle + live state, and the user's
+  Mednafen screenshot (RBG0 texture *is* drawn, just dark) was the decisive oracle.
 - **Sangokushi V — two cache purges.** Signature failure = SH-2 cache purges we
   weren't honoring. (1) `Cpu::reset` didn't purge the cache, so an SSHON-re-reset
   slave ran stale code and never relocated → blank menu (`35ce7e8`). (2) A 16-bit
