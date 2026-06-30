@@ -349,11 +349,11 @@ fn special_color_calc_mode2_gates_blending_by_sfcode() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
 
-    // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
+    // Dot A: cc on → red over blue, front weight (0x1F-16)=15/32 → [119, 0, 135].
     let a = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(
         &out[a..a + 4],
-        &[123, 0, 132, 0xFF],
+        &[119, 0, 135, 0xFF],
         "code 4: SFCODE bit set → blended"
     );
     // Dot B: cc gated off → opaque red.
@@ -551,11 +551,11 @@ fn special_color_calc_mode3_uses_cram_msb_in_rgb888_mode() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
 
-    // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
+    // Dot A: cc on → red over blue, front weight (0x1F-16)=15/32 → [119, 0, 135].
     let a = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(
         &out[a..a + 4],
-        &[123, 0, 132, 0xFF],
+        &[119, 0, 135, 0xFF],
         "CRAM MSB set → blended"
     );
     // Dot B: MSB clear → cc gated off → opaque red.
@@ -592,11 +592,11 @@ fn special_color_calc_mode3_always_blends_rgb_direct_dots() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
 
-    // Red over blue at alpha = (31-16)*255/31 = 123 → [123, 0, 132].
+    // Red over blue, front weight (0x1F-16)=15/32 → [119, 0, 135].
     let px = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(
         &out[px..px + 4],
-        &[123, 0, 132, 0xFF],
+        &[119, 0, 135, 0xFF],
         "RGB direct dot blends under SFCCMD 3"
     );
 }
@@ -648,11 +648,11 @@ fn rbg0_special_color_calc_mode2_gates_blending_by_sfcode() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
 
-    // Dot A: cc on → red over blue at alpha = (31-16)*255/31 = 123.
+    // Dot A: cc on → red over blue, front weight (0x1F-16)=15/32 → [119, 0, 135].
     let a = (60 * FRAME_WIDTH + 50) * 4;
     assert_eq!(
         &out[a..a + 4],
-        &[123, 0, 132, 0xFF],
+        &[119, 0, 135, 0xFF],
         "code 4: SFCODE bit set → blended"
     );
     // Dot B: cc gated off → opaque red.
@@ -692,12 +692,12 @@ fn extended_color_calc_blends_front_over_second_third_average() {
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     let px = (60 * FRAME_WIDTH + 50) * 4;
 
-    // EXCEN off: front blends only with the 2nd layer (green) at alpha 123.
+    // EXCEN off: front blends only with the 2nd layer (green), front weight 15/32.
     sat.bus.write16(0x05F8_00EC, 0x0003, AccessKind::Data); // CCCTL: N0 + N1 cc, EXCEN off
     sat.run_frame(&mut out);
     assert_eq!(
         &out[px..px + 4],
-        &[123, 132, 0, 0xFF],
+        &[119, 135, 0, 0xFF],
         "EXCEN off → red over green"
     );
 
@@ -706,7 +706,7 @@ fn extended_color_calc_blends_front_over_second_third_average() {
     sat.run_frame(&mut out);
     assert_eq!(
         &out[px..px + 4],
-        &[123, 65, 65, 0xFF],
+        &[119, 67, 67, 0xFF],
         "EXCEN on → red over avg(green, blue)"
     );
 }
