@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-30
+
+The **M13 Tier H cross-chip silent-feature audit** lands: a systematic sweep
+for missing or subtly-wrong hardware features across all eight processors,
+split into correctness fixes (H1), new capabilities (H2), and refinements (H3).
+Plus the Wachenröder RBG0 coefficient line-colour fix. The `bios_boot` golden
+`0x0B1BA6E5180766F7` is unchanged and all five game render goldens (Virtua
+Fighter 2, Doukyuusei, Panzer Dragoon Zwei, Sangokushi V, Greatest Nine '98)
+pass; the two pixel-visible VDP changes (VDP2 ÷32 blend, VDP1 mesh/RGB-direct
+transparency) were play-test verified in Wachenröder and VF2.
+
+**Savestate format bumped 13 → 15** (CD-block FAD-search state, SCSP DMA
+engine); states written by 0.17.x are rejected on load.
+
+### Added
+
+- **SCSP slot noise sound source** (H2a) — the per-slot noise generator the FM
+  engine selects as an operator/carrier input.
+- **SCSP DMA engine + DMA-end interrupt** (H2b) — the SCSP's own DMA transfer
+  channel and its completion interrupt (savestate v15).
+- **CD-block FAD-search commands** `0x55` / `0x56` (H2c, savestate v14).
+- **VDP2 normal sprite shadow + self-shadow** (H2d) — priority-bearing shadow
+  dots driven by TPShadSel.
+- **VDP2 bitmap palette-bank + colour-calc window** (H3) — the BMPNA/BMPNB
+  bitmap palette bank folds into the CRAM index, and the colour-calc window
+  gates where blending applies.
+- **VDP1 RGB-direct transparency** (H3) — RGB-direct sprite dots honour the
+  MSB transparency band and end-code.
+- **SCSP SoundDirect** (H3) — reg6 bit 8 routes the raw PCM voice bypassing the
+  envelope generator and total-level attenuation.
+
+### Changed
+
+- **VDP2 colour-calc blend is ÷32, not ÷31** (H3) — front weight `0x1F-ratio`
+  of 32, back the complement to 32 (matching Mednafen); slightly shifts
+  translucency weights. *Pixel-visible — play-test verified.*
+- **VDP1 mesh checkerboard phase** corrected (H3) — meshed dots drop on the
+  opposite parity of `(x ^ y)`. *Pixel-visible — play-test verified.*
+- **SMPC reports port-2 pad state independently of port 1** (H2e) — the second
+  controller port is no longer mirrored from the first.
+- **SCU-DSP ALU faithfulness** (H3) — ADD/SUB carry and sign flags computed at
+  native 32-bit width (not sign-extended 64-bit), the overflow (V) flag is now
+  sticky, and a DMA `count == 0` transfers 256 words.
+- **SCSP SBXOR** (H3) — XORs the PCM taps in both the FM and plain-interpolation
+  paths.
+
+### Fixed
+
+- **SH-2 NMI sets `SR.imask` to 15, not 0** (H1a) — a non-maskable interrupt
+  must mask all lower levels.
+- **SH-2 VCRDMA0/1 routed to the INTC vector table** (H1d).
+- **SH-2 misaligned cached read/write force-align** (H3) — a misaligned cached
+  word/long access is force-aligned (`A &= ~(size-1)`) before the cache-line
+  slice, fixing a latent out-of-bounds panic. The byte path stays unaligned.
+- **SH-2 DIVU overflow writes a saturated quotient**, not the stale dividend
+  (H3).
+- **VDP2 colour-offset sprite/back-screen bits were swapped** (H1b).
+- **VDP2 RBG0 coefficient-table line colour** — the per-dot line-colour index
+  comes from the rotation coefficient word's top byte (KTCTL bit 4), not LCTA
+  (was washing Wachenröder's 3D-battle floor white).
+- **VDP1 16bpp MSB-ON read-modifies the destination**, discarding the source
+  (H1c).
+- **VDP1 end-code row truncation** (H3) — an end-code truncates the rest of the
+  sprite row.
+- **SCU DMA HBlank-IN / Timer0 / Timer1 start-factors** are now wired (H1e).
+
 ## [0.17.1] - 2026-06-29
 
 A maintenance release: one bit-identical hot-loop optimization plus
