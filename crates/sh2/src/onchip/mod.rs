@@ -159,6 +159,11 @@ impl OnChip {
         // back to byte aggregation.
         match addr & 0x1FF {
             0x100..=0x11F => self.divu.read32(addr & 0x1F),
+            // VCRDMA0/1 (FFFFFFA0/A8): the on-chip-DMAC channel interrupt
+            // vectors live in the INTC, not the DMAC register block, so they
+            // are routed here rather than in `dmac_read32`.
+            0x1A0 => self.intc.vcrdma0,
+            0x1A8 => self.intc.vcrdma1,
             0x180..=0x1BF => dmac_read32(&self.dmac, addr & 0x3F),
             _ => {
                 ((self.read8(addr) as u32) << 24)
@@ -172,6 +177,12 @@ impl OnChip {
     pub fn write32(&mut self, addr: u32, val: u32) {
         match addr & 0x1FF {
             0x100..=0x11F => self.divu.write32(addr & 0x1F, val),
+            // VCRDMA0/1 (FFFFFFA0/A8): store the on-chip-DMAC transfer-end
+            // interrupt vector (low 7 bits, like VCRDIV) into the INTC, which
+            // owns the vector table; without this the DMAC IRQ vectors through
+            // a stale 0 → wild jump.
+            0x1A0 => self.intc.vcrdma0 = val & 0x7F,
+            0x1A8 => self.intc.vcrdma1 = val & 0x7F,
             0x180..=0x1BF => dmac_write32(&mut self.dmac, addr & 0x3F, val),
             _ => {
                 self.write8(addr, (val >> 24) as u8);
@@ -497,6 +508,25 @@ mod tests {
             None,
             "cleared OVF → request dropped"
         );
+    }
+
+    #[test]
+    fn vcrdma_routes_the_onchip_dmac_interrupt_vector() {
+        // VCRDMA0/1 (FFFFFFA0/A8) hold the on-chip-DMAC channel interrupt
+        // vectors. They live in the INTC vector table, not the DMAC register
+        // block, so the bus write must be routed into the INTC — without it the
+        // DMAC transfer-end IRQ vectors through a stale 0 → wild jump.
+        // (M13 Tier H — H1d.)
+        let mut o = OnChip::new();
+        o.write32(0xFFFF_FFA0, 0x4C); // VCRDMA0
+        o.write32(0xFFFF_FFA8, 0x5D); // VCRDMA1
+        assert_eq!(o.read32(0xFFFF_FFA0), 0x4C, "VCRDMA0 reads back");
+        assert_eq!(o.read32(0xFFFF_FFA8), 0x5D, "VCRDMA1 reads back");
+        assert_eq!(o.intc.vector_for(Source::DmacCh0), 0x4C, "ch0 IRQ vector");
+        assert_eq!(o.intc.vector_for(Source::DmacCh1), 0x5D, "ch1 IRQ vector");
+        // The vector field is the low 7 bits (like VCRDIV); bit 7 is masked.
+        o.write32(0xFFFF_FFA0, 0xCC);
+        assert_eq!(o.read32(0xFFFF_FFA0), 0x4C, "bit 7 masked off");
     }
 
     #[test]
