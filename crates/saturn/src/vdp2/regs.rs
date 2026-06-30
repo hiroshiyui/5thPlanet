@@ -395,6 +395,13 @@ impl Vdp2Regs {
         self.read16(0x0E2) & (1 << screen_bit) != 0
     }
 
+    /// TPShadSel (SDCTL 0x0E2 bit 8): a pure-MSB (transparent-pen) sprite pixel
+    /// acts as a shadow only when this is set; otherwise it is fully
+    /// transparent. Mednafen `T_DrawSpriteData` `TA_TPShadSel`.
+    pub fn sprite_tp_shadow_select(&self) -> bool {
+        self.read16(0x0E2) & 0x100 != 0
+    }
+
     /// Per-screen colour-offset enable (CLOFEN, 0x110, bits 0..6): 0 NBG0/RBG1,
     /// 1 NBG1, 2 NBG2, 3 NBG3, 4 RBG0, 5 back screen, 6 sprite (the sprite/back
     /// assignment is the reverse of the line-colour/shadow `screen_bit` — bits

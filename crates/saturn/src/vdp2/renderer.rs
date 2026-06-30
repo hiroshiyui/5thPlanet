@@ -629,7 +629,9 @@ fn render_line(
         let mut top: Option<Dot> = None;
         let mut second: Option<Dot> = None;
         let mut third: Option<Dot> = None;
-        let mut shadow = false;
+        // The sprite shadow's priority (`None` = no shadow this pixel), so it
+        // darkens only the layer it actually wins over.
+        let mut shadow: Option<u8> = None;
 
         // The sprite layer may produce a colour dot or an MSB shadow.
         if window_allows(
@@ -644,7 +646,7 @@ fn render_line(
                 Some(SpriteDot::Colour(d)) => {
                     insert_dot(&mut top, &mut second, &mut third, Some(d))
                 }
-                Some(SpriteDot::Shadow) => shadow = true,
+                Some(SpriteDot::Shadow(pri)) => shadow = Some(pri),
                 None => {}
             }
         }
@@ -724,14 +726,23 @@ fn render_line(
         // (back screen when nothing is on top) — applied after colour calc,
         // before sprite-shadow halving, matching Mednafen's MixIt order.
         rgb = apply_color_offset(vdp2, top, rgb);
-        // An MSB-shadow sprite darkens the screen beneath it by half — but
-        // only screens whose SDCTL shadow-receive bit is set (NBG/RBG via
-        // Layer::screen_bit, the back screen via bit 5). C2: previously every
-        // screen was darkened unconditionally.
-        if shadow {
-            let receiver = top.map_or(5, |t| t.layer.screen_bit());
-            if vdp2.regs.shadow_enabled(receiver) {
-                rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+        // MSB self-shadow (sprite types 2–7 with the MSB and colour bits): the
+        // sprite drew its own colour above; halve it once. Mutually exclusive
+        // with the shadow-below path (one sprite pixel is one or the other).
+        if top.is_some_and(|t| t.self_shadow) {
+            rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+        }
+        // A shadow sprite darkens the screen directly beneath it by half — but
+        // only when the shadow actually wins the priority race (sprite wins
+        // ties → `>=`), and only if that screen's SDCTL shadow-receive bit is
+        // set (NBG/RBG via Layer::screen_bit, the back screen via bit 5).
+        if let Some(spri) = shadow {
+            let top_pri = top.map_or(0, |t| t.pri);
+            if spri >= top_pri {
+                let receiver = top.map_or(5, |t| t.layer.screen_bit());
+                if vdp2.regs.shadow_enabled(receiver) {
+                    rgb = (rgb.0 >> 1, rgb.1 >> 1, rgb.2 >> 1);
+                }
             }
         }
         let dst = x * 4;
@@ -793,6 +804,10 @@ struct Dot {
     /// bit 4/12). When `Some`, the compositor uses it for this layer's
     /// line-colour partner instead of the LCTA table. Only ever set for RBG0.
     lc: Option<u8>,
+    /// MSB self-shadow (sprite types 2–7 with the MSB set *and* colour bits):
+    /// the dot draws its own colour, then the compositor halves it once
+    /// (Mednafen PIX_SELFSHAD). Only ever set for a sprite colour dot.
+    self_shadow: bool,
 }
 
 /// A sampled background dot before priority / colour-calc resolution: its
@@ -946,7 +961,11 @@ fn line_color(vdp2: &Vdp2, y: usize) -> Option<(u8, u8, u8)> {
 /// darkens the layer beneath instead of drawing.
 enum SpriteDot {
     Colour(Dot),
-    Shadow,
+    /// A shadow that darkens the layer beneath it (Mednafen DOSHAD) — either a
+    /// normal palette-code shadow or a pure-MSB transparent shadow. Carries the
+    /// sprite's priority so it darkens only the layer it actually sits on top
+    /// of (it must win the priority race like a colour sprite).
+    Shadow(u8),
 }
 
 /// Slot `cand` into the running top-three by priority. Front-order callers win
@@ -1262,6 +1281,7 @@ fn nbg_layer(
         layer: Layer::Nbg(n as u8),
         is_rgb: s.is_rgb,
         lc: None,
+        self_shadow: false,
     })
 }
 
@@ -1355,6 +1375,7 @@ fn rbg_layer(
         layer: Layer::Rbg(which as u8),
         is_rgb: s.is_rgb,
         lc,
+        self_shadow: false,
     })
 }
 
@@ -1834,14 +1855,9 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
     }
     let stype = vdp2.regs.sprite_type();
 
-    // MSB shadow: for shadow-capable types a word with only bit 15 set is a
-    // pure shadow that darkens the layer below rather than drawing a colour.
-    if SPRITE_SHADOW[stype] != 0 && pix == 0x8000 {
-        return Some(SpriteDot::Shadow);
-    }
-
     // RGB direct colour: MSB set and SPCLMD enabled. Priority comes from
-    // sprite register 0.
+    // sprite register 0. (In RGB-direct mode the MSB is the direct-colour flag,
+    // not a shadow flag — shadow handling is for the paletted path below.)
     if pix & 0x8000 != 0 && vdp2.regs.sprite_rgb_mode() {
         let pri = vdp2.regs.sprite_priority(0);
         return (pri != 0).then(|| {
@@ -1852,6 +1868,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
                 layer: Layer::Sprite,
                 is_rgb: true,
                 lc: None,
+                self_shadow: false,
             })
         });
     }
@@ -1866,16 +1883,39 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
         }
     }
 
-    // Palette code: priority bits index PRISA..PRISD; the masked low bits are
-    // a CRAM colour code (0 = transparent).
+    // Priority bits index PRISA..PRISD; a priority-0 dot (colour or shadow)
+    // can never win the layer race, so drop it.
     let pidx = ((pix >> SPRITE_PRIO_SHIFT[stype]) & SPRITE_PRIO_MASK[stype]) as usize;
     let pri = vdp2.regs.sprite_priority(pidx);
     if pri == 0 {
         return None;
     }
     let code = (pix & SPRITE_COLORMASK[stype]) as usize;
+
+    // Normal (palette-code) shadow: the colour code equals the type's max-even
+    // value (Mednafen `nshad = dc == (mask & ~1)`), for every sprite type. It
+    // bears the sprite's priority and darkens the layer it sits on.
+    if code == (SPRITE_COLORMASK[stype] & !1) as usize {
+        return Some(SpriteDot::Shadow(pri));
+    }
+
+    // MSB shadow (types 2–7, bit 15 set, paletted path): a pixel that also has
+    // colour bits is a SELF-shadow (draw the colour, then halve it once); a
+    // pure-MSB pixel is a transparent shadow only when TPShadSel (SDCTL bit 8)
+    // is set, otherwise fully transparent. Mednafen `T_DrawSpriteData`.
+    let mut self_shadow = false;
+    if SPRITE_SHADOW[stype] != 0 && pix & 0x8000 != 0 {
+        if pix & 0x7FFF != 0 {
+            self_shadow = true;
+        } else if vdp2.regs.sprite_tp_shadow_select() {
+            return Some(SpriteDot::Shadow(pri));
+        } else {
+            return None;
+        }
+    }
+
     if code == 0 {
-        return None;
+        return None; // transparent (a colour code of 0)
     }
     let ccidx = ((pix >> SPRITE_CCR_SHIFT[stype]) & SPRITE_CCR_MASK[stype]) as usize;
     Some(SpriteDot::Colour(Dot {
@@ -1885,6 +1925,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
         layer: Layer::Sprite,
         is_rgb: false,
         lc: None,
+        self_shadow,
     }))
 }
 
@@ -2970,7 +3011,10 @@ mod tests {
         enable_nbg0(&mut v);
         v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
         v.regs.write16(0x0E0, 0x0002); // SPCTL.SPTYPE = 2 (shadow-capable)
-        v.regs.write16(0x0E2, 0x0001); // SDCTL: NBG0 receives shadow (C2 gating)
+        // SDCTL: NBG0 receives shadow (bit 0) + TPShadSel (bit 8) so a pure-MSB
+        // transparent pixel acts as a shadow rather than being transparent.
+        v.regs.write16(0x0E2, 0x0101);
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3 (shadow > NBG0 prio 1)
         v.cram.write16(2, 0x7FFF); // index 1 = white (0xFF,0xFF,0xFF)
         v.vram.write8(0, 1); // NBG0 white at (0,0)
         v.vram.write8(512, 1); // NBG0 white at (0,1)
@@ -2979,6 +3023,77 @@ mod tests {
         render_frame(&v, Some(&fb), &mut buf);
         assert_eq!(pixel(&buf, 0, 0), [0x7F, 0x7F, 0x7F, 0xFF], "shadowed");
         assert_eq!(pixel(&buf, 0, 1), [0xFF, 0xFF, 0xFF, 0xFF], "unshadowed");
+    }
+
+    #[test]
+    fn sprite_normal_shadow_halves_the_layer_below() {
+        // A normal (palette-code) shadow: the colour code = the type's max-even
+        // value (type 0 → 0x07FE). It bears the sprite's priority and darkens
+        // the layer it sits on (H2d).
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012); // NBG0 bitmap, 8bpp
+        v.regs.write16(0x0E0, 0x0000); // SPCTL.SPTYPE = 0
+        v.regs.write16(0x0E2, 0x0001); // SDCTL: NBG0 receives shadow
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3 (> NBG0 prio 1)
+        v.cram.write16(2, 0x7FFF); // index 1 = white
+        v.vram.write8(0, 1); // NBG0 white at (0,0)
+        v.vram.write8(512, 1); // NBG0 white at (0,1)
+        let fb = sprite_fb_with(0, 0, 0x07FE); // type-0 shadow code at (0,0)
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0x7F, 0x7F, 0x7F, 0xFF],
+            "shadow darkens NBG0"
+        );
+        assert_eq!(
+            pixel(&buf, 0, 1),
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            "next dot unshadowed"
+        );
+    }
+
+    #[test]
+    fn sprite_shadow_that_loses_the_priority_race_is_inert() {
+        // The shadow bears priority: if a background layer outranks it, that
+        // layer displays opaquely and the shadow has no effect.
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0012);
+        v.regs.write16(0x0E0, 0x0000); // type 0
+        v.regs.write16(0x0E2, 0x0001); // NBG0 receives shadow
+        v.regs.write16(0x0F8, 0x0005); // PRINA.N0PRIN = 5 (NBG0 above the shadow)
+        v.regs.write16(0x0F0, 0x0002); // PRISA.S0PRIN = 2 (< NBG0 prio 5)
+        v.cram.write16(2, 0x7FFF); // white
+        v.vram.write8(0, 1);
+        let fb = sprite_fb_with(0, 0, 0x07FE);
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            "shadow below NBG0 → no darkening"
+        );
+    }
+
+    #[test]
+    fn sprite_msb_self_shadow_halves_its_own_colour_once() {
+        // MSB set + colour bits (types 2–7) = a self-shadow: draw the colour,
+        // then halve it once (was 2× too bright — drawn at full brightness).
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // TVMD.DISP
+        v.regs.write16(0x0E0, 0x0002); // SPCTL.SPTYPE = 2 (MSB-shadow capable)
+        v.regs.write16(0x0F0, 0x0003); // PRISA.S0PRIN = 3
+        v.cram.write16(0x12 * 2, 0x001F); // sprite colour code 0x12 = red
+        let fb = sprite_fb_with(5, 5, 0x8012); // MSB + code 0x12 → self-shadow
+        let mut buf = fresh_buf();
+        render_frame(&v, Some(&fb), &mut buf);
+        assert_eq!(
+            pixel(&buf, 5, 5),
+            [0x7F, 0, 0, 0xFF],
+            "self-shadow red halved once"
+        );
     }
 
     /// The sprite window (WCTL SWE/SWA) gates a layer by bit 15 of the VDP1
