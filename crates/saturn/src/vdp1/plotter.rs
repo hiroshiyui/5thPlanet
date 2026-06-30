@@ -581,9 +581,6 @@ impl<'a> Plotter<'a> {
             }
         }
 
-        // MSBON — force the MSB (used by VDP2 for shadow/priority).
-        pix |= pmod & 0x8000;
-
         // transpen is 0; draw unless transparent and SPD is off.
         if raw == 0 && !spd {
             return;
@@ -601,6 +598,19 @@ impl<'a> Plotter<'a> {
                 pix
             };
             self.fb.set_pixel8(x, fy, b as u8);
+            return;
+        }
+
+        // MSBON (16bpp): a shadow/stencil sprite — the source colour is
+        // *discarded*; read-modify the destination dot's MSB (which VDP2 reads
+        // for sprite shadow/priority) and skip gouraud + colour-calc entirely
+        // (Mednafen `PlotPixel`: `pix = *p | 0x8000`, with the
+        // gouraud/half-lum/half-trans blocks confined to the non-MSBON `else`).
+        // Mirrors the bpp8 read-modify above; writing the sprite's own CMDCOLR
+        // instead painted a solid block where hardware only flags the pixel.
+        if pmod & 0x8000 != 0 {
+            let d = self.fb.pixel(x, fy);
+            self.fb.set_pixel(x, fy, d | 0x8000);
             return;
         }
 

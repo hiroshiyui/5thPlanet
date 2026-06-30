@@ -161,6 +161,63 @@ fn normal_sprite_blits_16bpp_character() {
 }
 
 #[test]
+fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
+    // CMDPMOD MSBON (bit 15): a shadow/stencil sprite must READ-MODIFY the
+    // destination dot's MSB (which VDP2 reads for sprite shadow/priority) and
+    // DISCARD its own colour — not paint a solid block. The 8bpp path already
+    // did this; the 16bpp path wrongly wrote the sprite's colour. (M13 H1c.)
+    let mut v = Vdp1::new();
+    // Underlying scene: an 8×8 char of RGB 0x4210 at VRAM 0x1000.
+    for i in 0..64u32 {
+        v.vram.write16(0x1000 + i * 2, 0x4210);
+    }
+    // The MSBON sprite's own colour: a DIFFERENT RGB 0x7C00 at VRAM 0x2000,
+    // which must NOT reach the framebuffer.
+    for i in 0..64u32 {
+        v.vram.write16(0x2000 + i * 2, 0x7C00);
+    }
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0000, 0x0000),                 // type 0 normal sprite
+            w(0x0028, 0x0000),                 // CMDPMOD: 16bpp RGB
+            w((0x1000u32 / 8) as u16, 0x0108), // SRCA | SIZE 8×8 → lays down 0x4210
+            w(5, 5),
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(
+        &mut v,
+        1,
+        [
+            w(0x0000, 0x0000),                 // type 0 normal sprite
+            w(0x8028, 0x0000),                 // CMDPMOD: MSBON + 16bpp RGB
+            w((0x2000u32 / 8) as u16, 0x0108), // SRCA 0x7C00 (must be discarded)
+            w(5, 5),
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(&mut v, 2, END);
+    v.process_list();
+
+    // The dot keeps the underlying 0x4210 with bit 15 forced — NOT the MSBON
+    // sprite's 0x7C00 (the pre-fix 16bpp bug wrote 0x7C00 | 0x8000 = 0xFC00).
+    assert_eq!(
+        v.fb.pixel(5, 5),
+        0x4210 | 0x8000,
+        "MSBON read-modifies the dest MSB and discards the source colour"
+    );
+    assert_eq!(v.fb.pixel(12, 12), 0x4210 | 0x8000, "far corner too");
+}
+
+#[test]
 fn normal_sprite_4bpp_adds_colour_bank() {
     let mut v = Vdp1::new();
     // 4bpp character: every byte 0x33 → both nibbles select colour 3.
@@ -1118,13 +1175,17 @@ fn shadow_calc_halves_only_a_marked_destination() {
 #[test]
 fn msbon_forces_the_pixel_high_bit() {
     let mut v = Vdp1::new();
-    // MSBON (CMDPMOD bit 15 = 0x8000) ORs 0x8000 into every drawn pixel.
+    // MSBON (CMDPMOD bit 15) read-modifies the destination dot's MSB and
+    // DISCARDS the source colour (Mednafen `PlotPixel`). Over an empty (black)
+    // framebuffer the dot becomes 0x0000 | 0x8000 = 0x8000 — the source blue
+    // (0x1F) is not written. (The dest-colour-preserving case is covered by
+    // msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour.)
     put(
         &mut v,
         0,
         [
             w(0x0004, 0x0000),
-            w(0x8040, 0x001F), // MSBON (0x8000) + SPD (0x40), colour blue
+            w(0x8040, 0x001F), // MSBON (0x8000) + SPD (0x40), source colour blue
             0,
             w(10, 10),
             w(20, 10),
@@ -1135,7 +1196,11 @@ fn msbon_forces_the_pixel_high_bit() {
     );
     put(&mut v, 1, END);
     v.process_list();
-    assert_eq!(v.fb.pixel(15, 15), 0x801F, "MSBON sets the high bit");
+    assert_eq!(
+        v.fb.pixel(15, 15),
+        0x8000,
+        "MSBON sets the dest MSB and discards the source colour"
+    );
 }
 
 #[test]
