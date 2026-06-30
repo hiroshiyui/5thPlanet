@@ -363,7 +363,7 @@ contradict an existing ✅ — they are *refinements* of a tier marked done):
 
 | # | Gap | Status |
 |---|-----|--------|
-| H2a | SCSP slot **noise sound-source** (SourceControl, reg0 bits 8:7) | ⬜ the LFSR feeds only the LFO noise *waveform*, never a slot *source* (`scsp/mod.rs`); noise-driven percussion/explosions/hats play wrong data |
+| H2a | SCSP slot **noise sound-source** (SourceControl, reg0 bits 8:7) | ✅ (`09017d1`) — `slot_sample` decodes SSCTL (reg0 bits 8:7) + SBCTL XOR (bits 10:9): source 0 = sound RAM (existing PCM, byte-unchanged), 1 = noise (shared LFSR low byte placed high), 2/3 = digital zero, then `^ SB_XOR_Table`. Was treating every slot as PCM → noise percussion/explosions/hats played sound-RAM garbage. No new state (LFSR already drives the LFO noise) → no savestate bump. Regressions `noise_source_slot_outputs_the_shared_lfsr`/`zero_source_slot_is_silent`/`sbctl_xor_inverts_the_noise_source`; goldens unchanged |
 | H2b | SCSP **DMA engine** (regs 0x412–0x416 / RunDMA) + its DMA-end IRQ (SCIPD bit 4) | ⬜ entirely absent; sample upload/clear via SCSP-DMA fails, and a driver waiting on the DMA-end IRQ can hang (not just sound wrong) |
 | H2c | CD-block **FAD-search** (0x55 ExecuteFADSearch / 0x56 GetFADSearchResults) | ⬜ companion to F2 (move/copy 0x65/66); falls to the default arm → returns status + `CMOK` ("success") but does no work / no results — silent |
 | H2d | VDP2 **normal (non-MSB) sprite shadow** | ⬜ a shadow palette code is drawn as an ordinary colour (`renderer.rs:1859`); 2D drop-shadows render as solid blobs. Needs a priority-bearing shadow `Dot` (which also fixes MSB self-shadow being 2× too bright) |
