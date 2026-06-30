@@ -30,9 +30,10 @@
 //! and the IREG0 CONTINUE/BREAK handshake). The
 //! peripheral report lays out one block per controller port from the
 //! [`PortDevice`] selection: the standard digital pad (ID `0x02`,
-//! [`pad`] bits, active-low) and the Shuttle Mouse (ID `0xE3`,
+//! [`pad`] bits, active-low), the Shuttle Mouse (ID `0xE3`,
 //! [`mouse`] bits + X/Y deltas — see [`Smpc::take_mouse_report`];
-//! M13 E3). Unrecognised commands are queued and complete as no-ops so
+//! M13 E3), and the 3D Control Pad in analog mode (ID `0x16`, the pad
+//! bytes + [`analog`] X/Y/L/R channels; M13 E2). Unrecognised commands are queued and complete as no-ops so
 //! BIOS init code doesn't deadlock.
 //!
 //! Register layout (offsets from `SMPC_BASE = 0x0010_0000`):
@@ -164,6 +165,14 @@ pub struct Smpc {
     /// buttons — previously the peripheral phase reported `pad1` for both ports,
     /// so player 2 mirrored player 1. Default 0 = nothing pressed.
     pub pad2: u16,
+    /// Port-1 analog channels for a 3D Control Pad ([`PortDevice::ThreeDPad`]),
+    /// reported after the two digital-button bytes: `[X, Y, L, R]` indexed by
+    /// [`analog`] (sticks `0x80`-centered, triggers `0x00`-released). The
+    /// frontend sets it; centered by default (see [`Smpc::new`]). Inert unless
+    /// port 1 is a `ThreeDPad`.
+    pub analog1: [u8; 4],
+    /// Port-2 analog channels (same `[X, Y, L, R]` layout as [`Self::analog1`]).
+    pub analog2: [u8; 4],
     /// What is plugged into controller ports 1 and 2 — drives the INTBACK
     /// peripheral-report layout. Defaults: a digital pad on port 1, nothing
     /// on port 2 (the original fixed behaviour).
@@ -232,13 +241,34 @@ pub mod mouse {
 /// What is plugged into an SMPC controller port, for the INTBACK peripheral
 /// report ([`crate::Saturn::set_port_devices`]). `Pad` is the standard digital
 /// control pad (ID `0x02`); `Mouse` is the Shuttle Mouse (ID `0xE3`, 3 data
-/// bytes — Mednafen `smpc.cpp:1421` special-cases ID1 class 3 to `0xE3`).
+/// bytes — Mednafen `smpc.cpp:1421` special-cases ID1 class 3 to `0xE3`);
+/// `ThreeDPad` is the 3D Control Pad ("Multi Controller") in analog mode
+/// (ID `0x16`, 6 data bytes: the 2 standard-pad button bytes + stick X, stick Y,
+/// L-trigger, R-trigger — Mednafen `input/3dpad.cpp`). The pad's digital-mode
+/// position reports as a plain `Pad` (ID `0x02`), so only the analog mode needs
+/// its own variant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PortDevice {
     #[default]
     None,
     Pad,
     Mouse,
+    ThreeDPad,
+}
+
+/// Channel indices into [`Smpc::analog1`]/[`Smpc::analog2`] for a 3D Control Pad
+/// ([`PortDevice::ThreeDPad`]). Values are unsigned bytes on the wire.
+pub mod analog {
+    /// Stick X: `0x00` = full left, `0x80` = center, `0xFF` = full right.
+    pub const X: usize = 0;
+    /// Stick Y: `0x00` = full up, `0x80` = center, `0xFF` = full down.
+    pub const Y: usize = 1;
+    /// Left analog trigger: `0x00` = released .. `0xFF` = fully pressed.
+    pub const L: usize = 2;
+    /// Right analog trigger: `0x00` = released .. `0xFF` = fully pressed.
+    pub const R: usize = 3;
+    /// The neutral resting state: sticks centered, triggers released.
+    pub const NEUTRAL: [u8; 4] = [0x80, 0x80, 0x00, 0x00];
 }
 
 /// Region code for INTBACK OREG9 (SMPC manual area-code table).
@@ -335,6 +365,9 @@ impl Smpc {
     pub fn new() -> Self {
         Self {
             port1: PortDevice::Pad,
+            // 3D-pad analog channels rest centered (sticks 0x80, triggers 0).
+            analog1: analog::NEUTRAL,
+            analog2: analog::NEUTRAL,
             region: region::NORTH_AMERICA,
             // Deterministic default clock: 1996-01-01 00:00:00. The frontend
             // overrides it with the host time via `set_rtc_unix`.

@@ -507,6 +507,45 @@ fn intback_peripheral_reports_the_shuttle_mouse() {
     assert_eq!(sat.bus.smpc.oreg[4], 0, "Y accumulator reset");
 }
 
+/// A 3D Control Pad on port 1 reports analog mode (ID 0x16, 6 data bytes): the
+/// two standard-pad button bytes followed by stick X/Y + L/R analog triggers
+/// (Mednafen `input/3dpad.cpp`).
+#[test]
+fn intback_peripheral_reports_the_3d_control_pad_analog() {
+    use saturn::smpc::{PortDevice, analog, pad};
+    let mut sat = build();
+    sat.set_port_devices(PortDevice::ThreeDPad, PortDevice::None);
+    // Hold Start + Left (same buttons as the digital-pad test).
+    sat.set_pad1(pad::START | pad::LEFT);
+    // Stick pushed right-of-center + down, L half, R full.
+    let mut a = analog::NEUTRAL;
+    a[analog::X] = 0xC0;
+    a[analog::Y] = 0xE0;
+    a[analog::L] = 0x40;
+    a[analog::R] = 0xFF;
+    sat.set_analog1(a);
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // CONTINUE
+    sat.run_for(40_000);
+    assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: 1 device, direct");
+    assert_eq!(
+        sat.bus.smpc.oreg[1], 0x16,
+        "3D Control Pad, analog mode (type 1, 6 data bytes)"
+    );
+    // Digital bytes are byte-identical to the standard pad's.
+    assert_eq!(sat.bus.smpc.oreg[2], !0x48, "buttons byte 0 (Start + Left)");
+    assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "buttons byte 1 (none held)");
+    // Four analog channels, each a full byte (0x80 = centered).
+    assert_eq!(sat.bus.smpc.oreg[4], 0xC0, "stick X");
+    assert_eq!(sat.bus.smpc.oreg[5], 0xE0, "stick Y");
+    assert_eq!(sat.bus.smpc.oreg[6], 0x40, "L trigger");
+    assert_eq!(sat.bus.smpc.oreg[7], 0xFF, "R trigger");
+    assert_eq!(sat.bus.smpc.oreg[8], 0xF0, "port 2: no peripheral");
+}
+
 /// Out-of-range mouse motion clamps to ±256/255 with the overflow flags set
 /// (Mednafen `input/mouse.cpp` clamps and sets flags 0x4/0x8).
 #[test]

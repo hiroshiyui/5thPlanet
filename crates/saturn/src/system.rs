@@ -1638,6 +1638,24 @@ impl Saturn {
                     s.oreg[o + 4] = y;
                     o += 5;
                 }
+                crate::smpc::PortDevice::ThreeDPad => {
+                    // 3D Control Pad, analog mode (ID 0x16 = type 1, 6 data
+                    // bytes; Mednafen input/3dpad.cpp): the two standard-pad
+                    // button bytes (identical encoding — the analog-mode digital
+                    // bytes match a plain pad) followed by the four analog
+                    // channels stick-X, stick-Y, L-trigger, R-trigger.
+                    let pressed = if port == 0 { s.pad1 } else { s.pad2 };
+                    let a = if port == 0 { s.analog1 } else { s.analog2 };
+                    s.oreg[o] = 0xF1;
+                    s.oreg[o + 1] = 0x16;
+                    s.oreg[o + 2] = !((pressed >> 8) as u8); // buttons byte 0
+                    s.oreg[o + 3] = !(pressed as u8) | 0x07; // buttons byte 1
+                    s.oreg[o + 4] = a[crate::smpc::analog::X];
+                    s.oreg[o + 5] = a[crate::smpc::analog::Y];
+                    s.oreg[o + 6] = a[crate::smpc::analog::L];
+                    s.oreg[o + 7] = a[crate::smpc::analog::R];
+                    o += 8;
+                }
             }
         }
         s.oreg[31] = 0x10;
@@ -1674,6 +1692,20 @@ impl Saturn {
     /// (see [`Self::set_port_devices`]); the frontend feeds a 2nd controller.
     pub fn set_pad2(&mut self, pressed: u16) {
         self.bus.smpc.pad2 = pressed;
+    }
+
+    /// Set the port-1 3D Control Pad analog channels `[X, Y, L, R]` (indexed by
+    /// [`crate::smpc::analog`]: sticks `0x80`-centered, triggers `0x00`-released).
+    /// Reported only when port 1 is a [`crate::smpc::PortDevice::ThreeDPad`]; the
+    /// digital buttons still come from [`Self::set_pad1`].
+    pub fn set_analog1(&mut self, channels: [u8; 4]) {
+        self.bus.smpc.analog1 = channels;
+    }
+
+    /// Set the port-2 3D Control Pad analog channels (same layout as
+    /// [`Self::set_analog1`]; reported when port 2 is a `ThreeDPad`).
+    pub fn set_analog2(&mut self, channels: [u8; 4]) {
+        self.bus.smpc.analog2 = channels;
     }
 
     /// Set the SMPC area (region) code reported to the BIOS via INTBACK

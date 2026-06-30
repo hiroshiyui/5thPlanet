@@ -57,8 +57,10 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// added the CD-block FAD-search result latch (`fad_search_fad`/`_spos`/`_pnum`,
 /// the Mednafen `COMMAND_GET_FADSRCH` state read back by command 0x56). v15
 /// added the SCSP DMA engine state (`ScspCtrl` `dmea`/`drga`/`dtlg` +
-/// `dma_exec`/`dma_dir`/`dma_gate`, regs 0x412–0x416).
-const VERSION: u32 = 15;
+/// `dma_exec`/`dma_dir`/`dma_gate`, regs 0x412–0x416). v16 added the SMPC
+/// 3D Control Pad analog channels (`Smpc::analog1`/`analog2`, the `[X, Y, L, R]`
+/// bytes reported after the digital buttons by a `ThreeDPad` port — M13 E2).
+const VERSION: u32 = 16;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
