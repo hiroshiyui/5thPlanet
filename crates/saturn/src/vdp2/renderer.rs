@@ -360,6 +360,8 @@ struct NbgCtx {
     bm_dims: (u32, u32),
     bm_spr: bool,
     bm_scc: bool,
+    /// BMPNA bitmap palette bank (≤8bpp), at CRAM index bits [10:8].
+    bm_pal: usize,
 }
 
 impl NbgCtx {
@@ -459,6 +461,7 @@ impl NbgCtx {
             },
             bm_spr: n < 2 && r.nbg_bitmap_special_priority(n),
             bm_scc: n < 2 && r.nbg_bitmap_special_calc(n),
+            bm_pal: if n < 2 { r.nbg_bitmap_palette(n) } else { 0 },
         }
     }
 }
@@ -687,9 +690,20 @@ fn render_line(
             nbg_layer(vdp2, ctx, sprite_fb, 3, sx, sy),
         );
 
+        // The colour-calc window (WCTLD hi-byte) gates *where* colour calc
+        // applies — one global window for all layers. Inert (always passes)
+        // when its WCTLD enable bits are clear. Mednafen `WinControl[CC]`.
+        let cc_win = window_allows(
+            vdp2,
+            ctx,
+            sprite_fb,
+            vdp2.regs.color_calc_window_control(),
+            sx,
+            sy,
+        );
         let mut rgb = match top {
             Some(t) => match t.cc {
-                Some((ratio, add)) => {
+                Some((ratio, add)) if cc_win => {
                     // Line-colour screen: when LNCLEN selects the top layer,
                     // the line colour is the colour-calc partner (it sits at
                     // the bottom of the colour-calc stack); otherwise the
@@ -717,7 +731,8 @@ fn render_line(
                     };
                     blend(t.rgb, below, ratio, add)
                 }
-                None => t.rgb,
+                // CC disabled, or the CC window excludes this pixel → opaque.
+                _ => t.rgb,
             },
             None => backdrop,
         };
@@ -1541,7 +1556,10 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
         1 => {
             let idx = vdp2.vram.read8(base + py * w + px) as usize;
             (idx != 0 || tpon).then(|| {
-                let (rgb, msb) = cram_cc(vdp2, coff | idx);
+                // BMPNA palette bank lands at CRAM index bits [10:8] (Mednafen
+                // `(BMP & 7) << 8` + CRAOffs). `+` since the bank and offset can
+                // carry; `| idx` is the non-overlapping low pixel.
+                let (rgb, msb) = cram_cc(vdp2, (coff + (nc.bm_pal << 8)) | idx);
                 Sample {
                     rgb,
                     code: idx as u8,
@@ -1552,13 +1570,13 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
                 }
             })
         }
-        // 4bpp paletted (16 colour). The BMPNA palette bank is a later
-        // refinement; the nibble indexes the low palette directly.
+        // 4bpp paletted (16 colour). The BMPNA palette bank selects the CRAM
+        // bank at index bits [10:8] (16-colour banks spaced every 256 entries).
         _ => {
             let byte = vdp2.vram.read8(base + (py * w + px) / 2);
             let nibble = if px & 1 == 0 { byte >> 4 } else { byte & 0xF } as usize;
             (nibble != 0 || tpon).then(|| {
-                let (rgb, msb) = cram_cc(vdp2, coff | nibble);
+                let (rgb, msb) = cram_cc(vdp2, (coff + (nc.bm_pal << 8)) | nibble);
                 Sample {
                     rgb,
                     code: nibble as u8,
@@ -3003,6 +3021,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn colour_calc_window_gates_where_blending_applies() {
+        // Two blending layers (NBG0 red over NBG1 blue). The colour-calc window
+        // (WCTLD hi-byte) restricts the blend to its W0 rectangle; outside, the
+        // top draws opaque. (H3 #2; blend math is the branch's current ÷31.)
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0003); // NBG0 + NBG1
+        v.regs.write16(0x028, 0x1212); // both bitmap, 8bpp
+        v.regs.write16(0x0F8, 0x0205); // N0PRIN=5 (top), N1PRIN=2
+        v.regs.write16(0x03C, 0x0010); // NBG1 bitmap base 0x20000
+        v.regs.write16(0x0EC, 0x0001); // CCCTL.N0CCEN, ratio
+        v.regs.write16(0x108, 0x000F); // CCRNA.N0CCRT = 15
+        v.cram.write16(2, 0x001F); // red (front)
+        v.cram.write16(4, 0x7C00); // blue (below)
+        for x in 0..8u32 {
+            v.vram.write8(x, 1); // NBG0
+            v.vram.write8(0x2_0000 + x, 2); // NBG1
+        }
+        // CC window: W0 enable + inside (WCTLD hi-byte), x∈[2,5], all rows.
+        v.regs.write16(0x0D6, 0x0300);
+        v.regs.write16(0x0C0, 4); // WPSX0 → sx 2
+        v.regs.write16(0x0C2, 0); // WPSY0 → sy 0
+        v.regs.write16(0x0C4, 0x0A); // WPEX0 → ex 5
+        v.regs.write16(0x0C6, 0xE0); // WPEY0 → ey 224
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 3, 0),
+            [131, 0, 124, 0xFF],
+            "inside CC window → blended"
+        );
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "outside CC window → opaque top"
+        );
+    }
+
     /// An MSB-shadow sprite dot (type 2, word = 0x8000) halves the colour of
     /// the NBG layer beneath instead of drawing its own colour.
     #[test]
@@ -3282,6 +3339,25 @@ mod tests {
             pixel(&buf, 1, 0),
             [0, 0, 0xFF, 0xFF],
             "odd column → low nibble"
+        );
+    }
+
+    #[test]
+    fn bitmap_4bpp_honours_the_bmpna_palette_bank() {
+        // BMPNA N0BMP selects the CRAM bank at index bits [10:8] (H3 #3).
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0002); // 4bpp bitmap
+        v.regs.write16(0x02C, 0x0001); // BMPNA: N0BMP = 1 → bank 0x100
+        v.cram.write16((0x100 | 0xA) * 2, 0x001F); // banked index = red
+        v.cram.write16(0xA * 2, 0x7C00); // bank-0 decoy = blue
+        v.vram.write8(0, 0xA0); // px0 nibble = 0xA
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 0, 0),
+            [0xFF, 0, 0, 0xFF],
+            "reads the banked palette (0x10A), not bank 0"
         );
     }
 

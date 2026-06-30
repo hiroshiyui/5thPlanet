@@ -486,6 +486,12 @@ impl Vdp2Regs {
     pub fn nbg_bitmap_special_calc(&self, n: usize) -> bool {
         (self.read16(0x02C) >> (4 + n * 8)) & 1 != 0
     }
+    /// NBG`n` **bitmap** palette number (BMPNA 0x02C: NBG0 bits 2:0, NBG1 bits
+    /// 10:8 — Mednafen `BMPalNo`). For a ≤8bpp bitmap it selects the CRAM bank,
+    /// landing at index bits [10:8] (`(BMP & 7) << 8`), added to the CRAM offset.
+    pub fn nbg_bitmap_palette(&self, n: usize) -> usize {
+        ((self.read16(0x02C) >> (n * 8)) & 0x7) as usize
+    }
     /// RBG 1-word pattern-name supplement spr/scc (PNCR 0x038 bits 9/8).
     pub fn rbg_pn_special_priority(&self) -> bool {
         self.rbg_pncr() & 0x200 != 0
@@ -880,6 +886,12 @@ impl Vdp2Regs {
     }
     pub fn sprite_window_control(&self) -> u8 {
         ((self.read16(0x0D4) >> 8) & 0xFF) as u8
+    }
+    /// Colour-calculation window control (WCTLD 0x0D6 high byte, masked `0xBF` —
+    /// Mednafen `WinControl[WINLAYER_CC]`). Gates *where* colour calc applies
+    /// (one global window for all layers), independent of the per-layer windows.
+    pub fn color_calc_window_control(&self) -> u8 {
+        ((self.read16(0x0D6) >> 8) & 0xBF) as u8
     }
 
     // ---- Rotation backgrounds (RBG0 / RBG1) ----
