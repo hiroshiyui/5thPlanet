@@ -312,7 +312,7 @@ matched to the oracle's no-op).
 
 | # | Gap | Status |
 |---|-----|--------|
-| E1 | Multitap + port-2 scanning | 🟡 core port-2 pad state done (H2e, `b424fec`: `Smpc::pad2` + per-port INTBACK report); remaining — the frontend 2nd-controller feed (`set_pad2`) and the multitap/6-player adapter |
+| E1 | Multitap + port-2 scanning | 🟡 core port-2 pad state done (H2e, `b424fec`: `Smpc::pad2` + per-port INTBACK report); **frontend per-port assignment + 2nd-controller feed done (E-1: `ports.rs` wired — `set_pad1`/`set_pad2` routed per port)**; remaining — the multitap/6-player adapter (E-3) |
 | E2 | Analog peripherals (3D pad, Mission Stick, racing) + per-button gamepad rebind | ⬜ |
 | E3 | Specialty peripherals | 🟡 Shuttle Mouse done (`638cda7`/`80b7120`, savestate v5, `--mouse[=1|2]`); light gun + keyboard remaining |
 
@@ -342,7 +342,7 @@ device **type**.
 *Phased build (foundation-first; each phase ships something playable).*
 | Phase | Side | Work | Closes |
 |---|---|---|--------|
-| E-1 | host | Finish wiring the parked `feat/jupiter-per-port-input` (`ports.rs`, 9 tests): 2-port device assignment + host binding for the existing Pad/Mouse types, multi-gamepad by GUID, config `port1`/`port2`, OSD `CyclePort`. Cheapest win — unblocks "P1 = gamepad, P2 = keyboard". | E1 frontend 2nd-controller feed (`set_pad2`) |
+| E-1 | host | ✅ **done** — `ports.rs` wired into the frontend: 2-port device assignment + host binding for the Pad/Mouse types, multi-gamepad by stable SDL GUID, config `port1`/`port2` (legacy `mouse` migrated), OSD Controller **Port 1 / Port 2** `CyclePort` rows. The emu thread owns the `Ports` assignment + routes each frame's per-device input (`EmuIn::Input` keyboard + per-GUID pad bits) to `set_pad1`/`set_pad2`; the SDL thread is a pure sensor (hot-plug → `EmuIn::PadList`). Unblocks "P1 = gamepad, P2 = keyboard". | E1 frontend 2nd-controller feed (`set_pad2`) |
 | E-2 | emulated + host | Analog controller **types** — 3D/Multi pad, Mission Stick, racing wheel: new INTBACK ID + report layout in SMPC (per-type INTBACK-layout regression tests, savestate bump); host capability-map + per-button gamepad rebind become load-bearing here. | E2 |
 | E-3 | emulated + host | **Multitap / 6-player** — emit a tap-container ID + N sub-peripheral blocks in the INTBACK peripheral phase; the host port list simply grows >2 (`ports.rs` already iterates a port list). Rides on E-1/E-2. | E1 multitap |
 | E-4 | emulated + host | Remaining specialty — **light gun** (raster-position latch) + **keyboard** (type-3 ID). | E3 |
