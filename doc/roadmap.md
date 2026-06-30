@@ -339,6 +339,66 @@ with `chdman extractcd`. The G2–G7 IDs are unchanged.)
 | G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | 🟡 **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
 | G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | 🟡 **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
 
+**Tier H — cross-chip silent-feature audit (2026-06-30).** Output of a
+six-agent oracle-diff sweep run after the Wachenröder RBG0 coefficient
+line-colour fix (`7e2341b`) — that bug was a *silent* gap (an unread register
+bit/field that renders wrong with **no panic and no log**), so this pass hunted
+the same class across every chip. Each **H1/H2** row is verified by direct code
+inspection (not merely agent-reported). None blocks the five playable titles;
+golden-safe, pulled when a game or accuracy need surfaces. Overlaps already on
+this backlog are cross-referenced, not repeated (see "Already tracked" below).
+
+**H1 — confirmed correctness bugs** (small, silent, high-value; several
+contradict an existing ✅ — they are *refinements* of a tier marked done):
+
+| # | Gap | Status |
+|---|-----|--------|
+| H1a | SH-2 NMI sets `SR.imask` = 0, not 15 | ⬜ `set_imask(16)` → `16 & 0xF = 0` (`sh2 regs.rs:85`); HW masks to 15 (`sh7095_ops.inc`). NMI (SMPC `NMIREQ`) handler runs fully preemptible → spurious nesting. ~1-line fix; the NMI test only checks PC, not imask |
+| H1b | VDP2 colour-offset **sprite/back bits swapped** | ⬜ *refines C7 ✅* — `apply_color_offset` uses sprite=bit5 / back=bit6 (`renderer.rs:995`); HW/oracle is sprite=bit6 / back=bit5 (`vdp2_render.cpp:2148/2404`). Sprite-only / backdrop-only fades (a common idiom) misfire or invert. Fix must special-case the offset path — `screen_bit()`=5-for-sprite is *correct* for the line-colour path |
+| H1c | VDP1 **16bpp MSB-ON** writes the sprite colour | ⬜ `plotter.rs:585`+`615` OR the MSB into the source pixel and write it; HW read-modifies the destination MSB (`vdp1_common.h:254`). The **8bpp sibling path is already correct** (half-finished fix) → 16bpp/RGB sprite shadows render as solid colour |
+| H1d | SH-2 on-chip-DMAC vectors **VCRDMA0/1 unrouted** | ⬜ *refines D2 ✅* — INTC declares + consumes the vectors (`intc.rs:56-57,224-225`) but the bus write path never sets them. On-chip-DMAC transfer-end IRQ vectors through 0 → wild jump (latent: most games use SCU DMA / poll TE) |
+| H1e | SCU DMA **HBlank-IN/Timer0/Timer1 start-factors not wired** | ⬜ *refines D5 ✅* — the live path (`system.rs`) calls `trigger_dma_factor` only for 0/1/5/6 (VBIN/VBOUT/SCSP/VDP1); factors 2/3/4 fire only in unit tests. HBlank-paced raster splits + timer-paced streaming DMA never trigger |
+
+**H2 — confirmed missing capabilities** (a whole feature/block absent):
+
+| # | Gap | Status |
+|---|-----|--------|
+| H2a | SCSP slot **noise sound-source** (SourceControl, reg0 bits 8:7) | ⬜ the LFSR feeds only the LFO noise *waveform*, never a slot *source* (`scsp/mod.rs`); noise-driven percussion/explosions/hats play wrong data |
+| H2b | SCSP **DMA engine** (regs 0x412–0x416 / RunDMA) + its DMA-end IRQ (SCIPD bit 4) | ⬜ entirely absent; sample upload/clear via SCSP-DMA fails, and a driver waiting on the DMA-end IRQ can hang (not just sound wrong) |
+| H2c | CD-block **FAD-search** (0x55 ExecuteFADSearch / 0x56 GetFADSearchResults) | ⬜ companion to F2 (move/copy 0x65/66); falls to the default arm → returns status + `CMOK` ("success") but does no work / no results — silent |
+| H2d | VDP2 **normal (non-MSB) sprite shadow** | ⬜ a shadow palette code is drawn as an ordinary colour (`renderer.rs:1859`); 2D drop-shadows render as solid blobs. Needs a priority-bearing shadow `Dot` (which also fixes MSB self-shadow being 2× too bright) |
+| H2e | SMPC **port-2 pad state** | ⬜ part of E1 — only `set_pad1` exists; INTBACK reports pad1 for *both* ports → every 2-player game sees P2 mirror P1 (latent today: the frontend feeds one pad) |
+
+**H3 — confirmed silent refinements** (lower current exposure, all verified-or-agent-reported):
+
+- **SH-2:** DIVU overflow leaves the stale dividend instead of a saturated quotient (refines D1); address-error exceptions (vec 9/10) never raised; a misaligned *cached* word/long read at a line boundary **panics** (out-of-bounds slice) where HW traps — a latent crash vector (unreachable by correct code).
+- **VDP2:** CCRTMD (ratio-from-2nd-layer, CCCTL bit 9) unread; colour-calc **window** (WCTLD hi-byte) unimplemented → windowed translucency blends the whole layer; MSB self-shadow (types 2–7) 2× too bright; bitmap palette-bank (BMPNA/B) ignored; blend ratio is ÷31 not ÷32 (subtle). *(Code-comment cleanup: `regs.rs:428-437` "per-dot application not yet wired" is stale — it is wired.)*
+- **VDP1:** RGB-direct transparency uses `==0` not `<0x4000`; end-code doesn't truncate the textured row (trailing garbage on variable-width sprites); mesh checkerboard phase inverted; user-clip "outside" mode (CMDPMOD bit 9) ignored.
+- **SCU-DSP** (least oracle-faithful SCU area): program-RAM DMA (`drw==4`) folds to data bank 0; DMA address-stride table follows MAME not Mednafen; ALU carry/sign computed on sign-extended operands (wrong carry-chains), V flag not sticky; `count==0` moves 0 words (should be 256).
+- **SCSP:** SoundDirect, AttackLoopLink, EGBypass, ShortWave, SBXOR — decoded-but-ignored slot bits (same `mod.rs` decode sites); EG/pan are float-table approximations, not bit-exact.
+- **SMPC:** SYSRES (0x0D) decoded but a no-op (`// M4+ will route to reset()` — never did); direct-mode PDR/DDR peripheral I/O is store-only (no TH/TR handshake); SMEM (the BIOS language/setup byte) not persisted to a host file.
+
+**Needs verification before acting** (agent-reported, inspection inconclusive):
+VDP2 "2048-colour (depth 2) → 4bpp garbage" (the code has *partial* depth-2
+awareness); VDP1 command-0xB severity (whether shipping games emit it — but our
+plotter ends the list on 0xB while our timing model treats it as a clip command,
+so the two halves disagree); SMPC per-command SF-busy durations.
+
+**Already tracked on this backlog (not repeated here):** SCSP G2/G3/G4; VDP1
+erase/BEF G5; VDP2 VBLANK-clear/ODD G6; rendering C5 (dual-window coeff,
+screen-over mode 1), C6 (TVM=3), C9 (line-colour EXCC + gradient), C10
+(rotation/bitmap-CG fetch gating); input E1 (multitap + port-2 scanning), E2
+(analog peripherals), E3 (light gun + keyboard); F1 (MPEG card), F2 (CD
+move/copy sector ops), F3 (SH-2 cache address/data-array spaces).
+
+**Confirmed faithful (audit cleared, for the record):** SH-2 ISA decoder (all
+~142 encodings) + illegal-slot table + cache (LRU/purge/CCR width) +
+FRT/WDT/INTC/DMAC-run-condition + DIVU non-overflow; **M68k ISA essentially
+complete**; **SCSP-DSP a faithful `RunDSP` port**; VDP2 windows / mosaic / the 16
+sprite-type bit-splits / special-priority+CC / coefficient table (incl. the new
+KTCTL line-colour) / back-screen; VDP1 command 0x0–0xA dispatch / gouraud / 4bpp
+/ CEF.
+
 ## Performance (opt-in "fast mode" — future)
 
 Accuracy stays the default and the trace-diff baseline; never a JIT/dynarec.
