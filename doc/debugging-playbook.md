@@ -241,7 +241,11 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
 
 ## Case studies (scrubbed)
 
-- **Wachenröder — white 3D-battle floor (the unread KTCTL register).** The RBG0
+Each case distils one blocker to symptom → trace → root → lesson. The **CASE#N**
+IDs are stable references — cite them from commit messages, the roadmap, or the
+forensic records below; append new cases at the end rather than renumbering.
+
+- **CASE#1: Wachenröder — white 3D-battle floor (the unread KTCTL register).** The RBG0
   rotating floor washed near-white. Confirmed it was RBG0 (layer isolation), and
   that *disabling* its additive colour-calc fixed it — but the contradiction was
   that Mednafen's identical additive blend should wash too. Resolution: the
@@ -263,13 +267,13 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   three different roots; all but the right one were falsified by live register/poke
   data — adjudicate every agent claim against the oracle + live state, and the user's
   Mednafen screenshot (RBG0 texture *is* drawn, just dark) was the decisive oracle.
-- **Sangokushi V — two cache purges.** Signature failure = SH-2 cache purges we
+- **CASE#2: Sangokushi V — two cache purges.** Signature failure = SH-2 cache purges we
   weren't honoring. (1) `Cpu::reset` didn't purge the cache, so an SSHON-re-reset
   slave ran stale code and never relocated → blank menu (`35ce7e8`). (2) A 16-bit
   `MOV.W @CCR` cache-purge fell through (only byte-CCR reached the cache) → stale
   display-list → blank menu buttons (`6215aab`). The second was found by
   *recognizing the cache-coherency class*, after a long symptom-trace did not.
-- **Sangokushi V — interrupt in a delay slot.** Its scenario-opening movie stalled
+- **CASE#3: Sangokushi V — interrupt in a delay slot.** Its scenario-opening movie stalled
   *intermittently* (interactively "random"). Made deterministic via
   record→replay→snapshot; classified core-not-pacing (`SAT_MOVIE_PROBE` showed
   frames advancing while the CD buffer froze full, `free=0 parts=[0:200]`);
@@ -284,7 +288,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   deterministic instance once captured — and the symptom subsystem is rarely the
   buggy one.** (Full forensic record — the deterministic-repro recipe and the
   ruled-out evidence table — in *Boot-blocker case files* below.)
-- **Greatest Nine '98 — VDP1 draw-end flag cleared before the ISR read it**
+- **CASE#4: Greatest Nine '98 — VDP1 draw-end flag cleared before the ISR read it**
   (`9b91689`). Wedged forever at "Now Loading": its CD-loader's VBlank-OUT ISR
   gates on **EDSR.CEF** (VDP1 draw-end). We cleared CEF (via `vdp1.frame_change`
   → `render_list`) on the **VBlank-OUT edge** in `update_video_timing`, but that
@@ -301,7 +305,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   deferral. **Lesson: a 2-CPU flag-wait deadlock — trace UPSTREAM to what stops
   driving the flag (the FTI deadlock was the victim); and when a fix "should
   work" but doesn't, instrument the value AT THE READ SITE.**
-- **Greatest Nine '98 — SMPC SF spuriously set on a COMREG write** (`e1a7401`,
+- **CASE#5: Greatest Nine '98 — SMPC SF spuriously set on a COMREG write** (`e1a7401`,
   the second GN98 blocker). After the CEF fix, GN98 wedged in a black-screen
   self-loop at `0x06004A7E` (a read-once-or-spin SMPC **SF** check). Root: our
   `queue_command` set `sf=1` on every COMREG write, but SF is software-managed
@@ -313,7 +317,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   premise is stale," a **concurrency confound** when agents both edit and
   observe; trust the agent that *made* the change + the oracle model, and re-run
   the repro yourself. (See the "SMPC SF is software-set" fertile-gap class above.)
-- **Greatest Nine '98 — 8bpp 2-word pattern-name palette over-shift** (`ff6e7a4`,
+- **CASE#6: Greatest Nine '98 — 8bpp 2-word pattern-name palette over-shift** (`ff6e7a4`,
   an in-game render bug, GN98 now fully playable). The team-select menu's two
   LARGE preview flags (NBG1, 8bpp/256-colour, 2-word PN) rendered as scrambled
   rainbow palettes; the small grid flags (NBG3, 4bpp) were fine — **wrong colours,
@@ -330,7 +334,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   "wrong colours, right shape" = a palette/CRAM-bank decode bug; the layer's
   registers were all correct — the bug was the per-depth/per-PN-width CRAM-index
   math. (See the "VDP2 colour / CRAM-bank decode" fertile-gap class above.)
-- **Greatest Nine '98 — VDP1 double-interlace field strobe** (`33ccf8a` gated →
+- **CASE#7: Greatest Nine '98 — VDP1 double-interlace field strobe** (`33ccf8a` gated →
   `b1bb3ce` default-on, user-verified). The main menu's foreground (title + menu
   bars) jittered every frame; the VDP2 background was steady. Classified as a
   *temporal* render bug: `fbdump` of consecutive frames showed a strict 2-frame
@@ -352,17 +356,30 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   not combed — a static-frame combing preview over-predicts motion). (See the
   "VDP1 double-interlace (DIE) deinterlace" fertile-gap class above; cf. the
   reverted P5 per-field *rendering*, a different, broader mechanism.)
-- **Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
+- **CASE#8: Doukyuusei ~if~ — dropped DMA.** The record-select menu was empty because an
   SCU indirect-DMA descriptor-table base pointer was read through an unfolded
   cache-through alias → empty descriptors → the menu-background DMA moved nothing.
   The "control-flow-skip / under-driven" symptom pointed at game logic; the root
   was a silently-dropped bus transfer.
-- **Virtua Fighter 2 — audio fidelity.** Silent SFX traced to SH-2→SCSP B-bus
+- **CASE#9: Virtua Fighter 2 — audio fidelity.** Silent SFX traced to SH-2→SCSP B-bus
   wait-states being charged 0 (vs the reference's read +48 / write +17), which
   let the game's sound-submit spin-timeout expire before the 68k driver's wake,
   latching a permanent "sound wedged" flag. Found by diffing the timing model
   against the oracle, not by reading the driver.
-- **BIOS Memory Manager — line scroll is a base, not an offset (and a near-miss).**
+- **CASE#10: BIOS CD-player BGM silence — an m68k decode bug, not a timing gap**
+  (`32662f7`, resolved 2026-06-06). The BIOS CD-player's BGM was silent, and
+  because it surfaced during the M12 whole-system cycle-accuracy push the natural
+  suspicion was a timing gap. Root: `ADDA.L` / `SUBA.L Dn,An` were mis-decoded as
+  `ADDX` / `SUBX` — the two share the bit-8 + bits-5:4==`00` encoding, and the
+  `op_addsub` dispatch guard failed to exclude opmode `0b11`, so the address
+  register never accumulated and the sound driver's note-ring collapsed to 2
+  entries. Found by a **cross-emulator note-ring diff** (the signal
+  "oscilloscope", `tools/scope_diff.py`), not by reading the driver; regression
+  `m68k/tests/ring_offset_repro.rs`. **Lesson: an audio-silence symptom that
+  appears during a timing-accuracy push is not automatically a timing bug — a
+  cross-emulator *data* diff (here the 68k note-ring) localised it to a plain ISA
+  decode error.** (See the `op_addsub` ADDX/SUBX gotcha in `CLAUDE.md`.)
+- **CASE#11: BIOS Memory Manager — line scroll is a base, not an offset (and a near-miss).**
   A BIOS screen rendered doubled: two copies of the menu stacked in one 320×224
   frame. A long trace *wrongly cleared the renderer* — it ruled out char-mode,
   scroll, zoom, window (WCTLA), and interlace (TVMD), but **never read SCRCTL**
@@ -382,7 +399,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   coordinate next to the computed source coordinate, and don't gate the probe on
   the value you're validating; a half-screen repeat is a vertical-sampling-rate
   bug, not VRAM duplication.
-- **Panzer Dragoon Zwei — input dead (peripheral-only INTBACK).** The game
+- **CASE#12: Panzer Dragoon Zwei — input dead (peripheral-only INTBACK).** The game
   reached its title (via the Seek fix below) but accepted **no** controller input
   — START did nothing, no button skipped the FMV — while **VF2 read input fine**.
   Classified to the SMPC INTBACK path with a new `SAT_SMPCLOG` access logger
@@ -400,7 +417,7 @@ changed the core and is wrong. *Extend the instrument, don't perturb the core.*
   traffic of both and diff; a one-off `SAT_SMPCLOG` was the decisive instrument.
   The symptom subsystem (input) was right, but the bug was an unhandled INTBACK
   acquisition mode, not the pad-report format (which VF2 proved correct).
-- **Panzer Dragoon Zwei — a MAME-derived CD command in a Mednafen world.** The
+- **CASE#13: Panzer Dragoon Zwei — a MAME-derived CD command in a Mednafen world.** The
   opening FMV played, then the game bailed to the BIOS CD player. Three competing
   agents (Mednafen oracle-diff / sdbg verdict-trace / CD-status register-audit)
   converged: the post-FMV teardown issues `Seek 1100,0200`, and our CD **Seek
@@ -447,7 +464,7 @@ SH-2 software run under LLE — no decoder to implement either way.)
 
 ### Sangokushi V — scenario-opening movie stall (full record)
 
-Root cause is the *"Sangokushi V — interrupt in a delay slot"* case study above;
+Root cause is **CASE#3** (*Sangokushi V — interrupt in a delay slot*) above;
 the value retained here is the forensic trail — how an interactively-"random"
 stall was made deterministic, and how the field of suspects was cleared.
 
@@ -493,8 +510,8 @@ invariant now extends to the SCU forwarding layer.
 
 ### Panzer Dragoon Zwei — reference notes
 
-Both fixes are case studies above (the CD **Seek (0x11)** decode and the
-peripheral-only **INTBACK**). Notes worth keeping:
+Both fixes are case studies above — the CD **Seek (0x11)** decode (**CASE#13**)
+and the peripheral-only **INTBACK** (**CASE#12**). Notes worth keeping:
 - `mednaref/src/ss/db.cpp`: **no per-game hack for PDZ** — it boots on generic
   CD-block fidelity, so both blockers were our-side gaps.
 - Mednafen's PROBLEMATIC-GAMES list flags PD2 as "relies on illegal/questionable
