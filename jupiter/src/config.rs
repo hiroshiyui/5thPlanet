@@ -64,10 +64,21 @@ pub struct Config {
     /// Cartridge token, same vocabulary as `--cart=`: `none` / `ram1m` /
     /// `ram4m` / `bram`.
     pub cartridge: String,
-    /// Shuttle Mouse token, same vocabulary as `--mouse[=1|2]`: `off` (no
-    /// mouse, default), `1` (mouse on port 1, replacing the pad) or `2` (mouse
-    /// on port 2, keyboard pad stays on port 1). The CLI flag overrides this.
+    /// **Legacy** Shuttle Mouse token (`off`/`1`/`2`), kept only so a pre-0.18
+    /// config still parses; superseded by [`Config::port1`]/[`Config::port2`].
+    /// [`Config::migrate_ports`] folds it into the port tokens on load, and
+    /// [`Config::to_text`] no longer writes it. The `--mouse[=1|2]` CLI flag
+    /// still works (applied as a startup port override in `main.rs`).
     pub mouse: String,
+    /// Per-port input-source tokens (the layered input model, M13 E-1): `none`,
+    /// `keyboard`, `mouse`, or `gamepad:<sdl-guid>`. Empty = unset (a pre-0.18
+    /// config) → [`Config::migrate_ports`] derives them from the legacy
+    /// [`Config::mouse`] key. Default after migration: `keyboard` on port 1,
+    /// `none` on port 2 (the original single-player layout). A `gamepad:<guid>`
+    /// resolves against the connected controllers at runtime
+    /// (`ports::Source::from_token`); an unplugged GUID falls back to `none`.
+    pub port1: String,
+    pub port2: String,
     /// Graphics-presentation backend token, same vocabulary as `--backend`:
     /// `auto` (default — SDL3 picks its platform default), `opengl`, `opengles`,
     /// `direct3d11`, `direct3d12`, `metal`, or `software`. Selects which SDL3
@@ -111,6 +122,8 @@ impl Default for Config {
             region: None,
             cartridge: "none".into(),
             mouse: "off".into(),
+            port1: String::new(),
+            port2: String::new(),
             backend: "auto".into(),
             // TODO(gpu-presenter): flip to "auto" when the SDL_GPU CRT presenter
             // consumes the probe verdict (ADR-0019). The flip also requires
@@ -152,6 +165,8 @@ impl Config {
                 "region" => cfg.region = Some(unquote(v)).filter(|s| !s.is_empty()),
                 "cartridge" => cfg.cartridge = unquote(v),
                 "mouse" => cfg.mouse = unquote(v),
+                "port1" => cfg.port1 = unquote(v),
+                "port2" => cfg.port2 = unquote(v),
                 "backend" => cfg.backend = unquote(v),
                 "gpu" => cfg.gpu = unquote(v),
                 "scaling" => cfg.scaling = unquote(v),
@@ -170,6 +185,24 @@ impl Config {
         cfg
     }
 
+    /// Fold a pre-0.18 config into the per-port tokens: if neither `port1` nor
+    /// `port2` was set, derive them from the legacy [`Config::mouse`] key —
+    /// `1` → mouse on port 1 (no pad); `2` → keyboard on 1, mouse on 2; anything
+    /// else (incl. `off`) → keyboard on 1, nothing on 2 (the original layout).
+    /// Idempotent: a config that already carries port tokens is left untouched.
+    pub fn migrate_ports(&mut self) {
+        if !self.port1.is_empty() || !self.port2.is_empty() {
+            return;
+        }
+        let (p1, p2) = match self.mouse.as_str() {
+            "1" => ("mouse", "none"),
+            "2" => ("keyboard", "mouse"),
+            _ => ("keyboard", "none"),
+        };
+        self.port1 = p1.into();
+        self.port2 = p2.into();
+    }
+
     /// Serialize back to the flat TOML-subset text.
     // Only the SDL3 frontend writes the config (the OSD); headless reads it.
     #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
@@ -181,7 +214,10 @@ impl Config {
             out.push_str(&format!("region = \"{r}\"\n"));
         }
         out.push_str(&format!("cartridge = \"{}\"\n", self.cartridge));
-        out.push_str(&format!("mouse = \"{}\"\n", self.mouse));
+        // The legacy `mouse` key is no longer written — it's folded into
+        // port1/port2 by migrate_ports on load (still parsed for old configs).
+        out.push_str(&format!("port1 = \"{}\"\n", self.port1));
+        out.push_str(&format!("port2 = \"{}\"\n", self.port2));
         out.push_str(&format!("backend = \"{}\"\n", self.backend));
         out.push_str(&format!("gpu = \"{}\"\n", self.gpu));
         out.push_str(&format!("scaling = \"{}\"\n", self.scaling));
@@ -283,7 +319,8 @@ mod tests {
             fullscreen: true,
             region: Some("europe-pal".into()),
             cartridge: "ram4m".into(),
-            mouse: "2".into(),
+            port1: "gamepad:0300abcd".into(),
+            port2: "keyboard".into(),
             backend: "software".into(),
             gpu: "auto".into(),
             scaling: "smooth".into(),
@@ -321,6 +358,40 @@ mod tests {
         assert_eq!(cfg.scale, 1);
         assert_eq!(cfg.keys[12], "Space");
         assert_eq!(cfg.keys[0], "Up");
+    }
+
+    #[test]
+    fn port_tokens_parse_and_round_trip() {
+        let cfg = Config::parse("port1 = \"gamepad:0300dead\"\nport2 = \"mouse\"\n");
+        assert_eq!(cfg.port1, "gamepad:0300dead");
+        assert_eq!(cfg.port2, "mouse");
+        // The legacy `mouse` key is no longer emitted.
+        assert!(!cfg.to_text().contains("\nmouse ="));
+    }
+
+    #[test]
+    fn migrate_ports_derives_from_legacy_mouse_key() {
+        // mouse=2 → keyboard on 1, mouse on 2.
+        let mut c = Config::parse("mouse = \"2\"\n");
+        assert_eq!((c.port1.as_str(), c.port2.as_str()), ("", ""));
+        c.migrate_ports();
+        assert_eq!((c.port1.as_str(), c.port2.as_str()), ("keyboard", "mouse"));
+        // mouse=1 → mouse on 1, nothing on 2.
+        let mut c = Config::parse("mouse = \"1\"\n");
+        c.migrate_ports();
+        assert_eq!((c.port1.as_str(), c.port2.as_str()), ("mouse", "none"));
+        // off / absent → the original single-player layout.
+        let mut c = Config::default();
+        c.migrate_ports();
+        assert_eq!((c.port1.as_str(), c.port2.as_str()), ("keyboard", "none"));
+    }
+
+    #[test]
+    fn migrate_ports_leaves_explicit_tokens_untouched() {
+        let mut c = Config::parse("mouse = \"1\"\nport1 = \"keyboard\"\nport2 = \"none\"\n");
+        c.migrate_ports();
+        // Explicit port tokens win over the legacy mouse key.
+        assert_eq!((c.port1.as_str(), c.port2.as_str()), ("keyboard", "none"));
     }
 
     #[test]

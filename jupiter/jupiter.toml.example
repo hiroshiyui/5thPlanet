@@ -99,13 +99,24 @@ shader = "none"
 # Default: "none".
 cartridge = "none"
 
-# Shuttle Mouse, same vocabulary as the `--mouse[=1|2]` CLI flag:
-#   "off"  no mouse (default)
-#   "1"    mouse on port 1, replacing the keyboard pad
-#   "2"    mouse on port 2, keyboard pad stays on port 1
-# The host mouse drives it (motion + clicks; Return = the mouse Start button;
-# F10 toggles pointer capture). Default: "off".
-mouse = "off"
+# --- Controller ports -------------------------------------------------------
+#
+# Each of the two SMPC controller ports is assigned an input source. Tokens:
+#   "none"             nothing plugged into the port
+#   "keyboard"         the host keyboard (the key bindings below)
+#   "mouse"            the host mouse (Shuttle Mouse: motion + clicks; Return =
+#                      the mouse Start button; F10 toggles pointer capture)
+#   "gamepad:<guid>"   a specific game controller, by its stable SDL GUID
+# A device drives at most one port; an unplugged "gamepad:<guid>" falls back to
+# "none". Any connected controller NOT bound to a port still drives the keyboard
+# port, so a single pad works out of the box. Assign these live in the OSD
+# (Settings -> Controller). Default: keyboard on port 1, nothing on port 2.
+# port1 = "keyboard"
+# port2 = "none"
+#
+# Legacy: the older `mouse = "off"|"1"|"2"` key (and the `--mouse[=1|2]` CLI
+# flag) still work — on load a `mouse` value is folded into port1/port2 when
+# those are unset; the flag overrides the config at startup.
 
 # --- Keyboard bindings ------------------------------------------------------
 #

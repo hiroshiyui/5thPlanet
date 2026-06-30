@@ -70,37 +70,6 @@ pub enum OsdCart {
     BackupRam,
 }
 
-/// Which SMPC port carries the Shuttle Mouse (frontend maps to
-/// `saturn::smpc::PortDevice`): `Off` = both ports default (pad on 1), `Port1`
-/// replaces the pad on port 1, `Port2` keeps the pad on 1 and adds a mouse on 2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OsdMouse {
-    Off,
-    Port1,
-    Port2,
-}
-
-impl OsdMouse {
-    /// The next setting in the Off → Port 1 → Port 2 → Off cycle (the Controller
-    /// screen advances through these on each activation).
-    fn next(self) -> Self {
-        match self {
-            OsdMouse::Off => OsdMouse::Port1,
-            OsdMouse::Port1 => OsdMouse::Port2,
-            OsdMouse::Port2 => OsdMouse::Off,
-        }
-    }
-
-    /// Short label for the cycling Controller-screen row.
-    fn label(self) -> &'static str {
-        match self {
-            OsdMouse::Off => "Off",
-            OsdMouse::Port1 => "Port 1",
-            OsdMouse::Port2 => "Port 2",
-        }
-    }
-}
-
 /// Graphics-presentation backend as the OSD names it (the frontend maps these to
 /// `present::RenderBackend` config tokens). A convenience subset of the full
 /// `--backend` vocabulary: `Direct3D` stands in for the D3D11/12 tokens and
@@ -180,8 +149,12 @@ pub enum OsdAction {
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
     SetCartridge(OsdCart),
-    /// Move the Shuttle Mouse (frontend re-points the SMPC ports live, no reset).
-    SetMouse(OsdMouse),
+    /// Advance the input source on controller port `0` or `1` to its next
+    /// candidate (the frontend cycles None → Keyboard → Mouse → each connected
+    /// pad against the live device list, re-points the SMPC ports live with no
+    /// reset, and persists `port1`/`port2`). The OSD only names the port; it has
+    /// no device list of its own.
+    CyclePort(u8),
     /// Change the graphics-presentation backend. The frontend writes the config;
     /// the SDL3 render driver is fixed at window creation, so it applies on the
     /// next launch.
@@ -242,8 +215,10 @@ pub struct OsdCtx {
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
     pub cart: OsdCart,
-    /// Current Shuttle Mouse port — the Controller screen shows it.
-    pub mouse: OsdMouse,
+    /// Current input-source label for each controller port (port 1, port 2) —
+    /// the Controller screen shows them on the two `CyclePort` rows. Built from
+    /// `ports::Source::label()` (e.g. `Keyboard`, `Mouse`, `Pad: Xbox 360`).
+    pub port_labels: [String; 2],
     /// Current graphics-presentation backend — the Graphics screen cycles it.
     pub backend: OsdBackend,
     /// Whether the CRT shader is selected — the Shaders screen marks it
@@ -538,10 +513,15 @@ impl Osd {
                         Select::Emit(OsdAction::StartRebind(i as u8)),
                     ));
                 }
-                // Shuttle Mouse port cycles Off → Port 1 → Port 2 → Off.
+                // Per-port input source: each row cycles through the available
+                // sources (None / Keyboard / Mouse / each connected pad).
                 v.push(mk(
-                    &format!("Mouse: {}", ctx.mouse.label()),
-                    Select::Emit(OsdAction::SetMouse(ctx.mouse.next())),
+                    &format!("Port 1: {}", ctx.port_labels[0]),
+                    Select::Emit(OsdAction::CyclePort(0)),
+                ));
+                v.push(mk(
+                    &format!("Port 2: {}", ctx.port_labels[1]),
+                    Select::Emit(OsdAction::CyclePort(1)),
                 ));
                 v.push(mk("Reset Defaults", Select::Emit(OsdAction::ResetBinds)));
                 v.push(mk("Back", Select::Close));
@@ -935,7 +915,7 @@ mod tests {
             keep_aspect: true,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
-            mouse: OsdMouse::Off,
+            port_labels: ["Keyboard".into(), "None".into()],
             backend: OsdBackend::Auto,
             #[cfg(feature = "gpu-presenter")]
             shader_crt: false,
@@ -1223,16 +1203,6 @@ mod tests {
     }
 
     #[test]
-    fn osd_mouse_cycles_and_labels() {
-        assert_eq!(OsdMouse::Off.next(), OsdMouse::Port1);
-        assert_eq!(OsdMouse::Port1.next(), OsdMouse::Port2);
-        assert_eq!(OsdMouse::Port2.next(), OsdMouse::Off);
-        assert_eq!(OsdMouse::Off.label(), "Off");
-        assert_eq!(OsdMouse::Port1.label(), "Port 1");
-        assert_eq!(OsdMouse::Port2.label(), "Port 2");
-    }
-
-    #[test]
     fn osd_backend_cycles_and_labels() {
         let mut b = OsdBackend::Auto;
         let mut seen = vec![b.label()];
@@ -1259,17 +1229,33 @@ mod tests {
     }
 
     #[test]
-    fn controller_mouse_row_emits_next_port() {
+    fn controller_port_rows_emit_cycle_port() {
         let mut osd = Osd::new();
         osd.toggle();
-        let c = ctx(true); // mouse = Off
+        let c = ctx(true); // port_labels = ["Keyboard", "None"]
         select_main(&mut osd, &c, "Settings");
         select_main(&mut osd, &c, "Controller");
-        // The row reads "Mouse: Off"; activating it cycles to Port 1.
-        assert_eq!(
-            select_main(&mut osd, &c, "Mouse: Off"),
-            Some(OsdAction::SetMouse(OsdMouse::Port1))
-        );
+        // Both port rows live on one screen, so inspect them directly (the
+        // select_main helper navigates by absolute index and can't select two
+        // rows on the same screen). Each row shows the port's source label and
+        // asks the frontend to cycle that port.
+        let items = osd.items(osd.screen(), &c);
+        let p1 = items
+            .iter()
+            .find(|it| it.label == "Port 1: Keyboard")
+            .expect("port 1 row");
+        let p2 = items
+            .iter()
+            .find(|it| it.label == "Port 2: None")
+            .expect("port 2 row");
+        assert!(matches!(
+            p1.on_select,
+            Select::Emit(OsdAction::CyclePort(0))
+        ));
+        assert!(matches!(
+            p2.on_select,
+            Select::Emit(OsdAction::CyclePort(1))
+        ));
     }
 
     #[test]
@@ -1337,9 +1323,10 @@ mod tests {
             select_main(&mut osd, &c, "Start  Return"),
             Some(OsdAction::StartRebind(12))
         );
-        // Selection stays on Start (12); the rows below are Mouse (13) then
-        // Reset Defaults (14), so two Downs reach Reset Defaults.
-        osd.handle(Nav::Down, &c); // Mouse
+        // Selection stays on Start (12); the rows below are Port 1 (13),
+        // Port 2 (14), then Reset Defaults (15) — three Downs reach Reset.
+        osd.handle(Nav::Down, &c); // Port 1
+        osd.handle(Nav::Down, &c); // Port 2
         osd.handle(Nav::Down, &c); // Reset Defaults
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ResetBinds));
     }

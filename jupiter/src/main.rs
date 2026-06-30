@@ -26,6 +26,8 @@ use saturn::cartridge::Cartridge;
 mod config;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod osd;
+#[cfg(feature = "sdl-frontend")]
+mod ports;
 #[cfg(any(feature = "sdl-frontend", test))]
 mod present;
 // The SDL_GPU presentation backend (`--gpu`); compiled only with the
@@ -396,17 +398,11 @@ fn main() -> ExitCode {
     // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
     let save_base = std::path::PathBuf::from(&bios_path);
 
-    // Shuttle Mouse: `--mouse[=1|2]` wins, else the config `mouse` token
-    // (`off` / `1` / `2`), mirroring how `--cart=` overrides `cfg.cartridge`.
-    let mouse_port = mouse_port.or_else(|| match cfg.mouse.as_str() {
-        "1" => Some(1),
-        "2" => Some(2),
-        "off" | "" => None,
-        other => {
-            eprintln!("config: bad mouse ('{other}'); using off");
-            None
-        }
-    });
+    // Fold the legacy `mouse` config token (`off`/`1`/`2`) into the per-port
+    // tokens (cfg.port1/port2) for the layered input model. The `--mouse[=1|2]`
+    // CLI flag stays a startup override applied in run() (CLI > config),
+    // mirroring how `--cart=` overrides `cfg.cartridge`.
+    cfg.migrate_ports();
 
     let region = detect_region(&bios_path, cfg.region.as_deref());
     run(bios, disc_spec, cart, save_base, region, mouse_port, cfg)
@@ -701,12 +697,27 @@ fn run(
     let mut saturn = Saturn::new(bios);
     saturn.reset();
     saturn.set_region(region);
-    // Plug the Shuttle Mouse into the requested port (None = power-on default,
-    // pad on 1). On port 2 the keyboard pad stays on port 1; --mouse=1 replaces
-    // the pad (the mouse's Start button is on the Return key either way).
-    if mouse_port.is_some() {
-        apply_mouse_port(&mut saturn, mouse_port);
+    // Build the per-port input assignment from the persisted tokens
+    // (cfg.port1/port2, already migrated from the legacy `mouse` key in main()).
+    // The connected-controller list is empty at startup — the SDL thread sends
+    // an EmuIn::PadList once pads enumerate, which re-resolves any gamepad GUIDs.
+    let mut initial_ports = ports::Ports::from_tokens(&cfg.port1, &cfg.port2, &[]);
+    // --mouse[=1|2] overrides the configured assignment (CLI > config): 1 = mouse
+    // on port 1 (no pad), 2 = keyboard on port 1 + mouse on port 2. The mouse's
+    // Start button is on the Return key either way.
+    if let Some(n) = mouse_port {
+        initial_ports.source = if n == 1 {
+            [ports::Source::Mouse, ports::Source::None]
+        } else {
+            [ports::Source::Keyboard, ports::Source::Mouse]
+        };
     }
+    saturn.set_port_devices(
+        initial_ports.source[0].device(),
+        initial_ports.source[1].device(),
+    );
+    // Seed the SDL thread's mouse-capture gate to match the assignment.
+    mouse_port = initial_ports.mouse_port();
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery. Capture the seed so
     // an input recording (SAT_INPUT_REC) can store it in its header — a
@@ -758,7 +769,10 @@ fn run(
             eprintln!("load save state {path} failed: {e:?}");
             return ExitCode::from(1);
         }
-        apply_mouse_port(&mut saturn, mouse_port);
+        saturn.set_port_devices(
+            initial_ports.source[0].device(),
+            initial_ports.source[1].device(),
+        );
         let m = saturn.master();
         let s = saturn.slave();
         eprintln!(
@@ -1093,7 +1107,8 @@ fn run(
         bios_paths,
         bios_names,
         bios_active,
-        mouse_port,
+        ports: initial_ports,
+        pad_list: Vec::new(),
         browse_dir,
         browse_entries: Vec::new(),
         diag_results: Vec::new(),
@@ -1112,7 +1127,13 @@ fn run(
             let mut osd = osd;
             let mut pipe = pipe;
             let mut sess = sess;
+            // Port-1 pad mask the recorder logs (kept = the routed port-1 bits).
             let mut held = 0u16;
+            // Latest per-device input from the SDL thread (EmuIn::Input): the
+            // keyboard mask + per-controller masks keyed by GUID. The port
+            // assignment in `sess.ports` routes these to pad 1/2 each frame.
+            let mut kbd_bits = 0u16;
+            let mut gamepad_states: Vec<(String, u16)> = Vec::new();
             // Frame buffers circulating emu → main → recycle; seed enough that
             // the pipe spare + the in-flight frame + the displayed frame never
             // starve the pool (a dip just skips one frame's hand-off).
@@ -1166,7 +1187,13 @@ fn run(
                     keep_aspect: sess.ui.keep_aspect,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
-                    mouse: mouse_port_to_osd(sess.mouse_port),
+                    // Per-port source labels for the Controller screen's
+                    // CyclePort rows (only read while the menu is open).
+                    port_labels: if osd.is_open() {
+                        [sess.ports.source[0].label(), sess.ports.source[1].label()]
+                    } else {
+                        [String::new(), String::new()]
+                    },
                     backend: sess.ui.backend,
                     #[cfg(feature = "gpu-presenter")]
                     shader_crt: sess.ui.shader_crt,
@@ -1219,7 +1246,24 @@ fn run(
                 };
                 while let Ok(msg) = emu_rx.try_recv() {
                     match msg {
-                        EmuIn::Pad(p) => held = p,
+                        EmuIn::Input { kbd, pads } => {
+                            kbd_bits = kbd;
+                            gamepad_states = pads;
+                        }
+                        EmuIn::PadList(list) => {
+                            // Re-resolve the port assignment against the new
+                            // device list (the persisted port1/port2 tokens are
+                            // the intent; a reconnected pad reattaches, an
+                            // unplugged one falls back to None), then re-point
+                            // the SMPC ports + the SDL mouse-capture gate.
+                            sess.pad_list = list;
+                            sess.ports = ports::Ports::from_tokens(
+                                &sess.cfg.port1,
+                                &sess.cfg.port2,
+                                &sess.pad_list,
+                            );
+                            apply_ports(&mut saturn, &sess.ports, &ui_tx);
+                        }
                         EmuIn::Mouse(dx, dy, buttons) => saturn.feed_mouse(dx, dy, buttons),
                         EmuIn::Toggle => {
                             let _ = osd.toggle();
@@ -1249,7 +1293,7 @@ fn run(
                             match fs::read(&path) {
                             Ok(bytes) => match saturn.load_state(&bytes) {
                                 Ok(()) => {
-                                    apply_mouse_port(&mut saturn, sess.mouse_port);
+                                    apply_ports(&mut saturn, &sess.ports, &ui_tx);
                                     let _ = audio_tx.send(AudioMsg::Reset);
                                     eprintln!("quickload: {}", path.display());
                                     osd.set_toast("Quickload", 90);
@@ -1315,9 +1359,10 @@ fn run(
                 emu_osd_open.store(osd.is_open(), Ordering::Relaxed);
 
                 if osd.is_open() {
-                    // Frozen: don't advance the machine or feed the pad.
+                    // Frozen: don't advance the machine or feed the pads.
                     // Composite the menu over the retained last frame.
                     saturn.set_pad1(0);
+                    saturn.set_pad2(0);
                     osd.tick_toast();
                     if let Some(mut buf) = pool.pop() {
                         buf.copy_from_slice(&last_frame);
@@ -1336,7 +1381,12 @@ fn run(
                 }
 
                 if scripted_pad.is_none() {
-                    saturn.set_pad1(held);
+                    // Route this frame's per-device input to the two ports via
+                    // the assignment, then drive both SMPC pads.
+                    let (p1, p2) = sess.ports.route(kbd_bits, &gamepad_states);
+                    held = p1;
+                    saturn.set_pad1(p1);
+                    saturn.set_pad2(p2);
                 }
                 // Record a pad-state change at the frame it takes effect (the
                 // burst below holds `held` constant for its whole span).
@@ -1644,6 +1694,10 @@ fn run(
                                         c.name().unwrap_or_default()
                                     );
                                     controllers.push(c);
+                                    let _ = emu_tx.send(EmuIn::PadList(pad_list_of(
+                                        &controllers,
+                                        &controller_subsystem,
+                                    )));
                                 }
                             }
                             Err(e) => eprintln!("controller open failed: {e}"),
@@ -1651,6 +1705,10 @@ fn run(
                     }
                     Event::ControllerDeviceRemoved { which, .. } => {
                         controllers.retain(|c| c.id().ok().map(|j| j.0) != Some(which));
+                        let _ = emu_tx.send(EmuIn::PadList(pad_list_of(
+                            &controllers,
+                            &controller_subsystem,
+                        )));
                     }
                     // Controller navigation of the open menu: D-pad moves, A
                     // selects, B backs out, Start toggles. Suppressed while a
@@ -1674,26 +1732,30 @@ fn run(
                     _ => {}
                 }
             }
-            // Map the host keyboard to the port-1 digital pad through the
-            // rebindable keymap (defaults: arrows = D-pad, Z/X/C = A/B/C,
-            // A/S/D = X/Y/Z, Q/W = L/R, Enter = Start).
+            // Sample the host keyboard into the rebindable pad mask (defaults:
+            // arrows = D-pad, Z/X/C = A/B/C, A/S/D = X/Y/Z, Q/W = L/R, Enter =
+            // Start). This frame's per-device input is sent to the emu thread,
+            // which routes each device to its assigned port (`ports::Ports`).
             let keys = events.keyboard_state();
-            let mut held = 0u16;
+            let mut kbd = 0u16;
             for (sc, bit) in keymap.iter().zip(PAD_BITS) {
                 if keys.is_scancode_pressed(*sc) {
-                    held |= bit;
+                    kbd |= bit;
                 }
             }
-            // Merge any attached game controllers into the same port-1 pad.
+            // One held-bits entry per connected controller, keyed by its stable
+            // SDL GUID (so the port assignment survives relaunch + hot-plug).
             // Fixed mapping on SDL's normalized Xbox-style layout, following
             // Sega's own Saturn-port convention: A/B/C = X/A/B (bottom arc),
             // X/Y/Z = Y/LB/RB, L/R = the analog triggers (thresholded), D-pad
             // or left stick = D-pad. Per-button gamepad rebind arrives with
             // the M13 E2 analog-peripheral work.
+            let mut pad_inputs: Vec<(String, u16)> = Vec::with_capacity(controllers.len());
             {
                 use sdl3::gamepad::{Axis, Button};
                 const TH: i16 = 16384; // half of full deflection
                 for c in &controllers {
+                    let mut bits = 0u16;
                     // SDL3 renamed the face buttons: South/East/West/North are
                     // the physical bottom/right/left/top (Xbox A/B/X/Y).
                     for (btn, bit) in [
@@ -1710,29 +1772,38 @@ fn run(
                         (Button::Start, pad::START),
                     ] {
                         if c.button(btn) {
-                            held |= bit;
+                            bits |= bit;
                         }
                     }
                     if c.axis(Axis::TriggerLeft) > TH {
-                        held |= pad::L;
+                        bits |= pad::L;
                     }
                     if c.axis(Axis::TriggerRight) > TH {
-                        held |= pad::R;
+                        bits |= pad::R;
                     }
                     let (lx, ly) = (c.axis(Axis::LeftX), c.axis(Axis::LeftY));
                     if lx < -TH {
-                        held |= pad::LEFT;
+                        bits |= pad::LEFT;
                     } else if lx > TH {
-                        held |= pad::RIGHT;
+                        bits |= pad::RIGHT;
                     }
                     if ly < -TH {
-                        held |= pad::UP;
+                        bits |= pad::UP;
                     } else if ly > TH {
-                        held |= pad::DOWN;
+                        bits |= pad::DOWN;
                     }
+                    let guid = c
+                        .id()
+                        .ok()
+                        .map(|j| controller_subsystem.guid_for_id(j).string())
+                        .unwrap_or_default();
+                    pad_inputs.push((guid, bits));
                 }
             }
-            let _ = emu_tx.send(EmuIn::Pad(held));
+            let _ = emu_tx.send(EmuIn::Input {
+                kbd,
+                pads: pad_inputs,
+            });
 
             // Shuttle Mouse: this iteration's accumulated relative motion plus
             // the held buttons (host Left/Right/Middle clicks; Return doubles
@@ -2011,8 +2082,17 @@ fn run(
 /// Messages from the SDL main thread to the emulation thread.
 #[cfg(feature = "sdl-frontend")]
 enum EmuIn {
-    /// Current held pad-1 bits (sampled from the keyboard each iteration).
-    Pad(u16),
+    /// This iteration's per-device held bits: the keyboard pad mask plus one
+    /// `(GUID, mask)` entry per connected game controller. The emu thread routes
+    /// these to ports 1/2 through the `ports::Ports` assignment (replacing the
+    /// old "merge everything onto port 1" `Pad(u16)`).
+    Input {
+        kbd: u16,
+        pads: Vec<(String, u16)>,
+    },
+    /// The connected-controller list changed (hot-plug): GUID + display name per
+    /// open pad. The emu thread re-resolves its port assignment against it.
+    PadList(Vec<ports::Pad>),
     /// OSD menu navigation (only sent while the menu is open).
     Nav(osd::Nav),
     /// Toggle the OSD menu.
@@ -2116,8 +2196,13 @@ struct Session {
     bios_paths: Vec<std::path::PathBuf>,
     bios_names: Vec<String>,
     bios_active: usize,
-    /// Which port carries the Shuttle Mouse (re-applied across a power cycle).
-    mouse_port: Option<u8>,
+    /// The live per-port input assignment (the source of truth) and the
+    /// connected-controller list its gamepad GUIDs resolve against. The
+    /// *persisted* intent is `cfg.port1`/`port2`; this is re-derived from those
+    /// tokens whenever the device list changes, and re-applied across a power
+    /// cycle / state load (`apply_ports`).
+    ports: ports::Ports,
+    pad_list: Vec<ports::Pad>,
     /// The disc browser's current directory and its (cached) listing — rebuilt
     /// only as the user navigates, not every frame.
     browse_dir: std::path::PathBuf,
@@ -2295,37 +2380,37 @@ fn osd_cart_to_cartridge(c: osd::OsdCart) -> Cartridge {
     }
 }
 
-/// The Shuttle Mouse port as the OSD names it (`None`/`1`/`2` ↔ Off/Port1/Port2).
+/// Apply the per-port input assignment to the live machine: set each SMPC port's
+/// device from its [`ports::Source`], and tell the SDL thread which port (if any)
+/// now carries the mouse so its pointer-capture gate follows. A peripheral swap,
+/// not a reset — the game re-reads its devices on the next INTBACK poll.
 #[cfg(feature = "sdl-frontend")]
-fn mouse_port_to_osd(port: Option<u8>) -> osd::OsdMouse {
-    match port {
-        Some(1) => osd::OsdMouse::Port1,
-        Some(_) => osd::OsdMouse::Port2,
-        None => osd::OsdMouse::Off,
-    }
+fn apply_ports(
+    saturn: &mut saturn::Saturn,
+    ports: &ports::Ports,
+    ui_tx: &std::sync::mpsc::Sender<UiMsg>,
+) {
+    saturn.set_port_devices(ports.source[0].device(), ports.source[1].device());
+    let _ = ui_tx.send(UiMsg::SetMouse(ports.mouse_port()));
 }
 
-/// Inverse of [`mouse_port_to_osd`]: the port index the rest of the frontend
-/// tracks (the config token and the SDL capture gate use this).
+/// Snapshot the connected controllers as [`ports::Pad`] (stable GUID + display
+/// name) for the emu thread's port assignment and the OSD labels.
 #[cfg(feature = "sdl-frontend")]
-fn osd_mouse_to_port(m: osd::OsdMouse) -> Option<u8> {
-    match m {
-        osd::OsdMouse::Off => None,
-        osd::OsdMouse::Port1 => Some(1),
-        osd::OsdMouse::Port2 => Some(2),
-    }
-}
-
-/// Point the SMPC ports at the chosen mouse layout: port 1 mouse (no pad),
-/// port 2 mouse (pad stays on 1), or off (the power-on default, pad on 1).
-fn apply_mouse_port(saturn: &mut saturn::Saturn, port: Option<u8>) {
-    use saturn::smpc::PortDevice::{Mouse, None as NoDev, Pad};
-    let (p1, p2) = match port {
-        Some(1) => (Mouse, NoDev),
-        Some(_) => (Pad, Mouse),
-        None => (Pad, NoDev),
-    };
-    saturn.set_port_devices(p1, p2);
+fn pad_list_of(
+    controllers: &[sdl3::gamepad::Gamepad],
+    subsys: &sdl3::GamepadSubsystem,
+) -> Vec<ports::Pad> {
+    controllers
+        .iter()
+        .filter_map(|c| {
+            let id = c.id().ok()?;
+            Some(ports::Pad {
+                guid: subsys.guid_for_id(id).string(),
+                name: c.name().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Carry out a menu action against the running machine. Returns `true` if the
@@ -2358,7 +2443,7 @@ fn dispatch_osd(
             match fs::read(&path) {
                 Ok(bytes) => match saturn.load_state(&bytes) {
                     Ok(()) => {
-                        apply_mouse_port(saturn, sess.mouse_port);
+                        apply_ports(saturn, &sess.ports, ui_tx);
                         let _ = audio_tx.send(AudioMsg::Reset);
                         eprintln!("loaded slot {n}: {}", path.display());
                         osd.set_toast(format!("Loaded slot {n}"), 120);
@@ -2563,7 +2648,7 @@ fn dispatch_osd(
                     *saturn = saturn::Saturn::new(bytes);
                     saturn.reset();
                     saturn.set_region(osd_region_to_code(sess.ui.region));
-                    apply_mouse_port(saturn, sess.mouse_port);
+                    apply_ports(saturn, &sess.ports, ui_tx);
                     saturn.set_rtc_unix(host_unix_secs());
                     if let Some(spec) = &sess.launched_spec
                         && let Err(e) = insert_from_spec(saturn, spec)
@@ -2613,22 +2698,24 @@ fn dispatch_osd(
             osd.set_toast(format!("Cartridge: {name} (reset)"), 150);
             osd.close();
         }
-        OsdAction::SetMouse(m) => {
-            // A peripheral swap, not a hardware reset: re-point the SMPC ports
-            // live (the game re-reads devices on the next INTBACK poll), tell
-            // the SDL thread so its mouse-capture gate follows, and persist.
-            let port = osd_mouse_to_port(m);
-            sess.mouse_port = port;
-            apply_mouse_port(saturn, port);
-            let _ = ui_tx.send(UiMsg::SetMouse(port));
-            let (token, name) = match m {
-                osd::OsdMouse::Off => ("off", "Off"),
-                osd::OsdMouse::Port1 => ("1", "Port 1"),
-                osd::OsdMouse::Port2 => ("2", "Port 2"),
-            };
-            sess.cfg.mouse = token.to_string();
+        OsdAction::CyclePort(p) => {
+            // Advance this port to its next source against the live device list
+            // (skipping whatever the other port already uses), persist the new
+            // token, and re-point the SMPC ports + the SDL mouse-capture gate.
+            let p = (p as usize) & 1;
+            sess.ports.cycle(p, &sess.pad_list);
+            let token = sess.ports.source[p].to_token();
+            if p == 0 {
+                sess.cfg.port1 = token;
+            } else {
+                sess.cfg.port2 = token;
+            }
             sess.cfg.save();
-            osd.set_toast(format!("Mouse: {name}"), 120);
+            apply_ports(saturn, &sess.ports, ui_tx);
+            osd.set_toast(
+                format!("Port {}: {}", p + 1, sess.ports.source[p].label()),
+                120,
+            );
         }
     }
     false
@@ -2661,9 +2748,12 @@ fn run(
     saturn.set_region(region);
     // Plug the Shuttle Mouse into the requested port (None = power-on default,
     // pad on 1). On port 2 the keyboard pad stays on port 1; --mouse=1 replaces
-    // the pad (the mouse's Start button is on the Return key either way).
-    if mouse_port.is_some() {
-        apply_mouse_port(&mut saturn, mouse_port);
+    // the pad. Headless has no OSD/`ports` module, so apply the device layout
+    // inline (the same mapping `ports::Source::device()` would produce).
+    if let Some(n) = mouse_port {
+        use saturn::smpc::PortDevice::{Mouse, None as NoDev, Pad};
+        let (p1, p2) = if n == 1 { (Mouse, NoDev) } else { (Pad, Mouse) };
+        saturn.set_port_devices(p1, p2);
     }
     // Seed the RTC from the host clock so the Saturn shows real wall-clock
     // time, like a console with a charged backup battery.
