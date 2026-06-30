@@ -457,15 +457,24 @@ impl<'a> Plotter<'a> {
     /// Write one pixel. `pd` is the character byte address; `off` is the
     /// linear texel index `v*xsize + u`; `shade` is the interpolated gouraud
     /// colour (16.16 per channel) when gouraud is active.
-    fn draw_pixel(&mut self, x: i32, y: i32, pd: i32, off: i32, shade: Option<(i32, i32, i32)>) {
+    /// Draw one textured/poly dot; returns `true` if it was an end-code (the
+    /// caller stops the rest of the textured row/span — Mednafen line truncation).
+    fn draw_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        pd: i32,
+        off: i32,
+        shade: Option<(i32, i32, i32)>,
+    ) -> bool {
         self.pixels += 1; // a processed dot, drawn or clipped, costs draw time
         if self.mode == PixelMode::Poly {
             if let Some(fy) = self.fb_y(y) {
                 self.fb_put(x, fy, self.cmd.colr);
             }
-            return;
+            return false; // untextured polys have no end-code
         }
-        self.draw_pixel_generic(x, y, pd, off, shade);
+        self.draw_pixel_generic(x, y, pd, off, shade)
     }
 
     fn texel(&self, byte_addr: i32) -> u8 {
@@ -479,7 +488,10 @@ impl<'a> Plotter<'a> {
         pd: i32,
         off: i32,
         shade: Option<(i32, i32, i32)>,
-    ) {
+    ) -> bool {
+        // Returns `true` when this texel is an end-code (not disabled) — the
+        // caller stops drawing the rest of the textured row/span (Mednafen's
+        // `ec_count` line truncation). Every other outcome returns `false`.
         let pmod = self.cmd.pmod;
         let mesh = pmod & 0x100 != 0;
         // Mesh keys off the *source* y (Mednafen `PlotPixel` applies it
@@ -487,13 +499,13 @@ impl<'a> Plotter<'a> {
         // `(x ^ y) & 1 != 0` (Mednafen `transparent |= (x ^ y) & 1`); the
         // even-parity dots draw. (The phase was inverted.)
         if mesh && (x ^ y) & 1 != 0 {
-            return;
+            return false;
         }
-        let Some(fy) = self.fb_y(y) else { return };
+        let Some(fy) = self.fb_y(y) else { return false };
         let in_bounds = (0..FB_HEIGHT).contains(&fy)
             && (0..if self.bpp8 { FB_STRIDE * 2 } else { FB_STRIDE }).contains(&x);
         if !in_bounds {
-            return;
+            return false;
         }
         let spd = pmod & 0x40 != 0; // transparent-pixel disable
         // RGB-direct (16bpp) textured mode: transparency + end-code use the MSB
@@ -590,7 +602,7 @@ impl<'a> Plotter<'a> {
                 raw == endcode
             };
             if pmod & 0x80 == 0 && is_end {
-                return;
+                return true; // end-code: this texel + the rest of the row stop
             }
         }
 
@@ -599,7 +611,7 @@ impl<'a> Plotter<'a> {
         // `(rtd - 0x4000) >> 31`); paletted/poly use pen 0.
         let transparent = if rgb_direct { raw < 0x4000 } else { raw == 0 };
         if transparent && !spd {
-            return;
+            return false;
         }
 
         // TVM 8bpp frame buffer: one byte per dot — gouraud and the
@@ -614,7 +626,7 @@ impl<'a> Plotter<'a> {
                 pix
             };
             self.fb.set_pixel8(x, fy, b as u8);
-            return;
+            return false;
         }
 
         // MSBON (16bpp): a shadow/stencil sprite — the source colour is
@@ -627,7 +639,7 @@ impl<'a> Plotter<'a> {
         if pmod & 0x8000 != 0 {
             let d = self.fb.pixel(x, fy);
             self.fb.set_pixel(x, fy, d | 0x8000);
-            return;
+            return false;
         }
 
         // Gouraud shading (CMDPMOD bit 2): offset each RGB555 channel by the
@@ -662,6 +674,7 @@ impl<'a> Plotter<'a> {
             }
             _ => unreachable!(),
         }
+        false // a normally-drawn texel is not an end-code
     }
 
     // ---- primitives ---------------------------------------------------
@@ -714,7 +727,9 @@ impl<'a> Plotter<'a> {
                 let shade = self
                     .gouraud
                     .map(|g| gouraud_bilerp(&g, dx - x, dy - y, gw, gh));
-                self.draw_pixel(dx, dy, pd, uu, shade);
+                if self.draw_pixel(dx, dy, pd, uu, shade) {
+                    break; // end-code truncates the rest of this row
+                }
                 uu += dux;
                 dx += 1;
             }
@@ -928,13 +943,15 @@ impl<'a> Plotter<'a> {
         let xend = xx2.min(clip.max_x);
         while xx1 <= xend {
             let shade = self.gouraud.map(|_| (r, g, b));
-            self.draw_pixel(
+            if self.draw_pixel(
                 xx1,
                 y,
                 pd,
                 (v >> FRAC_SHIFT) * xsize + (u >> FRAC_SHIFT),
                 shade,
-            );
+            ) {
+                break; // end-code truncates the rest of this span
+            }
             xx1 += 1;
             u += slux;
             v += slvx;
@@ -1024,13 +1041,15 @@ impl<'a> Plotter<'a> {
                     let xend = xx2.min(clip.max_x);
                     while xx1 <= xend {
                         let shade = self.gouraud.map(|_| (r, g, b));
-                        self.draw_pixel(
+                        if self.draw_pixel(
                             xx1,
                             yy1,
                             pd,
                             (v >> FRAC_SHIFT) * xsize + (u >> FRAC_SHIFT),
                             shade,
-                        );
+                        ) {
+                            break; // end-code truncates the rest of this span
+                        }
                         xx1 += 1;
                         u += slux;
                         v += slvx;

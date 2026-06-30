@@ -954,10 +954,10 @@ fn colour_mode_64_128_256_add_the_correct_bank_mask() {
 }
 
 #[test]
-fn end_code_texel_is_skipped_unless_disabled() {
+fn end_code_truncates_the_row_unless_disabled() {
     let mut v = Vdp1::new();
     // 8bpp 64-colour character: texel (0,0) = 0xFF (the 8bpp end-code), the
-    // rest = 0x05. With ECD clear, the end-code texel is not drawn.
+    // rest = 0x05. With ECD clear, the end-code truncates the rest of its row.
     for i in 0..64u32 {
         v.vram.write8(0x5000 + i, 0x05);
     }
@@ -979,9 +979,19 @@ fn end_code_texel_is_skipped_unless_disabled() {
     );
     put(&mut v, 1, END);
     v.process_list();
-    // end-code texel left untouched (background 0); a normal texel drew.
-    assert_eq!(v.fb.pixel(10, 10), 0, "end-code texel skipped");
-    assert_eq!(v.fb.pixel(11, 10), 0x05, "non-end-code texel drawn");
+    // The end-code at (col0,row0) truncates the rest of that row (Mednafen line
+    // truncation) — but only that row; row 1 has no end-code and draws fully.
+    assert_eq!(v.fb.pixel(10, 10), 0, "end-code texel not drawn");
+    assert_eq!(
+        v.fb.pixel(11, 10),
+        0,
+        "rest of the row truncated after the end-code"
+    );
+    assert_eq!(
+        v.fb.pixel(10, 11),
+        0x05,
+        "the next row (no end-code) draws fully"
+    );
 
     // With ECD set (CMDPMOD bit 7 = 0x80) the end-code is treated as data.
     let mut v2 = Vdp1::new();
