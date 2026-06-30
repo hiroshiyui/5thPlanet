@@ -159,6 +159,11 @@ pub struct Smpc {
     /// [`pad`] bit positions. The INTBACK peripheral phase reports the
     /// active-low inverse; default 0 = nothing pressed. The frontend sets it.
     pub pad1: u16,
+    /// Port-2 digital-pad state (same encoding as [`Self::pad1`]). Kept distinct
+    /// so a 2-player config (a pad in both ports) reports each port's own
+    /// buttons — previously the peripheral phase reported `pad1` for both ports,
+    /// so player 2 mirrored player 1. Default 0 = nothing pressed.
+    pub pad2: u16,
     /// What is plugged into controller ports 1 and 2 — drives the INTBACK
     /// peripheral-report layout. Defaults: a digital pad on port 1, nothing
     /// on port 2 (the original fixed behaviour).

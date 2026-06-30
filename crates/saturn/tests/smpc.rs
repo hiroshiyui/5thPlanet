@@ -302,6 +302,34 @@ fn intback_peripheral_only_returns_the_pad_directly_without_a_continue() {
 }
 
 #[test]
+fn intback_reports_port2_pad_independently_of_port1() {
+    // M13 H2e: with a digital pad in BOTH ports, INTBACK must report each
+    // port's OWN buttons. Previously the peripheral phase reported pad1 for
+    // both ports, so player 2 mirrored player 1 — every 2-player game saw P2
+    // press whatever P1 pressed.
+    let mut sat = build();
+    sat.set_port_devices(saturn::smpc::PortDevice::Pad, saturn::smpc::PortDevice::Pad);
+    sat.set_pad1(saturn::smpc::pad::START); // P1 holds Start
+    sat.set_pad2(saturn::smpc::pad::LEFT); // P2 holds Left (a DIFFERENT button)
+    // Peripheral-only INTBACK (one-shot, no continue).
+    sat.bus.write8(0x0010_0001, 0x00, AccessKind::Data); // IREG0: no status
+    sat.bus.write8(0x0010_0003, 0x08, AccessKind::Data); // IREG1: peripheral
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // INTBACK
+    sat.run_for(40_000);
+    // Port 1: Start held (high byte bit 3, active low).
+    assert_eq!(sat.bus.smpc.oreg[0], 0xF1, "port 1: pad");
+    assert_eq!(sat.bus.smpc.oreg[1], 0x02);
+    assert_eq!(sat.bus.smpc.oreg[2], !0x08, "P1 Start (active low)");
+    assert_eq!(sat.bus.smpc.oreg[3], 0xFF, "P1 no second-byte buttons");
+    // Port 2: Left held — its OWN state, NOT a mirror of P1's Start (which
+    // would be OREG6 = !0x08).
+    assert_eq!(sat.bus.smpc.oreg[4], 0xF1, "port 2: pad");
+    assert_eq!(sat.bus.smpc.oreg[5], 0x02);
+    assert_eq!(sat.bus.smpc.oreg[6], !0x40, "P2 Left — its own buttons");
+    assert_eq!(sat.bus.smpc.oreg[7], 0xFF, "P2 no second-byte buttons");
+}
+
+#[test]
 fn setsmem_writes_smem_echoed_by_intback_oreg12_15() {
     let mut sat = build();
     // SETSMEM takes the four bytes from IREG0..3.

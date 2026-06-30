@@ -1609,7 +1609,7 @@ impl Saturn {
     fn respond_to_intback_peripheral(&mut self) {
         let s = &mut self.bus.smpc;
         let mut o = 0usize;
-        for dev in [s.port1, s.port2] {
+        for (port, dev) in [s.port1, s.port2].into_iter().enumerate() {
             match dev {
                 crate::smpc::PortDevice::None => {
                     s.oreg[o] = 0xF0; // no peripheral
@@ -1617,8 +1617,9 @@ impl Saturn {
                 }
                 crate::smpc::PortDevice::Pad => {
                     // Standard digital pad (ID 0x02 = type 0, 2 data bytes),
-                    // reporting the active-low inverse of the pressed mask.
-                    let pressed = s.pad1;
+                    // reporting the active-low inverse of the pressed mask —
+                    // each port reports its OWN state (port 2 ≠ a port-1 mirror).
+                    let pressed = if port == 0 { s.pad1 } else { s.pad2 };
                     s.oreg[o] = 0xF1; // direct connection, 1 device
                     s.oreg[o + 1] = 0x02;
                     s.oreg[o + 2] = !((pressed >> 8) as u8); // active low
@@ -1666,6 +1667,13 @@ impl Saturn {
     /// The frontend calls this each frame from the host keyboard.
     pub fn set_pad1(&mut self, pressed: u16) {
         self.bus.smpc.pad1 = pressed;
+    }
+
+    /// Set the port-2 digital-pad state (same encoding as [`Self::set_pad1`]).
+    /// Reported by INTBACK only when port 2 has a [`crate::smpc::PortDevice::Pad`]
+    /// (see [`Self::set_port_devices`]); the frontend feeds a 2nd controller.
+    pub fn set_pad2(&mut self, pressed: u16) {
+        self.bus.smpc.pad2 = pressed;
     }
 
     /// Set the SMPC area (region) code reported to the BIOS via INTBACK

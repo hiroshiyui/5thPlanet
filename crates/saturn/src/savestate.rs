@@ -52,8 +52,9 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// Sangokushi V instruction-cache-coherency hang). v12 `#[serde(skip)]`'d the
 /// presentation-only audio buffers (`Scsp::out`, `CdBlock::cd_audio` +
 /// `cd_audio_primed`) — `load_state` clears them, so they no longer bloat the
-/// snapshot.
-const VERSION: u32 = 12;
+/// snapshot. v13 added the SMPC port-2 pad state (`Smpc::pad2`) so a 2-player
+/// config reports each port's own buttons instead of mirroring player 1.
+const VERSION: u32 = 13;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
