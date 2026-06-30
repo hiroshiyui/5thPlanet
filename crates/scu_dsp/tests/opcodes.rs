@@ -826,3 +826,59 @@ fn start_resets_execution_state() {
     assert!(!d.end_interrupt_pending, "end-interrupt cleared");
     assert!(!d.stopped());
 }
+
+// ---- H3: ALU flags on native 32-bit width + sticky V, DMA count==0 ----
+
+#[test]
+fn alu_add_carry_and_zero_use_native_32bit_width() {
+    // 0x80000000 + 0x80000000 = 0x1_0000_0000: low 32 bits are 0 (Z) with a
+    // carry out of bit 31 (C). The old sign-extended-i64 math gave Z=0.
+    let mut d = Dsp::new();
+    d.regs.acl = 0x8000_0000;
+    d.regs.pl = 0x8000_0000;
+    d.load_program(0, &[op_alu(0x4), END]); // ADD
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.alu as u32, 0);
+    assert!(d.regs.flags.z, "native 32-bit result is zero");
+    assert!(d.regs.flags.c, "carry out of bit 31");
+}
+
+#[test]
+fn alu_sub_borrow_uses_native_32bit_width() {
+    // 0x80000000 - 1 = 0x7FFFFFFF does NOT borrow; the old i64 math set C.
+    let mut d = Dsp::new();
+    d.regs.acl = 0x8000_0000;
+    d.regs.pl = 1;
+    d.load_program(0, &[op_alu(0x5), END]); // SUB
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.alu as u32, 0x7FFF_FFFF);
+    assert!(!d.regs.flags.c, "0x80000000 - 1 does not borrow");
+}
+
+#[test]
+fn alu_overflow_flag_is_sticky() {
+    // ADD overflows (V set); a following non-overflowing SUB must NOT clear it
+    // (sticky V — cleared only by a status-register read). Old `=` reset it.
+    let mut d = Dsp::new();
+    d.regs.acl = 0x7FFF_FFFF;
+    d.regs.pl = 1;
+    d.load_program(0, &[op_alu(0x4), op_alu(0x5), END]); // ADD (overflow) then SUB
+    d.start(0);
+    d.run_until_stopped(16);
+    assert!(
+        d.regs.flags.v,
+        "the ADD overflow survives a later non-overflowing op"
+    );
+}
+
+#[test]
+fn dma_count_zero_transfers_256_words() {
+    let mut d = Dsp::new();
+    let dma = (0b11u32 << 30) | 0; // size field 0 → 256
+    d.load_program(0, &[dma, END]);
+    d.start(0);
+    d.step();
+    assert_eq!(d.take_dma().unwrap().size, 256, "count 0 means 256 words");
+}

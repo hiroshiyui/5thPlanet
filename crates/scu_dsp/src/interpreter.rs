@@ -242,20 +242,28 @@ impl Dsp {
                 self.regs.flags.s = i3 < 0;
             }
             AluOp::Add => {
-                let i3 = acl + pl;
-                set32(i3, &mut self.regs);
-                self.regs.flags.z = (i3 & 0xFFFF_FFFF_FFFF) == 0;
-                self.regs.flags.s = i3 & 0x1_0000_0000_0000 != 0;
-                self.regs.flags.c = i3 & 0x1_0000_0000 != 0;
-                self.regs.flags.v = (i3 ^ acl) & (i3 ^ pl) & 0x8000_0000 != 0;
+                // Carry/sign/zero on the NATIVE 32-bit operands (Mednafen
+                // `scu_dsp_gen.cpp`), not the sign-extended i64 — a 33-bit
+                // signed sum gives the wrong carry-chain + Z/S near the sign
+                // boundary. V is sticky (`|=`), cleared only by a status read.
+                let (a, p) = (self.regs.acl, self.regs.pl);
+                let tmp = a as u64 + p as u64;
+                let lo = tmp as u32;
+                set32(lo as i32 as i64, &mut self.regs);
+                self.regs.flags.z = lo == 0;
+                self.regs.flags.s = (lo as i32) < 0;
+                self.regs.flags.c = (tmp >> 32) & 1 != 0;
+                self.regs.flags.v |= !(a ^ p) & (a ^ lo) & 0x8000_0000 != 0;
             }
             AluOp::Sub => {
-                let i3 = acl - pl;
-                set32(i3, &mut self.regs);
-                self.regs.flags.z = i3 == 0;
-                self.regs.flags.c = i3 & 0x1_0000_0000 != 0;
-                self.regs.flags.s = i3 < 0;
-                self.regs.flags.v = (pl ^ acl) & (pl ^ i3) & 0x8000_0000 != 0;
+                let (a, p) = (self.regs.acl, self.regs.pl);
+                let tmp = (a as u64).wrapping_sub(p as u64);
+                let lo = tmp as u32;
+                set32(lo as i32 as i64, &mut self.regs);
+                self.regs.flags.z = lo == 0;
+                self.regs.flags.s = (lo as i32) < 0;
+                self.regs.flags.c = (tmp >> 32) & 1 != 0;
+                self.regs.flags.v |= (a ^ p) & (a ^ lo) & 0x8000_0000 != 0;
             }
             AluOp::Ad2 => {
                 let sum = self.regs.p48() + self.regs.ac48();
@@ -266,7 +274,8 @@ impl Dsp {
                 self.regs.flags.c = (sum as u64) & 0x1_0000_0000_0000 != 0;
                 let i1 = self.regs.p48();
                 let i2 = self.regs.ac48();
-                self.regs.flags.v = (sum ^ i1) & (sum ^ i2) & 0x8000_0000_0000 != 0;
+                // Sticky V (Mednafen `FlagV |=`).
+                self.regs.flags.v |= (sum ^ i1) & (sum ^ i2) & 0x8000_0000_0000 != 0;
             }
             AluOp::Sr => {
                 let aclu = self.regs.acl;
@@ -534,9 +543,9 @@ impl Dsp {
         let from_dsp = (op >> 12) & 1 != 0;
         let dsp_bank = ((op >> 8) & 0x3) as u8;
 
-        let (size, add) = if op & 0x2000 != 0 {
-            // Length from a data-RAM source register.
-            let sz = self.source_value(op as u8 & 0xF);
+        let (raw_size, add) = if op & 0x2000 != 0 {
+            // Length from a data-RAM source register (the count is a u8 field).
+            let sz = self.source_value(op as u8 & 0xF) & 0xFF;
             (sz, if add_sel & 0x7 == 0 { 0 } else { 4 })
         } else {
             let sz = op & 0xFF;
@@ -550,6 +559,9 @@ impl Dsp {
             };
             (sz, add)
         };
+        // A transfer count of 0 means 256 words, not 0 (Mednafen `uint8 count`
+        // with `do { … } while(--count)` runs 256 iterations when count == 0).
+        let size = if raw_size == 0 { 256 } else { raw_size };
 
         self.regs.flags.t0 = true;
         self.pending_dma = Some(DmaRequest {
