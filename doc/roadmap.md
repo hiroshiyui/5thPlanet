@@ -306,7 +306,7 @@ matched to the oracle's no-op).
 
 | # | Gap | Status |
 |---|-----|--------|
-| E1 | Multitap + port-2 scanning | ⬜ |
+| E1 | Multitap + port-2 scanning | 🟡 core port-2 pad state done (H2e, `b424fec`: `Smpc::pad2` + per-port INTBACK report); remaining — the frontend 2nd-controller feed (`set_pad2`) and the multitap/6-player adapter |
 | E2 | Analog peripherals (3D pad, Mission Stick, racing) + per-button gamepad rebind | ⬜ |
 | E3 | Specialty peripherals | 🟡 Shuttle Mouse done (`638cda7`/`80b7120`, savestate v5, `--mouse[=1|2]`); light gun + keyboard remaining |
 
@@ -367,7 +367,7 @@ contradict an existing ✅ — they are *refinements* of a tier marked done):
 | H2b | SCSP **DMA engine** (regs 0x412–0x416 / RunDMA) + its DMA-end IRQ (SCIPD bit 4) | ⬜ entirely absent; sample upload/clear via SCSP-DMA fails, and a driver waiting on the DMA-end IRQ can hang (not just sound wrong) |
 | H2c | CD-block **FAD-search** (0x55 ExecuteFADSearch / 0x56 GetFADSearchResults) | ⬜ companion to F2 (move/copy 0x65/66); falls to the default arm → returns status + `CMOK` ("success") but does no work / no results — silent |
 | H2d | VDP2 **normal (non-MSB) sprite shadow** | ⬜ a shadow palette code is drawn as an ordinary colour (`renderer.rs:1859`); 2D drop-shadows render as solid blobs. Needs a priority-bearing shadow `Dot` (which also fixes MSB self-shadow being 2× too bright) |
-| H2e | SMPC **port-2 pad state** | ⬜ part of E1 — only `set_pad1` exists; INTBACK reports pad1 for *both* ports → every 2-player game sees P2 mirror P1 (latent today: the frontend feeds one pad) |
+| H2e | SMPC **port-2 pad state** | ✅ (`b424fec`) — added `Smpc::pad2` + `Saturn::set_pad2`; INTBACK now reports each port's own pressed mask (was reporting pad1 for both → P2 mirrored P1). Default config unchanged. savestate v12→v13 (pad2 serialized). The **core data-model half of E1**; the frontend 2nd-controller feed + multitap remain under E1. Regression `intback_reports_port2_pad_independently_of_port1`; goldens unchanged |
 
 **H3 — confirmed silent refinements** (lower current exposure, all verified-or-agent-reported):
 
