@@ -55,8 +55,10 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// snapshot. v13 added the SMPC port-2 pad state (`Smpc::pad2`) so a 2-player
 /// config reports each port's own buttons instead of mirroring player 1. v14
 /// added the CD-block FAD-search result latch (`fad_search_fad`/`_spos`/`_pnum`,
-/// the Mednafen `COMMAND_GET_FADSRCH` state read back by command 0x56).
-const VERSION: u32 = 14;
+/// the Mednafen `COMMAND_GET_FADSRCH` state read back by command 0x56). v15
+/// added the SCSP DMA engine state (`ScspCtrl` `dmea`/`drga`/`dtlg` +
+/// `dma_exec`/`dma_dir`/`dma_gate`, regs 0x412–0x416).
+const VERSION: u32 = 15;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.

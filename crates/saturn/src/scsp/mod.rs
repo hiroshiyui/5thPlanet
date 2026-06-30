@@ -63,8 +63,15 @@ const MCIEB: u32 = 0x42A;
 const MCIPD: u32 = 0x42C;
 const MCIRE: u32 = 0x42E;
 
+// SCSP DMA engine registers (Mednafen `scsp.inc`): DMEA low / DRGA+DMEA high /
+// DTLG+EX/DI/GA control. Addresses are WORD addresses; lengths word counts.
+const DMEA_LO: u32 = 0x412;
+const DRGA_DMEA_HI: u32 = 0x414;
+const DTLG_DMA_CTL: u32 = 0x416;
+
 // Interrupt-source bits shared by SCIEB/SCIPD and MCIEB/MCIPD.
 const INT_MIDI: u16 = 0x008; // bit 3
+const INT_DMA: u16 = 0x010; // bit 4 (DMA transfer end)
 const INT_TIMER_A: u16 = 0x040; // bit 6
 const INT_TIMER_B: u16 = 0x080; // bit 7
 const INT_TIMER_C: u16 = 0x100; // bit 8
@@ -358,6 +365,17 @@ pub struct ScspCtrl {
     asserted_level: u8,
     /// Main-CPU sound interrupt pending (forwarded to the SCU).
     main_pending: bool,
+    /// SCSP DMA engine (regs 0x412–0x416, Mednafen `scsp.h` SCSP_DMA). `dmea`
+    /// (sound-RAM, 19-bit) and `drga` (register file, 11-bit) are WORD
+    /// addresses; `dtlg` the word count. `dma_exec` (DEXE) doubles as the
+    /// pending-transfer flag — `Scsp::run` drains it (it needs `&mut Ram`).
+    /// `dma_dir` (DDIR) true = registers→RAM; `dma_gate` (DGATE) zero-fills.
+    dmea: u32,
+    drga: u16,
+    dtlg: u16,
+    dma_exec: bool,
+    dma_dir: bool,
+    dma_gate: bool,
     /// Debug-only lifetime counters: how many times KYONEX was strobed
     /// (`key_on_execute`) and how many slot starts (`start_slot`) resulted.
     /// Distinguishes "driver never tries to play" from "key-on fails". Not
@@ -407,6 +425,12 @@ impl ScspCtrl {
             dsp: dsp::Dsp::new(),
             asserted_level: 0,
             main_pending: false,
+            dmea: 0,
+            drga: 0,
+            dtlg: 0,
+            dma_exec: false,
+            dma_dir: false,
+            dma_gate: false,
             dbg_keyon_execs: 0,
             dbg_slot_starts: 0,
             dbg_timer_of: [0; 3],
@@ -457,6 +481,22 @@ impl ScspCtrl {
         // than garbage. MOBUF writes (0x406) are accepted + discarded (no port).
         if idx & !1 == 0x404 {
             return if idx & 1 == 0 { 0x09 } else { 0x00 };
+        }
+        // SCSP DMA registers (Mednafen `scsp.inc`): DMEA/DRGA/DTLG read back 0
+        // (`DBV=0`); 0x416 returns only the DEXE/DDIR/DGATE flag bits, so a
+        // driver polling DEXE (bit 12) for completion reads the live flag.
+        if idx & !1 == DMEA_LO as usize || idx & !1 == DRGA_DMEA_HI as usize {
+            return 0;
+        }
+        if idx & !1 == DTLG_DMA_CTL as usize {
+            let w = ((self.dma_exec as u16) << 12)
+                | ((self.dma_dir as u16) << 13)
+                | ((self.dma_gate as u16) << 14);
+            return if idx & 1 == 0 {
+                (w >> 8) as u8
+            } else {
+                w as u8
+            };
         }
         self.raw[idx]
     }
@@ -562,6 +602,20 @@ impl ScspCtrl {
             }
             SCIEB | SCIPD | SCILV0 | SCILV1 | SCILV2 => self.recompute_irq(),
             MCIEB | MCIPD => self.recompute_main(),
+            // SCSP DMA registers (Mednafen `scsp.inc` write decode). DEXE is
+            // OR-set only (never cleared by a write); the transfer itself is
+            // drained by `Scsp::run` (it needs `&mut Ram`).
+            DMEA_LO => self.dmea = (self.dmea & !0x7FFF) | (((v >> 1) as u32) & 0x7FFF),
+            DRGA_DMEA_HI => {
+                self.dmea = (self.dmea & 0x7FFF) | (((v & 0xF000) as u32) << 3);
+                self.drga = (v >> 1) & 0x7FF;
+            }
+            DTLG_DMA_CTL => {
+                self.dtlg = (v >> 1) & 0x7FF;
+                self.dma_exec |= (v >> 12) & 1 != 0;
+                self.dma_dir = (v >> 13) & 1 != 0;
+                self.dma_gate = (v >> 14) & 1 != 0;
+            }
             // Latch the prescale + one-shot counter reload (the bank still holds
             // the written value for reads; the timer logic uses the latch).
             TIMA => self.timers[0].write(v),
@@ -651,6 +705,8 @@ impl ScspCtrl {
             self.decode_sci(8)
         } else if active & INT_MIDI != 0 {
             self.decode_sci(3)
+        } else if active & INT_DMA != 0 {
+            self.decode_sci(4)
         } else {
             0
         };
@@ -658,6 +714,48 @@ impl ScspCtrl {
 
     fn recompute_main(&mut self) {
         self.main_pending = self.read16(MCIPD) & self.read16(MCIEB) != 0;
+    }
+
+    /// Run the SCSP DMA transfer (Mednafen `scsp.inc` `RunDMA`): move `dtlg`
+    /// 16-bit words between sound RAM (`dmea`) and the register file (`drga`),
+    /// both word-addressed; DGATE forces the moved word to 0 (clear mode). On
+    /// completion DEXE auto-clears and the DMA-end interrupt (bit 4) is raised
+    /// on both the sound- and main-CPU sides. Called synchronously at the
+    /// trigger by `Scsp::run` (which holds `&mut Ram`). DMEA/DRGA/DTLG are not
+    /// modified by the transfer (per the `scsp.h` note).
+    fn run_dma(&mut self, ram: &mut Ram) {
+        if !self.dma_exec {
+            return;
+        }
+        let (mut mem, mut reg, mut len) = (self.dmea, self.drga, self.dtlg);
+        while len != 0 {
+            let reg_byte = (reg as u32) << 1;
+            if self.dma_dir {
+                // registers -> sound RAM
+                let mut t = self.read16(reg_byte);
+                if self.dma_gate {
+                    t = 0;
+                }
+                if mem < 0x40000 {
+                    ram.write16((mem << 1) & SOUND_RAM_MASK, t);
+                }
+            } else {
+                // sound RAM -> registers (full register side effects, faithful)
+                let mut t = ram.read16((mem << 1) & SOUND_RAM_MASK);
+                if self.dma_gate {
+                    t = 0;
+                }
+                self.write16(reg_byte, t);
+            }
+            reg = (reg + 1) & 0x7FF;
+            mem = (mem + 1) & 0x7FFFF;
+            len -= 1;
+        }
+        self.dma_exec = false;
+        self.store16(SCIPD, self.read16(SCIPD) | INT_DMA);
+        self.store16(MCIPD, self.read16(MCIPD) | INT_DMA);
+        self.recompute_irq();
+        self.recompute_main();
     }
 
     // ---- slot (PCM) engine --------------------------------------------
@@ -2036,6 +2134,13 @@ impl Scsp {
                     *last = nv;
                 }
             }
+            // SCSP DMA: a register write this step may have set DEXE — run the
+            // transfer synchronously now (it needs `&mut Ram`, unavailable
+            // inside the register write), so the DMA-end interrupt is asserted
+            // before the next 68k instruction latches `pending_irq`.
+            if ctrl.dma_exec {
+                ctrl.run_dma(ram);
+            }
             // Produce every output sample whose 256-cycle edge falls within this
             // 68k step — the timer ticks and the mixer run interleaved with the
             // 68k, not lumped before it.
@@ -2354,6 +2459,60 @@ mod tests {
         ctrl.write16(SCIRE, INT_TIMER_A); // acknowledge
         assert_eq!(ctrl.read16(SCIPD) & INT_TIMER_A, 0, "pending cleared");
         assert_eq!(ctrl.asserted_level, 0, "line dropped");
+    }
+
+    #[test]
+    fn scsp_dma_ram_to_registers_moves_words_and_raises_dma_end_irq() {
+        let mut ctrl = ScspCtrl::new();
+        let mut ram = Ram::new(SOUND_RAM_BYTES);
+        // Seed two words in sound RAM at word addr 0x100 (byte 0x200).
+        ram.write16(0x200, 0xAABB);
+        ram.write16(0x202, 0xCCDD);
+        // Route DMA-end (bit 4) to 68k level 4 (SCILV2 bit 4) and enable it.
+        ctrl.write16(SCILV2, INT_DMA);
+        ctrl.write16(SCIEB, INT_DMA);
+        // DMEA = word 0x100, DRGA = word 0x10 (reg byte 0x20 = slot 1 data[0]),
+        // DTLG = 2, DDIR = 0 (RAM→regs), DEXE = 1. Byte-addr fields are << 1.
+        ctrl.write16(DMEA_LO, 0x100u16 << 1);
+        ctrl.write16(DRGA_DMEA_HI, 0x10u16 << 1);
+        ctrl.write16(DTLG_DMA_CTL, (2u16 << 1) | (1 << 12));
+        assert!(ctrl.dma_exec, "DEXE latched the transfer");
+        ctrl.run_dma(&mut ram);
+        assert_eq!(
+            ctrl.read16(0x20),
+            0xAABB,
+            "word 0 landed in the register file"
+        );
+        assert_eq!(ctrl.read16(0x22), 0xCCDD, "word 1 landed");
+        assert_eq!(ctrl.read16(SCIPD) & INT_DMA, INT_DMA, "DMA-end pending set");
+        assert!(!ctrl.dma_exec, "DEXE auto-cleared on completion");
+        assert_eq!(ctrl.read16(DTLG_DMA_CTL) & 0x1000, 0, "DEXE reads back 0");
+        assert_eq!(
+            ctrl.asserted_level, 4,
+            "68k IRQ asserted at the SCILV level"
+        );
+    }
+
+    #[test]
+    fn scsp_dma_registers_to_ram_with_gate_clears_memory() {
+        let mut ctrl = ScspCtrl::new();
+        let mut ram = Ram::new(SOUND_RAM_BYTES);
+        ram.write16(0x200, 0x1234);
+        ctrl.write16(DMEA_LO, 0x100u16 << 1); // DMEA = word 0x100 (byte 0x200)
+        ctrl.write16(DRGA_DMEA_HI, 0); // DRGA = 0
+        // DTLG = 1, DDIR = 1 (regs→RAM), DGATE = 1 (force 0), DEXE = 1.
+        ctrl.write16(
+            DTLG_DMA_CTL,
+            (1u16 << 1) | (1 << 12) | (1 << 13) | (1 << 14),
+        );
+        ctrl.run_dma(&mut ram);
+        assert_eq!(
+            ram.read16(0x200),
+            0,
+            "gate zero-cleared the destination word"
+        );
+        assert_eq!(ctrl.read16(SCIPD) & INT_DMA, INT_DMA, "DMA-end raised");
+        assert!(!ctrl.dma_exec, "DEXE cleared");
     }
 
     #[test]
