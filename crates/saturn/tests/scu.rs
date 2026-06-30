@@ -79,6 +79,52 @@ fn dma_channel0_copies_a_block_between_work_ram() {
 }
 
 #[test]
+fn timer0_line_compare_triggers_an_armed_timer0_dma_channel() {
+    // M13 H1e: Timer-0 (line compare) is SCU DMA start factor 3. An armed
+    // factor-3 channel must fire when the raster first reaches scanline T0C —
+    // the factor was never wired to the event before. Drive frames and verify
+    // the transfer ran.
+    //
+    // Park the master on a `BRA .` self-loop (reset PC = 8) so a long run only
+    // advances the raster — the default all-zero BIOS would fault into an
+    // illegal-exception loop and clobber the DMA's source/dest over the frame.
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&0x0000_0008u32.to_be_bytes()); // reset PC
+    bios[4..8].copy_from_slice(&0x0600_0000u32.to_be_bytes()); // reset SP
+    bios[8..10].copy_from_slice(&0xAFFEu16.to_be_bytes()); // BRA .
+    bios[10..12].copy_from_slice(&0x0009u16.to_be_bytes()); // NOP (delay slot)
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    plant(&mut sat, WRAM, 0x40);
+    sat.bus.write32(D0R, WRAM, AccessKind::Data);
+    sat.bus.write32(D0W, 0x0020_1000, AccessKind::Data);
+    sat.bus.write32(D0C, 0x40, AccessKind::Data);
+    sat.bus.write32(D0AD, AD_CONTIGUOUS, AccessKind::Data);
+    // Start factor 3 (Timer-0) + address-update bits; arm — waits for the event.
+    sat.bus
+        .write32(D0MD, (1 << 16) | (1 << 8) | 3, AccessKind::Data);
+    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    // Enable the SCU timers (T1MD TENB) and set the line compare to an early
+    // scanline (a line is ~1700 SH-2 cycles, so line 10 lands well inside the
+    // run below).
+    sat.bus.write32(SCU_BASE + 0x90, 10, AccessKind::Data); // T0C = line 10
+    sat.bus.write32(SCU_BASE + 0x98, 1, AccessKind::Data); // T1MD: TENB
+
+    // Run past scanline 10; the line-compare event fires the factor-3 DMA,
+    // which drains at the batch boundary.
+    sat.run_for(40_000);
+
+    for i in 0..0x40u32 {
+        let (b, _) = sat.bus.read8(0x0020_1000 + i, AccessKind::Data);
+        assert_eq!(
+            b,
+            (0x10 + i) as u8,
+            "Timer-0 line-compare fired the factor-3 DMA: byte {i:#x}"
+        );
+    }
+}
+
+#[test]
 fn dma_address_registers_hold_when_update_bits_clear() {
     let mut sat = build();
     plant(&mut sat, WRAM, 0x10);

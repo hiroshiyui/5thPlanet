@@ -671,6 +671,9 @@ impl Scu {
                     if (!mode1 || timer0_met) && !self.timer1_met {
                         self.timer1_met = true;
                         self.raise(Source::Timer1);
+                        // Timer-1 is also SCU DMA start factor 4 (timer-paced
+                        // transfer); fire any channel armed with it. (M13 H1e.)
+                        self.trigger_dma_factor(4);
                     }
                 } else {
                     self.timer1_counter -= pclocks;
@@ -687,6 +690,9 @@ impl Scu {
         // level; we raise the edge, as VBlank-IN/-OUT are handled).
         if hb_start {
             self.raise(Source::HBlankIn);
+            // HBlank-IN is also SCU DMA start factor 2 — the per-line
+            // raster-split DMA source; fire any channel armed with it. (M13 H1e.)
+            self.trigger_dma_factor(2);
         }
     }
 
@@ -1159,6 +1165,47 @@ mod tests {
         assert!(
             s.take_pending_dma().is_none(),
             "unarmed channel never triggers"
+        );
+    }
+
+    #[test]
+    fn hblank_in_event_triggers_an_armed_hblank_dma_channel() {
+        // M13 H1e: HBlank-IN is SCU DMA start factor 2 — an armed channel must
+        // fire on the HBLANK rising edge (per-line raster-split DMA). The factor
+        // was never wired to the event before; tick_timers now triggers it.
+        let mut s = Scu::new();
+        s.write32(0x14, 2); // D0MD: start factor 2 (HBlank-IN)
+        s.write32(0x08, 0x10); // D0C: count
+        s.write32(0x10, DGO_BIT); // D0EN: arm
+        assert!(s.take_pending_dma().is_none(), "armed; waits for the event");
+        // An HBLANK rising edge (new_hb 0→1) fires it.
+        s.tick_timers(1000, 455, 455, true, false);
+        assert!(
+            s.take_pending_dma().is_some(),
+            "HBlank-IN event triggered the armed factor-2 channel"
+        );
+    }
+
+    #[test]
+    fn timer1_event_triggers_an_armed_timer1_dma_channel() {
+        // M13 H1e: Timer-1 is SCU DMA start factor 4.
+        let mut s = Scu::new();
+        s.write32(0x14, 4); // D0MD: start factor 4 (Timer1)
+        s.write32(0x08, 0x10);
+        s.write32(0x10, DGO_BIT); // arm
+        s.write32(0x98, 1); // T1MD: TENB (timers enabled), mode 0
+        s.write32(0x94, 2); // T1S: fire at H-position 2
+        // hb_start reloads the Timer-1 down-counter from T1S (=2)...
+        s.tick_timers(0, 455, 455, true, false);
+        assert!(
+            s.take_pending_dma().is_none(),
+            "no Timer-1 fire yet (counter just reloaded)"
+        );
+        // ...the next tick advances pclocks past 2 → Timer-1 met → factor 4.
+        s.tick_timers(10, 455, 455, false, false);
+        assert!(
+            s.take_pending_dma().is_some(),
+            "Timer-1 event triggered the armed factor-4 channel"
         );
     }
 

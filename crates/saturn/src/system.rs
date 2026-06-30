@@ -998,6 +998,9 @@ impl Saturn {
         let timer0_met = line == t0c;
         if self.bus.scu.timers_enabled() && timer0_met && prev_line != t0c {
             self.bus.scu.raise(crate::scu::Source::Timer0);
+            // Timer-0 is also SCU DMA start factor 3 (a line-compare-paced
+            // transfer); fire any channel armed with it. (M13 H1e.)
+            self.bus.scu.trigger_dma_factor(3);
         }
 
         // Timer 1 (sub-line H-position) + the HBlank-IN interrupt, ported from
