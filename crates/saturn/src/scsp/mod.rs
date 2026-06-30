@@ -1104,6 +1104,13 @@ impl ScspCtrl {
         let data0 = self.slot_reg(i, 0);
         let pcm8 = data0 & 0x0010 != 0;
         let lpctl = (data0 >> 5) & 3;
+        // Slot sound-source select (SSCTL, reg0 bits 8:7) and the source-bit
+        // control XOR (SBCTL, bits 10:9). Mednafen `scsp.inc`: source 0 = sound
+        // RAM (the interpolated PCM below), 1 = noise (the shared LFSR), 2/3 =
+        // digital zero; the chosen value is XOR'd by SBCTL's `SB_XOR_Table`
+        // entry. Source 0 keeps the byte-exact PCM path (golden-invariant).
+        let ssctl = (data0 >> 7) & 3;
+        let sbxor = [0x0000u16, 0x7FFF, 0x8000, 0xFFFF][((data0 >> 9) & 3) as usize];
         let sa = ((data0 as u32 & 0xF) << 16) | self.slot_reg(i, 1) as u32;
         let lsa = self.slot_reg(i, 2) as u32;
         let lea = self.slot_reg(i, 3) as u32;
@@ -1111,7 +1118,18 @@ impl ScspCtrl {
         let modalizer = self.fm_modalizer(i);
         let (cur, nxt) = (self.slots[i].cur, self.slots[i].nxt);
         let one = 1i32 << PHASE_SHIFT;
-        let sample = if modalizer != 0 {
+        let sample = if ssctl != 0 {
+            // Non-PCM source (Mednafen `scsp.inc`): 1 = noise (the shared LFSR's
+            // low byte placed high), 2/3 = digital zero; then XOR'd by SBCTL.
+            // The phase advance + loop logic below still runs, so the slot steps
+            // and loops/ends on its programmed pitch exactly as for PCM.
+            let raw: u16 = if ssctl == 1 {
+                (self.lfsr << 8) as u16
+            } else {
+                0
+            };
+            (raw ^ sbxor) as i16
+        } else if modalizer != 0 {
             // Phase-modulation FM (reg 7): the modulator outputs summed in
             // `fm_modalizer` shift this slot's read position by an integer sample
             // offset plus a 6-bit interpolation fraction (Mednafen `scsp.inc`'s
@@ -2453,6 +2471,34 @@ mod tests {
         keyon_slot0(&mut s, 0x0010, 0x200, 0, 0x100, 0); // PCM8B (bit 4)
         assert_eq!(s.slot_sample(0), 0x4000);
         assert_eq!(s.slot_sample(0), (0xC000u16) as i16);
+    }
+
+    #[test]
+    fn noise_source_slot_outputs_the_shared_lfsr() {
+        // SSCTL (reg0 bits 8:7) = 1 selects the noise sound source. A fresh
+        // SCSP's shared LFSR is 1, so the value is `(lfsr << 8)` = 0x0100 — the
+        // test `slot_sample` wrapper reads the LFSR without clocking it (clocking
+        // happens in `mix`). Mednafen `scsp.inc` per-sample source select.
+        let mut s = Scsp::new();
+        keyon_slot0(&mut s, 1 << 7, 0x100, 0, 0x100, 0); // SSCTL = 1 (noise)
+        assert_eq!(s.slot_sample(0), 0x0100);
+    }
+
+    #[test]
+    fn zero_source_slot_is_silent() {
+        // SSCTL = 2 → digital zero (SBCTL = 0 → no XOR).
+        let mut s = Scsp::new();
+        keyon_slot0(&mut s, 2 << 7, 0x100, 0, 0x100, 0);
+        assert_eq!(s.slot_sample(0), 0);
+    }
+
+    #[test]
+    fn sbctl_xor_inverts_the_noise_source() {
+        // SBCTL (reg0 bits 10:9) = 1 → `SB_XOR_Table[1]` = 0x7FFF, so the noise
+        // value 0x0100 becomes 0x0100 ^ 0x7FFF = 0x7EFF.
+        let mut s = Scsp::new();
+        keyon_slot0(&mut s, (1 << 7) | (1 << 9), 0x100, 0, 0x100, 0);
+        assert_eq!(s.slot_sample(0), 0x7EFF);
     }
 
     #[test]
