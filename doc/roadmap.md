@@ -316,6 +316,42 @@ matched to the oracle's no-op).
 | E2 | Analog peripherals (3D pad, Mission Stick, racing) + per-button gamepad rebind | ⬜ |
 | E3 | Specialty peripherals | 🟡 Shuttle Mouse done (`638cda7`/`80b7120`, savestate v5, `--mouse[=1|2]`); light gun + keyboard remaining |
 
+**E — layered input-configuration plan** (📋 design; unifies the E1/E2/E3 work
+above). A five-concern model — multitap → port enumeration → per-port controller
+*type* → host-device binding → per-binding remap — split across the project's
+existing sdl-free core seam. The two refinements over the naive five layers:
+*list-ports* is not a step but a property of the topology tree, and *bind* +
+*remap* are two edits on one `Binding` object whose map is keyed to the emulated
+device **type**.
+
+*Two-sided data model.*
+- **Emulated side** (`crates/saturn/smpc.rs`, accuracy-critical, golden-safe,
+  savestate-versioned): a **port-topology tree** — Port 1 / Port 2 each a direct
+  device *or* a multitap with ≤6 sub-ports — plus the per-(sub)port **controller
+  type** that fixes the INTBACK peripheral-phase **ID + report-byte layout**
+  (today: pad `0x02` / Shuttle Mouse `0xE3`). Exact IDs/report formats come from
+  the SMPC manual + Mednafen `smpc.cpp` — never invented.
+- **Host side** (`jupiter`, sdl-free + unit-tested, OSD + `ports.rs`): a
+  `Binding = (emulated port/subport + device-type) ← (host source GUID + capability
+  map)`. The OSD "Controller" screen picks the host source (bind) and edits its map
+  (remap); the map is **per emulated-device-type** (digital buttons / analog axes /
+  relative deltas), so the OSD filters selectable host sources by capability — or
+  synthesizes (e.g. digital keys → stepped analog) and says so. Bindings key on
+  gamepad **GUID** so hot-plug re-attaches to the right port.
+
+*Phased build (foundation-first; each phase ships something playable).*
+| Phase | Side | Work | Closes |
+|---|---|---|--------|
+| E-1 | host | Finish wiring the parked `feat/jupiter-per-port-input` (`ports.rs`, 9 tests): 2-port device assignment + host binding for the existing Pad/Mouse types, multi-gamepad by GUID, config `port1`/`port2`, OSD `CyclePort`. Cheapest win — unblocks "P1 = gamepad, P2 = keyboard". | E1 frontend 2nd-controller feed (`set_pad2`) |
+| E-2 | emulated + host | Analog controller **types** — 3D/Multi pad, Mission Stick, racing wheel: new INTBACK ID + report layout in SMPC (per-type INTBACK-layout regression tests, savestate bump); host capability-map + per-button gamepad rebind become load-bearing here. | E2 |
+| E-3 | emulated + host | **Multitap / 6-player** — emit a tap-container ID + N sub-peripheral blocks in the INTBACK peripheral phase; the host port list simply grows >2 (`ports.rs` already iterates a port list). Rides on E-1/E-2. | E1 multitap |
+| E-4 | emulated + host | Remaining specialty — **light gun** (raster-position latch) + **keyboard** (type-3 ID). | E3 |
+
+*Cross-cutting.* Every new device type / topology change bumps the savestate
+version; the default port config stays Pad-on-1 so `bios_boot` + the game render
+goldens hold (golden-safe); the host half stays sdl-free + unit-tested (the
+`ports.rs` template), the emulated half covered by `smpc.rs` integration tests.
+
 **Tier F — already-deferred:** F1 MPEG card ⏸ · F2 CD move/copy sector ops ⏸ ·
 F3 SH-2 cache address/data array spaces (open bus today; rare outside
 cache-as-RAM).
