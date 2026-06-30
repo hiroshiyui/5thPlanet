@@ -496,6 +496,10 @@ impl<'a> Plotter<'a> {
             return;
         }
         let spd = pmod & 0x40 != 0; // transparent-pixel disable
+        // RGB-direct (16bpp) textured mode: transparency + end-code use the MSB
+        // band rather than `== 0` / a per-mode end value (Mednafen `TexFetch`
+        // case 5). Paletted modes and untextured polys keep `raw == 0`.
+        let rgb_direct = !self.cmd.ispoly && pmod & 0x0038 == 0x0028;
 
         let raw: i32;
         let mut pix: u16;
@@ -577,14 +581,24 @@ impl<'a> Plotter<'a> {
             }
 
             // End-code: unless disabled (CMDPMOD bit 7), a run-terminator
-            // texel is skipped.
-            if pmod & 0x80 == 0 && raw == endcode {
+            // texel is skipped. RGB-direct keys on the bits[15:14]==01 band
+            // (0x4000–0x7FFF, Mednafen `(rtd & 0xC000) == 0x4000`); paletted
+            // modes match the exact per-mode `endcode`.
+            let is_end = if rgb_direct {
+                raw & 0xC000 == 0x4000
+            } else {
+                raw == endcode
+            };
+            if pmod & 0x80 == 0 && is_end {
                 return;
             }
         }
 
-        // transpen is 0; draw unless transparent and SPD is off.
-        if raw == 0 && !spd {
+        // Transparency: draw unless transparent and SPD is off. RGB-direct is
+        // transparent when the MSB is clear (`raw < 0x4000`, Mednafen
+        // `(rtd - 0x4000) >> 31`); paletted/poly use pen 0.
+        let transparent = if rgb_direct { raw < 0x4000 } else { raw == 0 };
+        if transparent && !spd {
             return;
         }
 

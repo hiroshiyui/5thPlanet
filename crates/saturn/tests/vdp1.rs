@@ -132,9 +132,9 @@ fn polygon_fills_a_solid_rectangle() {
 #[test]
 fn normal_sprite_blits_16bpp_character() {
     let mut v = Vdp1::new();
-    // 8×8 character of RGB555 colour 0x4210 at VRAM byte 0x1000.
+    // 8×8 character of RGB555 colour 0xC210 at VRAM byte 0x1000.
     for i in 0..64u32 {
-        v.vram.write16(0x1000 + i * 2, 0x4210);
+        v.vram.write16(0x1000 + i * 2, 0xC210);
     }
     let srca = (0x1000u32 / 8) as u16;
     put(
@@ -154,10 +154,41 @@ fn normal_sprite_blits_16bpp_character() {
     put(&mut v, 1, END);
     v.process_list();
 
-    assert_eq!(v.fb.pixel(5, 5), 0x4210, "sprite origin");
-    assert_eq!(v.fb.pixel(12, 12), 0x4210, "sprite far corner (8×8)");
+    assert_eq!(v.fb.pixel(5, 5), 0xC210, "sprite origin");
+    assert_eq!(v.fb.pixel(12, 12), 0xC210, "sprite far corner (8×8)");
     assert_eq!(v.fb.pixel(4, 4), 0, "above-left of sprite");
     assert_eq!(v.fb.pixel(13, 13), 0, "past the sprite");
+}
+
+#[test]
+fn rgb_direct_transparency_uses_the_msb_band() {
+    // 16bpp RGB-direct (M13 H3): a texel < 0x4000 is transparent, a texel in
+    // 0x4000-0x7FFF is an end-code (also not drawn), and an MSB-set texel is
+    // opaque — not the old `== 0` transparency / `== 0x7FFF` end-code.
+    let mut v = Vdp1::new();
+    v.vram.write16(0x1000, 0x1000); // col 0: transparent (< 0x4000)
+    v.vram.write16(0x1002, 0x8123); // col 1: opaque (MSB set)
+    v.vram.write16(0x1004, 0x4000); // col 2: end-code (0x4000-0x7FFF band)
+    let srca = (0x1000u32 / 8) as u16;
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0000, 0x0000), // type 0 normal sprite
+            w(0x0028, 0x0000), // CMDPMOD: 16bpp RGB
+            w(srca, 0x0101),   // SRCA | SIZE 8×1
+            w(5, 5),
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(5, 5), 0, "raw < 0x4000 → transparent");
+    assert_eq!(v.fb.pixel(6, 5), 0x8123, "MSB set → opaque");
+    assert_eq!(v.fb.pixel(7, 5), 0, "0x4000-0x7FFF → end-code, not drawn");
 }
 
 #[test]
@@ -167,14 +198,14 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
     // DISCARD its own colour — not paint a solid block. The 8bpp path already
     // did this; the 16bpp path wrongly wrote the sprite's colour. (M13 H1c.)
     let mut v = Vdp1::new();
-    // Underlying scene: an 8×8 char of RGB 0x4210 at VRAM 0x1000.
+    // Underlying scene: an 8×8 char of RGB 0xC210 at VRAM 0x1000.
     for i in 0..64u32 {
-        v.vram.write16(0x1000 + i * 2, 0x4210);
+        v.vram.write16(0x1000 + i * 2, 0xC210);
     }
-    // The MSBON sprite's own colour: a DIFFERENT RGB 0x7C00 at VRAM 0x2000,
+    // The MSBON sprite's own colour: a DIFFERENT RGB 0xFC00 at VRAM 0x2000,
     // which must NOT reach the framebuffer.
     for i in 0..64u32 {
-        v.vram.write16(0x2000 + i * 2, 0x7C00);
+        v.vram.write16(0x2000 + i * 2, 0xFC00);
     }
     put(
         &mut v,
@@ -182,7 +213,7 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
         [
             w(0x0000, 0x0000),                 // type 0 normal sprite
             w(0x0028, 0x0000),                 // CMDPMOD: 16bpp RGB
-            w((0x1000u32 / 8) as u16, 0x0108), // SRCA | SIZE 8×8 → lays down 0x4210
+            w((0x1000u32 / 8) as u16, 0x0108), // SRCA | SIZE 8×8 → lays down 0xC210
             w(5, 5),
             0,
             0,
@@ -196,7 +227,7 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
         [
             w(0x0000, 0x0000),                 // type 0 normal sprite
             w(0x8028, 0x0000),                 // CMDPMOD: MSBON + 16bpp RGB
-            w((0x2000u32 / 8) as u16, 0x0108), // SRCA 0x7C00 (must be discarded)
+            w((0x2000u32 / 8) as u16, 0x0108), // SRCA 0xFC00 (must be discarded)
             w(5, 5),
             0,
             0,
@@ -207,14 +238,14 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
     put(&mut v, 2, END);
     v.process_list();
 
-    // The dot keeps the underlying 0x4210 with bit 15 forced — NOT the MSBON
-    // sprite's 0x7C00 (the pre-fix 16bpp bug wrote 0x7C00 | 0x8000 = 0xFC00).
+    // The dot keeps the underlying 0xC210 with bit 15 forced — NOT the MSBON
+    // sprite's 0xFC00 (the pre-fix 16bpp bug wrote 0xFC00 | 0x8000 = 0xFC00).
     assert_eq!(
         v.fb.pixel(5, 5),
-        0x4210 | 0x8000,
+        0xC210 | 0x8000,
         "MSBON read-modifies the dest MSB and discards the source colour"
     );
-    assert_eq!(v.fb.pixel(12, 12), 0x4210 | 0x8000, "far corner too");
+    assert_eq!(v.fb.pixel(12, 12), 0xC210 | 0x8000, "far corner too");
 }
 
 #[test]
@@ -433,9 +464,9 @@ fn ptmr_write_through_registers_triggers_the_plot() {
 #[test]
 fn distorted_sprite_maps_a_texture_onto_a_skewed_quad() {
     let mut v = Vdp1::new();
-    // 8×8 character, solid colour 0x6318, at VRAM byte 0x2000.
+    // 8×8 character, solid colour 0xE318, at VRAM byte 0x2000.
     for i in 0..64u32 {
-        v.vram.write16(0x2000 + i * 2, 0x6318);
+        v.vram.write16(0x2000 + i * 2, 0xE318);
     }
     let srca = (0x2000u32 / 8) as u16;
     // A parallelogram skewed to the right as y increases.
@@ -458,7 +489,7 @@ fn distorted_sprite_maps_a_texture_onto_a_skewed_quad() {
 
     // Interior of the quad receives the texture colour; a point clearly
     // outside it stays blank.
-    assert_eq!(v.fb.pixel(30, 25), 0x6318, "inside the distorted quad");
+    assert_eq!(v.fb.pixel(30, 25), 0xE318, "inside the distorted quad");
     assert_eq!(v.fb.pixel(5, 5), 0, "outside the quad");
 }
 
@@ -626,9 +657,9 @@ fn put_hgradient_char(v: &mut Vdp1, base: u32) -> u16 {
 #[test]
 fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
     let mut v = Vdp1::new();
-    // 8×8 solid character colour 0x1234 at VRAM byte 0x3000.
+    // 8×8 solid character colour 0x9234 at VRAM byte 0x3000.
     for i in 0..64u32 {
-        v.vram.write16(0x3000 + i * 2, 0x1234);
+        v.vram.write16(0x3000 + i * 2, 0x9234);
     }
     let srca = (0x3000u32 / 8) as u16;
     // Type 1 scaled sprite with zoom==0 path: the destination rectangle is
@@ -652,9 +683,9 @@ fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
     v.process_list();
 
     // Every interior dot of the stretched rect samples the solid texture.
-    assert_eq!(v.fb.pixel(10, 10), 0x1234, "scaled top-left");
-    assert_eq!(v.fb.pixel(25, 20), 0x1234, "scaled interior");
-    assert_eq!(v.fb.pixel(40, 30), 0x1234, "scaled bottom-right");
+    assert_eq!(v.fb.pixel(10, 10), 0x9234, "scaled top-left");
+    assert_eq!(v.fb.pixel(25, 20), 0x9234, "scaled interior");
+    assert_eq!(v.fb.pixel(40, 30), 0x9234, "scaled bottom-right");
     assert_eq!(v.fb.pixel(9, 9), 0, "outside the scaled rect");
     assert_eq!(v.fb.pixel(41, 31), 0, "past the scaled rect");
 }
@@ -663,7 +694,7 @@ fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
 fn sprite_coordinates_are_signed_13_bit() {
     let mut v = Vdp1::new();
     for i in 0..64u32 {
-        v.vram.write16(0x3000 + i * 2, 0x1234);
+        v.vram.write16(0x3000 + i * 2, 0x9234);
     }
     let srca = (0x3000u32 / 8) as u16;
     put(
@@ -683,8 +714,8 @@ fn sprite_coordinates_are_signed_13_bit() {
     put(&mut v, 1, END);
     v.process_list();
 
-    assert_eq!(v.fb.pixel(0, 10), 0x1234);
-    assert_eq!(v.fb.pixel(3, 17), 0x1234);
+    assert_eq!(v.fb.pixel(0, 10), 0x9234);
+    assert_eq!(v.fb.pixel(3, 17), 0x9234);
     assert_eq!(v.fb.pixel(4, 10), 0);
 }
 
@@ -692,7 +723,7 @@ fn sprite_coordinates_are_signed_13_bit() {
 fn local_coordinates_are_signed_11_bit() {
     let mut v = Vdp1::new();
     for i in 0..64u32 {
-        v.vram.write16(0x3000 + i * 2, 0x2468);
+        v.vram.write16(0x3000 + i * 2, 0xA468);
     }
     let srca = (0x3000u32 / 8) as u16;
     put(
@@ -726,15 +757,15 @@ fn local_coordinates_are_signed_11_bit() {
     put(&mut v, 2, END);
     v.process_list();
 
-    assert_eq!(v.fb.pixel(10, 4), 0x2468);
-    assert_eq!(v.fb.pixel(17, 11), 0x2468);
+    assert_eq!(v.fb.pixel(10, 4), 0xA468);
+    assert_eq!(v.fb.pixel(17, 11), 0xA468);
 }
 
 #[test]
 fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
     let mut v = Vdp1::new();
     for i in 0..64u32 {
-        v.vram.write16(0x3000 + i * 2, 0x2468);
+        v.vram.write16(0x3000 + i * 2, 0xA468);
     }
     let srca = (0x3000u32 / 8) as u16;
     // zoom field = 0xA (CMDCTRL bits 11-8): "centre" anchor — the rect is
@@ -759,10 +790,10 @@ fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
 
     assert_eq!(
         v.fb.pixel(100, 100),
-        0x2468,
+        0xA468,
         "centred rect covers the anchor"
     );
-    assert_eq!(v.fb.pixel(91, 91), 0x2468, "near the shifted top-left");
+    assert_eq!(v.fb.pixel(91, 91), 0xA468, "near the shifted top-left");
     assert_eq!(v.fb.pixel(80, 80), 0, "outside the centred rect");
 }
 
