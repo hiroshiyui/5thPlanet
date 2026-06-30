@@ -213,6 +213,46 @@ fn color_offset_disabled_leaves_dot_unchanged() {
 }
 
 #[test]
+fn color_offset_keys_the_back_screen_on_bit5_not_bit6() {
+    // CLOFEN/CLOFSL bit 5 = back screen, bit 6 = sprite — the *reverse* of the
+    // line-colour/shadow `screen_bit` (sprite = 5). Regression for the
+    // sprite/back swap (M13 Tier H — H1b): a back-screen-only fade (a common
+    // idiom) keys on bit 5, and bit 6 (sprite) must NOT touch the back screen.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0000, AccessKind::Data); // no NBG/RBG → back screen shows
+    // Back screen = mid grey (132,132,132) at VRAM word 0x100.
+    sat.bus.vdp2.vram.write16(0x200, 0x4210);
+    sat.bus.write16(0x05F8_00AC, 0x0000, AccessKind::Data); // BKTAU
+    sat.bus.write16(0x05F8_00AE, 0x0100, AccessKind::Data); // BKTAL word 0x100
+    // Offset R = -64, set A.
+    sat.bus.write16(0x05F8_0112, 0x0000, AccessKind::Data); // CLOFSL: set A
+    sat.bus.write16(0x05F8_0114, 0x01C0, AccessKind::Data); // COAR = -64
+
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+
+    // CLOFEN bit 5 (back) → backdrop is offset.
+    sat.bus.write16(0x05F8_0110, 0x0020, AccessKind::Data);
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[132 - 64, 132, 132, 0xFF],
+        "back screen keyed on CLOFEN bit 5"
+    );
+
+    // CLOFEN bit 6 (sprite) → the back screen is untouched.
+    sat.bus.write16(0x05F8_0110, 0x0040, AccessKind::Data);
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[132, 132, 132, 0xFF],
+        "bit 6 is the sprite screen, not the back → backdrop unoffset"
+    );
+}
+
+#[test]
 fn nbg0_horizontal_reduction_halves_the_layer() {
     // ZMXN0 = 2.0 reduces NBG0 by half: each screen dot steps two source
     // pixels, so source x=100 lands at screen x=50.

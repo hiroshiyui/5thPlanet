@@ -396,7 +396,9 @@ impl Vdp2Regs {
     }
 
     /// Per-screen colour-offset enable (CLOFEN, 0x110, bits 0..6): 0 NBG0/RBG1,
-    /// 1 NBG1, 2 NBG2, 3 NBG3, 4 RBG0, 5 sprite, 6 back screen. When a screen's
+    /// 1 NBG1, 2 NBG2, 3 NBG3, 4 RBG0, 5 back screen, 6 sprite (the sprite/back
+    /// assignment is the reverse of the line-colour/shadow `screen_bit` — bits
+    /// resolved in `renderer::apply_color_offset`). When a screen's
     /// bit is set its final colour gets the selected RGB offset added — this is
     /// how games do fade-to-black / fade-to-white / tint transitions. (Mednafen
     /// `ColorOffsEn = V & 0x7F`; VDP2 manual §colour offset, CLOFEN.)

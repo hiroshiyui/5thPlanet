@@ -986,13 +986,25 @@ fn insert_dot(
 }
 
 /// Apply the VDP2 colour-offset function to the final dot. The enable bit and
-/// A/B set are taken from the front (top) screen — the back screen (bit 6) when
+/// A/B set are taken from the front (top) screen — the back screen (bit 5) when
 /// no layer is on top — matching Mednafen, which carries each layer's COE/COSEL
 /// flags on the winning pixel and adds the signed per-channel offset (clamped
 /// 0..=255) after colour calculation. A no-op when the front screen's CLOFEN
 /// bit is clear (the common case), so it's free when unused.
+///
+/// CLOFEN/CLOFSL bit layout: NBG0–3 = 0–3, RBG0 = 4, **back screen = 5, sprite
+/// = 6** (Mednafen `vdp2_render.cpp` sprite `>> 6`, back `>> 5`). This differs
+/// from [`Layer::screen_bit`] (sprite = 5), which is correct for the
+/// line-colour path but NOT for colour offset, so the sprite/back bits are
+/// resolved here rather than reusing `screen_bit`.
 fn apply_color_offset(vdp2: &Vdp2, top: Option<Dot>, rgb: (u8, u8, u8)) -> (u8, u8, u8) {
-    let bit = top.map_or(6, |t| t.layer.screen_bit());
+    let bit = match top {
+        None => 5, // back screen
+        Some(t) => match t.layer {
+            Layer::Sprite => 6,
+            other => other.screen_bit(), // NBG0–3 = 0–3, RBG0 = 4
+        },
+    };
     if vdp2.regs.color_offset_enable() & (1 << bit) == 0 {
         return rgb;
     }
