@@ -1253,6 +1253,12 @@ impl ScspCtrl {
                 let a1 = sa.wrapping_add(((off + 1) * 2) as u32) & SOUND_RAM_MASK;
                 (ram.read16(a0) as i16 as i32, ram.read16(a1) as i16 as i32)
             };
+            // SBXOR (SBCTL) inverts the PCM taps before interpolation (Mednafen
+            // `scsp.inc`: `s0 ^= SBXOR; s1 ^= SBXOR`). Inert when SBXOR == 0.
+            let (s0, s1) = (
+                (s0 as u16 ^ sbxor) as i16 as i32,
+                (s1 as u16 ^ sbxor) as i16 as i32,
+            );
             (((s0 * (0x40 - sia)) + (s1 * sia)) >> 6) as i16
         } else {
             let frac = (cur & ((1 << PHASE_SHIFT) - 1)) as i32;
@@ -1272,6 +1278,11 @@ impl ScspCtrl {
                     ram.read16((sa + a2) & SOUND_RAM_MASK) as i16 as i32,
                 )
             };
+            // SBXOR on the PCM taps (see the FM branch above).
+            let (p1, p2) = (
+                (p1 as u16 ^ sbxor) as i16 as i32,
+                (p2 as u16 ^ sbxor) as i16 as i32,
+            );
             ((p1 * (one - frac) + p2 * frac) >> PHASE_SHIFT) as i16
         };
 
@@ -1393,8 +1404,17 @@ impl ScspCtrl {
             // attenuation, consumed by `slot_sample`/`eg_advance`).
             self.run_lfo(i);
             let pcm = self.slot_sample(i, ram) as i32;
+            // Advance the EG regardless (it deactivates a slot whose envelope
+            // reached the end), but SoundDirect (reg6 bit 8) sends the raw PCM
+            // at full level — bypassing the EG/TL attenuation (Mednafen
+            // `scsp.inc`: `if(!SoundDirect) sample *= attenuation`). Inert unless
+            // a slot sets the bit.
             let eg_mul = self.eg_advance(i);
-            let voice = (pcm * eg_mul) >> PHASE_SHIFT;
+            let voice = if self.slot_reg(i, 6) & 0x0100 != 0 {
+                pcm
+            } else {
+                (pcm * eg_mul) >> PHASE_SHIFT
+            };
             let reg_b = self.slot_reg(i, 0xB);
             // Direct output: DISDL send level (bits 15-13) + DIPAN (12-8).
             let didx = ((((reg_b >> 13) & 7) << 5) | ((reg_b >> 8) & 0x1F)) as usize;
@@ -2658,6 +2678,42 @@ mod tests {
         let mut s = Scsp::new();
         keyon_slot0(&mut s, (1 << 7) | (1 << 9), 0x100, 0, 0x100, 0);
         assert_eq!(s.slot_sample(0), 0x7EFF);
+    }
+
+    #[test]
+    fn sbxor_inverts_the_pcm_taps() {
+        // A normal PCM slot (SSCTL=0) with SBCTL=1 XORs its interpolated taps by
+        // 0x7FFF (Mednafen `s0 ^= SBXOR`). At phase 0 the first tap dominates.
+        let mut s = Scsp::new();
+        s.ram.write16(0x100, 0x1234);
+        s.ram.write16(0x102, 0x1234);
+        keyon_slot0(&mut s, 1 << 9, 0x100, 0, 0x100, 0); // PCM, SBCTL=1
+        assert_eq!(s.slot_sample(0), (0x1234u16 ^ 0x7FFF) as i16);
+    }
+
+    #[test]
+    fn sound_direct_bypasses_eg_and_tl_attenuation() {
+        // Two identical TL-attenuated slots; the one with SoundDirect (reg6 bit
+        // 8) plays the raw PCM at full level, so it is louder.
+        let peak = |sound_direct: bool| -> i32 {
+            let mut s = Scsp::new();
+            s.ctrl.write16(0x400, 0x000F); // MVOL max (a fresh SCSP is silent)
+            s.ram.write16(0x100, 0x4000);
+            s.ctrl.write16(0x02, 0x100); // SA low
+            s.ctrl.write16(0x06, 0x100); // LEA (loop end)
+            s.ctrl.write16(0x08, 0x001F); // AR max (instant attack)
+            let reg6 = 0x20 | if sound_direct { 0x0100 } else { 0 }; // TL=0x20 (+SDIR)
+            s.ctrl.write16(0x0C, reg6);
+            s.ctrl.write16(0x16, 0xE000); // DISDL = 7 (full), centre pan
+            s.ctrl.write16(0x00, 0x1820); // KEY ON, forward loop
+            (0..32).map(|_| s.next_sample().0 as i32).max().unwrap()
+        };
+        assert!(
+            peak(true) > peak(false),
+            "SoundDirect ({}) skips TL attenuation, so it is louder than plain ({})",
+            peak(true),
+            peak(false)
+        );
     }
 
     #[test]
