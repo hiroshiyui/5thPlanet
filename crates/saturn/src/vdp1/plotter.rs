@@ -483,8 +483,10 @@ impl<'a> Plotter<'a> {
         let pmod = self.cmd.pmod;
         let mesh = pmod & 0x100 != 0;
         // Mesh keys off the *source* y (Mednafen `PlotPixel` applies it
-        // before the interlace line-halving).
-        if mesh && (x ^ y) & 1 == 0 {
+        // before the interlace line-halving). A mesh pixel is transparent when
+        // `(x ^ y) & 1 != 0` (Mednafen `transparent |= (x ^ y) & 1`); the
+        // even-parity dots draw. (The phase was inverted.)
+        if mesh && (x ^ y) & 1 != 0 {
             return;
         }
         let Some(fy) = self.fb_y(y) else { return };

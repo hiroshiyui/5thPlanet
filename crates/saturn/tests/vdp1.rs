@@ -1042,7 +1042,7 @@ fn transparent_texel_is_dropped_when_spd_off_and_kept_when_on() {
 fn mesh_mode_draws_a_checkerboard() {
     let mut v = Vdp1::new();
     // Type 4 polygon with MESH (CMDPMOD bit 8 = 0x100). Mesh drops dots where
-    // (x ^ y) & 1 == 0, leaving a 50% checkerboard.
+    // (x ^ y) & 1 != 0 (Mednafen), leaving a 50% checkerboard on even parity.
     put(
         &mut v,
         0,
@@ -1059,10 +1059,14 @@ fn mesh_mode_draws_a_checkerboard() {
     );
     put(&mut v, 1, END);
     v.process_list();
-    // (10,10): x^y = 0 → dropped. (11,10): x^y = 1 → drawn.
-    assert_eq!(v.fb.pixel(10, 10), 0, "mesh drops even-parity dot");
-    assert_eq!(v.fb.pixel(11, 10), 0x001F, "mesh keeps odd-parity dot");
-    assert_eq!(v.fb.pixel(12, 10), 0, "mesh drops the next even-parity dot");
+    // (10,10): x^y = 0 → drawn. (11,10): x^y = 1 → dropped.
+    assert_eq!(v.fb.pixel(10, 10), 0x001F, "mesh keeps even-parity dot");
+    assert_eq!(v.fb.pixel(11, 10), 0, "mesh drops odd-parity dot");
+    assert_eq!(
+        v.fb.pixel(12, 10),
+        0x001F,
+        "mesh keeps the next even-parity dot"
+    );
 }
 
 #[test]
