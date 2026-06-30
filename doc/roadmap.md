@@ -1,32 +1,26 @@
 # 5thPlanet Roadmap
 
 Accuracy-first SEGA Saturn emulator in Rust. Milestones are scoped tightly so
-the foundation is solid before the next chip is added. This file is a status
-tracker; blow-by-blow investigation history lives in the git log,
-`doc/system-architecture.md` §9 (Bootstrapping), and the commit messages
-referenced below. Commercial titles that run are listed in
-[`doc/compatible-game-titles.md`](compatible-game-titles.md); boot-blocker
-investigations (case studies + the full forensic case files) live in the
-[`doc/debugging-playbook.md`](debugging-playbook.md).
+the foundation is solid before the next chip is added. **This file is a status
+tracker** — blow-by-blow investigation history lives in the git log,
+`doc/system-architecture.md` §9 (Bootstrapping), and the referenced commits.
+Companion docs: playable titles in
+[`compatible-game-titles.md`](compatible-game-titles.md); boot-blocker case
+studies + forensic files in [`debugging-playbook.md`](debugging-playbook.md).
 
-Current test count: **1174 workspace-wide, 0 failures** (default features; +2 with `--features gpu-presenter`), ~85% line coverage
-(`cargo llvm-cov`; excludes the SDL3 frontend and the FFI `physdisc` crate).
+**Status:** M1–M12 ✅ complete · M13 (hardware completeness & fidelity backlog)
+📋 in progress · latest release **v0.18.0**. **Five commercial games are fully
+playable** — *Virtua Fighter 2* (60 fps, tag `vf2-good-emulation`),
+*Doukyuusei ~if~*, *Sangokushi V* (三國志V), *Panzer Dragoon Zwei*, and
+*Greatest Nine '98* (see [`compatible-game-titles.md`](compatible-game-titles.md)).
 
-**Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
-checks** (`run_all`, 16 so far across cpu / branch / memory / onchip DIVU·FRT·DMAC
-/ scu DMA / vdp2 render / scsp audio) run hermetically from reset — no BIOS, no
-disc, no toolchain — each verifying one behavior on a throwaway machine; they're
-golden, deterministic, and CI-able (the `all_diagnostics_pass` test). **System /
-boot-compatibility checks** (`run_system`) are heuristic and *do* need real
-media: given a BIOS (+ optional disc) they boot a throwaway and observe video /
-TOC / the 1st-read program reaching High WRAM. Surfaced via `jupiter doctor`
-(`doctor` = feature checks; `doctor <BIOS> [disc]` adds the boot checks), an OSD
-**"Diagnostics…"** screen (feature checks), and the CI test. Grow the feature
-set as chips/games surface needs.
+Test count: **1207 workspace-wide, 0 failures** (default features; +2 with
+`--features gpu-presenter`), ~85% line coverage (`cargo llvm-cov`; excludes the
+SDL3 frontend and the FFI `physdisc` crate).
 
 ## Component status
 
-✅ complete · 🟡 partial (usable core, refinements pending) · 🔶 stub · ⬜ not started.
+Legend: ✅ complete · 🟡 partial (usable core, refinements pending) · 🔶 stub · ⬜ not started.
 
 | Component | Status |
 |-----------|--------|
@@ -43,36 +37,50 @@ set as chips/games surface needs.
 | CD-block | 🟡 HLE (SH-1 firmware undumped — HLE is the model, as in every Saturn emulator): disc image (ISO/CUE/CCD) + TOC, 200-block buffer + 24 filters/partitions, Mednafen-faithful drive-phase read pump, data transfer (FIFO + SCU-DMA), ISO9660 FS, auth, SCU external IRQ (vec 0x50). Remaining: MPEG card, move/copy ops |
 | Cartridge slot | ✅ Extension DRAM (1/4 MB), battery backup RAM, ROM carts; cart-ID at `0x04FF_FFFF`; `--cart=` flag |
 | SDL3 frontend | ✅ Window + framebuffer, audio-paced run loop, rebindable keyboard + hot-plug gamepad, save-state hotkeys, persisted config (migrated SDL2→SDL3); optional SDL_GPU/Vulkan presenter + built-in CRT shader (`gpu-presenter` feature, off by default) |
-| Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v12); media referenced not embedded, fingerprint-validated |
+| Save states | ✅ `save_state`/`load_state` (bincode + versioned header, currently v15); media referenced not embedded, fingerprint-validated |
 | Backup RAM (battery) | ✅ Internal 32 KiB, hardware odd-byte packing, persisted to `<bios>.bup` |
 | On-screen menu (OSD) | ✅ Software-composited in-window menu (ADR-0008): save/load slots, reset, disc eject/insert + image browser, Settings (Graphics/Controller/Region/Cartridge/BIOS), persisted to `jupiter.toml` |
 
-**Milestones:** M1–M12 ✅ · M13 (fidelity backlog) 📋.
-Five commercial games are **fully playable**: *Virtua Fighter 2* (60 fps, tag
-`vf2-good-emulation`), *Doukyuusei ~if~*, *Sangokushi V* (三國志V), *Panzer
-Dragoon Zwei*, and *Greatest Nine '98* — see
-[`compatible-game-titles.md`](compatible-game-titles.md).
+## Test & diagnostics infrastructure
 
-## Milestone 1 — Cycle-accurate SH-2 core ✅
+**Self-diagnostics suite:** `saturn::diagnostics` has two tiers. **Feature
+checks** (`run_all`, 16 so far across cpu / branch / memory / onchip DIVU·FRT·DMAC
+/ scu DMA / vdp2 render / scsp audio) run hermetically from reset — no BIOS, no
+disc, no toolchain — each verifying one behavior on a throwaway machine; they're
+golden, deterministic, and CI-able (the `all_diagnostics_pass` test). **System /
+boot-compatibility checks** (`run_system`) are heuristic and *do* need real
+media: given a BIOS (+ optional disc) they boot a throwaway and observe video /
+TOC / the 1st-read program reaching High WRAM. Surfaced via `jupiter doctor`
+(`doctor` = feature checks; `doctor <BIOS> [disc]` adds the boot checks), an OSD
+**"Diagnostics…"** screen (feature checks), and the CI test. Grow the feature
+set as chips/games surface needs.
+
+## Completed milestones (M1–M12) ✅
+
+All complete — summarized below for the record (commit-level history is in the
+git log). **Active work is [Milestone 13](#milestone-13--hardware-completeness--fidelity-backlog-)
+and [Performance](#performance-opt-in-fast-mode--future), further down.**
+
+### Milestone 1 — Cycle-accurate SH-2 core ✅
 
 Standalone `sh2` crate: full ISA (~142 ops), delay slots, exceptions, 5-stage
 pipeline cycle model (load-use, multiply latency, branch costs), 4 KiB 4-way
 cache, on-chip peripherals (INTC/DMAC/DIVU/FRT/WDT behavioral; BSC/SCI/UBC
 storage stubs). ROM regression harness with committed golden hashes.
 
-## Milestone 2 — Saturn bus, dual SH-2, scheduler ✅
+### Milestone 2 — Saturn bus, dual SH-2, scheduler ✅
 
 `SaturnBus` typed regions + memory-map dispatch (open bus when unmapped), the
 cache wired into live fetch/data paths, second (slave) SH-2, deterministic
 event-driven `Scheduler` + `SchedEntity`, `Saturn` aggregate.
 
-## Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2 ✅
+### Milestone 3 — SCU, SMPC, VDP2 minimal, SDL2 ✅
 
 SMPC slave hold/release; SCU registers + 3 DMA channels + interrupt aggregator;
 `scu_dsp` full VLIW DSP crate wired into the SCU host; VDP2 register bank +
 VRAM/CRAM + minimal NBG0 renderer; SDL2 frontend shell; BIOS-boot golden test.
 
-## Milestone 4 — BIOS splash on screen ✅ (2026-05-28)
+### Milestone 4 — BIOS splash on screen ✅ (2026-05-28)
 
 The real BIOS boots to the animated SEGA splash, pixel-matching MAME (golden
 `0x2C379F92CE1B63F7` at frame 200; later re-baselined by C7 to
@@ -94,7 +102,7 @@ Values tuned to a reference rather than a datasheet are tagged `REVIEW(magic)`
 (`grep -rn "REVIEW(magic)" crates`); revisit a tag only if a divergence
 implicates it.
 
-## Milestone 5 — Chip build-out: VDP1, MC68EC000, VDP2 ✅
+### Milestone 5 — Chip build-out: VDP1, MC68EC000, VDP2 ✅
 
 - **VDP1 plotter** — one textured-quad rasteriser backs polygons/sprites/lines;
   all CMDPMOD colour modes, clipping, gouraud, erase, double-buffering (FBCR),
@@ -108,14 +116,14 @@ implicates it.
   sizes), colour calc + W0/W1 windows + sprite shadow, CRAM modes, per-line
   scroll/zoom/windows, vertical cell scroll.
 
-## Milestone 6 — SCSP audio ✅
+### Milestone 6 — SCSP audio ✅
 
 Timers A/B/C + the 68k/main-CPU interrupt model (SCIEB/SCIPD/SCILV, MCIPD →
 SCU); 32-slot PCM engine (OCT/FNS phase, loop modes, interpolation); ADSR + TL
 envelope; DISDL/DIPAN mixer to 44.1 kHz stereo; SDL2 audio output; 128-step
 effect DSP (MAC, delay line, PACK/UNPACK); SMPC digital pad from the keyboard.
 
-## Milestone 7 — CD-block (HLE) + cartridge slot ✅
+### Milestone 7 — CD-block (HLE) + cartridge slot ✅
 
 **Approach: HLE** — the SH-1's CD firmware is undumped and half its job is an
 analog servo, so there is nothing to LLE against; we model the host command
@@ -134,7 +142,7 @@ MAME `saturn_cd_hle.cpp`.
 Deferred within M7: CDDA→SCSP and live discs (→ done in M10); MPEG card and
 move/copy sector ops (still open, block nothing).
 
-## Milestone 8 — Save states + battery backup RAM ✅
+### Milestone 8 — Save states + battery backup RAM ✅
 
 serde derives across the cores (feature-gated) and `saturn`;
 `save_state`/`load_state` over bincode with a magic + version header; external
@@ -144,7 +152,7 @@ hardware odd-byte packing, "BackUpRam Format" default) persisted to
 `<bios>.bup`; F5/F9 frontend hotkeys. Deferred: state migration across version
 bumps, rewind/run-ahead, compression.
 
-## Milestone 9 — Frontend OSD ✅ (2026-06-11)
+### Milestone 9 — Frontend OSD ✅ (2026-06-11)
 
 Hand-rolled, software-composited in-window menu (ADR-0008), sdl2-free +
 core-free so it's unit-tested without a window. Esc opens it: save/load slots
@@ -163,7 +171,7 @@ Basic hot-plug SDL2 GameController support (fixed Xbox-style mapping, OSD
 navigation); per-button gamepad rebind + analog devices ride with M13 E2.
 Related fix: no disc now reports `NODISC` (0x07), matching MAME.
 
-## Milestone 10 — Live physical disc + CDDA→SCSP ✅
+### Milestone 10 — Live physical disc + CDDA→SCSP ✅
 
 - **`SectorSource` trait** decouples the CD-block from the in-memory `Disc`;
   `CdBlock.disc` is `Option<Box<dyn SectorSource>>` (drops `Clone`).
@@ -176,7 +184,7 @@ Related fix: no disc now reports `NODISC` (0x07), matching MAME.
 - **`physdisc` crate** — feature-gated libcdio `SectorSource` (the sole unsafe
   crate, ADR-0009); verified booting VF2 from a real drive on `/dev/sr0`.
 
-## Milestone 11 — Boot a game to gameplay ✅ (2026-06-10, tag `vf2-good-emulation`)
+### Milestone 11 — Boot a game to gameplay ✅ (2026-06-10, tag `vf2-good-emulation`)
 
 **Virtua Fighter 2 is fully playable at a steady 60 fps** (title → menus →
 character select with CD-DA BGM → 3D fights to the K.O. screen, correct
@@ -228,17 +236,15 @@ status `is_cdrom` bit; CD-block SCU external interrupt (vector 0x50, level 7,
 `57a1066`); the **`sdbg`** interactive debugger (`crates/debugger` — see
 project conventions).
 
-## Milestone 12 — Whole-system cycle accuracy ✅ complete (2026-06-12)
+### Milestone 12 — Whole-system cycle accuracy ✅ complete (2026-06-12)
 
 Close residual whole-system timing gaps vs the LLE reference (Mednafen) so
 timing-gated behaviour matches even when code/data are byte-identical.
 
-> **BGM resolved 2026-06-06** — the BIOS CD-player BGM silence was **not** a
-> timing gap but an `m68k` decode bug (`32662f7`): `ADDA.L`/`SUBA.L Dn,An`
-> mis-decoded as ADDX/SUBX (the guard must exclude opmode `0b11`), collapsing
-> the sound driver's note-ring to 2 entries. Found by a cross-emulator
-> note-ring diff; regression `m68k/tests/ring_offset_repro.rs`. The timing
-> items below stand on their own merits.
+> **BGM resolved 2026-06-06** — the BIOS CD-player BGM silence turned out to be
+> an `m68k` decode bug, **not** a timing gap (`32662f7`), so the timing items
+> below stand on their own merits. Full case study:
+> [`debugging-playbook.md`](debugging-playbook.md) **CASE#10**.
 
 | # | Task | Status |
 |---|------|--------|
@@ -339,14 +345,17 @@ with `chdman extractcd`. The G2–G7 IDs are unchanged.)
 | G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | 🟡 **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
 | G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | 🟡 **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
 
-**Tier H — cross-chip silent-feature audit (2026-06-30).** Output of a
-six-agent oracle-diff sweep run after the Wachenröder RBG0 coefficient
-line-colour fix (`7e2341b`) — that bug was a *silent* gap (an unread register
-bit/field that renders wrong with **no panic and no log**), so this pass hunted
-the same class across every chip. Each **H1/H2** row is verified by direct code
-inspection (not merely agent-reported). None blocks the five playable titles;
-golden-safe, pulled when a game or accuracy need surfaces. Overlaps already on
-this backlog are cross-referenced, not repeated (see "Already tracked" below).
+**Tier H — cross-chip silent-feature audit (2026-06-30).** ✅ **H1, H2, and H3
+all landed — shipped in v0.18.0.** Output of a six-agent oracle-diff sweep run
+after the Wachenröder RBG0 coefficient line-colour fix (`7e2341b`) — that bug
+was a *silent* gap (an unread register bit/field that renders wrong with **no
+panic and no log**), so this pass hunted the same class across every chip. Each
+**H1/H2** row is verified by direct code inspection (not merely agent-reported).
+None blocked the five playable titles; golden-safe throughout (`bios_boot` hash
++ all five game render goldens unchanged; the two pixel-visible H3 items were
+play-test verified). Overlaps already on this backlog are cross-referenced, not
+repeated (see "Already tracked" below); the remaining `⬜ deferred` items under
+H3 are the only open Tier-H work.
 
 **H1 — confirmed correctness bugs** (small, silent, high-value; several
 contradict an existing ✅ — they are *refinements* of a tier marked done):
