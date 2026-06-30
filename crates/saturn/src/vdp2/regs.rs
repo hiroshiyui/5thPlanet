@@ -995,6 +995,17 @@ impl Vdp2Regs {
         let shift = if which == 0 { 2 } else { 10 };
         ((self.read16(0x0B4) >> shift) & 0x3) as u8
     }
+    /// KTCTL coefficient-table line-colour-screen enable (KTCTL bit 4 for
+    /// parameter A, bit 12 for B). When set, the **per-dot** line-colour CRAM
+    /// index for the rotation layer is taken from the top 7 bits (30..24) of
+    /// each coefficient word rather than the LCTA line-colour table; it replaces
+    /// the low 7 bits of the LCTA index. Mednafen `vdp2_render.cpp`:
+    /// `if(KTCTL[i] & 0x10) LB.lc[x] = (coeff >> 24) & 0x7F`. (Wachenröder's
+    /// 3D-battle floor carries a dark line-colour index here — without it the
+    /// additive colour-calc adds CRAM[0] and washes the floor white.)
+    pub fn rbg_coeff_line_colour(&self, which: usize) -> bool {
+        self.read16(0x0B4) & (1 << if which == 0 { 4 } else { 12 }) != 0
+    }
     /// RAMCTL.CRKTE (bit 15): the rotation coefficient table lives in the
     /// upper half of CRAM instead of VRAM (Mednafen `CRKTE = (V >> 15) & 1`).
     pub fn coeff_in_cram(&self) -> bool {

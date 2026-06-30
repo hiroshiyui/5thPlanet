@@ -818,6 +818,72 @@ fn rotation_coefficients_walk_per_dot_when_a_bank_is_granted() {
     );
 }
 
+#[test]
+fn rbg0_coefficient_table_supplies_the_line_colour_index() {
+    // KTCTL bit 4 (coefficient-table line-colour enable): the per-dot line-colour
+    // CRAM index comes from the top byte (bits 30..24) of each rotation
+    // coefficient word, NOT the LCTA table (Mednafen `LB.lc = (coeff>>24)&0x7F`).
+    // This was Wachenröder's 3D-battle white floor: the LCTA table was all-zero
+    // so our (then LCTA-only) line colour resolved to CRAM[0]=light-grey, and the
+    // RBG0 floor's additive colour-calc washed the scene white. The coefficient
+    // word instead carries a dark line-colour index. Regression: with a coeff
+    // line-index of 5 (green) and CRAM[0]=blue, the additive blend must produce
+    // red+green=yellow (coeff path) — never red+blue=magenta (the stale LCTA path).
+    const ONE: u32 = 1 << 16;
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data);
+    sat.bus.write16(REG_BGON, 0x0010, AccessKind::Data); // RBG0 only
+    sat.bus.write16(0x05F8_002A, 0x1200, AccessKind::Data); // CHCTLB: R0BMEN + 8bpp
+    sat.bus.write16(0x05F8_00FC, 0x0001, AccessKind::Data); // PRIR (RBG0 priority) = 1
+    // Rotation parameter table at VRAM byte 0x20000 (word 0x10000): identity.
+    sat.bus.write16(0x05F8_00BC, 0x0001, AccessKind::Data); // RPTAU → word 0x10000
+    sat.bus.write16(0x05F8_00BE, 0x0000, AccessKind::Data); // RPTAL
+    for &(k, val) in &[
+        (4u32, ONE),
+        (5, ONE),
+        (7, ONE),
+        (11, ONE),
+        (19, ONE),
+        (20, ONE),
+    ] {
+        sat.bus.vdp2.vram.write32(0x20000 + k * 4, val);
+    }
+    // KTCTL: coefficient enable (bit 0) + longword size (bit 1 = 0) + mode 0
+    // (kx & ky) + line-colour-from-coefficient (bit 4). No RDBS bank grant →
+    // per-line (non-bank-gated) coefficient read.
+    sat.bus.write16(0x05F8_00B4, 0x0011, AccessKind::Data);
+    sat.bus.write16(0x05F8_00B6, 0x0001, AccessKind::Data); // KTAOF param A = 1 → coeff @ byte 0x40000
+    // Longword coefficient @ byte 0x40000: value 1.0 (identity scale) with the
+    // line-colour index 5 packed into the top byte (0x05 << 24).
+    sat.bus.vdp2.vram.write32(0x40000, 0x0501_0000);
+    // Line-colour screen on for RBG0; LCTA table all-zero (→ index 0 = the stale
+    // path's CRAM[0]).
+    sat.bus.write16(0x05F8_00E8, 0x0010, AccessKind::Data); // LNCLEN: RBG0 (bit 4)
+    sat.bus.write16(0x05F8_00A8, 0x0000, AccessKind::Data); // LCTAU
+    sat.bus.write16(0x05F8_00AA, 0x0100, AccessKind::Data); // LCTAL: word 0x100 (clear)
+    // Additive colour calc for RBG0 (CCCTL bit 4 = R0CCEN, bit 8 = CCMD add).
+    sat.bus.write16(0x05F8_00EC, 0x0110, AccessKind::Data);
+    sat.bus.vdp2.cram.write16(0, 0x7C00); // CRAM[0] = blue  (stale LCTA path)
+    sat.bus.vdp2.cram.write16(2, 0x001F); // CRAM[1] = red   (the RBG0 dot)
+    sat.bus.vdp2.cram.write16(5 * 2, 0x03E0); // CRAM[5] = green (coeff line colour)
+    // Bitmap row 10: red dots (code 1).
+    for x in 0..16u32 {
+        sat.bus.vdp2.vram.write8(10 * 512 + x, 1);
+    }
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    sat.run_frame(&mut out);
+
+    let px = (10 * FRAME_WIDTH + 5) * 4;
+    assert_eq!(
+        &out[px..px + 4],
+        &[0xFF, 0xFF, 0, 0xFF],
+        "RBG0 red dot + coefficient line colour (green, index 5) = yellow — \
+         not red + CRAM[0] blue = magenta"
+    );
+}
+
 /// RAMCTL.CRKTE: the coefficient table reads from the upper half of CRAM.
 #[test]
 fn rotation_coefficients_read_from_cram_when_crkte() {

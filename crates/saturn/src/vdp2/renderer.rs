@@ -145,6 +145,9 @@ struct CoeffCtx {
     enabled: bool,
     one_word: bool,
     mode: u8,
+    /// KTCTL bit 4/12: the per-dot line-colour index comes from the coefficient
+    /// word's top byte (bits 30..24) instead of the LCTA table.
+    line_colour: bool,
     crkte: bool,
     per_dot: bool,
     bank_ok: [bool; 4],
@@ -168,6 +171,7 @@ impl CoeffCtx {
             enabled: r.rbg_coeff_enabled(param),
             one_word: r.rbg_coeff_size_word(param),
             mode: r.rbg_coeff_mode(param),
+            line_colour: r.rbg_coeff_line_colour(param),
             crkte,
             per_dot: crkte || bank_ok.iter().any(|&b| b),
             bank_ok,
@@ -691,9 +695,19 @@ fn render_line(
                     // extended colour calc, the 2nd/3rd-layer average.
                     let lce = vdp2.regs.line_colour_enable() & (1 << t.layer.screen_bit()) != 0;
                     let below = if lce {
-                        line_color(vdp2, y)
-                            .or_else(|| second.map(|s| s.rgb))
-                            .unwrap_or(backdrop)
+                        // KTCTL coefficient-table line colour: a rotation dot may
+                        // carry its own per-dot line-colour index (top byte of the
+                        // coefficient), which replaces the LCTA index's low 7 bits
+                        // (Mednafen `LB.lc = (coeff >> 24) & 0x7F`). Otherwise the
+                        // LCTA table supplies the whole index.
+                        let lc = match t.lc {
+                            Some(idx) => {
+                                let base = line_colour_index(vdp2, y).unwrap_or(0) & !0x7F;
+                                Some(cram(vdp2, base | idx as usize))
+                            }
+                            None => line_color(vdp2, y),
+                        };
+                        lc.or_else(|| second.map(|s| s.rgb)).unwrap_or(backdrop)
                     } else if let Some(s) = second {
                         excc_partner(vdp2, s, third, backdrop)
                     } else {
@@ -775,6 +789,10 @@ struct Dot {
     /// RGB direct-colour dot (vs paletted). Extended colour calc's RGB888 mode
     /// averages the 3rd layer only when it is RGB direct colour.
     is_rgb: bool,
+    /// Per-dot line-colour CRAM index from the rotation coefficient (KTCTL
+    /// bit 4/12). When `Some`, the compositor uses it for this layer's
+    /// line-colour partner instead of the LCTA table. Only ever set for RBG0.
+    lc: Option<u8>,
 }
 
 /// A sampled background dot before priority / colour-calc resolution: its
@@ -909,14 +927,19 @@ fn back_color(vdp2: &Vdp2, y: usize) -> (u8, u8, u8) {
 /// **Simplified model:** the line colour is used as the below-reference of an
 /// LNCLEN-enabled top layer's colour calculation, rather than Mednafen's full
 /// per-pixel multi-screen insertion pipeline. Dormant unless LNCLEN is set.
-fn line_color(vdp2: &Vdp2, y: usize) -> Option<(u8, u8, u8)> {
+/// The LCTA line-colour-screen CRAM index for screen line `y` (the raw table
+/// value, masked to 11 bits), or `None` when no layer enables line colour.
+fn line_colour_index(vdp2: &Vdp2, y: usize) -> Option<usize> {
     if vdp2.regs.line_colour_enable() == 0 {
         return None;
     }
     let (base, per_line) = vdp2.regs.line_colour_screen();
     let word_addr = if per_line { base + y as u32 } else { base };
-    let index = (vdp2.vram.read16((word_addr & 0x3FFFF) * 2) & 0x07FF) as usize;
-    Some(cram(vdp2, index))
+    Some((vdp2.vram.read16((word_addr & 0x3FFFF) * 2) & 0x07FF) as usize)
+}
+
+fn line_color(vdp2: &Vdp2, y: usize) -> Option<(u8, u8, u8)> {
+    line_colour_index(vdp2, y).map(|i| cram(vdp2, i))
 }
 
 /// The sprite layer's contribution: a normal colour dot, or an MSB shadow that
@@ -1226,6 +1249,7 @@ fn nbg_layer(
         cc,
         layer: Layer::Nbg(n as u8),
         is_rgb: s.is_rgb,
+        lc: None,
     })
 }
 
@@ -1310,7 +1334,7 @@ fn rbg_layer(
     } else {
         1
     };
-    let s = sample_rbg(vdp2, ctx, param, which, mx, my)?;
+    let (s, lc) = sample_rbg(vdp2, ctx, param, which, mx, my)?;
     let (pri, cc) = resolve_special(rc.prio, rc.cc, rc.priomode, rc.sccm, rc.sfcode, &s);
     Some(Dot {
         pri,
@@ -1318,6 +1342,7 @@ fn rbg_layer(
         cc,
         layer: Layer::Rbg(which as u8),
         is_rgb: s.is_rgb,
+        lc,
     })
 }
 
@@ -1814,6 +1839,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
                 cc: sprite_cc(vdp2, pri, 0),
                 layer: Layer::Sprite,
                 is_rgb: true,
+                lc: None,
             })
         });
     }
@@ -1846,6 +1872,7 @@ fn sample_sprite(vdp2: &Vdp2, fb: &Framebuffer, x: u32, y: u32) -> Option<Sprite
         cc: sprite_cc(vdp2, pri, ccidx),
         layer: Layer::Sprite,
         is_rgb: false,
+        lc: None,
     }))
 }
 
@@ -1861,16 +1888,24 @@ fn sample_rbg(
     layer: usize,
     x: u32,
     y: u32,
-) -> Option<Sample> {
+) -> Option<(Sample, Option<u8>)> {
     let rp = &ctx.rot[param];
     let cc = &ctx.coeff[param];
     // Coefficient table: per-dot (or per-line) kx/ky/Xp override giving
     // perspective, with bit 31 marking the dot transparent.
     let (mut kx, mut ky, mut xp) = (rp.kx, rp.ky, None);
+    // KTCTL coefficient-table line colour (bit 4/12): the per-dot line-colour
+    // CRAM index comes from the coefficient word's top byte (bits 30..24),
+    // overriding the LCTA table's low 7 bits in the compositor. `None` when the
+    // coefficient table is off or KTCTL bit 4/12 is clear.
+    let mut lc = None;
     if cc.enabled {
         let coeff = cc.read(vdp2, x, y);
         if coeff & 0x8000_0000 != 0 {
             return None;
+        }
+        if cc.line_colour {
+            lc = Some(((coeff >> 24) & 0x7F) as u8);
         }
         let mut v = (coeff & 0x00FF_FFFF) as i32;
         if v & 0x0080_0000 != 0 {
@@ -1889,11 +1924,12 @@ fn sample_rbg(
         }
     }
     let (plane_x, plane_y) = rp.transform_k(x as i32, y as i32, kx, ky, xp);
-    if ctx.rbg[layer].bitmap {
+    let s = if ctx.rbg[layer].bitmap {
         sample_rot_bitmap(vdp2, ctx, param, layer, plane_x, plane_y)
     } else {
         sample_rot_tile(vdp2, ctx, param, layer, plane_x, plane_y)
-    }
+    }?;
+    Some((s, lc))
 }
 
 fn sample_rot_bitmap(
