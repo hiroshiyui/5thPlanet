@@ -53,8 +53,10 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// presentation-only audio buffers (`Scsp::out`, `CdBlock::cd_audio` +
 /// `cd_audio_primed`) — `load_state` clears them, so they no longer bloat the
 /// snapshot. v13 added the SMPC port-2 pad state (`Smpc::pad2`) so a 2-player
-/// config reports each port's own buttons instead of mirroring player 1.
-const VERSION: u32 = 13;
+/// config reports each port's own buttons instead of mirroring player 1. v14
+/// added the CD-block FAD-search result latch (`fad_search_fad`/`_spos`/`_pnum`,
+/// the Mednafen `COMMAND_GET_FADSRCH` state read back by command 0x56).
+const VERSION: u32 = 14;
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.

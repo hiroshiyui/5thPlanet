@@ -418,6 +418,11 @@ pub struct CdBlock {
     sectlenout: u32,
     /// Result of the last Calculate Actual Data Size, in 16-bit words.
     calcsize: u32,
+    /// Last Execute-FAD-Search (0x55) result, latched for Get-FAD-Search (0x56)
+    /// to read back. Mednafen `cdb.cpp` `FADSearch` {fad, spos, pnum}.
+    fad_search_fad: u32,
+    fad_search_spos: u16,
+    fad_search_pnum: u8,
 
     // ---- read pump + data transfer (M7 phase 3) ----
     /// FAD the read pump is currently at.
@@ -611,6 +616,9 @@ impl CdBlock {
             sectlenin: 2048,
             sectlenout: 2048,
             calcsize: 0,
+            fad_search_fad: 0,
+            fad_search_spos: 0,
+            fad_search_pnum: 0,
             cd_curfad: FAD_OFFSET,
             fadstoplay: -1,
             cd_speed: 2,
@@ -2852,6 +2860,56 @@ impl CdBlock {
                 self.cr4 = 0;
                 self.hirq |= HIRQ_CMOK;
             }
+            0x55 => {
+                // Execute FAD search (Mednafen `COMMAND_EXEC_FADSRCH`,
+                // cdb.cpp:3411): in partition `pnum`, scanning from list
+                // position `offs` (0xFFFF = the last block), find the buffered
+                // sector whose FAD is the largest still <= the target FAD. The
+                // result is latched for Get-FAD-Search (0x56).
+                let offs = self.cr2;
+                let pnum = (self.cr3 >> 8) as usize;
+                let sfad = (((self.cr3 & 0xFF) as u32) << 16) | self.cr4 as u32;
+                let count = self.partitions.get(pnum).map_or(0, |p| p.blocks.len());
+                if pnum >= MAX_FILTERS || (offs != 0xFFFF && offs as usize >= count) || count == 0 {
+                    // Reject (Mednafen `CDStatusResults(true)`): CMOK only, no ESEL.
+                    self.cd_report();
+                    self.cr1 |= STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                } else {
+                    self.fad_search_spos = 0xFFFF;
+                    self.fad_search_pnum = pnum as u8;
+                    self.fad_search_fad = 0;
+                    let effoffs = if offs == 0xFFFF {
+                        count - 1
+                    } else {
+                        offs as usize
+                    };
+                    let mut matched = false;
+                    for counter in effoffs..count {
+                        let bfad = self.blocks[self.partitions[pnum].blocks[counter]].fad as u32;
+                        // `>= fad + matched` keeps the lowest position on ties
+                        // (the comparison turns strict once a match exists).
+                        if bfad <= sfad && bfad >= self.fad_search_fad + matched as u32 {
+                            self.fad_search_spos = counter as u16;
+                            self.fad_search_fad = bfad;
+                            matched = true;
+                        }
+                    }
+                    self.cd_report();
+                    self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                }
+            }
+            0x56 => {
+                // Get FAD-search results (Mednafen `COMMAND_GET_FADSRCH`,
+                // cdb.cpp:3467): latch the last 0x55 result into CR1..CR4. CR1 =
+                // the base status (no STAT_TRANS — Mednafen `MakeBaseStatus`).
+                self.cr1 = (self.status as u16) << 8;
+                self.cr2 = self.fad_search_spos;
+                self.cr3 = ((self.fad_search_pnum as u16) << 8)
+                    | ((self.fad_search_fad >> 16) & 0xFF) as u16;
+                self.cr4 = self.fad_search_fad as u16;
+                self.hirq |= HIRQ_CMOK;
+            }
             _ => {
                 // Default: most commands answer with a status report.
                 self.cd_report();
@@ -3955,6 +4013,56 @@ mod tests {
         // A sub-range (offset 1, count 1) sums just that one block.
         cmd(&mut c, 0x5200, 0x0001, 0x0100, 0x0001);
         assert_eq!(c.calcsize, 1024, "block 11 only = 2048/2 words");
+    }
+
+    // ===== FAD search (0x55 Execute / 0x56 Get) =====
+
+    #[test]
+    fn fad_search_finds_largest_fad_not_exceeding_target_then_get_returns_it() {
+        let mut c = CdBlock::new();
+        // Three buffered sectors in partition 0 with FADs 150, 200, 300.
+        for (slot, fad) in [(0usize, 150i32), (1, 200), (2, 300)] {
+            c.blocks[slot].fad = fad;
+            c.blocks[slot].size = 2048;
+        }
+        c.partitions[0].blocks = vec![0, 1, 2];
+        // Execute FAD search (0x55): partition 0 (CR3 hi), offs 0 (CR2), target
+        // FAD 250 (CR3 lo << 16 | CR4) → best is the largest FAD <= 250 = 200@pos1.
+        cmd(&mut c, 0x5500, 0x0000, 0x0000, 250);
+        assert_eq!(c.hirq & (HIRQ_CMOK | HIRQ_ESEL), HIRQ_CMOK | HIRQ_ESEL);
+        // Get FAD-search results (0x56): spos=1, pnum=0, fad=200.
+        cmd(&mut c, 0x5600, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x001C), 1, "matched list position");
+        assert_eq!(c.read16(0x0020), 0x0000, "pnum 0, FAD high byte 0");
+        assert_eq!(c.read16(0x0024), 200, "matched FAD low word");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK);
+    }
+
+    #[test]
+    fn fad_search_no_match_returns_ffff_position() {
+        let mut c = CdBlock::new();
+        c.blocks[0].fad = 500;
+        c.blocks[0].size = 2048;
+        c.partitions[0].blocks = vec![0];
+        // Target 100 is below every buffered FAD → no match: spos 0xFFFF, fad 0.
+        cmd(&mut c, 0x5500, 0x0000, 0x0000, 100);
+        cmd(&mut c, 0x5600, 0x0000, 0x0000, 0x0000);
+        assert_eq!(c.read16(0x001C), 0xFFFF, "no match");
+        assert_eq!(c.read16(0x0024), 0, "FAD reset to 0");
+    }
+
+    #[test]
+    fn fad_search_rejects_empty_partition_without_esel() {
+        let mut c = CdBlock::new(); // partition 0 empty
+        c.hirq = 0;
+        cmd(&mut c, 0x5500, 0x0000, 0x0000, 0x0000);
+        assert_eq!(
+            c.read16(0x0018) & STAT_REJECT,
+            STAT_REJECT,
+            "empty partition rejected"
+        );
+        assert_eq!(c.hirq & HIRQ_ESEL, 0, "no ESEL on reject");
+        assert_eq!(c.hirq & HIRQ_CMOK, HIRQ_CMOK, "CMOK still set on reject");
     }
 
     // ===== Get copy/move error (0x67) =====
