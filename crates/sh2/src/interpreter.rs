@@ -391,7 +391,13 @@ impl Cpu {
             // line drops; on-chip sources are edge-triggered and we just
             // cleared the bit above. The Saturn-side glue will re-raise
             // External(level) on every step while IRL is held.
-            let cost = self.take_exception(vector, Some(level), bus);
+            //
+            // SR.imask is raised to the accepted level — clamped to 15, because
+            // NMI is presented at the synthetic priority 16 (so it always
+            // outranks the 4-bit mask) but the hardware sets imask to 0xF (15)
+            // on NMI acceptance, not 0 (`16 & 0xF` would wrongly unmask
+            // everything, leaving the NMI handler fully preemptible).
+            let cost = self.take_exception(vector, Some(level.min(15)), bus);
             self.pipeline.advance(cost);
             return cost;
         }

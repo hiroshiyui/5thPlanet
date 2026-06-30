@@ -99,6 +99,25 @@ fn external_interrupt_suppressed_below_mask() {
 }
 
 #[test]
+fn nmi_raises_imask_to_15_not_zero() {
+    // NMI is presented at the synthetic priority 16 so it always outranks the
+    // 4-bit SR mask, but the hardware sets SR.imask to 0xF (15) on acceptance,
+    // NOT 0 — `16 & 0xF == 0` would leave the NMI handler fully preemptible
+    // (any VBlank/SCU interrupt could nest into it). (M13 Tier H — H1a.)
+    let (mut cpu, mut bus) = make(&[0x0009]); // NOP at reset PC
+    install_vector(&mut bus, 11, 0x0000_6500); // NMI = fixed vector 11
+    cpu.regs.sr.set_imask(3);
+    cpu.onchip.intc.raise(InterruptSource::Nmi);
+
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs.pc, 0x0000_6500,
+        "vectored through the NMI vector (11)"
+    );
+    assert_eq!(cpu.regs.sr.imask(), 15, "NMI raises SR.imask to 15, not 0");
+}
+
+#[test]
 fn nmi_dispatches_even_at_max_mask() {
     let (mut cpu, mut bus) = make(&[0x0009]);
     install_vector(&mut bus, 11, 0x0000_6500); // NMI vector is fixed at 11
