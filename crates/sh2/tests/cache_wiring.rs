@@ -246,3 +246,33 @@ fn reset_purges_and_disables_the_cache_so_the_core_refetches() {
         "reset purged the stale line; the re-fetch reads current memory"
     );
 }
+
+#[test]
+fn misaligned_cached_long_read_force_aligns_without_panicking() {
+    // A MOV.L from cache-line offset 13 (0x400D) would slice line[13..17] out
+    // of the 16-byte line and panic before the force-align fix. The SH7604
+    // force-aligns a misaligned access down to its natural boundary (Mednafen
+    // `MemRead` `A &= ~(size-1)`), here 0x400C.
+    let mut cpu;
+    let mut bus;
+    (cpu, bus) = make_cpu(&[0x6212]); // MOV.L @R1, R2
+    cpu.regs.r[1] = 0x400D; // misaligned (line offset 13)
+    bus.inner.write_u32(0x400C, 0x1122_3344); // the aligned long
+    cpu.cache.set_ccr(0x01); // enable the cache (the panicking path)
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[2], 0x1122_3344, "read force-aligned to 0x400C");
+}
+
+#[test]
+fn misaligned_cached_word_read_at_line_end_force_aligns() {
+    // A MOV.W from line offset 15 (0x400F) would index line[16] and panic; the
+    // SH7604 force-aligns to 0x400E.
+    let mut cpu;
+    let mut bus;
+    (cpu, bus) = make_cpu(&[0x6211]); // MOV.W @R1, R2
+    cpu.regs.r[1] = 0x400F; // misaligned (line offset 15)
+    bus.inner.write_u16(0x400E, 0x3344);
+    cpu.cache.set_ccr(0x01);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[2], 0x0000_3344, "read force-aligned to 0x400E");
+}

@@ -1453,6 +1453,13 @@ impl Cpu {
         kind: AccessKind,
         bus: &mut impl Bus,
     ) -> (u16, u32) {
+        // SH7604: a misaligned data access is force-aligned to its natural
+        // boundary before the transfer (Mednafen `MemRead`/`MemWrite`:
+        // `A &= ~(size - 1)`). This is also what keeps the 16-byte cache-line
+        // extract (`cache::extract_u16`) from slicing out of bounds at line
+        // offset 15. (The pending address-error exception is deliberately not
+        // raised — see the roadmap H3 SH-2 note.)
+        let addr = addr & !1;
         if addr == CCR_ADDR {
             // Some Saturn code uses MOV.W @CCR,R0; OR #CP,R0; MOV.W R0,@CCR.
             // The SH7604 mirrors the 8-bit CCR into both halves of a 16-bit read
@@ -1522,6 +1529,7 @@ impl Cpu {
         kind: AccessKind,
         bus: &mut impl Bus,
     ) -> (u32, u32) {
+        let addr = addr & !3; // force-align (see mem_read16)
         if OnChip::owns(addr) {
             let stall = if is_divu_reg(addr) {
                 self.pipeline.stall_for_divide()
@@ -1628,6 +1636,7 @@ impl Cpu {
         kind: AccessKind,
         bus: &mut impl Bus,
     ) -> u32 {
+        let addr = addr & !1; // force-align (see mem_read16)
         if addr == CCR_ADDR {
             // Counterpart to the mem_read16 mirror: the 8-bit CCR occupies the low
             // byte of the word, so a word write feeds the low byte to set_ccr (CP
