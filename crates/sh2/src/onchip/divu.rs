@@ -95,12 +95,25 @@ impl Divu {
     }
 
     /// 32-bit signed dividend (DVDNT) ÷ 32-bit signed divisor (DVSR).
+    /// Mednafen `DIVU_S32_S32` (`sh7095.inc`).
     fn divide_32(&mut self) {
         let dividend = self.dvdntl as i32;
         let divisor = self.dvsr as i32;
 
-        if divisor == 0 || (dividend == i32::MIN && divisor == -1) {
+        // Divide-by-zero is the ONLY 32/32 overflow. (`i32::MIN / -1` is NOT an
+        // overflow on the SH7604 — it's the defined result DVDNT=0x80000000,
+        // DVDNTH=0, which `wrapping_div`/`wrapping_rem` produce in the normal
+        // path below.) On overflow the high half takes the arithmetic-shifted
+        // dividend and the low half a defined saturated quotient (or, with
+        // OVFIE set, the hardware's partial result) — not the stale dividend.
+        if divisor == 0 {
             self.dvcr |= 1; // OVF
+            self.dvdnth = (dividend >> 29) as u32;
+            self.dvdntl = if self.dvcr & 2 == 0 {
+                0x7FFF_FFFFu32.wrapping_add((dividend < 0) as u32)
+            } else {
+                ((dividend as u32) << 3) | (((!dividend) >> 31) as u32 & 7)
+            };
             self.pending_latency = Some(OVERFLOW_LATENCY);
             return;
         }
@@ -113,27 +126,65 @@ impl Divu {
     }
 
     /// 64-bit signed dividend (DVDNTH:DVDNTL) ÷ 32-bit signed divisor.
+    /// Mednafen `DIVU_S64_S32` (`sh7095.inc`).
     fn divide_64(&mut self) {
-        let dividend = ((self.dvdnth as u64) << 32 | self.dvdntl as u64) as i64;
-        let divisor = (self.dvsr as i32) as i64;
+        let divisor = self.dvsr as i32;
+        let dividend = (((self.dvdnth as u64) << 32) | self.dvdntl as u64) as i64;
 
-        if divisor == 0 {
+        // Overflow if: divisor 0, the i64::MIN / -1 special, or the quotient
+        // falls outside the asymmetric [-(2^31-1), 2^31-1] — except the exact
+        // 2^31 / (negative divisor) / zero-remainder case, which is defined.
+        // Divisor 0, or the i64::MIN / -1 special, are unconditional overflows.
+        let min_over_neg1 = dividend as u64 == 1u64 << 63 && divisor as u32 == 0xFFFF_FFFF;
+        let overflow = if divisor == 0 || min_over_neg1 {
+            true
+        } else {
+            let q = dividend.wrapping_div(divisor as i64);
+            // The exact 2^31 / (negative divisor) / zero-remainder case is defined.
+            if q == 2_147_483_648 && divisor < 0 && dividend.wrapping_rem(divisor as i64) == 0 {
+                false
+            } else {
+                !(-2_147_483_647..=2_147_483_647).contains(&q)
+            }
+        };
+
+        if overflow {
             self.dvcr |= 1;
+            let tmp = divu64_partial(dividend as u64, self.dvsr);
+            self.dvdnth = (tmp >> 32) as u32;
+            self.dvdntl = if self.dvcr & 2 != 0 {
+                tmp as u32
+            } else {
+                let neg = (((dividend >> 32) as i32) ^ divisor) < 0;
+                0x7FFF_FFFFu32.wrapping_add(neg as u32)
+            };
             self.pending_latency = Some(OVERFLOW_LATENCY);
-            return;
+        } else {
+            let q = dividend.wrapping_div(divisor as i64);
+            let r = dividend.wrapping_rem(divisor as i64);
+            self.dvdntl = q as u32;
+            self.dvdnth = r as u32;
+            self.pending_latency = Some(DIVIDE_LATENCY);
         }
-        // Quotient must fit in 32 bits signed; otherwise OVF.
-        let q = dividend.wrapping_div(divisor);
-        if q > i32::MAX as i64 || q < i32::MIN as i64 {
-            self.dvcr |= 1;
-            self.pending_latency = Some(OVERFLOW_LATENCY);
-            return;
-        }
-        let r = dividend.wrapping_rem(divisor);
-        self.dvdntl = q as i32 as u32;
-        self.dvdnth = r as i32 as u32;
-        self.pending_latency = Some(DIVIDE_LATENCY);
     }
+}
+
+/// Mednafen `DIVU64_Partial` — the 3-step non-restoring division loop that
+/// yields the SH7604's defined high half (remainder) on a 64/32 overflow.
+fn divu64_partial(mut dividend: u64, divisor: u32) -> u64 {
+    let mut q = dividend >> 63 != 0;
+    let m = divisor >> 31 != 0;
+    for _ in 0..3 {
+        if q == m {
+            dividend = dividend.wrapping_sub((divisor as u64) << 32);
+        } else {
+            dividend = dividend.wrapping_add((divisor as u64) << 32);
+        }
+        q = dividend >> 63 != 0;
+        dividend <<= 1;
+        dividend |= (q ^ true ^ m) as u64;
+    }
+    dividend
 }
 
 #[cfg(test)]
@@ -161,19 +212,30 @@ mod tests {
     }
 
     #[test]
-    fn divide_by_zero_sets_overflow_flag() {
+    fn divide_by_zero_overflows_with_a_saturated_quotient() {
+        // OVFIE clear: a positive dividend saturates to +max, a negative one to
+        // +min; the high half is the arithmetic-shifted dividend (Mednafen).
         let mut d = Divu::new();
         d.write32(0x00, 0);
         d.write32(0x04, 100);
-        assert_eq!(d.dvcr & 1, 1);
+        assert_eq!(d.dvcr & 1, 1, "OVF set");
+        assert_eq!(d.dvdntl, 0x7FFF_FFFF, "saturated to +max, not the dividend");
+        assert_eq!(d.dvdnth, 100 >> 29);
+        let mut d = Divu::new();
+        d.write32(0x00, 0);
+        d.write32(0x04, (-100i32) as u32);
+        assert_eq!(d.dvdntl, 0x8000_0000, "negative dividend saturates to +min");
     }
 
     #[test]
-    fn int_min_divided_by_minus_one_overflows() {
+    fn int_min_divided_by_minus_one_is_defined_not_overflow() {
+        // The SH7604 defines DVDNT = 0x80000000, DVDNTH = 0 here (no OVF).
         let mut d = Divu::new();
         d.write32(0x00, (-1i32) as u32);
         d.write32(0x04, i32::MIN as u32);
-        assert_eq!(d.dvcr & 1, 1);
+        assert_eq!(d.dvcr & 1, 0, "not an overflow");
+        assert_eq!(d.dvdntl, 0x8000_0000);
+        assert_eq!(d.dvdnth, 0);
     }
 
     #[test]
@@ -193,6 +255,22 @@ mod tests {
         d.write32(0x10, 1);
         d.write32(0x14, 0); // 1:0 / 1 = 2^32 → overflow
         assert_eq!(d.dvcr & 1, 1);
+        // OVFIE clear: the low half saturates (not the stale dividend). The
+        // dividend high word (1) ^ divisor (1) = 0 ≥ 0 → +max.
+        assert_eq!(d.dvdntl, 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn divide_64_quotient_2pow31_with_negative_divisor_is_defined() {
+        // dividend = 2^31 * (-2) = -2^32, divisor = -2 → quotient = 2^31,
+        // remainder 0: the special non-overflow case (DVDNTL = 0x80000000).
+        let mut d = Divu::new();
+        d.write32(0x00, (-2i32) as u32); // DVSR
+        d.write32(0x10, 0xFFFF_FFFF); // DVDNTH (high)
+        d.write32(0x14, 0x0000_0000); // DVDNTL (low) → dividend = -2^32
+        assert_eq!(d.dvcr & 1, 0, "defined, not an overflow");
+        assert_eq!(d.dvdntl, 0x8000_0000, "quotient 2^31");
+        assert_eq!(d.dvdnth, 0, "zero remainder");
     }
 
     #[test]
