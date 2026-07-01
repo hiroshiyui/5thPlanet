@@ -478,6 +478,35 @@ forensic records below; append new cases at the end rather than renumbering.
   the tie); (3) **0xFF is the dropped/short-transfer signature**; (4) new fertile
   class: **CD-XA Form-2 sector sizing** (`disc::read_sector` still hard-2048).
 
+- **CASE#15: Super Robot Wars F — scenario-movie black video (RGB888 direct-colour
+  TILE unimplemented).** The Mazinger Z scenario-intro FMV played BLACK video with
+  perfect audio (Mednafen shows both). The audio-fine/video-black split classified
+  it instantly as a render/decode gap, not a movie-playback failure. The FULL NBG0
+  register dump at the movie frame was the tell: `bgon=0x0001` (NBG0 only), NBG0
+  `bitmap=0` **tile** mode, character colour `cmode=4` (**RGB888** direct colour).
+  The decoded frame WAS in VRAM (32bpp `80 BE B4 84…` pixels + a 2-word PN table;
+  char `0x3EF8×0x20` = the pixel address), so the data path worked — the render
+  didn't. Root: `sample_pattern_cell` (the tile sampler, shared by NBG and
+  rotation) only handled 4bpp/8bpp; depths 2/3/4 fell through to the 4bpp branch
+  and were looked up in a black CRAM → black. Direct colour existed only in the
+  *bitmap* path. Fix: add depth 2 (2048), 3 (RGB555), 4 (RGB888) arms mirroring
+  the bitmap decode, with the character-number stride scaled per depth (`units =
+  1/2/4/8` for 4/8/16/32-bpp — an 8×8 cell spans 0x20/0x40/0x80/0x100 bytes). An
+  oracle-reference agent confirmed the stride exactly (Mednafen `vdp2_render.cpp`
+  `cidx*(bpp>>2)`) and flagged one deferred divergence (RGB transparency: we use
+  "colour≠0" like the bitmap path, Mednafen keys on the dot MSB — harmonise both
+  paths together, no visible effect here). Regression
+  `tile_rgb888_direct_colour_renders_not_black`; goldens + 1238 tests pass; FMV
+  verified by **rendering and looking** (a sky-with-clouds frame). **Lessons:**
+  (1) audio-works/video-black ⇒ render gap, and *data-present-in-VRAM* ⇒ our
+  *decode*, not the game; (2) dump the FULL layer register set — `cmode=4` was the
+  whole answer; (3) a feature tested for bitmaps may be missing for tiles (or vice
+  versa) — new fertile class: **direct-colour TILE characters**; (4) `sdbg run
+  <N>` diverges (single `run_for` re-anchors the batch grid — it reached the wrong
+  screen), so added `SAT_SAVESTATE_AT_FRAME` to capture a *faithful* per-frame
+  state that sdbg loads (disc grafted) for full `vdp2regs`/`cram`/`render`
+  inspection; (5) render+look, never trust a pixel count for a screen ID.
+
 ---
 
 ## Boot-blocker case files
