@@ -196,7 +196,9 @@ pub enum OsdAction {
 /// core-free.
 #[derive(Clone)]
 pub struct DiagResultRow {
+    /// The check's name (category + description), shown on the row.
     pub label: String,
+    /// Whether the check passed; drives the pass/fail marker + colour.
     pub passed: bool,
 }
 
@@ -204,6 +206,7 @@ pub struct DiagResultRow {
 /// state without the OSD depending on the core.
 #[derive(Clone)]
 pub struct OsdCtx {
+    /// Whether a disc is currently inserted — gates the Eject/Insert row label.
     pub disc_present: bool,
     /// Whether each save slot already has a file on disk.
     pub slot_used: [bool; SLOTS],
