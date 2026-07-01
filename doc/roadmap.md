@@ -381,7 +381,7 @@ with `chdman extractcd`. The G2–G7 IDs are unchanged.)
 
 | # | Gap | Status |
 |---|-----|--------|
-| G2 | SCSP `SNDON` does a full 68k reset, not an un-halt | ⬜ a `SNDON`-after-running re-resets the sound driver; want a `SetExtHalted`-style gate (`scsp/mod.rs:~1589`). **Risk: the full reset is currently load-bearing for working BGM — needs a repro before touching** |
+| G2 | SCSP `SNDON` re-reset a running 68k | ✅ (`d14abd7`) — the gap was mischaracterised: the fix is **not** un-halt-vs-reset but a **`!running` guard**. Mednafen `TurnSoundCPUOn` *also* does a full `SOUND_Reset68K`, but gated `if(!SoundCPUOn)` (smpc.cpp), so a redundant SNDON is a no-op. `Scsp::start` now returns early when already running; only the first SNDON after power-on / SNDOFF reloads the vectors. Golden-safe (bios_boot + 5 game render goldens unchanged); regression `sndon_while_running_does_not_re_reset_the_68k` |
 | G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | ⬜ only timers A/B/C + MIDI pend SCIPD (`scsp/mod.rs:~580`); a driver clocked off the per-sample tick gets no tick (both MAME and ours skip it) |
 | G4 | SCSP sound-IRQ level picks one source by priority, not the OR of enabled SCILV levels | ⬜ `recompute_irq`/`decode_sci` (`scsp/mod.rs:~599`); very low impact (needs simultaneous sources at different levels) |
 | G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `BEF` status flag always 0; `CEF`-clear-on-swap nuance | 🟡 **`CEF` itself is done** (latched on draw-end, cleared at list-start); the residue is erase-on-displayed + `BEF` + MAME's extra clear-on-swap. All edge cases |
