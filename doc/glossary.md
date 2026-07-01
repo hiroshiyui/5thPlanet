@@ -605,6 +605,18 @@ slot synthesis, the SCSP-DSP, timers/interrupts, master volume, LFO, and
 slot-to-slot FM. `Saturn::take_audio` drains the mixed 44.1 kHz stereo
 each frame. See `crates/saturn/src/scsp/`.
 
+**SCIPD / MCIPD / SCILV0–2** — [SCSP] sound-interrupt registers. `SCIPD`
+is the sound-68k interrupt-pending register (write-1-to-clear): one bit per
+source — Timer A/B/C, input/output FIFO, MIDI, DMA-end, and the **one-sample**
+interrupt (bit 10, `0x400`, pended every 44.1 kHz output sample so a driver can
+clock off the sample tick). `MCIPD` is the matching *main-CPU* (SH-2)
+sound-interrupt pending register, forwarded to the [SCU]. `SCILV0/1/2` are three
+8-bit level planes; the asserted 68k IRQ level is assembled bit-by-bit from all
+three for the active source, with sources above bit 7 (Timer C bit 8, one-sample
+bit 10) **collapsing onto bit 7**'s level (a faithful Mednafen `RecalcSoundInt`
+port, `432a7a4`). Enabled via the paired `SCIEB` / `MCIEB` mask registers. See
+`crates/saturn/src/scsp/mod.rs`.
+
 **SCU** — System Control Unit. Saturn's bus bridge between the SH-2s
 and everything not on the SH-2 bus. Holds 3 DMA channels, an
 interrupt aggregator, timers, and the [SCU-DSP] — all implemented
