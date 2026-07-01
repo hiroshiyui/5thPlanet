@@ -42,6 +42,41 @@ fn sndon_releases_the_sound_cpu_which_runs_from_sound_ram() {
 }
 
 #[test]
+fn sndon_while_running_does_not_re_reset_the_68k() {
+    // G2: a redundant SNDON must NOT restart a running sound driver — matching
+    // Mednafen's `if(!SoundCPUOn) TurnSoundCPUOn()` guard. Only the first SNDON
+    // after power-on / SNDOFF reloads the 68k reset vectors.
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.bus.write32(SOUND_RAM, 0x0001_0000, AccessKind::Data); // SSP vector
+    sat.bus
+        .write32(SOUND_RAM + 4, 0x0000_2000, AccessKind::Data); // PC vector
+
+    sat.bus.scsp.start(); // first SNDON → reset loads the PC vector
+    assert!(sat.bus.scsp.running);
+    assert_eq!(
+        sat.bus.scsp.cpu.regs.pc, 0x2000,
+        "reset loaded the PC vector"
+    );
+
+    // A running 68k has advanced its PC; a redundant SNDON must leave it.
+    sat.bus.scsp.cpu.regs.pc = 0x3000;
+    sat.bus.scsp.start(); // SNDON while running → no-op
+    assert_eq!(
+        sat.bus.scsp.cpu.regs.pc, 0x3000,
+        "SNDON while running did not re-reset the 68k"
+    );
+
+    // After SNDOFF the next SNDON does reset (reloads the vector).
+    sat.bus.scsp.stop();
+    sat.bus.scsp.start();
+    assert_eq!(
+        sat.bus.scsp.cpu.regs.pc, 0x2000,
+        "SNDON after SNDOFF reloaded the PC vector"
+    );
+}
+
+#[test]
 fn sndoff_re_holds_the_sound_cpu() {
     let mut sat = Saturn::with_blank_bios();
     sat.reset();

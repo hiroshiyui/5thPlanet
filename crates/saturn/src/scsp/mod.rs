@@ -1880,7 +1880,17 @@ impl Scsp {
 
     /// Release the 68k from reset (SMPC `SNDON`): reload SSP/PC from the
     /// sound-RAM vectors and start running.
+    ///
+    /// A `SNDON` issued while the 68k is **already running is a no-op** — it must
+    /// not re-reset a running sound driver. This matches Mednafen's
+    /// `if(!SoundCPUOn) TurnSoundCPUOn()` guard (`smpc.cpp`): only the first
+    /// `SNDON` after power-on or a `SNDOFF` reloads the vectors (G2). Previously
+    /// every `SNDON` reset the 68k unconditionally, so a game that re-issued it
+    /// while running would restart its sound driver mid-playback.
     pub fn start(&mut self) {
+        if self.running {
+            return;
+        }
         {
             let Scsp { ram, ctrl, cpu, .. } = &mut *self;
             let mut bus = M68kView { ram, ctrl };
