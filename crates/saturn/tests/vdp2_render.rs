@@ -712,6 +712,79 @@ fn extended_color_calc_blends_front_over_second_third_average() {
 }
 
 #[test]
+fn line_colour_extended_cc_averages_the_line_colour_with_the_layer_below() {
+    // Line-colour extended colour calc (EXCC_LINE_CRAM0): when a
+    // line-colour-enabled top layer blends under extended colour calc AND the
+    // line-EXCC variant is selected (CCCTL bit 5), the colour-calc partner is
+    // avg(line colour, pushed-down 2nd) rather than the raw line colour — and the
+    // pushed-down 2nd is halved first when its own per-layer CC bit is set.
+    // Scene: NBG0 (front, red, ratio 31 → output == partner) over NBG1 (blue) with
+    // the line colour = green.
+    let mut sat = Saturn::with_blank_bios();
+    sat.halt_slave();
+    sat.bus.write16(REG_TVMD, 0x8000, AccessKind::Data); // low-res → EXCC eligible
+    sat.bus.write16(REG_BGON, 0x0003, AccessKind::Data); // NBG0 + NBG1
+    sat.bus.write16(REG_CHCTLA, 0x1212, AccessKind::Data); // both bitmap, 8bpp
+    sat.bus.write16(0x05F8_003C, 0x0010, AccessKind::Data); // MPOFN: NBG1 base offset 1
+    sat.bus.write16(0x05F8_00F8, 0x0203, AccessKind::Data); // PRINA: N0=3 (front), N1=2
+    sat.bus.write16(0x05F8_0108, 0x001F, AccessKind::Data); // CCRNA: N0 ratio = 31
+    // Line-colour screen on for NBG0: table word 0x100 → CRAM index 9 (green).
+    sat.bus.write16(0x05F8_00E8, 0x0001, AccessKind::Data); // LNCLEN: NBG0
+    sat.bus.write16(0x05F8_00A8, 0x0000, AccessKind::Data); // LCTAU
+    sat.bus.write16(0x05F8_00AA, 0x0100, AccessKind::Data); // LCTAL: word 0x100
+    sat.bus.vdp2.vram.write16(0x200, 9); // line-colour palette index
+    sat.bus.vdp2.cram.write16(9 * 2, 0x03E0); // CRAM[9] = green (line colour)
+    sat.bus.vdp2.cram.write16(7 * 2, 0x001F); // CRAM[7] = red  (NBG0 dot)
+    sat.bus.vdp2.cram.write16(6 * 2, 0x7C00); // CRAM[6] = blue (NBG1 dot)
+    sat.bus.vdp2.vram.write8(60 * 512 + 50, 7); // NBG0 dot = index 7
+    sat.bus.vdp2.vram.write8(0x20000 + 60 * 512 + 50, 6); // NBG1 dot = index 6
+
+    let mut out = vec![0u8; FRAMEBUFFER_BYTES];
+    let px = (60 * FRAME_WIDTH + 50) * 4;
+
+    // EXCEN off (plain line colour, no averaging): partner = line colour = green.
+    sat.bus.write16(0x05F8_00EC, 0x0003, AccessKind::Data); // CCCTL: N0 + N1 cc
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 0xFF, 0, 0xFF],
+        "EXCEN off → raw line colour (green)"
+    );
+
+    // EXCEN on but the line variant NOT selected (bit 5 clear): the pixel has
+    // LNCLEN, so it still takes the raw line colour — the non-line 3-layer
+    // average does not apply to a line-colour pixel.
+    sat.bus.write16(0x05F8_00EC, 0x0403, AccessKind::Data); // CCCTL: + EXCEN
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 0xFF, 0, 0xFF],
+        "EXCEN on, line variant off → still raw line colour"
+    );
+
+    // EXCEN + line variant (bit 5) on, and NBG1's CC bit is set → the 2nd layer
+    // (blue, 255) is halved to 127 then averaged with the line colour (green):
+    // avg((0,255,0), (0,0,127)) = (0,127,63).
+    sat.bus.write16(0x05F8_00EC, 0x0423, AccessKind::Data); // CCCTL: N0+N1 cc, EXCEN, LINE
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 127, 63, 0xFF],
+        "line-EXCC → avg(line colour, half(NBG1))"
+    );
+
+    // Same, but NBG1's CC bit clear → no halving: avg((0,255,0), (0,0,255)) =
+    // (0,127,127).
+    sat.bus.write16(0x05F8_00EC, 0x0421, AccessKind::Data); // CCCTL: N0 cc, EXCEN, LINE (no N1)
+    sat.run_frame(&mut out);
+    assert_eq!(
+        &out[px..px + 4],
+        &[0, 127, 127, 0xFF],
+        "line-EXCC, NBG1 CC off → avg(line colour, NBG1) unhalved"
+    );
+}
+
+#[test]
 fn vram_cycle_pattern_gates_a_tile_layers_character_fetch() {
     // VRAM cycle-pattern (VCP) gating: a tile-NBG character fetch from a VRAM
     // bank the CYCx table doesn't grant reads as a transparent dummy → the layer

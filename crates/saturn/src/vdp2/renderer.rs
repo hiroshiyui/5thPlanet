@@ -723,7 +723,12 @@ fn render_line(
                             }
                             None => line_color(vdp2, y),
                         };
-                        lc.or_else(|| second.map(|s| s.rgb)).unwrap_or(backdrop)
+                        // Resolve the line colour (falling back to the layer
+                        // below / backdrop when LNCLEN somehow yields no index),
+                        // then — under the line-colour EXCC variant — average it
+                        // with the pushed-down layers instead of using it raw.
+                        let lc = lc.or_else(|| second.map(|s| s.rgb)).unwrap_or(backdrop);
+                        excc_line_partner(vdp2, lc, second, third, backdrop)
                     } else if let Some(s) = second {
                         excc_partner(vdp2, s, third, backdrop)
                     } else {
@@ -1055,8 +1060,9 @@ fn apply_color_offset(vdp2: &Vdp2, top: Option<Dot>, rgb: (u8, u8, u8)) -> (u8, 
 /// blend — when the 2nd layer's own CCCTL colour-calc-enable bit is set. In
 /// RGB888 CRAM mode the average is taken only when the 3rd layer is RGB direct
 /// colour (the back screen counts as RGB). Mirrors Mednafen's non-line
-/// `MIXIT_SPECIAL_EXCC_CRAM0`/`CRAM12` branch (`vdp2_render.cpp:2537-2550`); the
-/// line-colour and gradient EXCC variants are deferred.
+/// `MIXIT_SPECIAL_EXCC_CRAM0`/`CRAM12` branch (`vdp2_render.cpp:2537-2550`). The
+/// line-colour EXCC variant is [`excc_line_partner`]; the gradient variant is
+/// deferred.
 fn excc_partner(
     vdp2: &Vdp2,
     second: Dot,
@@ -1078,6 +1084,66 @@ fn excc_partner(
         return second.rgb;
     }
     avg_rgb(second.rgb, third_rgb)
+}
+
+/// The colour-calc partner for a front layer whose line-colour screen is
+/// enabled (LNCLEN selects it), under **extended colour calculation**. Without
+/// EXCC the partner is simply the line colour `lc` (the caller's default). Under
+/// the line-colour EXCC variant (CCCTL bit 5, [`Vdp2Regs::extended_color_calc_line`]),
+/// Mednafen inserts the line colour as the immediate blend partner and pushes
+/// the old 2nd/3rd layers down one rank, then averages the line colour with that
+/// pushed-down stack. Mirrors the `MIXIT_SPECIAL_EXCC_LINE_CRAM0`/`CRAM12`
+/// branch (`vdp2_render.cpp:2506-2533`).
+///
+/// Stack mapping (Mednafen → ours): pix2 (line colour) = `lc`, pix3 (old 2nd
+/// layer) = `second`, pix4 (old 3rd layer) = `third`. When nothing sits below
+/// the top layer the pushed-down slot is the back screen (RGB, no per-layer CC).
+fn excc_line_partner(
+    vdp2: &Vdp2,
+    lc: (u8, u8, u8),
+    second: Option<Dot>,
+    third: Option<Dot>,
+    backdrop: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    if !vdp2.regs.extended_color_calc_active() || !vdp2.regs.extended_color_calc_line() {
+        return lc;
+    }
+    // pix3 = the old 2nd layer, or the back pixel when nothing is below the top.
+    let (below_rgb, below_is_rgb, below_cc) = match second {
+        Some(s) => (
+            s.rgb,
+            s.is_rgb,
+            vdp2.regs.ccctl() & (1 << s.layer.cc_ctl_bit()) != 0,
+        ),
+        None => (backdrop, true, false),
+    };
+    if vdp2.regs.cram_mode() >= 2 {
+        // EXCC_LINE_CRAM12: average only when the pushed-down 2nd is RGB direct
+        // colour. Its own partner (the original 3rd = pix4) folds in first when
+        // the pushed-down layer's CC bit is set and both are RGB.
+        if !below_is_rgb {
+            return lc;
+        }
+        let mid = match third {
+            Some(t) if below_cc && t.is_rgb => avg_rgb(below_rgb, t.rgb),
+            _ => below_rgb,
+        };
+        avg_rgb(lc, mid)
+    } else {
+        // EXCC_LINE_CRAM0: the pushed-down 2nd is halved before averaging when
+        // its own per-layer CC bit is set (`third_rgb = (third_rgb >> 1) & 0x7F7F7F`).
+        let mid = if below_cc {
+            half_rgb(below_rgb)
+        } else {
+            below_rgb
+        };
+        avg_rgb(lc, mid)
+    }
+}
+
+/// Per-channel halve of an RGB colour (Mednafen `(rgb >> 1) & 0x7F7F7F`).
+fn half_rgb(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    (c.0 >> 1, c.1 >> 1, c.2 >> 1)
 }
 
 /// Per-channel rounding-down average of two RGB colours, matching Mednafen's

@@ -801,6 +801,16 @@ impl Vdp2Regs {
         let gradient = ccctl & 0x8000 != 0 && self.cram_mode() == 0;
         !gradient && ccctl & 0x0400 != 0
     }
+    /// Whether the **line-colour** extended-colour-calc variant is selected
+    /// (CCCTL bit 5, `MIXIT_SPECIAL_EXCC_LINE_CRAM0/12`): when a
+    /// line-colour-enabled top layer blends under extended colour calc, the line
+    /// colour is inserted as the immediate colour-calc partner and averaged with
+    /// the pushed-down layer below it, rather than replacing the partner outright.
+    /// Mednafen `:3140` (`special += (CCCTL >> 4) & 0x2`). Meaningful only while
+    /// [`Self::extended_color_calc_active`] is also true.
+    pub fn extended_color_calc_line(&self) -> bool {
+        self.ccctl() & 0x20 != 0
+    }
     /// Colour-calc ratio (0..31) for NBG`n`: CCRNA (0x108) holds N0/N1,
     /// CCRNB (0x10A) holds N2/N3, low/high 5-bit fields.
     pub fn nbg_color_calc_ratio(&self, n: usize) -> u8 {
