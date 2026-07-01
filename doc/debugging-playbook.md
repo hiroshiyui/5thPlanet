@@ -493,9 +493,11 @@ forensic records below; append new cases at the end rather than renumbering.
   the bitmap decode, with the character-number stride scaled per depth (`units =
   1/2/4/8` for 4/8/16/32-bpp — an 8×8 cell spans 0x20/0x40/0x80/0x100 bytes). An
   oracle-reference agent confirmed the stride exactly (Mednafen `vdp2_render.cpp`
-  `cidx*(bpp>>2)`) and flagged one deferred divergence (RGB transparency: we use
-  "colour≠0" like the bitmap path, Mednafen keys on the dot MSB — harmonise both
-  paths together, no visible effect here). Regression
+  `cidx*(bpp>>2)`) and flagged the RGB transparency test — since fixed (a
+  follow-up commit): direct-colour opacity keys on the dot MSB (bit31/bit15) not
+  "colour≠0", with TPON forcing opaque, applied to all three direct-colour sites
+  (NBG bitmap, NBG/RBG tile, and the easy-to-miss separate `sample_rot_bitmap`);
+  six tests that used artificial MSB=0 dots were corrected. Regression
   `tile_rgb888_direct_colour_renders_not_black`; goldens + 1238 tests pass; FMV
   verified by **rendering and looking** (a sky-with-clouds frame). **Lessons:**
   (1) audio-works/video-black ⇒ render gap, and *data-present-in-VRAM* ⇒ our
