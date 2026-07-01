@@ -52,6 +52,11 @@ cd "$ROOT"
 # --- knobs (env-overridable) ---------------------------------------------
 BIOS="${PGO_BIOS:-bios/Sega Saturn BIOS v1.01 (JAP).bin}"   # training BIOS
 FRAMES="${PGO_FRAMES:-3000}"           # frames per boot-training disc (~50 s)
+# Extra cargo features for the SHIPPING binary only (not training — the
+# gpu-presenter/CRT path is presentation, never a hot path, so it's absent from
+# the profile by design; -pgo-warn-missing-function=0 already covers that).
+# e.g. PGO_SHIP_FEATURES=gpu-presenter
+SHIP_FEATURES="${PGO_SHIP_FEATURES:-}"
 PROFRAW_DIR="$ROOT/target/pgo/profraw-release"
 PROFDATA="$ROOT/target/pgo/release.profdata"
 SYSROOT="$(rustc --print sysroot)"
@@ -114,7 +119,9 @@ ls -lh "$PROFDATA" | awk '{print "   profdata: "$5}'
 # --- 4. build the shipping (SDL) binary with the profile -----------------
 note "[4/5] building shipping jupiter (-Cprofile-use) ..."
 USE_FLAGS="-Cprofile-use=$PROFDATA -Cllvm-args=-pgo-warn-missing-function=0"
-RUSTFLAGS="$USE_FLAGS" cargo build --release -p jupiter
+FEATURE_ARGS=()
+[ -n "$SHIP_FEATURES" ] && { FEATURE_ARGS=(--features "$SHIP_FEATURES"); note "  features: $SHIP_FEATURES"; }
+RUSTFLAGS="$USE_FLAGS" cargo build --release -p jupiter "${FEATURE_ARGS[@]}"
 note "  shipping binary: target/release/jupiter (PGO)"
 
 # --- 5. accuracy gates (build soundness) ---------------------------------
