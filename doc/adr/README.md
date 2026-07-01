@@ -66,6 +66,7 @@ We use Michael Nygard's lightweight format — see
 | [0025](0025-scu-dma-no-cpu-halt.md) | The SCU DMA halts neither SH-2 (synchronous copy at the trigger) | Accepted |
 | [0026](0026-cores-are-no-std-libraries.md) | Processor cores are `no_std`, library-shaped, dependency-free | Accepted |
 | [0027](0027-golden-fingerprint-regression-guards.md) | Regression correctness pinned to deterministic golden fingerprints | Accepted |
+| [0028](0028-backup-cartridge-virtual-cards.md) | Backup-RAM cartridge as multiple virtual memory cards (OSD-managed `.crtbup` files) | Accepted |
 
 ### Decisions worth recording (backlog)
 
