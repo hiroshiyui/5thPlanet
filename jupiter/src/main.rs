@@ -1815,7 +1815,9 @@ fn run(
             // Normalize an SDL axis to the Saturn 3D-pad byte: a centered stick
             // (i16 −32768..32767) → 0x00 (min) .. 0x80 (center) .. 0xFF (max); a
             // one-sided trigger (0..32767) → 0x00 (released) .. 0xFF (pressed).
-            let norm_stick = |v: i16| (((v as i32) + 32768) * 255 / 65535) as u8;
+            // The stick maps 0 exactly onto 0x80 (the `analog::NEUTRAL` center)
+            // rather than 0x7F, so a resting pad matches the neutral default.
+            let norm_stick = |v: i16| (128 + (v as i32) * 128 / 32768).clamp(0, 255) as u8;
             let norm_trig = |v: i16| ((v.max(0) as i32) * 255 / 32767) as u8;
             {
                 use sdl3::gamepad::Axis;

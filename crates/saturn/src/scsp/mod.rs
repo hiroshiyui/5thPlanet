@@ -682,10 +682,10 @@ impl ScspCtrl {
         }
         // The one-sample interrupt (bit 10) pends on both SCIPD and MCIPD every
         // output sample (Mednafen `SCIPD |= 0x400; MCIPD |= 0x400;`, scsp.inc),
-        // letting a sound driver clock off the 44.1 kHz sample tick (G3). Any
-        // elapsed sample re-pends it — inert unless SCIEB/MCIEB bit 10 is
-        // enabled. Delivery is per-batch here (our sample tick is batched), like
-        // the timer sources above; the IRQ lines are recomputed once at the end.
+        // letting a sound driver clock off the 44.1 kHz sample tick (G3). The
+        // caller drives one `tick_timers(1)` per output sample, so this pends
+        // once per sample — inert unless SCIEB/MCIEB bit 10 is enabled. The IRQ
+        // lines are recomputed at the end, like the timer sources above.
         self.store16(SCIPD, self.read16(SCIPD) | INT_ONE_SAMPLE);
         self.store16(MCIPD, self.read16(MCIPD) | INT_ONE_SAMPLE);
         self.recompute_irq();
