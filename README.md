@@ -56,9 +56,35 @@ Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md), and
 the per-title compatibility list in
 [`doc/compatible-game-titles.md`](doc/compatible-game-titles.md).
 
+## Screenshots
+
+A few frames from the emulator running commercial games on the real-BIOS LLE
+path. The full set — including the optional CRT shader and the in-window menu —
+is in [`doc/screenshots/`](doc/screenshots).
+
+<p align="center">
+  <img src="doc/screenshots/vf2-fight.png" alt="Virtua Fighter 2 — in-match 3D fight (Akira, Round 1)" width="600"><br>
+  <em>Virtua Fighter 2 — a 3D fight at a steady 60 fps.</em>
+</p>
+
+| ![Panzer Dragoon Zwei — in-game 3D rail-shooting](doc/screenshots/panzer-game.png) | ![Greatest Nine '98 — in-game 3D baseball](doc/screenshots/gn98-game.png) |
+| :---: | :---: |
+| ***Panzer Dragoon Zwei*** — 3D rail-shooting at 704×448. | ***Greatest Nine '98*** — 3D baseball at 704×480 interlaced. |
+| ![Sangokushi V — in-game strategy screen](doc/screenshots/sangokushi-strategy.png) | ![Doukyuusei ~if~ — overworld town map](doc/screenshots/doukyuusei-town.png) |
+| **Sangokushi V** (三國志V) — the in-game strategy map. | ***Doukyuusei ~if~*** — the town overworld at 640×224. |
+
+The screenshots show SEGA's and other rights holders' copyrighted material and
+are included solely to document the emulator's output — see
+[Trademarks & copyrights](#trademarks--copyrights).
+
+<details>
+<summary>BIOS boot splash (M4)</summary>
+
 | USA BIOS | Japanese BIOS (v1.01) |
 | --- | --- |
 | ![USA BIOS splash](doc/screenshots/bios-splash-usa.png) | ![Japanese v1.01 BIOS splash](doc/screenshots/bios-splash-jp.png) |
+
+</details>
 
 ## Quick start
 
