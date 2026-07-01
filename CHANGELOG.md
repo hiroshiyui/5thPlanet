@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The M13 **Tier E (input hardware)** and **Tier G (residual reference-audit)**
+work landed since 0.18.0. Tier E broadens controller support; Tier G is a set of
+golden-safe fidelity fixes to the SCSP interrupts and the VDP status flags. The
+`bios_boot` golden `0x0B1BA6E5180766F7` and all five game render goldens are
+unchanged.
+
+**Savestate format bumped 15 → 16** (the 3D Control Pad's analog axes); states
+written by 0.18.x are rejected on load.
+
+### Added
+
+- **Per-port controller-input assignment** (Tier E-1) — each Saturn port is
+  assigned a device (keyboard, a specific game controller by identity, or the
+  Shuttle Mouse) from the OSD Controller screen; config keys `port1`/`port2`
+  fold in the legacy `mouse` setting.
+- **Analog 3D Control Pad** (Tier E-2a/E-2b) — emulated (INTBACK ID `0x16`, stick
+  + analog L/R triggers, oracle-faithful) and host-wired: assign a controller as
+  a 3D pad to feed its stick and triggers.
+- **Per-button gamepad rebinding** (Tier E-2d) — press-to-bind the gamepad map
+  from the OSD (*Controller → Gamepad Buttons…*); config `gpad_*` SDL tokens.
+- **SCSP one-sample interrupt** (Tier G3) — SCIPD/MCIPD bit 10 pends every
+  44.1 kHz output sample, letting a sound driver clock off the sample tick.
+
+### Changed
+
+- **SCSP sound-IRQ level assembled from all three SCILV planes** (Tier G4) — a
+  faithful `RecalcSoundInt` port; sources above bit 7 (Timer C, one-sample)
+  collapse onto bit 7's level (fixing a latent Timer C = level 0 bug).
+
+### Fixed
+
+- **SMPC `SNDON` on an already-running sound 68k is a no-op** (Tier G2) — a
+  redundant SNDON no longer re-resets the running sound CPU.
+- **VDP1 `EDSR.BEF` status flag at the frame swap** (Tier G5) — `EDSR >>= 1`
+  moves the finished draw's CEF to the now-displayed buffer's BEF; BEF was
+  previously hard-wired 0.
+- **VDP2 `TVSTAT.ODD` field flag** (Tier G6) — constant 1 in a progressive mode,
+  toggling per field only in an interlaced mode (was toggling unconditionally).
+
 ## [0.18.0] - 2026-06-30
 
 The **M13 Tier H cross-chip silent-feature audit** lands: a systematic sweep
