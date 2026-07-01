@@ -42,6 +42,14 @@ pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
 /// Offset of the data-transfer FIFO within the region.
 const DATA_FIFO: u32 = 0x8000;
 
+/// Byte offset of the user payload inside a raw 2352-byte Mode-2 sector:
+/// 12 sync + 4 header + 8 subheader.
+const MODE2_USER_OFFSET: usize = 24;
+/// User-payload length of a Mode-2 **Form-2** sector (`submode` bit 5 set): the
+/// EDC/ECC area shrinks to a single 4-byte EDC, so the payload grows from the
+/// Form-1 2048 to 2324 (`2352 - 12 sync - 4 header - 8 subheader - 4 EDC`).
+const FORM2_USER_LEN: usize = 2324;
+
 // HIRQ status bits (cs2.c).
 const HIRQ_CMOK: u16 = 0x0001; // command dispatch OK / ready for next
 const HIRQ_DRDY: u16 = 0x0002; // data transfer ready
@@ -1025,31 +1033,52 @@ impl CdBlock {
         if self.cd_device_filter == NO_FILTER || self.buf_full {
             return false;
         }
-        let len = self.sectlenin as usize;
         let (data, sub) = {
             let Some(disc) = self.disc.as_ref() else {
                 return false;
             };
+            let sub = disc.subheader(fad);
+            // A Mode-2 **Form-2** sector (subheader `submode` bit 5) carries a
+            // 2324-byte user payload, not 2048. With the host sector length at
+            // 2048, the CD block still transfers the full 2324 bytes for a
+            // Form-2 sector — Mednafen `cdb.cpp` sizes `GetSecLen==SECLEN_2048`
+            // + Mode-2 Form-2 as 1162 words (2324) at word offset 12 (byte 24).
+            // Delivering only 2048 drops 276 bytes/sector and misframes a stream
+            // strided on 2324-byte blocks (Super Robot Wars F streams Form-2
+            // XA-ADPCM audio through the data port + SCU-DMA and software-decodes
+            // it; the 276-byte drift fed its ADPCM decoder a stray control byte
+            // → a runaway IIR filter → a loud saturating buzz).
+            let form2 = matches!(sub, Some((_, _, subm, _)) if subm & 0x20 != 0);
             let mut buf = [0u8; 2352];
-            // Store `sectlenin` bytes: the 2048 user payload for the common
-            // case, else a leading slice of the full on-disc sector.
-            let data = if len == 2048 {
-                if !disc.read_sector(fad, &mut buf[..2048]) {
-                    return false;
+            // Store the sector's payload: the 2324-byte Form-2 user data, else
+            // the 2048 user payload (`sectlenin==2048`, the common case), else a
+            // leading slice of the full on-disc sector.
+            let data = if self.sectlenin == 2048 {
+                if form2 {
+                    let n = disc.read_full_sector(fad, &mut buf);
+                    if n < MODE2_USER_OFFSET + FORM2_USER_LEN {
+                        return false;
+                    }
+                    buf[MODE2_USER_OFFSET..MODE2_USER_OFFSET + FORM2_USER_LEN].to_vec()
+                } else {
+                    if !disc.read_sector(fad, &mut buf[..2048]) {
+                        return false;
+                    }
+                    buf[..2048].to_vec()
                 }
-                buf[..2048].to_vec()
             } else {
+                let len = self.sectlenin as usize;
                 let n = disc.read_full_sector(fad, &mut buf);
                 if n == 0 {
                     return false;
                 }
                 buf[..len.min(n)].to_vec()
             };
-            (data, disc.subheader(fad))
+            (data, sub)
         };
         let (chan, fnum, subm, cinf) = sub.unwrap_or((0, 0, 0, 0));
         self.curblock = Block {
-            size: len as i32,
+            size: data.len() as i32,
             fad: fad as i32,
             data,
             chan,
@@ -1126,6 +1155,10 @@ impl CdBlock {
             return false;
         };
         self.blocks[b].fad = self.curblock.fad;
+        // Adopt the working sector's actual byte count (`alloc_block` seeded it
+        // with `sectlenin`); a Form-2 sector delivers 2324, not 2048, and the
+        // data-port transfer paces on `block.size`.
+        self.blocks[b].size = self.curblock.size;
         self.blocks[b].data = self.curblock.data.clone();
         self.blocks[b].chan = self.curblock.chan;
         self.blocks[b].fnum = self.curblock.fnum;
@@ -3209,6 +3242,75 @@ mod tests {
     fn take_cd_audio_pads_with_silence_when_empty() {
         let mut c = CdBlock::new();
         assert_eq!(c.take_cd_audio(8), vec![0i16; 8]);
+    }
+
+    /// A 2-sector `MODE2/2352` disc: sector 0 is CD-XA **Form-2** (subheader
+    /// `submode` bit 5 set), sector 1 is **Form-1**. Each user payload is a byte
+    /// ramp starting at raw offset 24, so a delivered block can be checked for
+    /// both length and content.
+    fn mode2_form_disc() -> Disc {
+        let mut bin = vec![0u8; 2352 * 2];
+        for (s, form2) in [(0usize, true), (1usize, false)] {
+            let base = s * 2352;
+            // 12-byte sync + 4-byte header; the mode byte (offset 15) = 2 is what
+            // `Disc::subheader` keys on.
+            bin[base + 1..base + 11].fill(0xFF);
+            bin[base + 15] = 2;
+            // 8-byte subheader (offset 16): file, channel, submode(18), coding,
+            // then the duplicate. Form-2 sets submode bit 5 (0x20); use SRW F's
+            // observed AUDIO|FORM2|RT = 0x64, and DATA-only 0x08 for Form-1.
+            let submode = if form2 { 0x64 } else { 0x08 };
+            bin[base + 18] = submode;
+            bin[base + 22] = submode;
+            // User payload from raw offset 24: a ramp (marks index 2300, which
+            // only exists in the 2324-byte Form-2 window, not a 2048 one).
+            for i in 0..FORM2_USER_LEN {
+                bin[base + MODE2_USER_OFFSET + i] = (i as u8).wrapping_add(s as u8);
+            }
+        }
+        Disc::from_cue(
+            "FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("mode2 cue")
+    }
+
+    /// Regression: a Mode-2 **Form-2** sector is delivered as its full 2324-byte
+    /// user payload (not truncated to the Form-1 2048), while a Form-1 sector
+    /// still yields 2048. Truncating Form-2 to 2048 misframed Super Robot Wars
+    /// F's 2324-strided XA-ADPCM stream → runaway software decoder → a buzz.
+    #[test]
+    fn form2_sector_delivers_2324_bytes_form1_stays_2048() {
+        let mut c = CdBlock::new();
+        c.insert_disc(mode2_form_disc());
+        // Route every sector through the default filter (matches all) to
+        // partition 0; the host sector length is the 2048 default.
+        c.cd_device_filter = 0;
+        assert_eq!(c.sectlenin, 2048);
+
+        // Form-2 sector at FAD 150 → 2324 bytes = raw[24..2348].
+        assert!(c.read_filtered_sector(FAD_OFFSET));
+        let b2 = c.partitions[0].blocks[0];
+        assert_eq!(
+            c.blocks[b2].size, FORM2_USER_LEN as i32,
+            "Form-2 sector delivers the full 2324-byte payload"
+        );
+        assert_eq!(c.blocks[b2].data.len(), FORM2_USER_LEN);
+        assert_eq!(c.blocks[b2].data[0], 0, "payload starts at raw offset 24");
+        assert_eq!(
+            c.blocks[b2].data[2300], 2300usize as u8,
+            "the 2324-window carries bytes past the Form-1 2048 boundary"
+        );
+
+        // Form-1 sector at FAD 151 → the unchanged 2048-byte user payload.
+        assert!(c.read_filtered_sector(FAD_OFFSET + 1));
+        let b1 = c.partitions[0].blocks[1];
+        assert_eq!(c.blocks[b1].size, 2048, "Form-1 sector stays 2048 bytes");
+        assert_eq!(c.blocks[b1].data.len(), 2048);
+        assert_eq!(
+            c.blocks[b1].data[0], 1,
+            "Form-1 payload ramp (sector tag 1)"
+        );
     }
 
     /// Demonstration (manual): our CD-block decodes the REAL Doukyuusei disc's
