@@ -3381,6 +3381,20 @@ fn run(
     let mut last_pc = u32::MAX;
     let mut dump_dims = (FRAME_WIDTH, FRAME_HEIGHT);
     let mut audio_dump = WavDump::from_env("SAT_AUDIO_DUMP");
+    // Observer-only: `SAT_SRAM_DUMP_FRAME=N SAT_SRAM_DUMP_ADDR=0xOFF [SAT_SRAM_DUMP_LEN=0x40]`
+    // hex-dumps a window of SCSP sound RAM (byte offset within the 512 KiB) at the
+    // end of the given frame, interpreting the words as i16 PCM. Read-only.
+    let sram_dump_frame: Option<u32> = std::env::var("SAT_SRAM_DUMP_FRAME")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let sram_dump_addr: u32 = std::env::var("SAT_SRAM_DUMP_ADDR")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x7C000);
+    let sram_dump_len: u32 = std::env::var("SAT_SRAM_DUMP_LEN")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x40);
     for f in 0..headless_frames {
         apply_scripted_pad(&mut saturn, f);
         if cache_purge {
@@ -3455,6 +3469,55 @@ fn run(
                 eprintln!("frame {f:4} master PC=0x{pc:08X}");
                 last_pc = pc;
             }
+        }
+        if sram_dump_frame == Some(f) {
+            let ram = saturn.bus.scsp.ram.as_slice();
+            let mut nonzero = 0usize;
+            // Stats over the full requested window (may be large; rows suppressed
+            // when SAT_SRAM_DUMP_ROWS=0).
+            let mut maxabs = 0i32;
+            let mut maxdelta = 0i32;
+            let mut prev = 0i32;
+            let mut w = 0u32;
+            while w < sram_dump_len / 2 {
+                let base = (sram_dump_addr + w * 2) as usize;
+                let b0 = *ram.get(base).unwrap_or(&0);
+                let b1 = *ram.get(base + 1).unwrap_or(&0);
+                let s = i16::from_be_bytes([b0, b1]) as i32;
+                maxabs = maxabs.max(s.abs());
+                if w > 0 {
+                    maxdelta = maxdelta.max((s - prev).abs());
+                }
+                prev = s;
+                w += 1;
+            }
+            let show_rows = std::env::var("SAT_SRAM_DUMP_ROWS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(u32::MAX);
+            eprintln!(
+                "SRAM DUMP f={f} off=0x{sram_dump_addr:05X} len=0x{sram_dump_len:X}: maxabs={maxabs} max_sample_delta={maxdelta}"
+            );
+            let mut off = 0u32;
+            while off < sram_dump_len && (off / 16) < show_rows {
+                let base = (sram_dump_addr + off) as usize;
+                let mut bytes = String::new();
+                let mut words = String::new();
+                for w in 0..8u32 {
+                    let b0 = *ram.get(base + (w * 2) as usize).unwrap_or(&0);
+                    let b1 = *ram.get(base + (w * 2 + 1) as usize).unwrap_or(&0);
+                    // sound RAM is big-endian 16-bit
+                    let s = i16::from_be_bytes([b0, b1]);
+                    if s != 0 {
+                        nonzero += 1;
+                    }
+                    bytes.push_str(&format!("{b0:02X}{b1:02X} "));
+                    words.push_str(&format!("{s:6} "));
+                }
+                eprintln!("  {:05X}: {bytes}| {words}", sram_dump_addr + off);
+                off += 16;
+            }
+            eprintln!("  (nonzero i16 words in window: {nonzero})");
         }
     }
     if std::env::var_os("SAT_REGWATCH").is_some() {
