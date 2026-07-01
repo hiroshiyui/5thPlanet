@@ -7,8 +7,8 @@ developer must supply their own legally-obtained dump.
 
 ## Expected filenames
 
-When the frontend wires up BIOS loading (M2), it will probe `bios/` for
-these names (matching the common preservation-community naming):
+The frontend autodetects a BIOS by probing `bios/` for these names (matching
+the common preservation-community naming) when none is passed on the CLI:
 
 | Filename                              | Region | Notes                       |
 | ------------------------------------- | ------ | --------------------------- |

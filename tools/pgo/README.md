@@ -1,10 +1,12 @@
 # PGO experiment — SH-2 interpreter
 
-`run_pgo.sh` measures whether **Profile-Guided Optimization** buys any
-bit-identical single-core speedup on the interpreter hot path. It is the
-roadmap's P4 lever and the one interpreter micro-opt not yet measured-out (the
-decode-LUT fixed-array and fat LTO were both measured as noise — see
-`doc/roadmap.md` "Interpreter micro-opt investigation").
+`run_pgo.sh` measures the A/B speedup **Profile-Guided Optimization** buys on
+the interpreter hot path — the one sanctioned, build-time-only, bit-identical
+single-core lever ([ADR-0024](../../doc/adr/0024-pgo-sanctioned-performance-lever.md)).
+It is a **measured win** (≈+30–56%, and it generalises to held-out games), by far
+the biggest source-free lever; the decode-LUT fixed-array and fat LTO were both
+measured as noise (see `doc/roadmap.md` "Interpreter micro-opt investigation").
+`build_release.sh` (below) is the adoption recipe.
 
 ## Why PGO (and why it's charter-safe)
 
