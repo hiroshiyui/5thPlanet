@@ -7,16 +7,15 @@
 //! it; standing this crate up parallel to `sh2` keeps that future work
 //! a wire-up exercise rather than a redesign.
 //!
-//! # M3 scope
+//! # Status
 //!
-//! M3 implements the *standalone* forms of the operation classes the
-//! SCU manual lists first: NOP / ALU ops on ACL + MD0 / MVI / END /
-//! ENDI / unconditional + flag-tested JMP. The DSP's real VLIW
-//! parallel-issue (ALU + bus + multiplier + jump in one 32-bit word)
-//! is deliberately *not* modeled yet — the decoder reads only the ALU
-//! slot for class-00 words. As VDP1 and 3D games show specific
-//! microcode shapes the project needs, extend the decoder to emit
-//! all four slots and have `Dsp::step` retire them together.
+//! The DSP core is complete: the operation word's full VLIW
+//! parallel-issue — ALU + X-bus + Y-bus + D1-bus executing in hardware
+//! order within one instruction (`interpreter::exec_operation`), feeding
+//! the vector multiplier — plus MVI / DMA / LOOP / END / ENDI and
+//! unconditional + flag-tested JMP. (An earlier milestone modeled only
+//! the standalone ALU slot for class-00 words; the parallel slots landed
+//! with the full operation word.)
 //!
 //! # Layout
 //!
@@ -30,9 +29,8 @@
 //! "start" bit; `Dsp::run_until_stopped` runs the program to its `END`
 //! or `ENDI` instruction; if `ENDI`, the host sees
 //! `end_interrupt_pending` and forwards the DSP-end source to the SCU
-//! INTC. That host-side glue is deferred to a later milestone (when a
-//! target microcode program surfaces); this crate stands alone in the
-//! interim.
+//! INTC. That host glue is wired (`Saturn::drain_scu_dsp`); the crate
+//! still builds and tests standalone.
 //!
 //! Optional `serde` feature (off by default): derives `Serialize`/
 //! `Deserialize` on the DSP state (`Dsp`, registers, program + data RAM) for
