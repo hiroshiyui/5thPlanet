@@ -371,24 +371,26 @@ The deliberate, *do-not-regress* divergences from MAME/Yabause those audits
 recorded now live in [`system-architecture.md`](system-architecture.md) §9,
 Part C.1.
 
-**Triage (updated 2026-07-01):** **G2, G3, G4 are ✅ done** (2026-07-01 SCSP
-audit — all three were oracle-diffed against Mednafen, which decided each: G2 was
-a mischaracterised guard, G3's "oracle skips it too" premise was wrong, and G4
-fell out of G3's `RecalcSoundInt` port; all golden-safe). The remaining **G5–G7
-are rendering/timing residues** (VDP1 erase/BEF, VDP2 VBLANK-clear phase, SCU
-Timer0 HCNT) — lower audio exposure; **G6 still carries golden-risk** (the current
-1-line VBLANK phase is load-bearing) — fix only with a repro. (G1, CHD disc
-images, was implemented in v0.8.0 and **removed** after v0.9.0 — the `chd`
-dependency wasn't worth it; convert `.chd` → CUE-BIN with `chdman extractcd`.)
+**Triage (fully worked through 2026-07-01):** the whole **G2–G7 audit is now
+resolved** — each was oracle-diffed against Mednafen, which corrected the
+backlog description in almost every case. **G2/G3/G4** (SCSP) ✅ fixed. **G5**
+(BEF) ✅ + **G6** (ODD) ✅ — the golden-safe status-bit fixes. **G7** 🟢 has no
+clean fix (Timer0 is already faithful; the "free-running HCNT" was a
+mischaracterisation). The only things left are **golden-risk residues with no
+repro** — VDP1 erase-buffer (G5), the ~1-line VBLANK-clear phase (G6), SCU
+indirect-DMA-writeback/DMA-illegal (G7) — deferred per the "fix only with a
+repro" rule. (G1, CHD disc images, was implemented in v0.8.0 and **removed**
+after v0.9.0 — the `chd` dependency wasn't worth it; convert `.chd` → CUE-BIN
+with `chdman extractcd`.)
 
 | # | Gap | Status |
 |---|-----|--------|
 | G2 | SCSP `SNDON` re-reset a running 68k | ✅ (`d14abd7`) — the gap was mischaracterised: the fix is **not** un-halt-vs-reset but a **`!running` guard**. Mednafen `TurnSoundCPUOn` *also* does a full `SOUND_Reset68K`, but gated `if(!SoundCPUOn)` (smpc.cpp), so a redundant SNDON is a no-op. `Scsp::start` now returns early when already running; only the first SNDON after power-on / SNDOFF reloads the vectors. Golden-safe (bios_boot + 5 game render goldens unchanged); regression `sndon_while_running_does_not_re_reset_the_68k` |
 | G3 | SCSP per-sample interrupt (SCIPD/MCIPD bit `0x400`) never generated | ✅ (`432a7a4`) — **the "both MAME and ours skip it" note was wrong about the oracle**: Mednafen `SCIPD \|= 0x400; MCIPD \|= 0x400;` every output sample (scsp.inc). Now pended in `tick_timers` (per batch); inert unless SCIEB/MCIEB bit 10 is enabled. Golden-safe; regression `one_sample_interrupt_pends_every_sample` |
 | G4 | SCSP sound-IRQ level picks one source by priority, not the proper SCILV assembly | ✅ (`432a7a4`, landed with G3) — replaced the single-source priority chain with a faithful `RecalcSoundInt` port: the level is assembled bit-by-bit from all three SCILV planes (masked by active sources), and **sources above bit 7 collapse onto bit 7** (fixed a latent bug where Timer C read the nonexistent SCILV bit 8 → always level 0). Golden-safe; regressions `sound_irq_level_assembled_from_all_three_scilv_planes` + `sources_above_bit7_collapse_onto_bit7_for_their_irq_level` |
-| G5 | VDP1 erase targets the *draw* buffer, not the displayed (non-draw) buffer at swap; `BEF` status flag always 0; `CEF`-clear-on-swap nuance | 🟡 **`CEF` itself is done** (latched on draw-end, cleared at list-start); the residue is erase-on-displayed + `BEF` + MAME's extra clear-on-swap. All edge cases |
-| G6 | VDP2 VBLANK-clear ~1-line phase; ODD bit should be constant 1 in progressive (LSMD≠3) | 🟡 **VBlank-OUT itself is an exact clamp edge now** (`cycles_to_next_vblank_out`); residue is the 1-line VBLANK-*clear* phase + ODD-toggles-always (`system.rs:~828`). Marginal, golden-risk |
-| G7 | SCU Timer0 missing the free-running HCNT counter mode; indirect-mode DMA write-back address; DMA-illegal predicate same-bus/unmapped vs MAME's BIOS-source key | 🟡 **Timer0 line-compare *does* fire** (the common mode, `system.rs:~888`); DMA-illegal predicate is test-covered, just unverified vs a BIOS-source DMA |
+| G5 | VDP1 `BEF` status flag always 0; erase-buffer nuance | 🟡 **BEF done** (`3c6e59f`) — `EDSR >>= 1` at the frame swap (CEF→BEF, CEF clear), golden-safe. **Residue left:** VDP1 erase targeting the displayed (non-draw) buffer at v-blank vs our erase-the-draw-buffer-at-draw-start — **golden-risk (changes which buffer is cleared), no repro** → deferred |
+| G6 | VDP2 ODD field bit; VBLANK-clear ~1-line phase | 🟡 **ODD done** (`643e964`) — TVSTAT.ODD is now constant 1 in progressive, toggles only when TVMD.LSMD≠0 (was toggling always), golden-safe. **Residue left:** the ~1-line VBLANK-*clear* phase — **golden-risk (the current phase is load-bearing), no repro** → deferred |
+| G7 | SCU Timer0 / indirect-DMA writeback / DMA-illegal predicate | 🟢 **investigated 2026-07-01 — no clean fix.** Timer0 line-compare already matches Mednafen (`Timer0_Counter` per-HBLANK, reset at VBlank-end, fire on `==compare`); the "free-running HCNT counter mode" is a **mischaracterisation** — the SCU has no guest-readable Timer0 counter register (Mednafen exposes it only as a debug GSREG). The indirect-DMA-writeback + DMA-illegal-predicate residues are golden-risk / merely-unverified with no repro → left as-is |
 
 **Tier H — cross-chip silent-feature audit (2026-06-30).** ✅ **H1, H2, and H3
 all landed — shipped in v0.18.0.** Output of a six-agent oracle-diff sweep run
