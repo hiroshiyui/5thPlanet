@@ -303,6 +303,9 @@ impl Vdp1 {
         if changed {
             core::mem::swap(&mut self.fb, &mut self.display);
             self.regs.write16(0x02, fbcr & !0x01); // clear the one-shot FCT
+            // Shift EDSR: the finished draw's CEF becomes the now-displayed
+            // buffer's BEF, and CEF clears for the new draw (Mednafen G5).
+            self.regs.swap_edsr();
         }
         // Automatic-draw mode: redraw the list into the back buffer each time
         // the buffers change (MAME gates `vdp1_process_list` on the swap).

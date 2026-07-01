@@ -73,6 +73,14 @@ impl Vdp1Regs {
     pub fn cef_set(&mut self) {
         self.edsr |= EDSR_CEF;
     }
+    /// At a frame-buffer swap the VDP1 shifts EDSR right by one: CEF (bit 1)
+    /// becomes BEF (bit 0) — the draw-end status of the buffer now being
+    /// displayed — and CEF clears (Mednafen `EDSR = EDSR >> 1`, vdp1.cpp:1010).
+    /// A game polls BEF to know whether the frame it is now showing finished
+    /// drawing; previously BEF was hard-wired 0 (G5).
+    pub fn swap_edsr(&mut self) {
+        self.edsr >>= 1;
+    }
     /// Latch the last/current command-table addresses (already >>3).
     pub fn set_command_addrs(&mut self, lopr: u16, copr: u16) {
         self.lopr = lopr;
@@ -165,6 +173,28 @@ mod tests {
         assert_eq!(r.read16(0x10) & EDSR_CEF, EDSR_CEF, "draw acked");
         r.cef_clear();
         assert_eq!(r.read16(0x10) & EDSR_CEF, 0, "cleared at list start");
+    }
+
+    #[test]
+    fn swap_edsr_moves_cef_to_bef() {
+        // G5: at a frame swap CEF shifts to BEF and CEF clears (EDSR >>= 1).
+        let mut r = Vdp1Regs::new();
+        r.cef_set(); // draw finished this frame
+        assert_eq!(r.read16(0x10), EDSR_CEF);
+        r.swap_edsr();
+        assert_eq!(
+            r.read16(0x10) & 0x0001,
+            0x0001,
+            "BEF = the finished draw's CEF"
+        );
+        assert_eq!(r.read16(0x10) & EDSR_CEF, 0, "CEF cleared for the new draw");
+        // A second swap with no new draw drops BEF too.
+        r.swap_edsr();
+        assert_eq!(
+            r.read16(0x10),
+            0,
+            "BEF clears when the new frame's CEF was 0"
+        );
     }
 
     #[test]
