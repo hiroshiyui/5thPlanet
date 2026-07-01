@@ -1594,11 +1594,13 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
     // Bitmap special-function bits are whole-layer constants (BMSPR/BMSCC).
     let (spr, scc) = (nc.bm_spr, nc.bm_scc);
     match nc.depth {
-        // 32bpp RGB888 direct colour (16M-colour bitmap).
+        // 32bpp RGB888 direct colour (16M-colour bitmap). A direct-colour dot is
+        // opaque iff its MSB (bit 31) is set, else transparent — unless TPON
+        // (`igntp`) forces it opaque (Mednafen `vdp2_render.cpp:1517,1553`).
         4 => {
             let off = base + (py * w + px) * 4;
             let entry = vdp2.vram.read32(off);
-            (entry & 0x00FF_FFFF != 0).then(|| {
+            (tpon || entry & 0x8000_0000 != 0).then(|| {
                 let (rgb, msb) = direct_rgb888(entry);
                 Sample {
                     rgb,
@@ -1610,11 +1612,12 @@ fn sample_bitmap(vdp2: &Vdp2, nc: &NbgCtx, sx: u32, sy: u32) -> Option<Sample> {
                 }
             })
         }
-        // 16bpp RGB555 direct colour.
+        // 16bpp RGB555 direct colour: opaque iff MSB (bit 15) set, else
+        // transparent (TPON forces opaque).
         3 => {
             let off = base + (py * w + px) * 2;
             let entry = vdp2.vram.read16(off);
-            (entry & 0x7FFF != 0).then(|| Sample {
+            (tpon || entry & 0x8000 != 0).then(|| Sample {
                 rgb: cram::rgb555_to_888(entry),
                 code: 0,
                 spr,
@@ -1823,15 +1826,13 @@ fn sample_pattern_cell(
     match depth {
         // 32bpp RGB888 direct colour (16.7M). Direct colour bypasses CRAM, so a
         // black CRAM can't hide it — the tile path historically fell through to
-        // the 4bpp branch and rendered these FMV frames black (SRW F intro).
-        // Transparency here is "visible colour ≠ 0", matching the bitmap direct-
-        // colour path; Mednafen instead keys on the dot MSB (bit 31 / bit 15),
-        // so an opaque-black dot (MSB=1, RGB=0) differs — a pre-existing
-        // convention shared with `sample_bitmap`, to harmonise across both paths
-        // (with a render-golden re-verify) rather than only here.
+        // the 4bpp branch and rendered these FMV frames black (SRW F intro). A
+        // direct-colour dot is opaque iff its MSB (bit 31) is set, else
+        // transparent, unless TPON forces it opaque — matching `sample_bitmap`
+        // and Mednafen `vdp2_render.cpp:1517,1553`.
         4 => {
             let entry = vdp2.vram.read32(cell_base + (py * 8 + px) * 4);
-            (entry & 0x00FF_FFFF != 0).then(|| {
+            (tpon || entry & 0x8000_0000 != 0).then(|| {
                 let (rgb, msb) = direct_rgb888(entry);
                 Sample {
                     rgb,
@@ -1843,10 +1844,11 @@ fn sample_pattern_cell(
                 }
             })
         }
-        // 16bpp RGB555 direct colour (32K).
+        // 16bpp RGB555 direct colour (32K): opaque iff MSB (bit 15) set, else
+        // transparent (TPON forces opaque).
         3 => {
             let entry = vdp2.vram.read16(cell_base + (py * 8 + px) * 2);
-            (entry & 0x7FFF != 0).then(|| Sample {
+            (tpon || entry & 0x8000 != 0).then(|| Sample {
                 rgb: cram::rgb555_to_888(entry),
                 code: 0,
                 spr: pat.spr,
@@ -2175,9 +2177,12 @@ fn sample_rot_bitmap(
         vdp2.regs.rbg_bitmap_special_calc(),
     );
     match depth {
+        // Direct colour: opaque iff the dot MSB (bit 31 / bit 15) is set, else
+        // transparent unless TPON forces it opaque (as in `sample_bitmap` /
+        // `sample_pattern_cell`; Mednafen `vdp2_render.cpp:1517,1524,1553`).
         4 => {
             let entry = vdp2.vram.read32(base + (py * w + px) * 4);
-            (entry & 0x00FF_FFFF != 0).then(|| {
+            (tpon || entry & 0x8000_0000 != 0).then(|| {
                 let (rgb, msb) = direct_rgb888(entry);
                 Sample {
                     rgb,
@@ -2191,7 +2196,7 @@ fn sample_rot_bitmap(
         }
         3 => {
             let entry = vdp2.vram.read16(base + (py * w + px) * 2);
-            (entry & 0x7FFF != 0).then(|| Sample {
+            (tpon || entry & 0x8000 != 0).then(|| Sample {
                 rgb: cram::rgb555_to_888(entry),
                 code: 0,
                 spr,
@@ -2404,7 +2409,8 @@ mod tests {
         enable_nbg0(&mut v);
         // N0BMEN + N0CHCN = 3 (32K colour): CHCTLA = bmen(0x2) | (3<<4)=0x30.
         v.regs.write16(0x028, 0x0032);
-        v.vram.write16(5u32 * 512 * 2 + 10 * 2, 0x001F); // (10,5) = red
+        // Bit 15 set = opaque direct-colour dot (else transparent); low 15 = red.
+        v.vram.write16(5u32 * 512 * 2 + 10 * 2, 0x801F); // (10,5) = red
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 10, 5), [0xFF, 0, 0, 0xFF]);
@@ -2416,10 +2422,46 @@ mod tests {
         enable_nbg0(&mut v);
         // N0BMEN + N0CHCN = 4 (16M colour): 32-bit RGB888 bitmap.
         v.regs.write16(0x028, 0x0042);
-        v.vram.write32((5u32 * 512 + 10) * 4, 0x0056_3412); // R=0x12, G=0x34, B=0x56
+        // Bit 31 set = opaque direct-colour dot (else transparent).
+        v.vram.write32((5u32 * 512 + 10) * 4, 0x8056_3412); // R=0x12, G=0x34, B=0x56
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 10, 5), [0x12, 0x34, 0x56, 0xFF]);
+    }
+
+    /// A direct-colour dot's opacity keys on the dot MSB (bit 31 RGB888 / bit 15
+    /// RGB555), not "colour ≠ 0": an MSB-clear dot is transparent (Mednafen
+    /// `vdp2_render.cpp:1524,1553`), and TPON (`NxTPON`) forces it opaque.
+    #[test]
+    fn direct_colour_opacity_keys_on_the_dot_msb() {
+        let mut v = Vdp2::new();
+        enable_nbg0(&mut v);
+        v.regs.write16(0x028, 0x0032); // NBG0 RGB555 bitmap
+        let off = (5u32 * 512 + 10) * 2;
+        // MSB clear + non-zero colour → transparent → the (black) backdrop shows.
+        v.vram.write16(off, 0x001F); // red-15, bit 15 clear
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 10, 5),
+            [0, 0, 0, 0xFF],
+            "MSB clear → transparent"
+        );
+        // MSB set → opaque red.
+        v.vram.write16(off, 0x801F);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(pixel(&buf, 10, 5), [0xFF, 0, 0, 0xFF], "MSB set → opaque");
+        // TPON (BGON N0TPON, bit 8) forces the MSB-clear dot opaque.
+        v.vram.write16(off, 0x001F);
+        v.regs.write16(0x020, 0x0101); // BGON: NBG0 + N0TPON
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 10, 5),
+            [0xFF, 0, 0, 0xFF],
+            "TPON forces MSB-clear opaque"
+        );
     }
 
     #[test]
@@ -3763,7 +3805,8 @@ mod tests {
         setup_rot_identity(&mut v, 0);
         v.vram.write32(20 * 4, 2 << 16); // ky = 2.0 → plane row = 2·screen y
         // 16bpp RGB555 blue dot at plane (40, 400) — row 400 needs h=512.
-        v.vram.write16(0x20000 + (400 * 512 + 40) * 2, 0x7C00);
+        // Bit 15 set = opaque direct-colour dot.
+        v.vram.write16(0x20000 + (400 * 512 + 40) * 2, 0xFC00);
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         // Screen (40,200) → plane (40, 400) → blue (only because size=512×512).
@@ -3792,7 +3835,8 @@ mod tests {
         v.regs.write16(0x0FC, 0x0001); // priority 1
         v.regs.write16(0x03E, 0x0001); // base 0x20000
         setup_rot_identity(&mut v, 0);
-        v.vram.write32(0x20000 + (30 * 512 + 40) * 4, 0x00CC_8844);
+        // Bit 31 set = opaque direct-colour dot (else transparent).
+        v.vram.write32(0x20000 + (30 * 512 + 40) * 4, 0x80CC_8844);
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(pixel(&buf, 40, 30), [0x44, 0x88, 0xCC, 0xFF]);
@@ -3876,8 +3920,8 @@ mod tests {
         setup_rot_param_at(&mut v, 0x8000);
         v.vram.write16(0, 8); // PN[0] → char 8
         // Char 8 (8×8 RGB888): byte base 8·0x20 = 0x100; dot (px=1,py=2) at
-        // 0x100 + (py·8+px)·4. A black CRAM must not be able to hide it.
-        v.vram.write32(0x100 + (2 * 8 + 1) * 4, 0x00CC_8844);
+        // 0x100 + (py·8+px)·4. Bit 31 set = opaque; a black CRAM must not hide it.
+        v.vram.write32(0x100 + (2 * 8 + 1) * 4, 0x80CC_8844);
         let mut buf = fresh_buf();
         render_frame(&v, None, &mut buf);
         assert_eq!(

@@ -586,8 +586,9 @@ fn special_color_calc_mode3_always_blends_rgb_direct_dots() {
     sat.bus.write16(0x05F8_00EC, 0x0001, AccessKind::Data); // CCCTL N0 cc enable
     sat.bus.write16(0x05F8_0108, 0x0010, AccessKind::Data); // CCRNA N0 ratio = 16
     sat.bus.write16(0x05F8_00EE, 0x0003, AccessKind::Data); // SFCCMD NBG0 = 3
-    // 16bpp RGB555 red dot (bit 15 clear — proves cc is on regardless of the MSB).
-    sat.bus.vdp2.vram.write16((60 * 512 + 50) * 2, 0x001F);
+    // 16bpp RGB555 red dot: bit 15 set = opaque direct-colour dot; SFCCMD mode 3
+    // then enables colour calc for it unconditionally (no palette code to gate on).
+    sat.bus.vdp2.vram.write16((60 * 512 + 50) * 2, 0x801F);
 
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     sat.run_frame(&mut out);
