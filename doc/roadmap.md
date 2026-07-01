@@ -297,7 +297,7 @@ empty-status, DAC18B/MEM4MB faithful no-ops).
 | C6 | VDP1 framebuffer TVM modes | 🟡 8bpp + DIE-interlace plotting done (`0dd3ddd`); display-side **DIE field-weave** — the VDP2 compositor weaves the even/odd fields into one full-height image instead of line-doubling the current field (Mednafen per-field placement; default-on, opt-out `SAT_VDP1_NOWEAVE`) — done (`33ccf8a`→`b1bb3ce`, v0.17.0; fixed GN98's menu strobe, smoother VF2); TVM=3 (8bpp+rotate layout) deferred |
 | C7 | Colour offset (CLOFEN/COA*/COB*) | ✅ (deliberate golden re-baseline → `0x0B1BA6E5180766F7`; validated by Doukyuusei's logo fade) |
 | C8 | NBG0/1 reduction (ZMXN/ZMYN) + fractional scroll | ✅ |
-| C9 | Extended colour calc (3-layer) | 🟡 non-line EXCC done; line-colour variants + gradient blend deferred |
+| C9 | Extended colour calc (3-layer) | 🟡 non-line EXCC + **line-colour EXCC** (`EXCC_LINE_CRAM0/12`: line colour inserted into the CC stack, averaged with the halved/pushed-down layer below — CCCTL bit 5 selector) done; gradient blend (`MIXIT_SPECIAL_GRAD`, CCCTL[14:12] + horizontal-blur partner) deferred |
 | C10 | VRAM cycle-pattern fetch gating | 🟡 fetch gating done (validated by the unchanged splash golden); reduction-limit deliberately excluded (Mednafen uses a per-game whitelist — an oracle hack); bitmap-CG + rotation fetch path deferred |
 
 **Tier D — CPU & SCU peripherals** ✅ complete (2026-06-07): D1 SH-2 DIVU 39-cy
