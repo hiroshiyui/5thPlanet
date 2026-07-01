@@ -70,11 +70,15 @@ const DRGA_DMEA_HI: u32 = 0x414;
 const DTLG_DMA_CTL: u32 = 0x416;
 
 // Interrupt-source bits shared by SCIEB/SCIPD and MCIEB/MCIPD.
+// MIDI-in (bit 3) isn't pended (we don't model MIDI input); kept for the
+// documented interrupt-bit map + the IRQ-level tests.
+#[cfg_attr(not(test), allow(dead_code))]
 const INT_MIDI: u16 = 0x008; // bit 3
 const INT_DMA: u16 = 0x010; // bit 4 (DMA transfer end)
 const INT_TIMER_A: u16 = 0x040; // bit 6
 const INT_TIMER_B: u16 = 0x080; // bit 7
 const INT_TIMER_C: u16 = 0x100; // bit 8
+const INT_ONE_SAMPLE: u16 = 0x400; // bit 10 (pended every output sample)
 
 pub const NUM_SLOTS: usize = 32;
 /// Slot-register block: 32 slots × 0x20 bytes at the base of the register space.
@@ -655,8 +659,6 @@ impl ScspCtrl {
         self.dbg_tt_calls = self.dbg_tt_calls.wrapping_add(1);
         self.dbg_tt_samples = self.dbg_tt_samples.wrapping_add(samples);
         let bits = [INT_TIMER_A, INT_TIMER_B, INT_TIMER_C];
-        let mut scipd = false;
-        let mut mcipd = false;
         // Per output sample: each timer is clocked when the global sample
         // counter's low `Control` bits are 0 (Mednafen `DoClock =
         // !(SampleCounter & ((1<<Control)-1))`), so its `2^Control` prescale is
@@ -671,45 +673,54 @@ impl ScspCtrl {
                 if self.timers[i].clock() {
                     self.dbg_timer_of[i] = self.dbg_timer_of[i].wrapping_add(1);
                     self.store16(SCIPD, self.read16(SCIPD) | bit);
-                    scipd = true;
                     if i == 0 {
                         // Timer A also pends the main-CPU sound interrupt.
                         self.store16(MCIPD, self.read16(MCIPD) | INT_TIMER_A);
-                        mcipd = true;
                     }
                 }
             }
         }
-        if scipd {
-            self.recompute_irq();
-        }
-        if mcipd {
-            self.recompute_main();
-        }
+        // The one-sample interrupt (bit 10) pends on both SCIPD and MCIPD every
+        // output sample (Mednafen `SCIPD |= 0x400; MCIPD |= 0x400;`, scsp.inc),
+        // letting a sound driver clock off the 44.1 kHz sample tick (G3). Any
+        // elapsed sample re-pends it — inert unless SCIEB/MCIEB bit 10 is
+        // enabled. Delivery is per-batch here (our sample tick is batched), like
+        // the timer sources above; the IRQ lines are recomputed once at the end.
+        self.store16(SCIPD, self.read16(SCIPD) | INT_ONE_SAMPLE);
+        self.store16(MCIPD, self.read16(MCIPD) | INT_ONE_SAMPLE);
+        self.recompute_irq();
+        self.recompute_main();
     }
 
-    /// The 68k interrupt level for source bit `bit`, assembled from SCILV0..2.
-    fn decode_sci(&self, bit: u32) -> u8 {
-        let g = |off: u32| ((self.read16(off) >> bit) & 1) as u8;
-        g(SCILV0) | (g(SCILV1) << 1) | (g(SCILV2) << 2)
-    }
-
-    /// Recompute the asserted 68k IRQ level from pending & enabled sources.
+    /// Recompute the asserted 68k IRQ level from the pending & enabled sound
+    /// interrupts — a faithful port of Mednafen `RecalcSoundInt` (scsp.inc).
+    /// `SCILV0..2` are 8-bit planes giving each source (bits 0..7) a 3-bit level;
+    /// **any source above bit 7 (Timer C bit 8, the one-sample interrupt bit 10)
+    /// collapses onto bit 7** and shares its level. The output level is then
+    /// assembled bit-by-bit from the three planes (masked by the active
+    /// sources), successive-refining so a consistent source wins.
     fn recompute_irq(&mut self) {
-        let active = self.read16(SCIPD) & self.read16(SCIEB);
-        self.asserted_level = if active & INT_TIMER_A != 0 {
-            self.decode_sci(6)
-        } else if active & INT_TIMER_B != 0 {
-            self.decode_sci(7)
-        } else if active & INT_TIMER_C != 0 {
-            self.decode_sci(8)
-        } else if active & INT_MIDI != 0 {
-            self.decode_sci(3)
-        } else if active & INT_DMA != 0 {
-            self.decode_sci(4)
-        } else {
-            0
-        };
+        let mut mask = u32::from(self.read16(SCIPD) & self.read16(SCIEB));
+        if mask & !0xFF != 0 {
+            mask = (mask & 0xFF) | 0x80;
+        }
+        let mut lv = [
+            u32::from(self.read16(SCILV0)) & mask,
+            u32::from(self.read16(SCILV1)) & mask,
+            u32::from(self.read16(SCILV2)) & mask,
+        ];
+        let mut out = 0u8;
+        if lv[2] != 0 {
+            out |= 0x4;
+            lv[1] &= lv[2];
+            lv[0] &= lv[2];
+        }
+        if lv[1] != 0 {
+            out |= 0x2;
+            lv[0] &= lv[1];
+        }
+        out |= (lv[0] != 0) as u8;
+        self.asserted_level = out;
     }
 
     fn recompute_main(&mut self) {
@@ -3230,38 +3241,51 @@ mod tests {
     // ---- timers B and C, and the multi-source IRQ-level decode ----
 
     #[test]
-    fn timer_b_and_c_route_to_their_own_interrupt_levels() {
+    fn sources_above_bit7_collapse_onto_bit7_for_their_irq_level() {
+        // A faithful port of Mednafen `RecalcSoundInt`: any interrupt source
+        // above bit 7 (Timer C = bit 8, the one-sample interrupt = bit 10)
+        // shares bit 7's SCILV level (the `mask & ~0xFF → | 0x80` collapse).
+        // So Timer C's level is read from SCILV bit 7, not bit 8.
         let mut c = ScspCtrl::new();
-        // Timer B (bit 7) → level 2 (010b): SCILV1 bit 7.
-        // Timer C (bit 8) → level 5 (101b): SCILV0 + SCILV2 bit 8.
-        c.write16(SCILV1, INT_TIMER_B);
-        c.write16(SCILV0, INT_TIMER_C);
-        c.write16(SCILV2, INT_TIMER_C);
-        c.write16(SCIEB, INT_TIMER_B | INT_TIMER_C);
-        // Prescale 0, reload 0xFF → both overflow on their first clock.
-        c.write16(TIMB, 0x00FF);
-        c.write16(TIMC, 0x00FF);
+        // SCILV bit 7 → level 5 (101b): SCILV0 + SCILV2 bit 7 set.
+        c.write16(SCILV0, 0x80);
+        c.write16(SCILV2, 0x80);
+        c.write16(SCIEB, INT_TIMER_C); // enable only Timer C
+        c.write16(TIMC, 0x00FF); // reload 0xFF → overflow on first clock
         c.tick_timers(2);
-        assert_eq!(c.read16(SCIPD) & INT_TIMER_B, INT_TIMER_B, "B pending");
         assert_eq!(c.read16(SCIPD) & INT_TIMER_C, INT_TIMER_C, "C pending");
-        // recompute_irq picks the highest-priority active source: A > B > C, so
-        // with only B and C pending it asserts B's level (2).
-        assert_eq!(c.asserted_level, 2, "B has priority over C");
-        // Acknowledge B; the line falls to C's level (5).
-        c.write16(SCIRE, INT_TIMER_B);
-        assert_eq!(c.asserted_level, 5, "after B ack, C's level shows");
+        assert_eq!(
+            c.asserted_level, 5,
+            "Timer C reads its level from the collapsed SCILV bit 7"
+        );
+        // Timer B (bit 7) shares that same SCILV bit-7 level.
+        let mut c = ScspCtrl::new();
+        c.write16(SCILV0, 0x80);
+        c.write16(SCILV2, 0x80);
+        c.write16(SCIEB, INT_TIMER_B);
+        c.write16(TIMB, 0x00FF);
+        c.tick_timers(2);
+        assert_eq!(c.asserted_level, 5, "Timer B uses SCILV bit 7 too");
     }
 
     #[test]
-    fn decode_sci_assembles_the_three_level_bits() {
+    fn sound_irq_level_assembled_from_all_three_scilv_planes() {
+        // G4: the asserted 68k level is assembled from all three SCILV planes
+        // for the active source (Mednafen RecalcSoundInt), not a single-source
+        // priority pick.
         let mut c = ScspCtrl::new();
-        // For the MIDI source (bit 3) set level 7 (111b): all three SCILV bits.
-        c.write16(SCILV0, INT_MIDI);
-        c.write16(SCILV1, INT_MIDI);
-        c.write16(SCILV2, INT_MIDI);
-        assert_eq!(c.decode_sci(3), 7);
-        // Timer A (bit 6) is left 0 in every SCILV → level 0.
-        assert_eq!(c.decode_sci(6), 0);
+        c.write16(SCIEB, INT_MIDI); // enable MIDI (bit 3)
+        c.write16(SCILV0, INT_MIDI); // level bit 0
+        c.write16(SCILV1, INT_MIDI); // level bit 1
+        c.write16(SCILV2, INT_MIDI); // level bit 2  → level 7
+        c.store16(SCIPD, INT_MIDI); // pend it
+        c.recompute_irq();
+        assert_eq!(c.irq_state().0, 7, "MIDI level 7 from all three planes");
+        // Only SCILV0 set → level 1.
+        c.write16(SCILV1, 0);
+        c.write16(SCILV2, 0);
+        c.recompute_irq();
+        assert_eq!(c.irq_state().0, 1, "one plane → level 1");
     }
 
     #[test]
@@ -3305,6 +3329,34 @@ mod tests {
         let (of, calls, samples) = s.ctrl.dbg_timer_counts();
         assert_eq!(of[0], 1, "one Timer-A overflow");
         assert!(calls >= 1 && samples >= 2);
+    }
+
+    #[test]
+    fn one_sample_interrupt_pends_every_sample() {
+        // G3: SCIPD/MCIPD bit 10 pends every output sample (Mednafen
+        // `SCIPD |= 0x400; MCIPD |= 0x400;`), so a driver can clock off the
+        // 44.1 kHz sample tick. Inert unless SCIEB/MCIEB enable it.
+        let mut s = Scsp::new();
+        // Enable the one-sample source. It's above bit 7, so its level comes
+        // from SCILV bit 7 (Mednafen collapses high sources onto bit 7). Set
+        // level 3 there (SCILV0|SCILV1 bit 7).
+        s.ctrl.write16(SCIEB, INT_ONE_SAMPLE);
+        s.ctrl.write16(SCILV0, 0x80);
+        s.ctrl.write16(SCILV1, 0x80);
+        // Nothing pended before any sample elapses.
+        let (lvl0, _, pd0) = s.ctrl.irq_state();
+        assert_eq!(pd0 & INT_ONE_SAMPLE, 0, "not pended before a sample");
+        assert_eq!(lvl0, 0);
+        // One sample tick pends bit 10 and asserts the 68k IRQ at its level.
+        s.ctrl.tick_timers(1);
+        let (lvl, _, pd) = s.ctrl.irq_state();
+        assert_eq!(pd & INT_ONE_SAMPLE, INT_ONE_SAMPLE, "one-sample IRQ pended");
+        assert_eq!(lvl, 3, "asserted at the SCILV-encoded level");
+        assert_eq!(
+            s.ctrl.read16(MCIPD) & INT_ONE_SAMPLE,
+            INT_ONE_SAMPLE,
+            "main-CPU one-sample interrupt pended too"
+        );
     }
 
     // ---- pitch / phase step ----
