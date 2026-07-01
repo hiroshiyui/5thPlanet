@@ -72,6 +72,8 @@ is in [`doc/screenshots/`](doc/screenshots).
 | ***Panzer Dragoon Zwei*** — 3D rail-shooting at 704×448. | ***Greatest Nine '98*** — 3D baseball at 704×480 interlaced. |
 | ![Sangokushi V — in-game strategy screen](doc/screenshots/sangokushi-strategy.png) | ![Doukyuusei ~if~ — overworld town map](doc/screenshots/doukyuusei-town.png) |
 | **Sangokushi V** (三國志V) — the in-game strategy map. | ***Doukyuusei ~if~*** — the town overworld at 640×224. |
+| ![Wachenröder — isometric tactical battle](doc/screenshots/wachenroder-battle.png) | |
+| **Wachenröder** (ヴァッケンローダー, 🚧 WIP) — the isometric tactical battle, with the RBG0 rotating floor. | |
 
 The screenshots show SEGA's and other rights holders' copyrighted material and
 are included solely to document the emulator's output — see
