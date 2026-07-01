@@ -444,6 +444,40 @@ forensic records below; append new cases at the end rather than renumbering.
   instant completion" symptom on a position-sensitive command points at the
   addressing decode + the missing timed phase machine.
 
+- **CASE#14: Super Robot Wars F — the trademark-scene buzz (CD-XA Form-2 delivered as Form-1).**
+  A loud saturating buzz during the intro logos; Mednafen played it clean. Two
+  waves of three competing agents each (the skill's "always fan out" default):
+  wave 1 (SCSP synthesis / slot-register provenance / sample-data) established the
+  buzz was a **legit SCSP slot-2 voice** correctly looping a buffer the game's own
+  **SH-2 software audio mixer** had filled with full-scale garbage — so the SCSP
+  was faithful and the fault was upstream; wave 2 (Mednafen oracle-diff / input-data
+  provenance / onset-trigger) triangulated the root. The mixer at PC `0x0608E03C`
+  is a **2-tap IIR/ADPCM decoder**: a *control byte* at `[buf+4]` selects a
+  coefficient pair (`table[hi_nibble<<2]`, valid entries 0–3); the oracle read a
+  valid `0x0-0x3` nibble and **never clamped**, ours read **0xFF** → entry 0xF =
+  literal-pool bytes as coeffs (~25000, gain ~98×) → the IIR **ran away** to the
+  −32768 floor (it feeds its own prior outputs back, so it self-sustained). The
+  control byte was wrong because the game streams **CD-XA Form-2** XA-ADPCM audio
+  (Track 2, `MODE2/2352`, subheader submode `0x64`) via the data port + SCU-DMA,
+  striding its blocks on **2324 bytes** (DMA count `0x1228` = 2×2324; buffer
+  midpoint `dst+2324`), but our `read_filtered_sector` delivered only the Form-1
+  **2048** per sector — a **276-byte drift** that walked the control byte off its
+  frame. Fix: deliver the full 2324-byte Form-2 payload (raw offset 24) when
+  `sectlenin==2048` and submode bit 5 is set, matching Mednafen `cdb.cpp:1353`
+  (`SECLEN_2048` + Mode-2 Form-2 → 1162 words); `filter_data` now propagates
+  `curblock.size` (the data-port transfer paces on `block.size`, which
+  `alloc_block` had seeded with `sectlenin`). Regression
+  `form2_sector_delivers_2324_bytes_form1_stays_2048`; goldens + 1237 workspace
+  tests pass; buzz gone (peak-abs 32768→11465, negative-clamp fires 879×→0).
+  **Lessons:** (1) *the game's own software decoder producing garbage from correct
+  code is the divergence signal* — don't reverse-engineer the decoder; pivot to
+  what fed it (here, a CD delivery-size fidelity gap); (2) "bytes match the disc"
+  proves the FIFO held disc bytes, **not** that the *framing* is right — check the
+  stride/offset, not just the values (the onset agent was misled by the byte-match
+  into suspecting SH-2 arithmetic; the oracle diff + the DMA-count = 2×2324 broke
+  the tie); (3) **0xFF is the dropped/short-transfer signature**; (4) new fertile
+  class: **CD-XA Form-2 sector sizing** (`disc::read_sector` still hard-2048).
+
 ---
 
 ## Boot-blocker case files
