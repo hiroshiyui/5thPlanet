@@ -1063,6 +1063,9 @@ fn run(
             Scancode::from_name(config::DEFAULT_KEYS[i]).expect("default scancode name")
         })
     });
+    // Game-controller button/trigger tokens (SDL strings), resolved per read via
+    // `gpad_pressed`. Owned by the SDL thread + rebound live like `keymap`.
+    let mut gpad_map: [String; config::PAD_BUTTONS] = cfg.gpad.clone();
 
     let (emu_tx, emu_rx) = mpsc::channel::<EmuIn>();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, (usize, usize))>(2);
@@ -1208,6 +1211,11 @@ fn run(
                     } else {
                         std::array::from_fn(|_| String::new())
                     },
+                    gpad_binds: if osd.is_open() {
+                        sess.cfg.gpad.clone()
+                    } else {
+                        std::array::from_fn(|_| String::new())
+                    },
                     bios_names: if osd.is_open() {
                         sess.bios_names.clone()
                     } else {
@@ -1349,6 +1357,21 @@ fn run(
                                         120,
                                     );
                                     sess.cfg.keys[i] = name;
+                                    sess.cfg.save();
+                                }
+                                None => osd.set_toast("Rebind cancelled", 90),
+                            }
+                        }
+                        EmuIn::GamepadBindResult(b, captured) => {
+                            osd.end_capture();
+                            let i = b as usize % config::PAD_BUTTONS;
+                            match captured {
+                                Some(tok) => {
+                                    osd.set_toast(
+                                        format!("{} = {tok}", config::BUTTON_NAMES[i]),
+                                        120,
+                                    );
+                                    sess.cfg.gpad[i] = tok;
                                     sess.cfg.save();
                                 }
                                 None => osd.set_toast("Rebind cancelled", 90),
@@ -1556,6 +1579,7 @@ fn run(
         let mut cur_dims = (FRAME_WIDTH, FRAME_HEIGHT);
         // OSD rebind: which pad button (if any) captures the next keypress.
         let mut rebind_target: Option<u8> = None;
+        let mut gpad_rebind_target: Option<u8> = None;
         // Shuttle Mouse capture state (only used when --mouse is given).
         let (mut mouse_dx, mut mouse_dy) = (0i32, 0i32);
         let mut mouse_grabbed = false;
@@ -1590,6 +1614,15 @@ fn run(
                             #[cfg(feature = "gpu-presenter")]
                             &mut gpu,
                         ));
+                    }
+                    // Esc on the keyboard cancels an armed *gamepad* rebind
+                    // (before the nav arm consumes it as a menu Back).
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        ..
+                    } if gpad_rebind_target.is_some() => {
+                        let b = gpad_rebind_target.take().expect("armed");
+                        let _ = emu_tx.send(EmuIn::GamepadBindResult(b, None));
                     }
                     // An armed rebind owns the next keypress (before the OSD
                     // nav arm — the menu is open during capture). Esc cancels.
@@ -1717,8 +1750,32 @@ fn run(
                     // Controller navigation of the open menu: D-pad moves, A
                     // selects, B backs out, Start toggles. Suppressed while a
                     // key-capture rebind is armed (that modal owns the input).
+                    // An armed gamepad rebind captures the next controller
+                    // button (or a trigger, below) — before the nav arm.
+                    Event::ControllerButtonDown { button, .. } if gpad_rebind_target.is_some() => {
+                        let b = gpad_rebind_target.take().expect("armed");
+                        let tok = button.string();
+                        gpad_map[b as usize % config::PAD_BUTTONS] = tok.clone();
+                        let _ = emu_tx.send(EmuIn::GamepadBindResult(b, Some(tok)));
+                    }
+                    Event::ControllerAxisMotion { axis, value, .. }
+                        if gpad_rebind_target.is_some()
+                            && matches!(
+                                axis,
+                                sdl3::gamepad::Axis::TriggerLeft
+                                    | sdl3::gamepad::Axis::TriggerRight
+                            )
+                            && value > 24000 =>
+                    {
+                        let b = gpad_rebind_target.take().expect("armed");
+                        let tok = axis.string();
+                        gpad_map[b as usize % config::PAD_BUTTONS] = tok.clone();
+                        let _ = emu_tx.send(EmuIn::GamepadBindResult(b, Some(tok)));
+                    }
                     Event::ControllerButtonDown { button, .. }
-                        if osd_open.load(Ordering::Relaxed) && rebind_target.is_none() =>
+                        if osd_open.load(Ordering::Relaxed)
+                            && rebind_target.is_none()
+                            && gpad_rebind_target.is_none() =>
                     {
                         use sdl3::gamepad::Button;
                         let msg = match button {
@@ -1761,35 +1818,18 @@ fn run(
             let norm_stick = |v: i16| (((v as i32) + 32768) * 255 / 65535) as u8;
             let norm_trig = |v: i16| ((v.max(0) as i32) * 255 / 32767) as u8;
             {
-                use sdl3::gamepad::{Axis, Button};
+                use sdl3::gamepad::Axis;
                 const TH: i16 = 16384; // half of full deflection
                 for c in &controllers {
                     let mut bits = 0u16;
-                    // SDL3 renamed the face buttons: South/East/West/North are
-                    // the physical bottom/right/left/top (Xbox A/B/X/Y).
-                    for (btn, bit) in [
-                        (Button::DPadUp, pad::UP),
-                        (Button::DPadDown, pad::DOWN),
-                        (Button::DPadLeft, pad::LEFT),
-                        (Button::DPadRight, pad::RIGHT),
-                        (Button::West, pad::A),
-                        (Button::South, pad::B),
-                        (Button::East, pad::C),
-                        (Button::North, pad::X),
-                        (Button::LeftShoulder, pad::Y),
-                        (Button::RightShoulder, pad::Z),
-                        (Button::Start, pad::START),
-                    ] {
-                        if c.button(btn) {
+                    // Apply the rebindable gamepad map (token per Saturn button,
+                    // BUTTON_NAMES order), same as the keyboard `keymap` loop.
+                    for (tok, bit) in gpad_map.iter().zip(PAD_BITS) {
+                        if gpad_pressed(c, tok) {
                             bits |= bit;
                         }
                     }
-                    if c.axis(Axis::TriggerLeft) > TH {
-                        bits |= pad::L;
-                    }
-                    if c.axis(Axis::TriggerRight) > TH {
-                        bits |= pad::R;
-                    }
+                    // The left analog stick always doubles as the D-pad.
                     let (lx, ly) = (c.axis(Axis::LeftX), c.axis(Axis::LeftY));
                     if lx < -TH {
                         bits |= pad::LEFT;
@@ -1996,6 +2036,10 @@ fn run(
                                 .expect("default scancode name")
                         });
                     }
+                    UiMsg::ArmGamepadRebind(b) => gpad_rebind_target = Some(b),
+                    UiMsg::ResetGamepadMap => {
+                        gpad_map = config::DEFAULT_GPAD.map(str::to_string);
+                    }
                     UiMsg::SetMouse(port) => {
                         // Off (None) releases any active pointer grab next frame
                         // (the grab loop is gated on `mouse_port.is_some()`).
@@ -2134,6 +2178,9 @@ enum EmuIn {
     /// A key-capture rebind finished on the SDL thread: the pad-button index
     /// and the captured scancode name (`None` = cancelled with Esc).
     BindResult(u8, Option<String>),
+    /// A gamepad-button rebind finished on the SDL thread: the pad-button index
+    /// and the captured SDL gamepad token (`None` = cancelled with Esc).
+    GamepadBindResult(u8, Option<String>),
 }
 
 /// Ordered audio-control stream from emulation to SDL. A machine timeline reset
@@ -2166,6 +2213,10 @@ enum UiMsg {
     ArmRebind(u8),
     /// Restore the default keyboard→pad bindings.
     ResetKeymap,
+    /// Capture the next gamepad button/trigger for this pad button (OSD rebind).
+    ArmGamepadRebind(u8),
+    /// Restore the default gamepad→pad bindings.
+    ResetGamepadMap,
     /// Move the Shuttle Mouse (or remove it): updates the SDL thread's capture
     /// gate so motion/clicks are fed only while a mouse port is active.
     SetMouse(Option<u8>),
@@ -2411,6 +2462,24 @@ fn apply_ports(
 ) {
     saturn.set_port_devices(ports.source[0].device(), ports.source[1].device());
     let _ = ui_tx.send(UiMsg::SetMouse(ports.mouse_port()));
+}
+
+/// Is the game-controller input named by `token` currently pressed on `c`? A
+/// token is an SDL gamepad button name (`a`/`b`/`x`/`y`/`dpup`/`leftshoulder`/…)
+/// or one of the two analog triggers (`lefttrigger`/`righttrigger`, thresholded
+/// to a digital press). An unknown token is never pressed.
+#[cfg(feature = "sdl-frontend")]
+fn gpad_pressed(c: &sdl3::gamepad::Gamepad, token: &str) -> bool {
+    use sdl3::gamepad::{Axis, Button};
+    const TRIG_TH: i16 = 16384; // half deflection
+    if let Some(btn) = Button::from_string(token) {
+        c.button(btn)
+    } else if let Some(ax) = Axis::from_string(token) {
+        // Only the triggers make sense as a digital binding.
+        matches!(ax, Axis::TriggerLeft | Axis::TriggerRight) && c.axis(ax) > TRIG_TH
+    } else {
+        false
+    }
 }
 
 /// Snapshot the connected controllers as [`ports::Pad`] (stable GUID + display
@@ -2699,6 +2768,18 @@ fn dispatch_osd(
             sess.cfg.save();
             let _ = ui_tx.send(UiMsg::ResetKeymap);
             osd.set_toast("Default keys restored", 120);
+        }
+        OsdAction::StartGamepadRebind(b) => {
+            // Modal like StartRebind, but the SDL thread captures the next
+            // controller button/trigger and answers with GamepadBindResult.
+            osd.begin_capture(b);
+            let _ = ui_tx.send(UiMsg::ArmGamepadRebind(b));
+        }
+        OsdAction::ResetGamepadBinds => {
+            sess.cfg.gpad = config::DEFAULT_GPAD.map(str::to_string);
+            sess.cfg.save();
+            let _ = ui_tx.send(UiMsg::ResetGamepadMap);
+            osd.set_toast("Default gamepad binds restored", 120);
         }
         OsdAction::SetCartridge(k) => {
             sess.ui.cart = k;

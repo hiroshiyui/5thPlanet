@@ -51,6 +51,47 @@ const KEY_KEYS: [&str; PAD_BUTTONS] = [
     "key_start",
 ];
 
+/// Default game-controller bindings — SDL gamepad **button/axis token strings**
+/// (resolved via `Button::from_string` / `Axis::from_string` at the SDL edge),
+/// index-matched to [`BUTTON_NAMES`]. Mirrors the original fixed Xbox-style map
+/// (Sega's Saturn-port convention): D-pad = dpad, A/B/C = West/South/East
+/// (`x`/`a`/`b`), X/Y/Z = North/LB/RB (`y`/`leftshoulder`/`rightshoulder`),
+/// L/R = the analog triggers, Start = start.
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+pub const DEFAULT_GPAD: [&str; PAD_BUTTONS] = [
+    "dpup",
+    "dpdown",
+    "dpleft",
+    "dpright",
+    "x",
+    "a",
+    "b",
+    "y",
+    "leftshoulder",
+    "rightshoulder",
+    "lefttrigger",
+    "righttrigger",
+    "start",
+];
+
+/// The config-file keys for the gamepad bindings, index-matched to
+/// [`BUTTON_NAMES`].
+const GPAD_KEYS: [&str; PAD_BUTTONS] = [
+    "gpad_up",
+    "gpad_down",
+    "gpad_left",
+    "gpad_right",
+    "gpad_a",
+    "gpad_b",
+    "gpad_c",
+    "gpad_x",
+    "gpad_y",
+    "gpad_z",
+    "gpad_l",
+    "gpad_r",
+    "gpad_start",
+];
+
 /// Persisted frontend settings. `region: None` means "autodetect from the
 /// BIOS filename" (the user has never picked one in the OSD).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +153,10 @@ pub struct Config {
     pub shader: String,
     /// SDL scancode names bound to each pad button ([`BUTTON_NAMES`] order).
     pub keys: [String; PAD_BUTTONS],
+    /// SDL gamepad button/axis token strings bound to each pad button
+    /// ([`BUTTON_NAMES`] order); resolved via `Button::from_string` /
+    /// `Axis::from_string` at the SDL edge. Defaults to [`DEFAULT_GPAD`].
+    pub gpad: [String; PAD_BUTTONS],
 }
 
 impl Default for Config {
@@ -134,6 +179,7 @@ impl Default for Config {
             aspect: "keep".into(),
             shader: "none".into(),
             keys: DEFAULT_KEYS.map(str::to_string),
+            gpad: DEFAULT_GPAD.map(str::to_string),
         }
     }
 }
@@ -177,6 +223,11 @@ impl Config {
                         let name = unquote(v);
                         if !name.is_empty() {
                             cfg.keys[i] = name;
+                        }
+                    } else if let Some(i) = GPAD_KEYS.iter().position(|kk| *kk == k) {
+                        let tok = unquote(v);
+                        if !tok.is_empty() {
+                            cfg.gpad[i] = tok;
                         }
                     }
                 }
@@ -225,6 +276,9 @@ impl Config {
         out.push_str(&format!("shader = \"{}\"\n", self.shader));
         for (i, key) in KEY_KEYS.iter().enumerate() {
             out.push_str(&format!("{key} = \"{}\"\n", self.keys[i]));
+        }
+        for (i, key) in GPAD_KEYS.iter().enumerate() {
+            out.push_str(&format!("{key} = \"{}\"\n", self.gpad[i]));
         }
         out
     }
@@ -358,6 +412,21 @@ mod tests {
         assert_eq!(cfg.scale, 1);
         assert_eq!(cfg.keys[12], "Space");
         assert_eq!(cfg.keys[0], "Up");
+    }
+
+    #[test]
+    fn gpad_bindings_default_and_round_trip() {
+        // Defaults match the fixed Xbox-style map.
+        let c = Config::default();
+        assert_eq!(c.gpad[0], "dpup"); // Up
+        assert_eq!(c.gpad[4], "x"); // A = West
+        assert_eq!(c.gpad[10], "lefttrigger"); // L
+        // A rebound gamepad button round-trips through the text.
+        let mut c = Config::default();
+        c.gpad[4] = "north".into();
+        c.gpad[10] = "leftshoulder".into();
+        let back = Config::parse(&c.to_text());
+        assert_eq!(back.gpad, c.gpad);
     }
 
     #[test]

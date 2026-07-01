@@ -165,6 +165,12 @@ pub enum OsdAction {
     StartRebind(u8),
     /// Restore the default key bindings.
     ResetBinds,
+    /// Rebind a pad button to a game-controller button/trigger
+    /// ([`crate::config::BUTTON_NAMES`] index): the frontend captures the next
+    /// gamepad input and reports back via [`Osd::end_capture`].
+    StartGamepadRebind(u8),
+    /// Restore the default game-controller bindings.
+    ResetGamepadBinds,
     /// Power-cycle into another BIOS image (an [`OsdCtx::bios_names`] index).
     SetBios(u8),
     /// Descend into / ascend out of a directory in the disc browser (an
@@ -228,6 +234,9 @@ pub struct OsdCtx {
     /// Host key name bound to each pad button ([`BUTTON_NAMES`] order) —
     /// the Controller screen lists them.
     pub pad_keys: [String; PAD_BUTTONS],
+    /// Gamepad button/axis token bound to each pad button ([`BUTTON_NAMES`]
+    /// order) — the Gamepad rebind screen lists them.
+    pub gpad_binds: [String; PAD_BUTTONS],
     /// Display names of the BIOS images found beside the launched one; the
     /// BIOS screen lists them and marks [`OsdCtx::bios_active`].
     pub bios_names: Vec<String>,
@@ -266,6 +275,9 @@ enum Screen {
     #[cfg(feature = "gpu-presenter")]
     Shaders,
     Controller,
+    /// Per-button game-controller rebind (press-to-bind), reached from the
+    /// Controller screen.
+    Gamepad,
     Region,
     Cartridge,
     Bios,
@@ -506,7 +518,7 @@ impl Osd {
             Screen::Controller => {
                 // One row per pad button: "<button>  <bound key>"; selecting
                 // it asks the frontend to capture the next host keypress.
-                let mut v = Vec::with_capacity(PAD_BUTTONS + 2);
+                let mut v = Vec::with_capacity(PAD_BUTTONS + 4);
                 for (i, name) in BUTTON_NAMES.iter().enumerate() {
                     v.push(mk(
                         &format!("{name:<6} {}", ctx.pad_keys[i]),
@@ -523,7 +535,25 @@ impl Osd {
                     &format!("Port 2: {}", ctx.port_labels[1]),
                     Select::Emit(OsdAction::CyclePort(1)),
                 ));
-                v.push(mk("Reset Defaults", Select::Emit(OsdAction::ResetBinds)));
+                v.push(mk("Gamepad Buttons...", Select::Push(Screen::Gamepad)));
+                v.push(mk("Reset Keys", Select::Emit(OsdAction::ResetBinds)));
+                v.push(mk("Back", Select::Close));
+                v
+            }
+            Screen::Gamepad => {
+                // One row per pad button: "<button>  <gamepad token>"; selecting
+                // it asks the frontend to capture the next gamepad button/trigger.
+                let mut v = Vec::with_capacity(PAD_BUTTONS + 2);
+                for (i, name) in BUTTON_NAMES.iter().enumerate() {
+                    v.push(mk(
+                        &format!("{name:<6} {}", ctx.gpad_binds[i]),
+                        Select::Emit(OsdAction::StartGamepadRebind(i as u8)),
+                    ));
+                }
+                v.push(mk(
+                    "Reset Defaults",
+                    Select::Emit(OsdAction::ResetGamepadBinds),
+                ));
                 v.push(mk("Back", Select::Close));
                 v
             }
@@ -678,6 +708,7 @@ impl Osd {
             #[cfg(feature = "gpu-presenter")]
             Screen::Shaders => "Shaders",
             Screen::Controller => "Controller",
+            Screen::Gamepad => "Gamepad Buttons",
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
             Screen::Bios => "BIOS",
@@ -776,8 +807,10 @@ impl Osd {
         // Key-capture mode replaces the items with a modal prompt.
         if let Some(b) = self.capturing {
             let name = BUTTON_NAMES[b as usize % PAD_BUTTONS];
-            let line1 = format!("Press a key for {name}");
-            let pw = 180usize;
+            let line1 = format!("Press a key or button for {name}");
+            // Size the panel to the (now longer) prompt so centering never
+            // underflows, with a sane minimum.
+            let pw = (Canvas::text_width(&line1) + 24).max(180);
             let ph = 44usize;
             let px = c.w.saturating_sub(pw) / 2;
             let py = c.h.saturating_sub(ph) / 2;
@@ -920,6 +953,7 @@ mod tests {
             #[cfg(feature = "gpu-presenter")]
             shader_crt: false,
             pad_keys: crate::config::DEFAULT_KEYS.map(str::to_string),
+            gpad_binds: crate::config::DEFAULT_GPAD.map(str::to_string),
             bios_names: vec!["sega_101".into(), "mpr-17933".into()],
             bios_active: 0,
             browse_entries: Vec::new(),
@@ -1324,11 +1358,36 @@ mod tests {
             Some(OsdAction::StartRebind(12))
         );
         // Selection stays on Start (12); the rows below are Port 1 (13),
-        // Port 2 (14), then Reset Defaults (15) — three Downs reach Reset.
+        // Port 2 (14), Gamepad Buttons... (15), then Reset Keys (16).
         osd.handle(Nav::Down, &c); // Port 1
         osd.handle(Nav::Down, &c); // Port 2
-        osd.handle(Nav::Down, &c); // Reset Defaults
+        osd.handle(Nav::Down, &c); // Gamepad Buttons...
+        osd.handle(Nav::Down, &c); // Reset Keys
         assert_eq!(osd.handle(Nav::Select, &c), Some(OsdAction::ResetBinds));
+    }
+
+    #[test]
+    fn gamepad_screen_lists_bindings_and_starts_a_rebind() {
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true);
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Controller");
+        select_main(&mut osd, &c, "Gamepad Buttons...");
+        // Rows are "<button> <gamepad token>" in BUTTON_NAMES order: A = "x".
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label == "A      x"));
+        assert!(items.iter().any(|it| it.label == "L      lefttrigger"));
+        assert_eq!(
+            select_main(&mut osd, &c, "Start  start"),
+            Some(OsdAction::StartGamepadRebind(12))
+        );
+        // Below Start (12) is only Reset Defaults (13), then Back.
+        osd.handle(Nav::Down, &c); // Reset Defaults
+        assert_eq!(
+            osd.handle(Nav::Select, &c),
+            Some(OsdAction::ResetGamepadBinds)
+        );
     }
 
     #[test]

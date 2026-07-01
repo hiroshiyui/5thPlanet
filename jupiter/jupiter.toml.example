@@ -139,3 +139,28 @@ key_z     = "D"
 key_l     = "Q"
 key_r     = "W"
 key_start = "Return"
+
+# --- Game-controller bindings -----------------------------------------------
+#
+# Each Saturn pad button is bound to one SDL *gamepad token* — a button name
+# ("a" "b" "x" "y" = South/East/West/North, "back" "guide" "start",
+# "leftstick" "rightstick", "leftshoulder" "rightshoulder", "dpup" "dpdown"
+# "dpleft" "dpright") or an analog trigger ("lefttrigger" "righttrigger",
+# thresholded). The defaults below follow Sega's Saturn-port convention. Rebind
+# interactively via OSD -> Settings -> Controller -> Gamepad, or edit here. The
+# left analog stick always doubles as the D-pad. (A controller only drives a
+# port when that port is assigned to it above.)
+
+gpad_up    = "dpup"
+gpad_down  = "dpdown"
+gpad_left  = "dpleft"
+gpad_right = "dpright"
+gpad_a     = "x"
+gpad_b     = "a"
+gpad_c     = "b"
+gpad_x     = "y"
+gpad_y     = "leftshoulder"
+gpad_z     = "rightshoulder"
+gpad_l     = "lefttrigger"
+gpad_r     = "righttrigger"
+gpad_start = "start"
