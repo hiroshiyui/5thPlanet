@@ -100,13 +100,15 @@ tools/pgo/build_release.sh        # -> target/release/jupiter
 
 ## Controls
 
-The SDL3 frontend maps the host keyboard — and any attached **game
-controller** — to **port&nbsp;1** (a standard Saturn digital control pad) plus
-a few emulator hotkeys. Every pad button can be rebound from the menu
-(**Esc → Settings → Controller**, press-to-bind); the bindings persist in the
-config file. Controllers hot-plug at any time (SDL's GameController layer —
-XInput on Windows, evdev on Linux — so Xbox-style pads just work) and can
-also navigate the menu (D-pad + A/B, Start toggles).
+The SDL3 frontend maps the host keyboard and any attached **game controller**
+to the two Saturn controller ports. Each port can be assigned a device —
+keyboard, a specific game controller (by identity, so two pads work
+side-by-side), or the Shuttle Mouse — from **Esc → Settings → Controller** (the
+default is the keyboard on port&nbsp;1). The analog **3D Control Pad** is
+emulated too: assign a controller as a 3D pad to feed its stick and analog
+triggers. Controllers hot-plug at any time (SDL's GameController layer — XInput
+on Windows, evdev on Linux — so Xbox-style pads just work) and can also navigate
+the menu (D-pad + A/B, Start toggles).
 
 ### Saturn control pad — port 1 (default bindings)
 
@@ -118,9 +120,10 @@ also navigate the menu (D-pad + A/B, Start toggles).
 | L / R         | Q / W | LT / RT |
 | Start         | Enter | Start |
 
-The gamepad mapping is fixed for now (it follows Sega's own layout from
-their Xbox Saturn ports); per-button gamepad rebinding arrives with the
-analog-peripheral work. The keyboard map is fully rebindable.
+Both maps are fully rebindable from **Settings → Controller** (the keyboard
+map, and the per-button gamepad map via *Gamepad Buttons…*, press-to-bind); the
+bindings persist in the config file. The defaults above follow Sega's own layout
+from their Xbox Saturn ports.
 
 ### Shuttle Mouse (`--mouse[=1|2]`)
 
