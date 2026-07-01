@@ -912,7 +912,7 @@ impl Saturn {
     /// bits into the stored TVSTAT each batch) and the raster-jitter probe (which
     /// compares a register read's *stored* value against this *exact* one to
     /// measure batch-drain staleness). See [`hblank_active`] and `VBLANK_IN_CYCLE`.
-    fn raster_state(now: u64, h_res: u8) -> (u16, u16) {
+    fn raster_state(now: u64, h_res: u8, interlaced: bool) -> (u16, u16) {
         let frame = now / CYCLES_PER_FRAME;
         let frame_cycle = now % CYCLES_PER_FRAME;
         let line = (frame_cycle / CYCLES_PER_LINE).min(LINES_PER_FRAME - 1);
@@ -926,7 +926,12 @@ impl Saturn {
         if hblank_active(line_cycle, h_res, CYCLES_PER_LINE) {
             bits |= 0x0004; // HBLANK
         }
-        if frame & 1 == 1 {
+        // TVSTAT.ODD (field flag): in a **non-interlaced** (progressive) mode it
+        // is a constant 1; only an interlaced mode (TVMD.LSMD != 0) toggles it
+        // per field (Mednafen VDP2: `if(InterlaceMode) Odd = !Odd; else Odd =
+        // true;`) (G6). We render one frame per field, so frame parity is the
+        // field parity.
+        if !interlaced || (frame & 1 == 1) {
             bits |= 0x0002; // ODD field
         }
         (line as u16, bits)
@@ -939,8 +944,10 @@ impl Saturn {
         // the edge reference for the SCU Timer-0 line compare.
         let prev_line = self.bus.vdp2.regs.read16(0x00A);
         let h_res = self.bus.vdp2.regs.h_resolution();
+        // TVMD.LSMD (bits 7:6) != 0 → an interlaced mode (ODD toggles per field).
+        let interlaced = (self.bus.vdp2.regs.tvmd() >> 6) & 0b11 != 0;
         // Cycle-exact raster state (shared with the jitter probe via raster_state).
-        let (line, raster_bits) = Self::raster_state(now, h_res);
+        let (line, raster_bits) = Self::raster_state(now, h_res, interlaced);
         let vblank = raster_bits & 0x0008 != 0;
         let hblank = raster_bits & 0x0004 != 0;
         let tvstat = (prev & !0x000E) | raster_bits; // replace VBLANK|HBLANK|ODD
@@ -1162,7 +1169,8 @@ impl Saturn {
                     && rj.len() < 65_536
                 {
                     let h_res = bus.vdp2.regs.h_resolution();
-                    let (vcnt, bits) = Saturn::raster_state(cyc, h_res);
+                    let interlaced = (bus.vdp2.regs.tvmd() >> 6) & 0b11 != 0;
+                    let (vcnt, bits) = Saturn::raster_state(cyc, h_res, interlaced);
                     // VCNT (0x00A): compare scanlines. TVSTAT (0x004): compare only
                     // the batch-drainable bits HBLANK|ODD (0x0006). VBLANK (0x0008)
                     // is excluded: it is already a cycle-exact clamp edge AND the
@@ -2135,11 +2143,13 @@ mod tests {
             if hblank_active(fc % CYCLES_PER_LINE, h_res, CYCLES_PER_LINE) {
                 bits |= 0x0004; // HBLANK
             }
+            // Exercise the interlaced path (ODD toggles per field/frame); the
+            // progressive path (constant ODD=1) is covered by `raster_odd_*`.
             if frame & 1 == 1 {
                 bits |= 0x0002; // ODD
             }
             assert_eq!(
-                Saturn::raster_state(now, h_res),
+                Saturn::raster_state(now, h_res, true),
                 (line, bits),
                 "now={now} h_res={h_res}"
             );
@@ -2150,5 +2160,33 @@ mod tests {
         check(CYCLES_PER_FRAME, 0); // frame 1 → ODD set
         check(CYCLES_PER_FRAME + CYCLES_PER_LINE * 100 + 400, 1); // mid-line, 352-family
         check(CYCLES_PER_FRAME * 2 - 1, 3); // last cycle of an even frame, 704
+    }
+
+    #[test]
+    fn raster_odd_bit_is_constant_in_progressive_toggles_in_interlace() {
+        // G6: TVSTAT.ODD is a constant 1 in a non-interlaced (progressive) mode;
+        // only an interlaced mode toggles it per field.
+        let h = 0; // 320-dot
+        assert_eq!(
+            Saturn::raster_state(0, h, false).1 & 0x0002,
+            0x0002,
+            "progressive ODD = 1"
+        );
+        assert_eq!(
+            Saturn::raster_state(CYCLES_PER_FRAME, h, false).1 & 0x0002,
+            0x0002,
+            "progressive ODD stays 1 across frames"
+        );
+        // Interlaced: even frame 0 clear, odd frame 1 set.
+        assert_eq!(
+            Saturn::raster_state(0, h, true).1 & 0x0002,
+            0,
+            "field 0 even"
+        );
+        assert_eq!(
+            Saturn::raster_state(CYCLES_PER_FRAME, h, true).1 & 0x0002,
+            0x0002,
+            "field 1 odd"
+        );
     }
 }
