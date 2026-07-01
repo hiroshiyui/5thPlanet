@@ -19,6 +19,10 @@ use std::path::PathBuf;
 /// Number of Saturn digital-pad buttons the keyboard maps.
 pub const PAD_BUTTONS: usize = 13;
 
+/// Number of virtual backup-RAM cartridge **cards** (memory-card slots) the OSD
+/// manager exposes, each a `<bios>.<n>.crtbup` file (ADR-0028).
+pub const BACKUP_CARDS: usize = 8;
+
 /// Pad-button display names, in the fixed binding order used everywhere
 /// (config keys, OSD rows, the frontend's pad-bit table).
 // Headless builds read the config but have no keyboard to name buttons for.
@@ -105,6 +109,10 @@ pub struct Config {
     /// Cartridge token, same vocabulary as `--cart=`: `none` / `ram1m` /
     /// `ram4m` / `bram`.
     pub cartridge: String,
+    /// Active backup-RAM cartridge **card** index (`0..BACKUP_CARDS`): which
+    /// `<bios>.<n>.crtbup` virtual memory-card file backs the `bram` cart
+    /// (ADR-0028). Managed from the OSD Cartridge → Backup RAM Cards submenu.
+    pub cart_card: u8,
     /// **Legacy** Shuttle Mouse token (`off`/`1`/`2`), kept only so a pre-0.18
     /// config still parses; superseded by [`Config::port1`]/[`Config::port2`].
     /// [`Config::migrate_ports`] folds it into the port tokens on load, and
@@ -166,6 +174,7 @@ impl Default for Config {
             fullscreen: false,
             region: None,
             cartridge: "none".into(),
+            cart_card: 0,
             mouse: "off".into(),
             port1: String::new(),
             port2: String::new(),
@@ -210,6 +219,11 @@ impl Config {
                 }
                 "region" => cfg.region = Some(unquote(v)).filter(|s| !s.is_empty()),
                 "cartridge" => cfg.cartridge = unquote(v),
+                "cart_card" => {
+                    if let Ok(n) = unquote(v).parse::<u8>() {
+                        cfg.cart_card = n.min(BACKUP_CARDS as u8 - 1);
+                    }
+                }
                 "mouse" => cfg.mouse = unquote(v),
                 "port1" => cfg.port1 = unquote(v),
                 "port2" => cfg.port2 = unquote(v),
@@ -265,6 +279,7 @@ impl Config {
             out.push_str(&format!("region = \"{r}\"\n"));
         }
         out.push_str(&format!("cartridge = \"{}\"\n", self.cartridge));
+        out.push_str(&format!("cart_card = {}\n", self.cart_card));
         // The legacy `mouse` key is no longer written — it's folded into
         // port1/port2 by migrate_ports on load (still parsed for old configs).
         out.push_str(&format!("port1 = \"{}\"\n", self.port1));
@@ -373,6 +388,7 @@ mod tests {
             fullscreen: true,
             region: Some("europe-pal".into()),
             cartridge: "ram4m".into(),
+            cart_card: 3,
             port1: "gamepad:0300abcd".into(),
             port2: "keyboard".into(),
             backend: "software".into(),

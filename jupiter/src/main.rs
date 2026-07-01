@@ -573,6 +573,47 @@ fn state_base_for(launched_spec: Option<&str>, bios_base: &std::path::Path) -> s
     }
 }
 
+/// Path to backup-RAM cartridge **card** `card`'s virtual memory-card file
+/// (`<save_base>.<card>.crtbup`), keyed to the BIOS like the internal `.bup`
+/// (ADR-0028). `card` is a [`config::BACKUP_CARDS`] slot index.
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+fn cart_card_path(save_base: &std::path::Path, card: u8) -> std::path::PathBuf {
+    save_base.with_extension(format!("{card}.crtbup"))
+}
+
+/// Persist the currently-plugged backup cartridge (if any) to the active card's
+/// file, before switching cards or ejecting (ADR-0028).
+#[cfg(feature = "sdl-frontend")]
+fn persist_active_backup_card(saturn: &saturn::Saturn, sess: &Session) {
+    if let Some(bytes) = saturn.cartridge_backup() {
+        let path = cart_card_path(&sess.save_base, sess.cfg.cart_card);
+        if let Err(e) = fs::write(&path, bytes) {
+            eprintln!("failed to persist backup card to {}: {e}", path.display());
+        }
+    }
+}
+
+/// Ensure the Backup RAM cartridge is plugged in, power-cycling into it when a
+/// different (or no) cart is present. A no-op when it is already the active
+/// cart, so switching cards mid-session hot-swaps the card contents without a
+/// machine reset (ADR-0028).
+#[cfg(feature = "sdl-frontend")]
+fn ensure_backup_cart(
+    saturn: &mut saturn::Saturn,
+    sess: &mut Session,
+    audio_tx: &std::sync::mpsc::Sender<AudioMsg>,
+) {
+    if saturn.cartridge_backup().is_some() {
+        return; // already a Backup RAM cart — just load the new card into it
+    }
+    sess.ui.cart = osd::OsdCart::BackupRam;
+    sess.cfg.cartridge = "bram".into();
+    saturn.reset();
+    saturn.set_region(osd_region_to_code(sess.ui.region));
+    saturn.insert_cartridge(osd_cart_to_cartridge(osd::OsdCart::BackupRam));
+    let _ = audio_tx.send(AudioMsg::Reset);
+}
+
 /// Subtract `n` from an atomic, clamping at 0. **Must saturate**: an
 /// `AudioMsg::Reset` zeroes `audio_inflight` (`store(0)`) and can race ahead of
 /// in-flight `Chunk` byte-count subtracts that were already queued, momentarily
@@ -757,11 +798,12 @@ fn run(
         eprintln!("loaded backup RAM from {}", battery_path.display());
     }
 
-    // The battery backup *cartridge* (a separate, larger memory card) persists
-    // to its own `.crtbup` file, also keyed to the BIOS — both are console-level
-    // cards, not per-game (see the save-file keying design). Only present when a
-    // `bram` cart is plugged in; loaded here and written back on exit.
-    let cart_battery_path = save_base.with_extension("crtbup");
+    // The battery backup *cartridge* persists to a `.crtbup` virtual memory-card
+    // file, also keyed to the BIOS — both are console-level cards, not per-game
+    // (see the save-file keying design). One card per slot (ADR-0028); the
+    // active card (`cart_card`) is loaded here and written back on exit. Only
+    // present when a `bram` cart is plugged in.
+    let cart_battery_path = cart_card_path(&save_base, cfg.cart_card);
     if saturn.cartridge_backup().is_some()
         && let Ok(bytes) = fs::read(&cart_battery_path)
     {
@@ -1140,7 +1182,7 @@ fn run(
         let emu_quit = Arc::clone(&quit_flag);
         // Returns the machine plus the final save base — a BIOS swap re-keys
         // the battery file mid-session, so the exit persist must follow it.
-        let emu = scope.spawn(move || -> (Saturn, std::path::PathBuf) {
+        let emu = scope.spawn(move || -> (Saturn, std::path::PathBuf, u8) {
             let mut saturn = saturn;
             let mut osd = osd;
             let mut pipe = pipe;
@@ -1205,6 +1247,16 @@ fn run(
                     keep_aspect: sess.ui.keep_aspect,
                     region: sess.ui.region,
                     cart: sess.ui.cart,
+                    backup_card: sess.cfg.cart_card,
+                    // Which card files exist — only stat'd while the menu is open
+                    // (the manager screen reads it); cheap default otherwise.
+                    backup_card_used: if osd.is_open() {
+                        std::array::from_fn(|n| {
+                            cart_card_path(&sess.save_base, n as u8).exists()
+                        })
+                    } else {
+                        [false; config::BACKUP_CARDS]
+                    },
                     // Per-port source labels for the Controller screen's
                     // CyclePort rows (only read while the menu is open).
                     port_labels: if osd.is_open() {
@@ -1587,7 +1639,7 @@ fn run(
                     pl_last = std::time::Instant::now();
                 }
             }
-            (saturn, sess.save_base)
+            (saturn, sess.save_base, sess.cfg.cart_card)
         });
 
         // ---- SDL main loop: events, audio, present -----------------------
@@ -2146,7 +2198,7 @@ fn run(
         // Unblock and join the emu thread, then persist the battery from the
         // final machine state — keyed to the final save base (a BIOS swap
         // re-keys it mid-session).
-        let (saturn, final_base) = emu.join().expect("emu thread");
+        let (saturn, final_base, final_card) = emu.join().expect("emu thread");
         let battery_path = final_base.with_extension("bup");
         if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
             eprintln!(
@@ -2154,9 +2206,10 @@ fn run(
                 battery_path.display()
             );
         }
-        // Persist the backup cartridge too, when one is plugged in.
+        // Persist the backup cartridge too, when one is plugged in — to the
+        // active card's file (ADR-0028).
         if let Some(bytes) = saturn.cartridge_backup() {
-            let cart_path = final_base.with_extension("crtbup");
+            let cart_path = cart_card_path(&final_base, final_card);
             if let Err(e) = fs::write(&cart_path, bytes) {
                 eprintln!(
                     "failed to persist backup cartridge to {}: {e}",
@@ -2761,7 +2814,7 @@ fn dispatch_osd(
                         eprintln!("failed to persist backup RAM to {}: {e}", old_bup.display());
                     }
                     if let Some(bytes) = saturn.cartridge_backup() {
-                        let old_crt = sess.save_base.with_extension("crtbup");
+                        let old_crt = cart_card_path(&sess.save_base, sess.cfg.cart_card);
                         if let Err(e) = fs::write(&old_crt, bytes) {
                             eprintln!(
                                 "failed to persist backup cartridge to {}: {e}",
@@ -2787,7 +2840,7 @@ fn dispatch_osd(
                         saturn.load_internal_backup(&b);
                     }
                     if saturn.cartridge_backup().is_some()
-                        && let Ok(b) = fs::read(sess.save_base.with_extension("crtbup"))
+                        && let Ok(b) = fs::read(cart_card_path(&sess.save_base, sess.cfg.cart_card))
                     {
                         saturn.load_cartridge_backup(&b);
                     }
@@ -2826,7 +2879,7 @@ fn dispatch_osd(
             // Persist the outgoing backup cartridge (if any) before it's swapped
             // out, so switching carts doesn't lose its saves.
             if let Some(bytes) = saturn.cartridge_backup() {
-                let crt = sess.save_base.with_extension("crtbup");
+                let crt = cart_card_path(&sess.save_base, sess.cfg.cart_card);
                 if let Err(e) = fs::write(&crt, bytes) {
                     eprintln!(
                         "failed to persist backup cartridge to {}: {e}",
@@ -2838,9 +2891,9 @@ fn dispatch_osd(
             saturn.reset();
             saturn.set_region(osd_region_to_code(sess.ui.region));
             saturn.insert_cartridge(osd_cart_to_cartridge(k));
-            // Adopt the new backup cartridge's persisted contents, if present.
+            // Adopt the active card's persisted contents, if present.
             if saturn.cartridge_backup().is_some()
-                && let Ok(bytes) = fs::read(sess.save_base.with_extension("crtbup"))
+                && let Ok(bytes) = fs::read(cart_card_path(&sess.save_base, sess.cfg.cart_card))
             {
                 saturn.load_cartridge_backup(&bytes);
             }
@@ -2854,6 +2907,60 @@ fn dispatch_osd(
                 osd::OsdCart::BackupRam => "Backup RAM",
             };
             osd.set_toast(format!("Cartridge: {name} (reset)"), 150);
+            osd.close();
+        }
+        OsdAction::SelectBackupCard(n) => {
+            let n = n.min(config::BACKUP_CARDS as u8 - 1);
+            // Persist the outgoing card, switch, ensure the Backup RAM cart is
+            // plugged, then load the selected card (ADR-0028).
+            persist_active_backup_card(saturn, sess);
+            sess.cfg.cart_card = n;
+            ensure_backup_cart(saturn, sess, audio_tx);
+            if let Ok(bytes) = fs::read(cart_card_path(&sess.save_base, n)) {
+                saturn.load_cartridge_backup(&bytes);
+            }
+            sess.cfg.save();
+            osd.set_toast(format!("Backup Card {n} selected"), 150);
+            osd.close();
+        }
+        OsdAction::CreateBackupCard(n) => {
+            let n = n.min(config::BACKUP_CARDS as u8 - 1);
+            persist_active_backup_card(saturn, sess);
+            // Write a fresh, formatted card image to the slot's file.
+            let fresh = osd_cart_to_cartridge(osd::OsdCart::BackupRam);
+            if let Some(b) = fresh.bram_bytes()
+                && let Err(e) = fs::write(cart_card_path(&sess.save_base, n), b)
+            {
+                eprintln!("failed to create backup card {n}: {e}");
+            }
+            sess.cfg.cart_card = n;
+            ensure_backup_cart(saturn, sess, audio_tx);
+            // Load the just-created (fresh) card so the live cart matches its file.
+            if let Ok(bytes) = fs::read(cart_card_path(&sess.save_base, n)) {
+                saturn.load_cartridge_backup(&bytes);
+            }
+            sess.cfg.save();
+            osd.set_toast(format!("Backup Card {n} created"), 150);
+            osd.close();
+        }
+        OsdAction::DeleteBackupCard(n) => {
+            let n = n.min(config::BACKUP_CARDS as u8 - 1);
+            let path = cart_card_path(&sess.save_base, n);
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("failed to delete backup card {n}: {e}");
+            }
+            // Deleting the active, currently-plugged card ejects the cart — no
+            // active-but-fileless state, and we don't re-save the deleted card.
+            if n == sess.cfg.cart_card && saturn.cartridge_backup().is_some() {
+                sess.ui.cart = osd::OsdCart::None;
+                sess.cfg.cartridge = "none".into();
+                saturn.reset();
+                saturn.set_region(osd_region_to_code(sess.ui.region));
+                saturn.insert_cartridge(osd_cart_to_cartridge(osd::OsdCart::None));
+                let _ = audio_tx.send(AudioMsg::Reset);
+            }
+            sess.cfg.save();
+            osd.set_toast(format!("Backup Card {n} deleted"), 150);
             osd.close();
         }
         OsdAction::CyclePort(p) => {
@@ -2888,8 +2995,9 @@ fn run(
     region: u8,
     mouse_port: Option<u8>,
     // The config already shaped `cart`/`region` in `main`; headless has no
-    // window or keymap, so nothing else applies.
-    _cfg: config::Config,
+    // window or keymap, so only the active backup card (`cart_card`) still
+    // applies to the `.crtbup` path.
+    cfg: config::Config,
 ) -> ExitCode {
     use saturn::Saturn;
     use saturn::vdp2::{FRAME_HEIGHT, FRAME_WIDTH, FRAMEBUFFER_BYTES};
@@ -2929,7 +3037,7 @@ fn run(
     if let Ok(bytes) = fs::read(&battery_path) {
         saturn.load_internal_backup(&bytes);
     }
-    let cart_battery_path = save_base.with_extension("crtbup");
+    let cart_battery_path = cart_card_path(&save_base, cfg.cart_card);
     if saturn.cartridge_backup().is_some()
         && let Ok(bytes) = fs::read(&cart_battery_path)
     {

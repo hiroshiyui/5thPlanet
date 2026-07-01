@@ -99,6 +99,11 @@ shader = "none"
 # Default: "none".
 cartridge = "none"
 
+# Active backup-RAM cartridge card (0..7): which virtual memory-card file
+# (<bios>.<n>.crtbup) the "bram" cart uses. Managed from the OSD Cartridge →
+# Backup RAM Cards submenu. Default: 0.
+cart_card = 0
+
 # --- Controller ports -------------------------------------------------------
 #
 # Each of the two SMPC controller ports is assigned an input source. Tokens:

@@ -10,7 +10,7 @@
 
 mod font;
 
-use crate::config::{BUTTON_NAMES, PAD_BUTTONS};
+use crate::config::{BACKUP_CARDS, BUTTON_NAMES, PAD_BUTTONS};
 use font::{Canvas, Rgb};
 
 /// Number of save-state slots the menu exposes.
@@ -149,6 +149,16 @@ pub enum OsdAction {
     SetRegion(OsdRegion),
     /// Swap the rear-slot cartridge (frontend applies it and resets).
     SetCartridge(OsdCart),
+    /// Make backup-RAM cartridge **card** `n` active (ADR-0028): the frontend
+    /// persists the outgoing card, plugs the Backup-RAM cart if needed, and
+    /// loads `<bios>.<n>.crtbup` into it. Emitted for a card that already exists.
+    SelectBackupCard(u8),
+    /// Create a fresh (formatted) backup-RAM card `n` and make it active — the
+    /// frontend writes a new `<bios>.<n>.crtbup`. Emitted for an empty slot.
+    CreateBackupCard(u8),
+    /// Delete backup-RAM card `n`'s file; if it is the active card the frontend
+    /// also ejects the backup cart (no active-but-fileless state).
+    DeleteBackupCard(u8),
     /// Advance the input source on controller port `0` or `1` to its next
     /// candidate (the frontend cycles None → Keyboard → Mouse → each connected
     /// pad against the live device list, re-points the SMPC ports live with no
@@ -224,6 +234,11 @@ pub struct OsdCtx {
     pub region: OsdRegion,
     /// Current rear-slot cartridge — the Cartridge screen marks it.
     pub cart: OsdCart,
+    /// Active backup-RAM cartridge card index — the card manager marks it.
+    pub backup_card: u8,
+    /// Whether each backup-RAM card slot already has a `<bios>.<n>.crtbup` file
+    /// (drives the used/empty mark + Create-vs-Select rows in the manager).
+    pub backup_card_used: [bool; BACKUP_CARDS],
     /// Current input-source label for each controller port (port 1, port 2) —
     /// the Controller screen shows them on the two `CyclePort` rows. Built from
     /// `ports::Source::label()` (e.g. `Keyboard`, `Mouse`, `Pad: Xbox 360`).
@@ -283,6 +298,16 @@ enum Screen {
     Gamepad,
     Region,
     Cartridge,
+    /// Backup-RAM cartridge card manager: one row per virtual memory-card slot
+    /// (ADR-0028), reached from the Cartridge screen.
+    CartManager,
+    /// Per-card actions (Select / Create / Delete) for backup-RAM card `n`.
+    CartCard(u8),
+    /// First delete confirmation for backup-RAM card `n` (ADR-0028 asks twice
+    /// before erasing a card).
+    CartDeleteConfirm1(u8),
+    /// Second (final) delete confirmation for backup-RAM card `n`.
+    CartDeleteConfirm2(u8),
     Bios,
     /// Filesystem browser for picking a disc image to load.
     DiscBrowser,
@@ -590,7 +615,80 @@ impl Osd {
                     row("Ext RAM 1M", OsdCart::ExtRam1M),
                     row("Ext RAM 4M", OsdCart::ExtRam4M),
                     row("Backup RAM", OsdCart::BackupRam),
+                    mk("Backup RAM Cards...", Select::Push(Screen::CartManager)),
                     mk("Back", Select::Close),
+                ]
+            }
+            Screen::CartManager => {
+                // One row per virtual memory-card slot: '*' marks the active
+                // card, '[*]'/'[-]' whether that card's file exists.
+                let mut v = Vec::with_capacity(BACKUP_CARDS + 1);
+                for n in 0..BACKUP_CARDS {
+                    let active = if ctx.backup_card as usize == n {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let mark = if ctx.backup_card_used[n] { "*" } else { "-" };
+                    let label = format!("{active}Card {n} [{mark}]");
+                    v.push(mk(&label, Select::Push(Screen::CartCard(n as u8))));
+                }
+                v.push(mk("Back", Select::Close));
+                v
+            }
+            Screen::CartCard(n) => {
+                // An existing card can be Selected or Deleted; an empty slot can
+                // be Created (which also makes it active).
+                let n = n as usize;
+                let used = n < BACKUP_CARDS && ctx.backup_card_used[n];
+                if used {
+                    vec![
+                        mk(
+                            "Select (Use)",
+                            Select::Emit(OsdAction::SelectBackupCard(n as u8)),
+                        ),
+                        // Deleting a card asks twice (ADR-0028) — this only opens
+                        // the first confirmation.
+                        mk(
+                            "Delete...",
+                            Select::Push(Screen::CartDeleteConfirm1(n as u8)),
+                        ),
+                        mk("Back", Select::Close),
+                    ]
+                } else {
+                    vec![
+                        mk(
+                            "Create & Use",
+                            Select::Emit(OsdAction::CreateBackupCard(n as u8)),
+                        ),
+                        mk("Back", Select::Close),
+                    ]
+                }
+            }
+            Screen::CartDeleteConfirm1(n) => {
+                // First of two confirmations. The safe "No" is the default (top)
+                // row so a stray Enter never erases a card.
+                vec![
+                    mk(
+                        &format!("Delete card {n}? This erases its saves."),
+                        Select::Close,
+                    ),
+                    mk("No - keep it", Select::Close),
+                    mk(
+                        "Yes - continue",
+                        Select::Push(Screen::CartDeleteConfirm2(n)),
+                    ),
+                ]
+            }
+            Screen::CartDeleteConfirm2(n) => {
+                // Second (final) confirmation; "No" is again the default row.
+                vec![
+                    mk("Are you sure? This cannot be undone.", Select::Close),
+                    mk("No - cancel", Select::Close),
+                    mk(
+                        "Yes - ERASE permanently",
+                        Select::Emit(OsdAction::DeleteBackupCard(n)),
+                    ),
                 ]
             }
             Screen::Bios => {
@@ -714,6 +812,10 @@ impl Osd {
             Screen::Gamepad => "Gamepad Buttons",
             Screen::Region => "Region",
             Screen::Cartridge => "Cartridge",
+            Screen::CartManager => "Backup RAM Cards",
+            Screen::CartCard(_) => "Backup Card",
+            Screen::CartDeleteConfirm1(_) => "Delete Card?",
+            Screen::CartDeleteConfirm2(_) => "Confirm Delete",
             Screen::Bios => "BIOS",
             Screen::DiscBrowser => "Load Disc",
             Screen::Diagnostics => "Diagnostics",
@@ -951,6 +1053,8 @@ mod tests {
             keep_aspect: true,
             region: OsdRegion::Japan,
             cart: OsdCart::None,
+            backup_card: 0,
+            backup_card_used: [false; BACKUP_CARDS],
             port_labels: ["Keyboard".into(), "None".into()],
             backend: OsdBackend::Auto,
             #[cfg(feature = "gpu-presenter")]
@@ -1344,6 +1448,80 @@ mod tests {
             select_main(&mut osd, &c, "  Ext RAM 4M"),
             Some(OsdAction::SetCartridge(OsdCart::ExtRam4M))
         );
+    }
+
+    #[test]
+    fn backup_card_manager_creates_selects_and_deletes() {
+        // ADR-0028: Cartridge → Backup RAM Cards → per-card Create/Select/Delete.
+        // Empty slot (card 0, active by default) offers Create & Use.
+        let mut osd = Osd::new();
+        osd.toggle();
+        let c = ctx(true); // all cards empty, backup_card = 0
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Cartridge");
+        select_main(&mut osd, &c, "Backup RAM Cards...");
+        select_main(&mut osd, &c, "*Card 0 [-]"); // active + empty
+        assert_eq!(
+            select_main(&mut osd, &c, "Create & Use"),
+            Some(OsdAction::CreateBackupCard(0))
+        );
+
+        // A used, non-active slot (card 1) offers Select (fresh osd — select_main
+        // navigates from the current cursor, so each flow starts clean).
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.backup_card_used[1] = true;
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Cartridge");
+        select_main(&mut osd, &c, "Backup RAM Cards...");
+        select_main(&mut osd, &c, " Card 1 [*]"); // inactive + used
+        assert_eq!(
+            select_main(&mut osd, &c, "Select (Use)"),
+            Some(OsdAction::SelectBackupCard(1))
+        );
+
+        // Deleting card 1 requires TWO confirmations before the action is
+        // emitted (ADR-0028).
+        let mut osd = Osd::new();
+        osd.toggle();
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Cartridge");
+        select_main(&mut osd, &c, "Backup RAM Cards...");
+        select_main(&mut osd, &c, " Card 1 [*]");
+        assert_eq!(
+            select_main(&mut osd, &c, "Delete..."),
+            None,
+            "opens confirm 1"
+        );
+        assert_eq!(
+            select_main(&mut osd, &c, "Yes - continue"),
+            None,
+            "opens confirm 2"
+        );
+        assert_eq!(
+            select_main(&mut osd, &c, "Yes - ERASE permanently"),
+            Some(OsdAction::DeleteBackupCard(1)),
+            "only the second confirmation emits the delete"
+        );
+    }
+
+    #[test]
+    fn backup_card_delete_first_confirmation_can_be_cancelled() {
+        // The safe "No" at confirm 1 pops back without emitting anything.
+        let mut osd = Osd::new();
+        osd.toggle();
+        let mut c = ctx(true);
+        c.backup_card_used[2] = true;
+        select_main(&mut osd, &c, "Settings");
+        select_main(&mut osd, &c, "Cartridge");
+        select_main(&mut osd, &c, "Backup RAM Cards...");
+        select_main(&mut osd, &c, " Card 2 [*]");
+        assert_eq!(select_main(&mut osd, &c, "Delete..."), None);
+        assert_eq!(select_main(&mut osd, &c, "No - keep it"), None);
+        // Back on the card screen: Select is still offered (nothing deleted).
+        let items = osd.items(osd.screen(), &c);
+        assert!(items.iter().any(|it| it.label == "Select (Use)"));
     }
 
     #[test]
