@@ -50,7 +50,7 @@ We use Michael Nygard's lightweight format — see
 | [0009](0009-physdisc-libcdio-ffi-crate.md) | Live physical-disc reads via a feature-gated libcdio FFI crate | Accepted |
 | [0010](0010-hle-direct-boot.md) | Optional HLE direct boot (load the 1st-read program, bypass the BIOS CD loader) | Superseded |
 | [0011](0011-hle-bios-syscalls.md) | HLE the BIOS system-call library for cold direct boot | Superseded |
-| [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Rejected |
+| [0012](0012-scsp-sound-driver-hle.md) | HLE the SCSP 68k sound driver (synthesis stays LLE) | Rejected / Removed |
 | [0013](0013-render-pipeline-worker-thread.md) | Render-pipeline worker thread (offload only the read-only render edge) | Accepted |
 | [0014](0014-audio-paced-emulation-loop.md) | Audio-paced emulation loop: real-time clock, reserve buffer, prebuffer | Accepted |
 | [0015](0015-cd-block-hle.md) | The CD-block is high-level-emulated — the one LLE exception | Accepted |
