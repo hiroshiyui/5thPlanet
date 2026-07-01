@@ -9,7 +9,7 @@ Companion docs: playable titles in
 studies + forensic files in [`debugging-playbook.md`](debugging-playbook.md).
 
 **Status:** M1–M12 ✅ complete · M13 (hardware completeness & fidelity backlog)
-📋 in progress · latest release **v0.18.0**. **Five commercial games are fully
+📋 in progress · latest release **v0.19.0**. **Five commercial games are fully
 playable** — *Virtua Fighter 2* (60 fps, tag `vf2-good-emulation`),
 *Doukyuusei ~if~*, *Sangokushi V* (三國志V), *Panzer Dragoon Zwei*, and
 *Greatest Nine '98* (see [`compatible-game-titles.md`](compatible-game-titles.md)).

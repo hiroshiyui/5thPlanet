@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-07-01
 
 The M13 **Tier E (input hardware)** and **Tier G (residual reference-audit)**
-work landed since 0.18.0. Tier E broadens controller support; Tier G is a set of
-golden-safe fidelity fixes to the SCSP interrupts and the VDP status flags. The
-`bios_boot` golden `0x0B1BA6E5180766F7` and all five game render goldens are
-unchanged.
+work landed since 0.18.0, alongside a **backup-RAM cartridge memory-card
+manager** (ADR-0028) and a **doubling of the built-in `doctor` diagnostics**.
+Tier E broadens controller support; Tier G is a set of golden-safe fidelity
+fixes to the SCSP interrupts and the VDP status flags. The `bios_boot` golden
+`0x0B1BA6E5180766F7` and all five game render goldens are unchanged.
 
 **Savestate format bumped 15 → 16** (the 3D Control Pad's analog axes); states
 written by 0.18.x are rejected on load.
@@ -27,6 +28,18 @@ written by 0.18.x are rejected on load.
   a 3D pad to feed its stick and triggers.
 - **Per-button gamepad rebinding** (Tier E-2d) — press-to-bind the gamepad map
   from the OSD (*Controller → Gamepad Buttons…*); config `gpad_*` SDL tokens.
+- **Backup-RAM cartridge as virtual memory cards** (ADR-0028) — the `--cart=bram`
+  extended backup cartridge is now persisted to host files and modelled as up to
+  eight virtual memory cards (`<bios>.<n>.crtbup`), managed from an OSD submenu
+  (*Cartridge → Backup RAM Cards…*: create / select / two-step-confirm delete);
+  config key `cart_card` selects the active card. Both the cartridge card and the
+  internal `.bup` are console-level battery cards, keyed to the BIOS.
+- **Six new `doctor` diagnostics** (registry 16 → 22, all in the CI
+  `all_diagnostics_pass` gate) — subsystem coverage for `m68k_exec`,
+  `scu_dsp_exec`, `vdp1_polygon`, and `savestate_roundtrip`, plus
+  signature-bug tripwires `cache_purge_coherency` (the SAN5 cache-coherency
+  class) and `scu_dma_alias_fold` (the Doukyuusei menu-bg cache-through-alias
+  bug).
 - **SCSP one-sample interrupt** (Tier G3) — SCIPD/MCIPD bit 10 pends every
   44.1 kHz output sample, letting a sound driver clock off the sample tick.
 
