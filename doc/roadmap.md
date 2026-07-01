@@ -14,7 +14,7 @@ playable** — *Virtua Fighter 2* (60 fps, tag `vf2-good-emulation`),
 *Doukyuusei ~if~*, *Sangokushi V* (三國志V), *Panzer Dragoon Zwei*, and
 *Greatest Nine '98* (see [`compatible-game-titles.md`](compatible-game-titles.md)).
 
-Test count: **1207 workspace-wide, 0 failures** (default features; +2 with
+Test count: **1232 workspace-wide, 0 failures** (default features; +2 with
 `--features gpu-presenter`), ~85% line coverage (`cargo llvm-cov`; excludes the
 SDL3 frontend and the FFI `physdisc` crate).
 
