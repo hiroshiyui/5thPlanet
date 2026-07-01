@@ -1786,6 +1786,21 @@ impl Saturn {
         self.bus.backup.load(bytes);
     }
 
+    /// The battery backup **cartridge**'s raw data bytes (unpacked), for host
+    /// persistence — `None` unless a `Bram` cart is plugged in. Like
+    /// [`Self::internal_backup`] but for the rear-slot backup cart (a separate,
+    /// larger battery card); write it to a host file on exit.
+    pub fn cartridge_backup(&self) -> Option<&[u8]> {
+        self.bus.cartridge.bram_bytes()
+    }
+
+    /// Restore the backup **cartridge** from a persisted image (loaded on
+    /// startup, after [`Self::insert_cartridge`]). A no-op unless a `Bram` cart
+    /// is present; length-clamped to the cart's capacity.
+    pub fn load_cartridge_backup(&mut self, bytes: &[u8]) {
+        self.bus.cartridge.load_bram_bytes(bytes);
+    }
+
     /// Run the SCU-DSP when host software has started it (PPAF EXF). Run at
     /// the aggregate, not inside the SCU, because the DSP's own DMA moves
     /// data between its data RAM and the A/B-bus — which only reachable from

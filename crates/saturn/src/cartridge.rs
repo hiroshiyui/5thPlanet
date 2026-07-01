@@ -138,6 +138,31 @@ impl Cartridge {
         }
     }
 
+    /// The raw linear backup buffer of a battery (`Bram`) cart, for host
+    /// persistence — `None` for any other cart (nothing battery-backed to save).
+    /// These are the *unpacked* data bytes; the bus applies the Saturn odd-byte
+    /// packing on access (see the module docs), so a persisted file mirrors the
+    /// internal-backup `.bup` format (data bytes only, no packing).
+    pub fn bram_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Cartridge::Bram { bytes, .. } => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Restore a battery (`Bram`) cart's linear buffer from a persisted image.
+    /// A no-op for any non-`Bram` cart. The incoming length is clamped to the
+    /// cart's current capacity: a shorter file leaves the tail (its
+    /// pre-formatted "BackUpRam Format" signature) intact, a longer one is
+    /// truncated — so a file saved against a differently-sized cart still loads
+    /// what fits (mirrors [`crate::memory::BackupRam::load`]).
+    pub fn load_bram_bytes(&mut self, src: &[u8]) {
+        if let Cartridge::Bram { bytes, .. } = self {
+            let n = src.len().min(bytes.len());
+            bytes[..n].copy_from_slice(&src[..n]);
+        }
+    }
+
     // --- byte primitives: every wider access is composed from these so the
     //     backup packing and ID-byte placement stay consistent across widths.
 

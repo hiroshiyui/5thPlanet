@@ -126,3 +126,51 @@ fn backup_ram_cart_odd_byte_packing_and_format_tag() {
     let (rb, _) = s.bus.read32(CART_BRAM_BASE + 0x40, AccessKind::Data);
     assert_eq!(rb, 0x00BB_00DD, "wired-to-0 lanes read back 0");
 }
+
+#[test]
+fn backup_cartridge_persists_and_reloads() {
+    // The host-persistence API (`cartridge_backup`/`load_cartridge_backup`):
+    // only a battery `Bram` cart exposes bytes, and a save→reload round-trip
+    // restores its contents into a fresh cart — the file-backed battery.
+    let mut s = sat();
+
+    // No cart, and non-battery carts, have nothing to persist.
+    assert!(
+        s.cartridge_backup().is_none(),
+        "empty slot: nothing to save"
+    );
+    s.insert_cartridge(Cartridge::ext_ram_1mb());
+    assert!(
+        s.cartridge_backup().is_none(),
+        "DRAM cart isn't battery-backed"
+    );
+
+    // A battery cart with a game write, captured as a persisted image.
+    s.insert_cartridge(Cartridge::backup_ram(0x0008_0000));
+    s.bus
+        .write32(CART_BRAM_BASE + 0x40, 0xAABB_CCDD, AccessKind::Data);
+    let saved = s
+        .cartridge_backup()
+        .expect("battery cart exposes its bytes")
+        .to_vec();
+
+    // A fresh console + fresh (formatted) cart of the same size; loading the
+    // image restores the written word through the bus packing.
+    let mut s2 = sat();
+    s2.insert_cartridge(Cartridge::backup_ram(0x0008_0000));
+    s2.load_cartridge_backup(&saved);
+    let (rb, _) = s2.bus.read32(CART_BRAM_BASE + 0x40, AccessKind::Data);
+    assert_eq!(
+        rb, 0x00BB_00DD,
+        "persisted battery contents survive a reload"
+    );
+
+    // Length reconciliation: loading into a smaller cart truncates without
+    // panicking, and a no-cart load is a silent no-op.
+    let mut s3 = sat();
+    s3.insert_cartridge(Cartridge::backup_ram(0x0008_0000));
+    s3.load_cartridge_backup(&vec![0xFF; 0x0040_0000]); // 4 MiB image into 512 KiB
+    let mut s4 = sat();
+    s4.load_cartridge_backup(&saved); // no cart plugged in
+    assert!(s4.cartridge_backup().is_none());
+}

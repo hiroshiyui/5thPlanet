@@ -757,6 +757,21 @@ fn run(
         eprintln!("loaded backup RAM from {}", battery_path.display());
     }
 
+    // The battery backup *cartridge* (a separate, larger memory card) persists
+    // to its own `.crtbup` file, also keyed to the BIOS — both are console-level
+    // cards, not per-game (see the save-file keying design). Only present when a
+    // `bram` cart is plugged in; loaded here and written back on exit.
+    let cart_battery_path = save_base.with_extension("crtbup");
+    if saturn.cartridge_backup().is_some()
+        && let Ok(bytes) = fs::read(&cart_battery_path)
+    {
+        saturn.load_cartridge_backup(&bytes);
+        eprintln!(
+            "loaded backup cartridge from {}",
+            cart_battery_path.display()
+        );
+    }
+
     if let Ok(path) = std::env::var("SAT_LOADSTATE") {
         let bytes = match fs::read(&path) {
             Ok(b) => b,
@@ -2139,6 +2154,16 @@ fn run(
                 battery_path.display()
             );
         }
+        // Persist the backup cartridge too, when one is plugged in.
+        if let Some(bytes) = saturn.cartridge_backup() {
+            let cart_path = final_base.with_extension("crtbup");
+            if let Err(e) = fs::write(&cart_path, bytes) {
+                eprintln!(
+                    "failed to persist backup cartridge to {}: {e}",
+                    cart_path.display()
+                );
+            }
+        }
         ExitCode::SUCCESS
     })
 }
@@ -2735,6 +2760,15 @@ fn dispatch_osd(
                     if let Err(e) = fs::write(&old_bup, saturn.internal_backup()) {
                         eprintln!("failed to persist backup RAM to {}: {e}", old_bup.display());
                     }
+                    if let Some(bytes) = saturn.cartridge_backup() {
+                        let old_crt = sess.save_base.with_extension("crtbup");
+                        if let Err(e) = fs::write(&old_crt, bytes) {
+                            eprintln!(
+                                "failed to persist backup cartridge to {}: {e}",
+                                old_crt.display()
+                            );
+                        }
+                    }
                     *saturn = saturn::Saturn::new(bytes);
                     saturn.reset();
                     saturn.set_region(osd_region_to_code(sess.ui.region));
@@ -2751,6 +2785,11 @@ fn dispatch_osd(
                     sess.bios_active = i;
                     if let Ok(b) = fs::read(sess.save_base.with_extension("bup")) {
                         saturn.load_internal_backup(&b);
+                    }
+                    if saturn.cartridge_backup().is_some()
+                        && let Ok(b) = fs::read(sess.save_base.with_extension("crtbup"))
+                    {
+                        saturn.load_cartridge_backup(&b);
                     }
                     let _ = audio_tx.send(AudioMsg::Reset);
                     osd.set_toast(format!("BIOS: {} (power cycle)", sess.bios_names[i]), 150);
@@ -2784,10 +2823,27 @@ fn dispatch_osd(
             osd.set_toast("Default gamepad binds restored", 120);
         }
         OsdAction::SetCartridge(k) => {
+            // Persist the outgoing backup cartridge (if any) before it's swapped
+            // out, so switching carts doesn't lose its saves.
+            if let Some(bytes) = saturn.cartridge_backup() {
+                let crt = sess.save_base.with_extension("crtbup");
+                if let Err(e) = fs::write(&crt, bytes) {
+                    eprintln!(
+                        "failed to persist backup cartridge to {}: {e}",
+                        crt.display()
+                    );
+                }
+            }
             sess.ui.cart = k;
             saturn.reset();
             saturn.set_region(osd_region_to_code(sess.ui.region));
             saturn.insert_cartridge(osd_cart_to_cartridge(k));
+            // Adopt the new backup cartridge's persisted contents, if present.
+            if saturn.cartridge_backup().is_some()
+                && let Ok(bytes) = fs::read(sess.save_base.with_extension("crtbup"))
+            {
+                saturn.load_cartridge_backup(&bytes);
+            }
             let _ = audio_tx.send(AudioMsg::Reset);
             sess.cfg.cartridge = osd_cart_to_token(k).to_string();
             sess.cfg.save();
@@ -2872,6 +2928,12 @@ fn run(
     let battery_path = save_base.with_extension("bup");
     if let Ok(bytes) = fs::read(&battery_path) {
         saturn.load_internal_backup(&bytes);
+    }
+    let cart_battery_path = save_base.with_extension("crtbup");
+    if saturn.cartridge_backup().is_some()
+        && let Ok(bytes) = fs::read(&cart_battery_path)
+    {
+        saturn.load_cartridge_backup(&bytes);
     }
 
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
@@ -3393,6 +3455,14 @@ fn run(
         eprintln!(
             "failed to persist backup RAM to {}: {e}",
             battery_path.display()
+        );
+    }
+    if let Some(bytes) = saturn.cartridge_backup()
+        && let Err(e) = fs::write(&cart_battery_path, bytes)
+    {
+        eprintln!(
+            "failed to persist backup cartridge to {}: {e}",
+            cart_battery_path.display()
         );
     }
 
