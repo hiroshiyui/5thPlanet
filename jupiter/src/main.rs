@@ -1133,7 +1133,7 @@ fn run(
             // keyboard mask + per-controller masks keyed by GUID. The port
             // assignment in `sess.ports` routes these to pad 1/2 each frame.
             let mut kbd_bits = 0u16;
-            let mut gamepad_states: Vec<(String, u16)> = Vec::new();
+            let mut gamepad_states: Vec<(String, u16, [u8; 4])> = Vec::new();
             // Frame buffers circulating emu → main → recycle; seed enough that
             // the pipe spare + the in-flight frame + the displayed frame never
             // starve the pool (a dip just skips one frame's hand-off).
@@ -1382,11 +1382,15 @@ fn run(
 
                 if scripted_pad.is_none() {
                     // Route this frame's per-device input to the two ports via
-                    // the assignment, then drive both SMPC pads.
+                    // the assignment, then drive both SMPC pads + the 3D-pad
+                    // analog channels (neutral when a port isn't an analog pad).
                     let (p1, p2) = sess.ports.route(kbd_bits, &gamepad_states);
                     held = p1;
                     saturn.set_pad1(p1);
                     saturn.set_pad2(p2);
+                    let analog = sess.ports.route_analog(&gamepad_states);
+                    saturn.set_analog1(analog[0].unwrap_or(saturn::smpc::analog::NEUTRAL));
+                    saturn.set_analog2(analog[1].unwrap_or(saturn::smpc::analog::NEUTRAL));
                 }
                 // Record a pad-state change at the frame it takes effect (the
                 // burst below holds `held` constant for its whole span).
@@ -1750,7 +1754,12 @@ fn run(
             // X/Y/Z = Y/LB/RB, L/R = the analog triggers (thresholded), D-pad
             // or left stick = D-pad. Per-button gamepad rebind arrives with
             // the M13 E2 analog-peripheral work.
-            let mut pad_inputs: Vec<(String, u16)> = Vec::with_capacity(controllers.len());
+            let mut pad_inputs: Vec<(String, u16, [u8; 4])> = Vec::with_capacity(controllers.len());
+            // Normalize an SDL axis to the Saturn 3D-pad byte: a centered stick
+            // (i16 −32768..32767) → 0x00 (min) .. 0x80 (center) .. 0xFF (max); a
+            // one-sided trigger (0..32767) → 0x00 (released) .. 0xFF (pressed).
+            let norm_stick = |v: i16| (((v as i32) + 32768) * 255 / 65535) as u8;
+            let norm_trig = |v: i16| ((v.max(0) as i32) * 255 / 32767) as u8;
             {
                 use sdl3::gamepad::{Axis, Button};
                 const TH: i16 = 16384; // half of full deflection
@@ -1792,12 +1801,21 @@ fn run(
                     } else if ly > TH {
                         bits |= pad::DOWN;
                     }
+                    // Analog channels for a 3D-pad assignment ([X, Y, L, R]); the
+                    // left stick + both triggers. Ignored unless this controller's
+                    // port is a `gamepad3d` (route_analog gates it).
+                    let analog = [
+                        norm_stick(lx),
+                        norm_stick(ly),
+                        norm_trig(c.axis(Axis::TriggerLeft)),
+                        norm_trig(c.axis(Axis::TriggerRight)),
+                    ];
                     let guid = c
                         .id()
                         .ok()
                         .map(|j| controller_subsystem.guid_for_id(j).string())
                         .unwrap_or_default();
-                    pad_inputs.push((guid, bits));
+                    pad_inputs.push((guid, bits, analog));
                 }
             }
             let _ = emu_tx.send(EmuIn::Input {
@@ -2082,13 +2100,14 @@ fn run(
 /// Messages from the SDL main thread to the emulation thread.
 #[cfg(feature = "sdl-frontend")]
 enum EmuIn {
-    /// This iteration's per-device held bits: the keyboard pad mask plus one
-    /// `(GUID, mask)` entry per connected game controller. The emu thread routes
-    /// these to ports 1/2 through the `ports::Ports` assignment (replacing the
-    /// old "merge everything onto port 1" `Pad(u16)`).
+    /// This iteration's per-device input: the keyboard pad mask plus one
+    /// `(GUID, digital mask, analog [X,Y,L,R])` entry per connected game
+    /// controller. The emu thread routes these to ports 1/2 through the
+    /// `ports::Ports` assignment (digital buttons via `route`, the 3D-pad analog
+    /// stick/trigger channels via `route_analog`).
     Input {
         kbd: u16,
-        pads: Vec<(String, u16)>,
+        pads: Vec<(String, u16, [u8; 4])>,
     },
     /// The connected-controller list changed (hot-plug): GUID + display name per
     /// open pad. The emu thread re-resolves its port assignment against it.
