@@ -16,7 +16,7 @@ mod asm;
 use crate::system::Saturn;
 use asm::{
     CLRMAC, NOP, add, add_imm, and_, assemble, bra_self, bt, cmp_eq, mac_l, mov_imm, movl_load,
-    movl_store, movw_load, mul_l, or_, shll, shll8, shll16, shlr, sts_macl, sub, xor_,
+    movl_store, movw_load, movw_store, mul_l, or_, shll, shll8, shll16, shlr, sts_macl, sub, xor_,
 };
 
 /// The result of one diagnostic check.
@@ -115,6 +115,36 @@ const REGISTRY: &[Diag] = &[
         name: "scsp_tone",
         category: "scsp",
         run: scsp_tone,
+    },
+    Diag {
+        name: "m68k_exec",
+        category: "m68k",
+        run: m68k_exec,
+    },
+    Diag {
+        name: "scu_dsp_exec",
+        category: "scu_dsp",
+        run: scu_dsp_exec,
+    },
+    Diag {
+        name: "vdp1_polygon",
+        category: "vdp1",
+        run: vdp1_polygon,
+    },
+    Diag {
+        name: "savestate_roundtrip",
+        category: "savestate",
+        run: savestate_roundtrip,
+    },
+    Diag {
+        name: "cache_purge_coherency",
+        category: "cache",
+        run: cache_purge_coherency,
+    },
+    Diag {
+        name: "scu_dma_alias_fold",
+        category: "scu",
+        run: scu_dma_alias_fold,
     },
 ];
 
@@ -461,7 +491,25 @@ fn cpu_shift_ops() -> (bool, String) {
 /// fires it (the engine drains within `run_for`). Source `0x0020_0200` →
 /// dest `0x0020_0300` (both Low WRAM — a legal DMA source, not the BIOS A-bus).
 fn scu_dma_copy() -> (bool, String) {
-    const DEST: u32 = 0x0020_0300;
+    verdict(read_low(&run_scu_dma_copy(false), 0x0020_0300), SENTINEL)
+}
+
+/// Like [`scu_dma_copy`], but the destination pointer is written as a
+/// cache-through **alias** (`0x2020_0300`, bit 29 set). The SCU-DMA engine must
+/// fold every address to its 27-bit physical form before the bus access, or the
+/// write lands nowhere (an unfolded alias reads/writes open bus — the Doukyuusei
+/// menu-background bug). Passing proves the folding still happens.
+fn scu_dma_alias_fold() -> (bool, String) {
+    verdict(read_low(&run_scu_dma_copy(true), 0x0020_0300), SENTINEL)
+}
+
+/// Shared SCU-DMA channel-0 word copy `0x0020_0200` → `0x0020_0300` (both Low
+/// WRAM — a legal DMA source, not the BIOS A-bus). Mirrors `tests/scu.rs`'s
+/// manual-trigger sequence: D0R/D0W/D0C/D0AD/D0MD, then a 32-bit write to D0EN
+/// with the DGO bit fires it (the engine drains within `run_for`). When
+/// `alias_dest`, the D0W pointer is the cache-through alias of the destination,
+/// which the engine must fold — see [`scu_dma_alias_fold`].
+fn run_scu_dma_copy(alias_dest: bool) -> Saturn {
     let mut code = sentinel_r0().to_vec(); // R0 = sentinel 0x2A2A2A2A
     code.extend([
         // R2 = source 0x0020_0200, plant the sentinel there
@@ -477,6 +525,13 @@ fn scu_dma_copy() -> (bool, String) {
         mov_imm(4, 3),
         shll8(4),
         add(3, 4),
+    ]);
+    if alias_dest {
+        // R3 |= 0x2000_0000 (the cache-through region bit: 0x20 << 24), turning
+        // the dest into its cache-through alias 0x2020_0300.
+        code.extend([mov_imm(4, 0x20), shll8(4), shll8(4), shll8(4), add(3, 4)]);
+    }
+    code.extend([
         // R1 = SCU base 0x05FE_0000 (6<<8 = 0x600, -2 = 0x5FE, <<16)
         mov_imm(1, 6),
         shll8(1),
@@ -518,7 +573,7 @@ fn scu_dma_copy() -> (bool, String) {
         movl_store(4, 5),
     ]);
     code.extend([bra_self(), NOP]);
-    verdict(read_low(&run_program(&code), DEST), SENTINEL)
+    run_program(&code)
 }
 
 /// SH-2 on-chip **DMAC** (the CPU's own 2-channel DMA controller, distinct from
@@ -718,6 +773,193 @@ fn scsp_tone() -> (bool, String) {
     (peak >= want, format!("peak {peak}, want >= {want}"))
 }
 
+/// SCSP **sound CPU** (MC68EC000) executes a program: stage a tiny 68k routine
+/// into sound RAM that writes the sentinel to a fixed address, release the CPU
+/// (`SNDON` resets it and reloads SSP/PC from sound-RAM `[0]`/`[4]`), run a few
+/// frames, and read the address back. Proves the hosted-68k boot + step path is
+/// alive (the class that historically silenced BGM). The 68k program is:
+/// `MOVE.L #$2A2A2A2A,($0800).W` (`0x21FC 2A2A 2A2A 0800`) then `BRA.S *`
+/// (`0x60FE`).
+fn m68k_exec() -> (bool, String) {
+    let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
+    sat.reset();
+    // 68k reset vectors: SSP at sound RAM [0], initial PC at [4].
+    sat.bus.scsp.ram.write32(0, 0x0000_1000); // SSP (grows down from 0x1000)
+    sat.bus.scsp.ram.write32(4, 0x0000_0100); // PC = 0x100
+    for (i, w) in [0x21FCu16, 0x2A2A, 0x2A2A, 0x0800, 0x60FE]
+        .iter()
+        .enumerate()
+    {
+        sat.bus.scsp.ram.write16(0x100 + i as u32 * 2, *w);
+    }
+    sat.bus.scsp.start(); // SNDON — resets + releases the 68k
+    let mut fb = vec![0u8; crate::vdp2::FRAMEBUFFER_BYTES];
+    for _ in 0..4 {
+        sat.run_frame(&mut fb);
+    }
+    verdict(sat.bus.scsp.ram.read32(0x0800), SENTINEL)
+}
+
+/// **SCU-DSP** executes microcode: load a 3-word program — `MVI RA0, WRAM>>2`;
+/// `DMA` one word A/B-bus → data-RAM bank 0; `ENDI` — via the PPD port, start it
+/// (PPAF `LEF|EXF`), and verify the sentinel planted in Work RAM lands in DSP
+/// data RAM. Mirrors `tests/scu.rs`'s DSP-DMA test; the aggregate steps the DSP
+/// in `drain_scu_dsp` during `run_for`.
+fn scu_dsp_exec() -> (bool, String) {
+    use sh2::bus::{AccessKind, Bus};
+    const SCU: u32 = 0x05FE_0000;
+    const PPD: u32 = SCU + 0x84;
+    const PPAF: u32 = SCU + 0x80;
+    const SRC: u32 = 0x0020_1000;
+    let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
+    sat.reset();
+    sat.bus.write32(SRC, SENTINEL, AccessKind::Data); // the word the DSP fetches
+    let ra0 = SRC >> 2;
+    let mvi_ra0 = (0b10u32 << 30) | (6 << 26) | (ra0 & 0x01FF_FFFF);
+    let dma = (0b11u32 << 30) | (1 << 15) | 1; // add_sel=1 (→4 bytes), 1 word
+    let endi = (0b11u32 << 30) | (0b11 << 28) | (1 << 27);
+    for w in [mvi_ra0, dma, endi] {
+        sat.bus.write32(PPD, w, AccessKind::Data); // load at PC 0,1,2
+    }
+    sat.bus
+        .write32(PPAF, (1 << 15) | (1 << 16), AccessKind::Data); // LEF | EXF: run
+    sat.run_for(4096);
+    let got = sat.bus.scu.dsp.data_ram[0][0];
+    (
+        got == SENTINEL && sat.bus.scu.dsp.stopped(),
+        format!("data_ram[0][0]=0x{got:08X}, want 0x{SENTINEL:08X}"),
+    )
+}
+
+/// **VDP1** plots a solid polygon: write a one-command list (a 10×10 blue quad)
+/// plus an END command into VDP1 VRAM, kick a one-shot draw (`PTMR` PTM=01), and
+/// check the draw framebuffer — an interior dot is filled and a corner outside
+/// the quad stays empty. Exercises the command-list plotter end to end (the
+/// whole subsystem had no self-check).
+fn vdp1_polygon() -> (bool, String) {
+    use sh2::bus::{AccessKind, Bus};
+    const VRAM: u32 = 0x05C0_0000; // command table
+    const FB: u32 = 0x05C8_0000; // draw framebuffer
+    let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
+    sat.reset();
+    // One polygon (10,10)-(20,20) in blue (RGB555 0x001F), then an END command.
+    let cmd: [u16; 14] = [
+        0x0004, 0x0000, // CMDCTRL polygon | CMDLINK
+        0x0080, 0x001F, // CMDPMOD (ECD, no transparency) | CMDCOLR (blue)
+        0x0000, 0x0000, // CMDSRCA | CMDSIZE (unused)
+        0x000A, 0x000A, // XA,YA = (10,10)
+        0x0014, 0x000A, // XB,YB = (20,10)
+        0x0014, 0x0014, // XC,YC = (20,20)
+        0x000A, 0x0014, // XD,YD = (10,20)
+    ];
+    for (i, w) in cmd.iter().enumerate() {
+        sat.bus.write16(VRAM + i as u32 * 2, *w, AccessKind::Data);
+    }
+    sat.bus.write16(VRAM + 0x20, 0x8000, AccessKind::Data); // END command
+    sat.bus.write16(0x05D0_0004, 0x0001, AccessKind::Data); // PTMR PTM=01: draw now
+    let px = |x: u32, y: u32| sat.bus.vdp1.read16(FB + (y * 512 + x) * 2);
+    let (interior, corner) = (px(15, 15), px(0, 0));
+    (
+        interior != 0 && corner == 0,
+        format!("interior=0x{interior:04X} (want !=0), corner=0x{corner:04X} (want 0)"),
+    )
+}
+
+/// **Save-state** round-trip is complete and deterministic (ADR-0027): snapshot
+/// a seeded throwaway, reload it into a fresh machine, run both forward by the
+/// same budget, and require byte-identical re-snapshots. A regression in *any*
+/// serialized field (an un-`Serialize`d peripheral) makes the two diverge.
+fn savestate_roundtrip() -> (bool, String) {
+    use sh2::bus::{AccessKind, Bus};
+    let prog = assemble(&[bra_self(), NOP]);
+    let mut a = Saturn::new(prog.clone());
+    a.reset();
+    a.run_for(50_000);
+    a.bus.write32(LOW_SCRATCH, SENTINEL, AccessKind::Data);
+    let snap = a.save_state();
+    let mut b = Saturn::new(prog);
+    b.reset();
+    if let Err(e) = b.load_state(&snap) {
+        return (false, format!("load_state rejected the snapshot: {e}"));
+    }
+    a.run_for(200_000);
+    b.run_for(200_000);
+    let _ = a.take_audio();
+    let _ = b.take_audio();
+    let (sa, sb) = (a.save_state(), b.save_state());
+    (
+        sa == sb,
+        format!(
+            "post-run snapshots {} ({} vs {} bytes)",
+            if sa == sb { "identical" } else { "DIVERGED" },
+            sa.len(),
+            sb.len()
+        ),
+    )
+}
+
+/// **SH-2 cache coherency** — the SAN5 signature bug class. Enable the cache,
+/// cache address A, change memory behind the cache via a **cache-through alias**
+/// write, confirm the cached read is now *stale*, then **associatively purge**
+/// the line and confirm the re-read sees the new value. Exercises CCR enable,
+/// line install, the cache-through bypass, and the by-address purge together.
+fn cache_purge_coherency() -> (bool, String) {
+    // R0 = V0 = sentinel — the value first cached at A.
+    let mut code = sentinel_r0().to_vec();
+    code.extend([
+        // Enable the cache: CCR (0xFFFFFE92, 16-bit) = 0x0001 (CE = bit 0).
+        mov_imm(1, -2),
+        shll8(1), // R1 = 0xFFFFFE00
+        mov_imm(2, 0x49),
+        shll(2),   // R2 = 0x92 (0x49 << 1 — 0x92 won't fit a signed imm)
+        add(1, 2), // R1 = 0xFFFFFE92
+        mov_imm(3, 1),
+        movw_store(1, 3), // CCR = 0x0001
+        // R4 = A = 0x0020_0200 (cacheable Low WRAM).
+        mov_imm(4, 0x20),
+        shll16(4),
+        mov_imm(5, 2),
+        shll8(5),
+        add(4, 5),        // R4 = 0x0020_0200
+        movl_store(4, 0), // [A] = V0 (write-through, no line yet)
+        movl_load(6, 4),  // read A → miss → install line holding V0
+        // Write V1 = 0x55 through the cache-through alias 0x2020_0200.
+        mov_imm(7, 0x55), // R7 = V1
+        mov_imm(8, 0x20),
+        shll8(8),
+        shll8(8),
+        shll8(8),         // R8 = 0x2000_0000
+        add(8, 4),        // R8 = 0x2020_0200 (alias of A)
+        movl_store(8, 7), // [alias] = V1 (bypasses cache → line now stale)
+        movl_load(9, 4),  // read A → HIT → stale V0 ("before")
+    ]);
+    code.extend(build_low_scratch_addr()); // R1 = 0x0020_0100 (clobbers R2)
+    code.extend([
+        movl_store(1, 9), // scratch[0x100] = before
+        // Associative-purge A via 0x4020_0200 (invalidate the line, no bus).
+        mov_imm(10, 0x40),
+        shll8(10),
+        shll8(10),
+        shll8(10),         // R10 = 0x4000_0000
+        add(10, 4),        // R10 = 0x4020_0200 (purge alias of A)
+        movl_load(11, 10), // purge access (returned value ignored)
+        movl_load(12, 4),  // read A → miss → refetch V1 ("after")
+        add_imm(1, 4),     // R1 = 0x0020_0104
+        movl_store(1, 12), // scratch[0x104] = after
+        bra_self(),
+        NOP,
+    ]);
+    let sat = run_program(&code);
+    let before = read_low(&sat, LOW_SCRATCH);
+    let after = read_low(&sat, LOW_SCRATCH + 4);
+    (
+        before == SENTINEL && after == 0x55,
+        format!(
+            "stale-hit 0x{before:08X} (want 0x2A2A2A2A), post-purge 0x{after:08X} (want 0x00000055)"
+        ),
+    )
+}
+
 /// `BRA disp` (`0xA000 | disp12`). Kept here (not in `asm`) because only the
 /// delay-slot check needs a non-self branch displacement.
 fn asm_bra(disp: i16) -> u16 {
@@ -808,6 +1050,10 @@ mod tests {
         assert!(matches!(
             decode(movw_load(3, 1)),
             Op::MovWL { rn: 3, rm: 1 }
+        ));
+        assert!(matches!(
+            decode(movw_store(1, 3)),
+            Op::MovWS { rn: 1, rm: 3 }
         ));
         assert!(matches!(decode(and_(0, 2)), Op::And { rn: 0, rm: 2 }));
         assert!(matches!(decode(or_(0, 2)), Op::Or { rn: 0, rm: 2 }));

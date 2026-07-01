@@ -59,6 +59,11 @@ pub fn movl_load(dst_rn: u16, addr_rm: u16) -> u16 {
 pub fn movw_load(dst_rn: u16, addr_rm: u16) -> u16 {
     0x6001 | (dst_rn << 8) | (addr_rm << 4)
 }
+/// `MOV.W Rm, @Rn` — store the low 16 bits of Rm to the address in Rn (`0x2nm1`,
+/// `MovWS`). Used to write the 16-bit-accessible on-chip `CCR`.
+pub fn movw_store(addr_rn: u16, src_rm: u16) -> u16 {
+    0x2001 | (addr_rn << 8) | (src_rm << 4)
+}
 /// `AND Rm, Rn` (`0x2nm9`).
 pub fn and_(rn: u16, rm: u16) -> u16 {
     0x2009 | (rn << 8) | (rm << 4)
