@@ -78,13 +78,16 @@ no-input stable frame), guarding the software-decoded-movie → VDP2 path.
 ## Under investigation
 
 - **Wachenröder** (ヴァッケンローダー) — Sega, serial **GS-9183**, JP / v1.01.
-  🚧 **Work in progress.** Boots to its 3D battle scene, which now renders
-  correctly after a VDP2 fidelity fix: the RBG0 rotating-floor layer's per-dot
-  line-colour index is taken from the rotation **coefficient-table** (KTCTL
-  bit 4), not the LCTA table — without it the floor's additive colour-calc
-  washed the whole scene near-white (commit `7e2341b`; case study in
-  [`debugging-playbook.md`](debugging-playbook.md)). Broader gameplay is being
-  verified; not yet promoted to the fully-playable list above.
+  🚧 **Work in progress.** Runs from its opening Cinepak FMV through the title
+  and story scenes and the pre-battle unit-select into the isometric tactical
+  battle (captures in [`screenshots/`](screenshots/README.md#wachenröder-ヴァッケンローダー)).
+  The battle's rotating-floor layer now renders correctly after a VDP2 fidelity
+  fix: RBG0's per-dot line-colour index is taken from the rotation
+  **coefficient-table** (KTCTL bit 4), not the LCTA table — without it the
+  floor's additive colour-calc washed the whole scene near-white (commit
+  `7e2341b`; case study in [`debugging-playbook.md`](debugging-playbook.md)).
+  Deeper gameplay — combat resolution, saving, progression — is still being
+  verified, so it is not yet promoted to the fully-playable list above.
 
 Resolved boot-blocker case studies (e.g. *Sangokushi V*, *Panzer Dragoon Zwei*)
 are kept as methodology references in the
