@@ -3052,7 +3052,7 @@ mod tests {
     fn colour_calc_window_gates_where_blending_applies() {
         // Two blending layers (NBG0 red over NBG1 blue). The colour-calc window
         // (WCTLD hi-byte) restricts the blend to its W0 rectangle; outside, the
-        // top draws opaque. (H3 #2; blend math is the branch's current ÷31.)
+        // top draws opaque. (H3 #2; ÷32 blend math.)
         let mut v = Vdp2::new();
         v.regs.write16(0x000, 0x8000); // DISP
         v.regs.write16(0x020, 0x0003); // NBG0 + NBG1
