@@ -78,6 +78,27 @@ the GN98 case study in the [`debugging-playbook.md`](../debugging-playbook.md).
 | [`gn98-matchup.png`](gn98-matchup.png) | The pre-game matchup for an exhibition game (オープン戦) — the Seibu Lions vs Yakult Swallows team flags at Meiji Jingu Stadium (明治神宮野球場). The flags exercise the VDP2 8bpp 2-word pattern-name palette-bank fix. |
 | [`gn98-game.png`](gn98-game.png) | In-game 3D baseball — the top of the 1st (1回表), the batter (松井, AVG .309) facing the pitcher (石井), with the S-B-O count diamond, the batting reticle, and the pad guide. |
 
+## Wachenröder (ヴァッケンローダー)
+
+SEGA's steampunk tactical RPG (serial GS-9183, JP) — **🚧 work in progress** on
+the JP v1.01 BIOS. It runs from its opening movie through the title and story
+scenes into the isometric tactical battle, whose rotating floor is an RBG0
+rotation layer with additive colour calculation. That floor previously washed the
+whole battle near-white until the VDP2 fix that takes the per-dot line-colour
+index from the rotation **coefficient table** (KTCTL bit 4) rather than LCTA
+(commit `7e2341b`; the Wachenröder case study in the
+[`debugging-playbook.md`](../debugging-playbook.md)). Broader gameplay is still
+being verified — it is not yet on the fully-playable list (see
+[`compatible-game-titles.md`](../compatible-game-titles.md)).
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`wachenroder-fmv.png`](wachenroder-fmv.png) | The opening Cinepak FMV — a ruined tower block against the dusk sky. |
+| [`wachenroder-title.png`](wachenroder-title.png) | The title screen — the riveted-brass "WACHENRÖDER" logo over the steam-machinery background with "Press start button", © SEGA ENTERPRISES, LTD., 1998. |
+| [`wachenroder-scene.png`](wachenroder-scene.png) | A story scene — the protagonist Lucian (ルシアン) and a drunkard (酔漢) trading dialogue, character portraits over the live background. |
+| [`wachenroder-party-select.png`](wachenroder-party-select.png) | The pre-battle unit-select / status screen — Lucian Tiller (ルシアン・ティラー) "SELECTED" at LV 1, HP 200, with the full stat block (AT / DF / SP / TP, MVP / ATP / SAP / OSP / ACP). |
+| [`wachenroder-battle.png`](wachenroder-battle.png) | The isometric tactical battle — Lucian on the grid with the move cursor and the AP (Action Point) gauge. The rotating stone floor is the RBG0 rotation layer whose coefficient-fed line colour the KTCTL fix corrected. |
+
 ## Frontend (in-window OSD)
 
 | Image | What it shows |
@@ -109,9 +130,9 @@ is easiest to see at full size.
 These screenshots are reproduced **solely to demonstrate the emulator's
 capabilities**, with **no intent to infringe** any copyright or trademark.
 
-- *SEGA*, *SEGA Saturn*, the Saturn logos, *Virtua Fighter 2*, and *Panzer
-  Dragoon Zwei* are trademarks and/or registered trademarks of **SEGA
-  Corporation**. © SEGA.
+- *SEGA*, *SEGA Saturn*, the Saturn logos, *Virtua Fighter 2*, *Panzer
+  Dragoon Zwei*, *Greatest Nine '98*, and *Wachenröder* are trademarks and/or
+  registered trademarks of **SEGA Corporation**. © SEGA.
 - *Doukyuusei ~if~* (同級生 if) is © **NEC InterChannel, Ltd.** / élf.
 - *Sangokushi V* (三國志V / *Romance of the Three Kingdoms V*) is © **KOEI Co., Ltd.** (now Koei Tecmo Games).
 - All other game titles, logos, characters, and artwork shown are the property
