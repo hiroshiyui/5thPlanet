@@ -1779,17 +1779,91 @@ fn sample_pattern_cell(
     // base is therefore always `char × 0x20`.
     let subcell = (in_y / 8) * 2 + (in_x / 8);
     let (px, py) = (in_x % 8, in_y % 8);
-    let cell = if depth == 1 {
-        pat.cell + subcell * 2
-    } else {
-        pat.cell + subcell
+    // The pattern-name character number addresses VRAM in 0x20-byte units. One
+    // 8×8 cell spans 0x20 (4bpp) / 0x40 (8bpp) / 0x80 (2048 & RGB555, 16bpp) /
+    // 0x100 (RGB888, 32bpp) bytes, i.e. `units` 0x20-blocks, so a 16×16
+    // character's four 8×8 sub-cells step the char number by that many units.
+    let units = match depth {
+        4 => 8,     // RGB888
+        2 | 3 => 4, // 2048-colour / RGB555
+        1 => 2,     // 8bpp
+        _ => 1,     // 4bpp
     };
+    let cell = pat.cell + subcell * units;
+    let cell_base = cell * 32;
     // VRAM cycle-pattern gating: a character fetch landing in a bank the VCP
     // table doesn't grant this NBG reads as a transparent dummy tile (code 0).
-    let cg_blocked = cg_gate.is_some_and(|mask| mask & (1 << (((cell * 32) >> 17) & 3)) == 0);
-    let (code, idx) = if cg_blocked {
-        (0, coff)
-    } else if depth == 1 {
+    let cg_blocked = cg_gate.is_some_and(|mask| mask & (1 << ((cell_base >> 17) & 3)) == 0);
+    if cg_blocked {
+        return tpon.then(|| {
+            let (rgb, msb) = cram_cc(vdp2, coff);
+            Sample {
+                rgb,
+                code: 0,
+                spr: pat.spr,
+                scc: pat.scc,
+                is_rgb: false,
+                msb,
+            }
+        });
+    }
+    let sample_paletted = |code: usize, idx: usize| {
+        (code != 0 || tpon).then(|| {
+            let (rgb, msb) = cram_cc(vdp2, idx);
+            Sample {
+                rgb,
+                code: code as u8,
+                spr: pat.spr,
+                scc: pat.scc,
+                is_rgb: false,
+                msb,
+            }
+        })
+    };
+    match depth {
+        // 32bpp RGB888 direct colour (16.7M). Direct colour bypasses CRAM, so a
+        // black CRAM can't hide it — the tile path historically fell through to
+        // the 4bpp branch and rendered these FMV frames black (SRW F intro).
+        // Transparency here is "visible colour ≠ 0", matching the bitmap direct-
+        // colour path; Mednafen instead keys on the dot MSB (bit 31 / bit 15),
+        // so an opaque-black dot (MSB=1, RGB=0) differs — a pre-existing
+        // convention shared with `sample_bitmap`, to harmonise across both paths
+        // (with a render-golden re-verify) rather than only here.
+        4 => {
+            let entry = vdp2.vram.read32(cell_base + (py * 8 + px) * 4);
+            (entry & 0x00FF_FFFF != 0).then(|| {
+                let (rgb, msb) = direct_rgb888(entry);
+                Sample {
+                    rgb,
+                    code: 0,
+                    spr: pat.spr,
+                    scc: pat.scc,
+                    is_rgb: true,
+                    msb,
+                }
+            })
+        }
+        // 16bpp RGB555 direct colour (32K).
+        3 => {
+            let entry = vdp2.vram.read16(cell_base + (py * 8 + px) * 2);
+            (entry & 0x7FFF != 0).then(|| Sample {
+                rgb: cram::rgb555_to_888(entry),
+                code: 0,
+                spr: pat.spr,
+                scc: pat.scc,
+                is_rgb: true,
+                msb: entry & 0x8000 != 0,
+            })
+        }
+        // 16bpp 2048-colour: the low 11 bits index CRAM directly, plus the
+        // layer's CRAM offset (Mednafen `vdp2_render.cpp:1544` `ColorCache[(pcco
+        // + dcc) & 2047]`) — `+` (not `|`), since an 11-bit code overlaps the
+        // offset's high bits; no per-character palette bank.
+        2 => {
+            let word = vdp2.vram.read16(cell_base + (py * 8 + px) * 2) as usize;
+            let code = word & 0x7FF;
+            sample_paletted(code, (coff + code) & 0x7FF)
+        }
         // 8bpp cell: 0x40 bytes, one byte/pixel. In 256-colour mode the CRAM
         // bank comes from palette bits [6:4] ONLY (a 256-entry palette spans
         // CRAM addr [7:0], so the palette number's low 4 bits are ignored) and
@@ -1797,25 +1871,17 @@ fn sample_pattern_cell(
         // bank in bits [6:4] (see `decode`). Using the full palette field here
         // over-shifted a 2-word PN's 7-bit field, folding the bank back to 0 —
         // GN98's scrambled team-flag previews.
-        let byte = vdp2.vram.read8(cell * 32 + py * 8 + px) as usize;
-        (byte, coff | (((pat.palette as usize) & 0x70) << 4) | byte)
-    } else {
-        // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
-        let b = vdp2.vram.read8(cell * 32 + py * 4 + px / 2);
-        let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
-        (nibble, coff | (pat.palette as usize) << 4 | nibble)
-    };
-    (code != 0 || tpon).then(|| {
-        let (rgb, msb) = cram_cc(vdp2, idx);
-        Sample {
-            rgb,
-            code: code as u8,
-            spr: pat.spr,
-            scc: pat.scc,
-            is_rgb: false,
-            msb,
+        1 => {
+            let byte = vdp2.vram.read8(cell_base + py * 8 + px) as usize;
+            sample_paletted(byte, coff | (((pat.palette as usize) & 0x70) << 4) | byte)
         }
-    })
+        // 4bpp cell: 0x20 bytes, two pixels/byte (high nibble = even column).
+        _ => {
+            let b = vdp2.vram.read8(cell_base + py * 4 + px / 2);
+            let nibble = if px & 1 == 0 { b >> 4 } else { b & 0xF } as usize;
+            sample_paletted(nibble, coff | (pat.palette as usize) << 4 | nibble)
+        }
+    }
 }
 
 fn sample_tile(vdp2: &Vdp2, ctx: &FrameCtx, n: usize, sx: u32, sy: u32) -> Option<Sample> {
@@ -3788,6 +3854,36 @@ mod tests {
             pixel(&buf, 1, 2),
             [0xFF, 0, 0, 0xFF],
             "rot 16×16 TL subcell"
+        );
+    }
+
+    /// Regression: a **RGB888 (16.7M-colour) direct-colour TILE** character must
+    /// render its direct colour, not fall through the 4bpp branch to a black
+    /// CRAM. The tile path (`sample_pattern_cell`, shared by NBG and rotation)
+    /// historically only handled 4bpp/8bpp, so Super Robot Wars F's scenario-intro
+    /// FMV (an NBG0 RGB888 tile layer) rendered fully black while its audio played.
+    #[test]
+    fn tile_rgb888_direct_colour_renders_not_black() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x000, 0x8000); // DISP
+        v.regs.write16(0x020, 0x0010); // RBG0
+        v.regs.write16(0x02A, 0x4000); // CHCTLB: R0CHCN=4 (RGB888), 8×8 tile
+        v.regs.write16(0x038, 0x8000); // PNCR: 1-word
+        v.regs.write16(0x03A, 0x0000); // RA plane size 1×1
+        v.regs.write16(0x0FC, 0x0001); // priority 1
+        v.regs.write16(0x050, 0x0000); // MPABRA: plane A map 0 → PN table at 0
+        v.regs.write16(0x0BE, 0x4000); // RPTAL → rot param table at 0x8000
+        setup_rot_param_at(&mut v, 0x8000);
+        v.vram.write16(0, 8); // PN[0] → char 8
+        // Char 8 (8×8 RGB888): byte base 8·0x20 = 0x100; dot (px=1,py=2) at
+        // 0x100 + (py·8+px)·4. A black CRAM must not be able to hide it.
+        v.vram.write32(0x100 + (2 * 8 + 1) * 4, 0x00CC_8844);
+        let mut buf = fresh_buf();
+        render_frame(&v, None, &mut buf);
+        assert_eq!(
+            pixel(&buf, 1, 2),
+            [0x44, 0x88, 0xCC, 0xFF],
+            "RGB888 tile dot renders its direct colour"
         );
     }
 
