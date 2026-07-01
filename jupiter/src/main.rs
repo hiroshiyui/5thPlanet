@@ -3406,6 +3406,20 @@ fn run(
             saturn.slave_mut().dbg_slow_fetch = slow_fetch;
         }
         dump_dims = saturn.run_frame(&mut framebuffer);
+        // Observer-only: `SAT_SAVESTATE_AT_FRAME=N SAT_SAVESTATE_OUT=path` writes a
+        // faithful (per-frame) save state at end of frame N — a foothold sdbg can
+        // load with the disc grafted, since sdbg's single `run_for` diverges.
+        if std::env::var("SAT_SAVESTATE_AT_FRAME")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            == Some(f)
+            && let Ok(path) = std::env::var("SAT_SAVESTATE_OUT")
+        {
+            match fs::write(&path, saturn.save_state()) {
+                Ok(()) => eprintln!("SAVESTATE wrote {path} at frame {f}"),
+                Err(e) => eprintln!("SAVESTATE write {path} failed: {e}"),
+            }
+        }
         let mut frame_audio = if audio_dump.is_some() {
             saturn.take_audio()
         } else {
