@@ -42,7 +42,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install # reads rust-toolchain.toml
 
-      - uses: Swatinem/rust-cache@v2 # also caches the cmake'd SDL3 in target/
+      # SHA-pinned (community action — supply-chain hygiene); the comment tracks
+      # the release the SHA corresponds to. Also caches the cmake'd SDL3 in target/.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Compute version
         id: ver
