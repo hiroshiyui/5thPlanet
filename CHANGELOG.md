@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-07-02
+
+The **Super Robot Wars F / F Final release**: the three emulation gaps that
+kept SRW F stuck at a black scenario intro, a loud XA-audio buzz, and a
+combat-entry stall are fixed, and both titles are now fully playable
+(user-verified). The same push lands the VDP2 **line-colour extended colour
+calc** (roadmap C9 `EXCC_LINE`) and two headless debugging probes. The
+`bios_boot` golden `0x0B1BA6E5180766F7` and all five game render goldens are
+unchanged, and the **savestate format stays at v16** — 0.19.0 states load.
+
+### Added
+
+- **VDP2 line-colour extended colour calc** (C9 `EXCC_LINE`, CCCTL bit 5) —
+  under extended colour calc a line-colour-enabled top layer now blends with
+  `avg(line colour, pushed-down 2nd layer)` per Mednafen's
+  `MIXIT_SPECIAL_EXCC_LINE_CRAM0/12`, instead of the raw line colour (the
+  gradient EXCC variant stays deferred).
+- **`SAT_SRAM_DUMP_*` headless probe** (jupiter) — hex-dump + PCM stats of a
+  SCSP sound-RAM window at the end of a chosen frame, for diffing streamed
+  audio against the Mednafen oracle.
+- **`SAT_SAVESTATE_AT_FRAME` hook** (jupiter) — write a faithful save state at
+  the end of frame N of a headless run, giving `sdbg` a bit-exact foothold in
+  the real per-frame timeline.
+- **PGO ship-features knob** (`PGO_SHIP_FEATURES`) — `tools/pgo/build_release.sh`
+  can compile extra cargo features (e.g. `gpu-presenter`) into the shipping
+  binary only.
+
+### Fixed
+
+- **CD-XA Form-2 sectors deliver their full 2324-byte payload** — a Mode-2
+  Form-2 sector (subheader submode bit 5) was truncated to 2048 bytes, which
+  misframed SRW F's 2324-strided software XA-ADPCM stream into a runaway IIR
+  decoder → a loud saturating buzz.
+- **RGB888/RGB555/2048 direct-colour tile characters render** — the VDP2 tile
+  path only handled 4bpp/8bpp paletted cells, so an RGB888 tile layer (SRW F's
+  scenario-intro FMV) rendered fully black; the character number now also steps
+  by the correct per-depth cell size.
+- **Direct-colour transparency keys on the dot MSB** (bit 31 RGB888 / bit 15
+  RGB555) across all three sample sites (NBG bitmap, NBG/RBG tile, RBG bitmap),
+  replacing the "visible colour ≠ 0" approximation; `NxTPON` forces opaque.
+- **A buffer-full pause no longer consumes the pending play-end IRQ** — a long
+  streaming Play that backed up on the 200-block pool lost its `PEND`, so the
+  range's real end raised no IRQ (SRW F polled the CD forever: black screen,
+  BGM playing).
+- **Mednafen-faithful CD drive timing** (seek, pause, resume) — the
+  direction-split per-FAD seek cost, Seek-pause-in-place settling BUSY→PAUSE
+  through the periodic walk at the 150 Hz cadence (not an instant park), and
+  buffer-full-pause resume as a timed re-seek triggered promptly on any block
+  free. Fixes SRW F's combat-entry stall, a timing-latent loader race
+  (debugging playbook CASE#16).
+- **Headless SRAM-dump probe stats** (jupiter) — the nonzero-word count now
+  covers the full requested window (not just displayed rows), and the
+  env-supplied window can no longer overflow the offset arithmetic.
+
 ## [0.19.0] - 2026-07-01
 
 The M13 **Tier E (input hardware)** and **Tier G (residual reference-audit)**
