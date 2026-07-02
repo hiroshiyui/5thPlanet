@@ -102,8 +102,11 @@ jobs:
       - name: Create archive + checksums
         run: |
           PKG='${{ steps.ver.outputs.pkg }}'
+          # Exclude the manifest itself: the > redirect creates it before find
+          # runs, so it would list (a racy hash of) itself and fail -c checks.
           ( cd "$PKG" &&
-            find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+            find . -type f ! -name SHA256SUMS -print0 | sort -z |
+              xargs -0 sha256sum > SHA256SUMS )
           tar -cjf "$PKG.tar.bz2" "$PKG"
           sha256sum "$PKG.tar.bz2" > "$PKG.tar.bz2.sha256"
 
