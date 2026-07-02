@@ -1,0 +1,125 @@
+# Packaging: build a self-contained x86-64 GNU/Linux tar.bz2 of the jupiter
+# frontend (SDL3 statically linked via the `sdl-static` cargo feature) with the
+# bios/ + roms/ (empty, legal) + doc/ hierarchy. Runs on every published
+# release (uploads the archive as a release asset) and on demand
+# (workflow_dispatch → CI artifact only). See doc/roadmap.md "Precompiled
+# binary packages" and tools/package/README.txt (the packaged README).
+name: package
+
+on:
+  release:
+    types: [published] # upload tar.bz2 + .sha256 as release assets
+  workflow_dispatch: {} # dry-run: CI artifact only
+
+permissions:
+  contents: write # gh release upload
+
+jobs:
+  linux-x64:
+    name: Linux x86-64 tar.bz2
+    # Pinned to 22.04 (glibc 2.35) for wider compat; SDL3 is built from source
+    # (vendored, static) so the older image costs nothing. ubuntu-latest
+    # (24.04) would raise the binary's glibc floor to 2.39.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time deps for the vendored SDL3 cmake build. SDL dlopens these
+      # backends at runtime, so the headers only decide which backends the
+      # static SDL3 supports (X11, Wayland, ALSA, PulseAudio, PipeWire, ...).
+      - name: Install SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libdecor-0-dev libdrm-dev libgbm-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libdbus-1-dev libibus-1.0-dev libudev-dev liburing-dev
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install # reads rust-toolchain.toml
+
+      - uses: Swatinem/rust-cache@v2 # also caches the cmake'd SDL3 in target/
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION='${{ github.event.release.tag_name }}'
+          else
+            CARGO_VER=$(cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "jupiter") | .version')
+            VERSION="v${CARGO_VER}-g$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pkg=5thplanet-${VERSION}-linux-x64" >> "$GITHUB_OUTPUT"
+
+      - name: Build jupiter (release, static SDL3)
+        run: |
+          cargo build --release -p jupiter --features sdl-static
+          BIN=target/release/jupiter
+          # Static-link gate: no dynamic libSDL3 dependency may remain.
+          if ldd "$BIN" | grep -qi 'libSDL3'; then
+            echo '::error::libSDL3 is still dynamically linked'; exit 1
+          fi
+          # Legal gate: distributed binaries must stay MIT-clean —
+          # physical-disc/libcdio (GPL) must never be linked.
+          if ldd "$BIN" | grep -qi 'cdio'; then
+            echo '::error::libcdio is linked into the release binary'; exit 1
+          fi
+
+      - name: Stage package directory
+        run: |
+          PKG='${{ steps.ver.outputs.pkg }}'
+          mkdir -p "$PKG/bios" "$PKG/roms"
+          cp target/release/jupiter       "$PKG/jupiter-linux-x64"
+          cp bios/README.md               "$PKG/bios/README.md"
+          cp roms/README.md               "$PKG/roms/README.md"
+          rsync -a --exclude='screenshots/' doc/ "$PKG/doc/"
+          cp jupiter/jupiter.toml.example "$PKG/jupiter.toml.example"
+          cp LICENSE                      "$PKG/LICENSE"
+          cp tools/package/README.txt     "$PKG/README.txt"
+          # SDL3 zlib licence from the vendored source (the sdl3-src crate).
+          SDL_LIC=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+            -path '*/sdl3-src-*/SDL/LICENSE.txt' -print -quit)
+          if [ -z "$SDL_LIC" ]; then
+            echo '::error::vendored SDL3 LICENSE.txt not found'; exit 1
+          fi
+          cp "$SDL_LIC" "$PKG/LICENSE-SDL3.txt"
+
+      - name: Verify binary (no unresolved libs + doctor)
+        run: |
+          PKG='${{ steps.ver.outputs.pkg }}'
+          if ldd "$PKG/jupiter-linux-x64" | grep -q 'not found'; then
+            echo '::error::unresolved shared libraries'; exit 1
+          fi
+          # Hermetic self-diagnostics, headless, exit 0/1 (no BIOS needed).
+          "$PKG/jupiter-linux-x64" doctor
+
+      - name: Create archive + checksums
+        run: |
+          PKG='${{ steps.ver.outputs.pkg }}'
+          ( cd "$PKG" &&
+            find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+          tar -cjf "$PKG.tar.bz2" "$PKG"
+          sha256sum "$PKG.tar.bz2" > "$PKG.tar.bz2.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.pkg }}
+          path: |
+            ${{ steps.ver.outputs.pkg }}.tar.bz2
+            ${{ steps.ver.outputs.pkg }}.tar.bz2.sha256
+          if-no-files-found: error
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload '${{ github.event.release.tag_name }}' \
+            '${{ steps.ver.outputs.pkg }}.tar.bz2' \
+            '${{ steps.ver.outputs.pkg }}.tar.bz2.sha256' --clobber

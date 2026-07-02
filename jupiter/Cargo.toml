@@ -24,6 +24,13 @@ default = ["sdl-frontend"]
 # runs a fixed number of frames, and dumps a one-line status report —
 # useful for the BIOS-boot regression in M3 task #8.
 sdl-frontend = ["dep:sdl3", "dep:png"]
+# Release-packaging: build the vendored SDL3 from source and link it statically
+# (a self-contained binary needing no system libSDL3). Local dev keeps the fast
+# dynamic pkg-config build — sdl3-sys compiles the pkg-config path out when
+# build-from-source is enabled, so combining the (additive) features is safe.
+# Used by .github/workflows/package-linux.yml; needs cmake + the SDL Linux
+# backend dev headers at build time.
+sdl-static = ["sdl-frontend", "sdl3/build-from-source-static"]
 # Enable live physical-disc support via libcdio (`--disc=cdrom:<device>`).
 # Off by default so the standard build needs no libcdio; enabling it links
 # the system library through the `physdisc` crate.
