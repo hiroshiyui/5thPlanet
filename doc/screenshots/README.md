@@ -99,6 +99,28 @@ being verified — it is not yet on the fully-playable list (see
 | [`wachenroder-party-select.png`](wachenroder-party-select.png) | The pre-battle unit-select / status screen — Lucian Tiller (ルシアン・ティラー) "SELECTED" at LV 1, HP 200, with the full stat block (AT / DF / SP / TP, MVP / ATP / SAP / OSP / ACP). |
 | [`wachenroder-battle.png`](wachenroder-battle.png) | The isometric tactical battle — Lucian on the grid with the move cursor and the AP (Action Point) gauge. The rotating stone floor is the RBG0 rotation layer whose coefficient-fed line colour the KTCTL fix corrected. |
 
+## Super Robot Wars F (スーパーロボット大戦F)
+
+Banpresto's mecha tactical RPG (serial T-20610G, JP) — **playable**
+(user-verified) on the JP v1.01 BIOS, from the title through the scenario-intro
+movies and the strategy map into the combat animations; its second half,
+*Super Robot Wars F Final* (スーパーロボット大戦F完結編, T-20612G), is playable
+on the same fix chain. The bring-up produced three distinct case studies in the
+[`debugging-playbook.md`](../debugging-playbook.md):
+CD-XA **Form-2** sectors truncated to 2048 bytes (misframed its software
+XA-ADPCM stream — the trademark-scene buzz), **RGB888 direct-colour tile**
+characters missing from the VDP2 tile path (black scenario movies), and the
+**CD drive-timing phase** model (seek / Seek-pause / buffer-full-resume timing,
+commit `ce0f7a4`) whose drift tripped a latent race in the game's own CD
+streaming driver and livelocked entering combat. See
+[`compatible-game-titles.md`](../compatible-game-titles.md).
+
+| Image | What it shows |
+| ----- | ------------- |
+| [`srwf-title.png`](srwf-title.png) | The title screen — the 「スーパーロボット大戦F」 logo over the starfield with "PRESS START BUTTON". |
+| [`srwf-map.png`](srwf-map.png) | The in-scenario strategy map — the player's units (blue) advancing on the enemy force (red) across the overworld terrain, with the move cursor on a selected unit. |
+| [`srwf-battle.png`](srwf-battle.png) | An in-combat attack animation — both units' HP/EN gauges, the attacking mech cutting in with its beam sabre against the sky, and the pilot's dialogue box (ジェス：「うおおおおっ！」). Reaching this scene is what the CD drive-timing fix unblocked. |
+
 ## Frontend (in-window OSD)
 
 | Image | What it shows |
@@ -135,6 +157,7 @@ capabilities**, with **no intent to infringe** any copyright or trademark.
   registered trademarks of **SEGA Corporation**. © SEGA.
 - *Doukyuusei ~if~* (同級生 if) is © **NEC InterChannel, Ltd.** / élf.
 - *Sangokushi V* (三國志V / *Romance of the Three Kingdoms V*) is © **KOEI Co., Ltd.** (now Koei Tecmo Games).
+- *Super Robot Wars F* (スーパーロボット大戦F) is © **Banpresto Co., Ltd.** (now Bandai Namco), with the featured robots and characters © their respective anime rights holders.
 - All other game titles, logos, characters, and artwork shown are the property
   of their respective owners.
 

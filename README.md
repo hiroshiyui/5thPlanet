@@ -45,6 +45,9 @@ following commercial games are **fully playable** on the real-BIOS LLE path:
   and menus into the game, at native 704×448 hi-res.
 - ***Greatest Nine '98*** — the baseball game, at native 704×480 interlaced
   resolution (VDP1 field-weave).
+- **Super Robot Wars F** and **F Final** (スーパーロボット大戦F / F完結編) —
+  Banpresto's mecha tactical RPGs, from the scenario-intro movies through the
+  strategy map into the combat animations with XA-ADPCM audio.
 
 Games load from disc images (CUE/BIN, ISO, CloneCD) or straight from an original
 disc in a host optical drive; save states, the console's battery-backed save
@@ -69,6 +72,8 @@ is in [`doc/screenshots/`](doc/screenshots).
 | ***Greatest Nine '98*** — 3D baseball at 704×480 interlaced. | **Sangokushi V** (三國志V) — the in-game strategy map. |
 | ![Doukyuusei ~if~ — overworld town map](doc/screenshots/doukyuusei-town.png) | ![Wachenröder — isometric tactical battle](doc/screenshots/wachenroder-battle.png) |
 | ***Doukyuusei ~if~*** — the town overworld at 640×224. | **Wachenröder** (ヴァッケンローダー, 🚧 WIP) — the isometric tactical battle, with the RBG0 rotating floor. |
+| ![Super Robot Wars F — strategy map](doc/screenshots/srwf-map.png) | ![Super Robot Wars F — combat animation](doc/screenshots/srwf-battle.png) |
+| **Super Robot Wars F** (スーパーロボット大戦F) — the strategy map… | …and a combat attack animation. |
 
 The screenshots show SEGA's and other rights holders' copyrighted material and
 are included solely to document the emulator's output — see

@@ -20,14 +20,17 @@ project.
 | **Sangokushi V** (三國志V) | T-7623G | JP / v1.01 | ✅ **Fully playable** — intro FMV → title → main menu → in-game strategy screen, with the per-scenario opening introduction movie now crossing the former intermittent stall. | 71680 px |
 | **Panzer Dragoon Zwei** | GS-9049 | JP / v1.01 | ✅ **Fully playable** — opening Cinepak FMV → title → main menu (NEW GAME / OPTIONS) → game, with controller input working at native 704×448 hi-res. | 274464 px |
 | **Greatest Nine '98** (グレイテストナイン'98) | GS-9185 | JP / v1.01 | ✅ **Fully playable** — boots to title, game-menu, and team-select; the interlaced foreground (titles, menu items, team-flag previews) renders steady and full-resolution at native 704×480 via the VDP1 DIE field-weave. | 146336 px |
+| **Super Robot Wars F** (スーパーロボット大戦F) | T-20610G | JP / v1.01 | ✅ **Playable** (user-verified 2026-07-02) — title → scenario-intro movies → strategy map → combat animations with the game's software-decoded XA-ADPCM audio, past the former combat-entry livelock. | — |
+| **Super Robot Wars F Final** (スーパーロボット大戦F完結編) | T-20612G | JP / v1.01 | ✅ **Playable** (user-verified 2026-07-02) — the second half of *F*, on the same engine and fix chain. | — |
 
 The **render-golden** column is the headless non-black pixel count asserted by
 the `#[ignore]`d render-regression tests in `crates/saturn/tests/trace_boot.rs`
 (`vf2_renders_non_black`, `doukyuusei_renders_non_black`, `pdz_renders_non_black`,
 `san5_renders_non_black`, and `gn98_boots_to_title`) — a guard that these titles
-keep rendering. All five fully-playable titles now have a render golden;
+keep rendering. The first five titles have a render golden;
 Sangokushi V's is captured during its opening Cinepak FILM movie (the only
-no-input stable frame), guarding the software-decoded-movie → VDP2 path.
+no-input stable frame), guarding the software-decoded-movie → VDP2 path. The
+two *Super Robot Wars F* halves don't have one yet.
 
 ## Notes
 
@@ -68,6 +71,18 @@ no-input stable frame), guarding the software-decoded-movie → VDP2 path.
   field strobe of the whole foreground) instead of weaving into a full-height
   image. All four are in the [`debugging-playbook.md`](debugging-playbook.md) case
   studies.
+- **Super Robot Wars F / F Final** each hit three distinct fidelity gaps, all
+  now fixed and written up as playbook case studies: CD-XA **Form-2** sectors
+  truncated to 2048 bytes (misframing the game's software XA-ADPCM stream — a
+  buzz at the trademark scene), **RGB888 direct-colour tile** characters missing
+  from the VDP2 tile path (black scenario-intro movies), and the **CD
+  drive-timing phase** model (Mednafen-faithful seek / Seek-pause /
+  buffer-full-resume timing, commit `ce0f7a4`) — accumulated timing drift
+  tripped a latent race in the game's own CD streaming driver and livelocked
+  combat entry, the project's canonical "every value matches the oracle, the
+  divergence is timing phase" case (CASE#16 in the
+  [`debugging-playbook.md`](debugging-playbook.md)). Captures in
+  [`screenshots/`](screenshots/README.md#super-robot-wars-f-スーパーロボット大戦f).
 
 ## Also runs
 
