@@ -1570,11 +1570,21 @@ impl CdBlock {
                 if self.pause_counter == 1 {
                     self.status = STAT_PAUSE;
                     self.fadstoplay = -1;
-                    // Don't fire if we've repeated with no fresh sector since.
-                    if end_met && self.play_end_irq != 0 && (self.play_repeat_counter & 0x80) == 0 {
-                        self.hirq |= self.play_end_irq;
+                    // Only a true end-of-range consumes the pending end IRQ
+                    // (Mednafen cdb.cpp:2437-2443 clears `PlayEndIRQType` INSIDE
+                    // `if(end_met && PlayEndIRQType)`). A buffer-full pause
+                    // (`end_met` false) must NOT clear it: a long streaming Play
+                    // that backs up on the 200-block pool still owes its `PEND`
+                    // at the real range end — unconditionally wiping it here lost
+                    // SRW F's combat-stream completion, so the game polled the
+                    // CD forever (black screen, BGM playing).
+                    if end_met && self.play_end_irq != 0 {
+                        // Don't fire if we've repeated with no fresh sector since.
+                        if (self.play_repeat_counter & 0x80) == 0 {
+                            self.hirq |= self.play_end_irq;
+                        }
+                        self.play_end_irq = 0;
                     }
-                    self.play_end_irq = 0;
                     self.pause_counter = -1;
                 } else if self.pause_counter == -1 {
                     self.status = STAT_PAUSE;
@@ -2013,6 +2023,26 @@ impl CdBlock {
         self.free_blocks += 1;
         self.buf_full = false;
         self.hirq &= !HIRQ_BFUL;
+        self.check_buf_pause_resume();
+    }
+
+    /// Mednafen `CheckBufPauseResume` (cdb.cpp:2104): the instant the host
+    /// frees a pool block, a buffer-full-paused drive resumes reading — without
+    /// waiting out the `pause_counter` cycle of the next drive periodics.
+    /// Mednafen calls this from every buffer-freeing site (EndDataXfer, Delete
+    /// Sector Data, get-then-delete, Reset Selector); hooking [`Self::free_block`]
+    /// covers them all, idempotently (once resumed the phase is no longer
+    /// `Pause`). An end-of-range pause (`end_met`) never resumes. Resumes
+    /// through the same continue-from-`drive_sector` path as the periodic's
+    /// resume arm.
+    fn check_buf_pause_resume(&mut self) {
+        if self.drive_phase == DrivePhase::Pause && !self.check_end_met() && self.free_blocks > 0 {
+            self.sec_prebuf_in = false;
+            self.status = STAT_BUSY;
+            self.drive_phase = DrivePhase::Play;
+            self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+            self.periodic_idle = PERIODIC_IDLE_CYC;
+        }
     }
 
     /// Free every block held by partition `p` and empty it.
@@ -3310,6 +3340,80 @@ mod tests {
         assert_eq!(
             c.blocks[b1].data[0], 1,
             "Form-1 payload ramp (sector tag 1)"
+        );
+    }
+
+    /// Regression: a **buffer-full pause** (`end_met` false) must NOT consume
+    /// the pending play-end IRQ — Mednafen clears `PlayEndIRQType` only inside
+    /// `if(end_met && PlayEndIRQType)` (cdb.cpp:2437-2443). Unconditionally
+    /// wiping it meant a long streaming Play that backed up on the block pool
+    /// lost its `PEND`, so the range's real end raised no IRQ.
+    #[test]
+    fn buffer_full_pause_preserves_the_pending_play_end_irq() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        // Mid-range buffer-full pause settling (pause_counter 1 → -1).
+        c.drive_phase = DrivePhase::Pause;
+        c.pause_counter = 1;
+        c.sec_prebuf_in = true;
+        c.play_end_irq = HIRQ_PEND;
+        c.play_repeat_counter = 0;
+        c.track = 1;
+        c.cur_play_start = 0x80_0000 | 100;
+        c.cur_play_end = 0x80_0000 | 1000;
+        c.cd_curfad = 500; // end NOT met: this is a buffer-full pause
+        c.hirq = 0;
+        c.drive_periodic();
+        assert_eq!(
+            c.play_end_irq, HIRQ_PEND,
+            "a buffer-full pause must keep the pending PEND"
+        );
+        assert_eq!(c.hirq & HIRQ_PEND, 0, "…and must not raise it early");
+
+        // The true end-of-range pause consumes it: PEND fires exactly once.
+        c.drive_phase = DrivePhase::Pause;
+        c.pause_counter = 1;
+        c.sec_prebuf_in = true;
+        c.cd_curfad = 1000; // end met
+        c.drive_periodic();
+        assert_ne!(c.hirq & HIRQ_PEND, 0, "range end raises PEND");
+        assert_eq!(c.play_end_irq, 0, "…and consumes the pending IRQ");
+    }
+
+    /// Regression: freeing a pool block resumes a buffer-full-paused drive
+    /// immediately (Mednafen `CheckBufPauseResume`, cdb.cpp:2104, called from
+    /// every buffer-freeing command) — not only on a later drive periodic. An
+    /// end-of-range pause must stay paused.
+    #[test]
+    fn freeing_a_block_resumes_a_buffer_full_pause_immediately() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        let b = c.alloc_block().expect("block");
+        c.drive_phase = DrivePhase::Pause;
+        c.pause_counter = -1;
+        c.track = 1;
+        c.cur_play_start = 0x80_0000 | 100;
+        c.cur_play_end = 0x80_0000 | 1000;
+        c.cd_curfad = 500; // end NOT met: buffer-full pause
+        c.status = STAT_PAUSE;
+        c.free_block(b);
+        assert_eq!(
+            c.drive_phase,
+            DrivePhase::Play,
+            "draining a block resumes the paused stream"
+        );
+        assert_eq!(c.status, STAT_BUSY);
+
+        // An end-of-range pause does NOT resume on drain.
+        let b = c.alloc_block().expect("block");
+        c.drive_phase = DrivePhase::Pause;
+        c.cd_curfad = 1000; // end met
+        c.status = STAT_PAUSE;
+        c.free_block(b);
+        assert_eq!(
+            c.drive_phase,
+            DrivePhase::Pause,
+            "an end-of-range pause stays paused"
         );
     }
 
