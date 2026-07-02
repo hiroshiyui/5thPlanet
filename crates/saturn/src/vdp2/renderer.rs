@@ -2464,6 +2464,66 @@ mod tests {
         );
     }
 
+    /// The CRAM12 arm of [`excc_line_partner`] (RGB888 CRAM modes): the line
+    /// colour averages only with an RGB direct-colour pushed-down layer — a
+    /// paletted one takes the raw line colour — and the old 3rd layer folds in
+    /// first when the pushed-down layer's CC bit is set and both are RGB
+    /// (Mednafen `MIXIT_SPECIAL_EXCC_LINE_CRAM12`, `vdp2_render.cpp:2506-2533`).
+    #[test]
+    fn excc_line_partner_cram12_averages_only_an_rgb_layer_below() {
+        let mut v = Vdp2::new();
+        v.regs.write16(0x00E, 0x2000); // RAMCTL: CRAM mode 2 (RGB888)
+        v.regs.write16(0x0EC, 0x0422); // CCCTL: EXCEN + line variant + NBG1 CC
+        let dot = |rgb, is_rgb| Dot {
+            pri: 1,
+            rgb,
+            cc: None,
+            layer: Layer::Nbg(1),
+            is_rgb,
+            lc: None,
+            self_shadow: false,
+        };
+        let lc = (0, 200, 0);
+        let backdrop = (0, 0, 0);
+        // Paletted pushed-down 2nd → the raw line colour, no averaging.
+        assert_eq!(
+            excc_line_partner(&v, lc, Some(dot((100, 0, 0), false)), None, backdrop),
+            lc,
+            "paletted below → raw line colour"
+        );
+        // RGB pushed-down 2nd, nothing further below → avg(lc, below).
+        assert_eq!(
+            excc_line_partner(&v, lc, Some(dot((100, 0, 0), true)), None, backdrop),
+            (50, 100, 0),
+            "RGB below → avg(line colour, below)"
+        );
+        // RGB below whose CC bit is set + an RGB 3rd → the 3rd folds in first:
+        // avg(lc, avg(below, third)) = avg((0,200,0), (70,0,0)) = (35,100,0).
+        assert_eq!(
+            excc_line_partner(
+                &v,
+                lc,
+                Some(dot((100, 0, 0), true)),
+                Some(dot((40, 0, 0), true)),
+                backdrop
+            ),
+            (35, 100, 0),
+            "RGB below + RGB 3rd → the 3rd folds into the average"
+        );
+        // …but a paletted 3rd does not fold in.
+        assert_eq!(
+            excc_line_partner(
+                &v,
+                lc,
+                Some(dot((100, 0, 0), true)),
+                Some(dot((40, 0, 0), false)),
+                backdrop
+            ),
+            (50, 100, 0),
+            "paletted 3rd stays out of the average"
+        );
+    }
+
     #[test]
     fn bitmap_base_follows_map_offset_register() {
         let mut v = Vdp2::new();

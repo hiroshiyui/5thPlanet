@@ -3467,6 +3467,81 @@ mod tests {
         );
     }
 
+    /// Regression: the drive periodic's own settled-pause arm (`pause_counter
+    /// == -1`) also resumes a buffer-full pause via the timed re-seek — the
+    /// path taken when blocks free up *between* periodics rather than through
+    /// a buffer-freeing host command (Mednafen cdb.cpp:2450-2456).
+    #[test]
+    fn drive_periodic_resumes_a_settled_buffer_full_pause() {
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Pause;
+        c.pause_counter = -1;
+        c.sec_prebuf_in = true;
+        c.track = 1;
+        c.cur_play_start = 0x80_0000 | 100;
+        c.cur_play_end = 0x80_0000 | 1000;
+        c.cd_curfad = 500; // end NOT met: buffer-full pause
+        c.drive_sector = 500;
+        c.drive_periodic();
+        assert_eq!(
+            c.drive_phase,
+            DrivePhase::SeekSettle,
+            "the periodic restarts the paused stream via the timed re-seek"
+        );
+        assert_eq!(c.status & 0x0F, STAT_BUSY);
+        assert_eq!(c.cd_curfad, 500, "the re-seek targets the held position");
+        assert_eq!(c.drive_counter, SEEKSTART2_CYC as i64);
+    }
+
+    /// Regression: Seek `0xFFFFFF` (pause in place, Mednafen cdb.cpp:2874-2885)
+    /// does NOT park the phase machine: it suspends the read-ahead, drops the
+    /// pending end IRQ, collapses the play range, and lets the normal periodic
+    /// walk settle BUSY → PAUSE — with no end IRQ for a host-requested pause.
+    /// On our parked phases (Idle/Startup) there is no play to wind down, so it
+    /// reports PAUSE directly.
+    #[test]
+    fn seek_pause_in_place_settles_busy_to_pause_through_the_periodic_walk() {
+        // Parked phase (fresh insert = Startup): reports PAUSE immediately.
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        assert_eq!(c.drive_phase, DrivePhase::Startup);
+        cmd(&mut c, 0x11FF, 0xFFFF, 0x0000, 0x0000);
+        assert_eq!(c.status & 0x0F, STAT_PAUSE, "no active play → PAUSE now");
+
+        // Mid-play: BUSY while the periodic walk winds the play down.
+        let mut c = CdBlock::new();
+        c.insert_disc(iso_disc());
+        c.drive_phase = DrivePhase::Play;
+        c.status = STAT_PLAY;
+        c.track = 1;
+        c.cur_play_start = 0x80_0000 | 150;
+        c.cur_play_end = 0x80_0000 | 1000;
+        c.cd_curfad = 151;
+        c.drive_sector = 151;
+        c.drive_counter = 1;
+        c.play_end_irq = HIRQ_PEND;
+        c.sec_prebuf_in = true;
+        c.sec_prebuf_fad = 151;
+        cmd(&mut c, 0x11FF, 0xFFFF, 0x0000, 0x0000);
+        assert_eq!(c.status & 0x0F, STAT_BUSY, "active play reports BUSY first");
+        assert_eq!(c.drive_phase, DrivePhase::Play, "the phase is not parked");
+        assert_eq!(c.play_end_irq, 0, "the pending end IRQ is dropped");
+        assert_eq!(
+            c.cur_play_end, 0x80_0000,
+            "the play range collapses (end always met)"
+        );
+        // A few sector periods of the normal walk settle BUSY → PAUSE.
+        c.tick(sector_cyc(1) * 20);
+        assert_eq!(c.drive_phase, DrivePhase::Pause, "settled paused in place");
+        assert_eq!(c.status & 0x0F, STAT_PAUSE);
+        assert_eq!(
+            c.hirq & HIRQ_PEND,
+            0,
+            "a host-requested pause raises no end IRQ"
+        );
+    }
+
     /// Demonstration (manual): our CD-block decodes the REAL Doukyuusei disc's
     /// Track 2 (Red Book audio — the "this disc is a SEGA Saturn game" warning)
     /// to the exact PCM you hear from
