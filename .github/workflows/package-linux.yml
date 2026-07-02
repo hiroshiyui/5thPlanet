@@ -1,6 +1,6 @@
 # Packaging: build a self-contained x86-64 GNU/Linux tar.bz2 of the jupiter
 # frontend (SDL3 statically linked via the `sdl-static` cargo feature) with the
-# bios/ + roms/ (empty, legal) + doc/ hierarchy. Runs on every published
+# bios/ + roms/ (empty, legal) hierarchy. Runs on every published
 # release (uploads the archive as a release asset) and on demand
 # (workflow_dispatch → CI artifact only). See doc/roadmap.md "Precompiled
 # binary packages" and tools/package/README.txt (the packaged README).
@@ -78,7 +78,6 @@ jobs:
           cp target/release/jupiter       "$PKG/jupiter-linux-x64"
           cp bios/README.md               "$PKG/bios/README.md"
           cp roms/README.md               "$PKG/roms/README.md"
-          rsync -a --exclude='screenshots/' doc/ "$PKG/doc/"
           cp jupiter/jupiter.toml.example "$PKG/jupiter.toml.example"
           cp LICENSE                      "$PKG/LICENSE"
           cp tools/package/README.txt     "$PKG/README.txt"
