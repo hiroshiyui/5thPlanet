@@ -1432,8 +1432,21 @@ impl CdBlock {
         // seek.
         let prev = self.drive_sector;
         let fad_target = self.cd_curfad;
-        let delta = fad_target.abs_diff(prev) as u64;
-        let seek_cyc = cd2m(12 * CD_CLOCK_HZ / 150) + cd2m(delta * 27);
+        // Seek time (Mednafen SEEK_START3, cdb.cpp:2226-2230): 12 sector
+        // periods, plus a direction-split per-FAD term (a backward seek pays
+        // 28/FAD, forward 26/FAD), plus one extra sector period for any
+        // backward seek or a forward hop ≥ 150 FAD (a short forward skip
+        // rides the spiral without a pickup jump). The old flat `|Δ|·27`
+        // under-charged every long/backward hop by ~one sector period —
+        // enough accumulated phase drift across a chunked-file loader to
+        // walk a sector pickup over a game's per-frame poll boundary.
+        let delta = fad_target as i64 - prev as i64;
+        let mut seek_cd =
+            12 * CD_CLOCK_HZ / 150 + delta.unsigned_abs() * if delta < 0 { 28 } else { 26 };
+        if !(0..150).contains(&delta) {
+            seek_cd += CD_CLOCK_HZ / 150;
+        }
+        let seek_cyc = cd2m(seek_cd);
         self.status = STAT_SEEK;
         self.drive_phase = DrivePhase::Seek;
         self.drive_sector = fad_target;
@@ -1590,11 +1603,9 @@ impl CdBlock {
                     self.status = STAT_PAUSE;
                     self.fadstoplay = -1;
                     if !end_met && self.free_blocks > 0 {
-                        // Resume from a buffer-full pause: continue reading from
-                        // where we stopped (drive_sector), not a fresh seek.
-                        self.status = STAT_BUSY;
-                        self.drive_phase = DrivePhase::Play;
-                        self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
+                        // Resume from a buffer-full pause via the timed re-seek
+                        // (Mednafen cdb.cpp:2450-2456 → DRIVEPHASE_SEEK_START2).
+                        self.resume_from_buffer_full_pause();
                     }
                 } else {
                     self.pause_counter += 1;
@@ -2032,17 +2043,28 @@ impl CdBlock {
     /// Mednafen calls this from every buffer-freeing site (EndDataXfer, Delete
     /// Sector Data, get-then-delete, Reset Selector); hooking [`Self::free_block`]
     /// covers them all, idempotently (once resumed the phase is no longer
-    /// `Pause`). An end-of-range pause (`end_met`) never resumes. Resumes
-    /// through the same continue-from-`drive_sector` path as the periodic's
-    /// resume arm.
+    /// `Pause`). An end-of-range pause (`end_met`) never resumes.
     fn check_buf_pause_resume(&mut self) {
         if self.drive_phase == DrivePhase::Pause && !self.check_end_met() && self.free_blocks > 0 {
-            self.sec_prebuf_in = false;
-            self.status = STAT_BUSY;
-            self.drive_phase = DrivePhase::Play;
-            self.drive_counter = SEEK_CPI_DELAY_CYC as i64;
-            self.periodic_idle = PERIODIC_IDLE_CYC;
+            self.resume_from_buffer_full_pause();
         }
+    }
+
+    /// Restart a buffer-full-paused stream: a **timed re-seek** to the held
+    /// position — Mednafen resumes through `DRIVEPHASE_SEEK_START2`
+    /// (cdb.cpp:2454), i.e. the full settle (256 000 CDB) + a Δ=0 seek
+    /// (903 168 CDB) + one sector period before the next sector is delivered,
+    /// not an instant hop back to `Play` (the old shape resumed ~2 470× too
+    /// fast, a large phase error under sustained backpressure).
+    fn resume_from_buffer_full_pause(&mut self) {
+        self.sec_prebuf_in = false;
+        self.status = STAT_BUSY;
+        // Re-seek to the held next-unread position; `seek_settle_done` then
+        // charges the Δ=0 radial time from `drive_sector`.
+        self.cd_curfad = self.drive_sector;
+        self.drive_phase = DrivePhase::SeekSettle;
+        self.drive_counter = SEEKSTART2_CYC as i64;
+        self.periodic_idle = PERIODIC_IDLE_CYC;
     }
 
     /// Free every block held by partition `p` and empty it.
@@ -2580,10 +2602,30 @@ impl CdBlock {
                     self.repcnt = 0x7F;
                     self.cd_report();
                 } else if cmd_sp == 0xFF_FFFF {
-                    // Pause in place (cdb.cpp:2874): drop the read-ahead + play
-                    // range, hold the head.
-                    self.drive_idle();
-                    self.status = STAT_PAUSE;
+                    // Pause in place (cdb.cpp:2874-2885): the phase machine is
+                    // NOT parked. The read-ahead is suspended, the pending end
+                    // IRQ dropped, and the play range collapsed to 0x800000
+                    // (end 0 → `check_end_met` always true), so the normal
+                    // periodic walk settles BUSY → PAUSE a sector period or two
+                    // later, and the paused drive keeps re-reading at the held
+                    // position on the 150 Hz per-sector report cadence. The old
+                    // instant `drive_idle` + PAUSE both skipped the BUSY settle
+                    // and dropped to the 60 Hz idle cadence — a large per-pause
+                    // phase error for chunked-file streamers that pause between
+                    // every extent. (Mednafen's STOPPED special case re-seeks
+                    // to FAD 150; we have no Stopped phase — Seek-stop parks
+                    // Idle, handled below.)
+                    self.sec_prebuf_in = false;
+                    self.play_end_irq = 0;
+                    self.cur_play_end = 0x80_0000;
+                    self.cur_play_repeat = 0;
+                    if matches!(self.drive_phase, DrivePhase::Idle | DrivePhase::Startup) {
+                        // No active play to wind down (our parked phase; the
+                        // reference drive never truly idles) — report PAUSE.
+                        self.status = STAT_PAUSE;
+                    } else {
+                        self.status = STAT_BUSY;
+                    }
                     self.cd_report();
                 } else {
                     // Real seek: report BUSY now, then the seek machine drives
@@ -3382,8 +3424,10 @@ mod tests {
 
     /// Regression: freeing a pool block resumes a buffer-full-paused drive
     /// immediately (Mednafen `CheckBufPauseResume`, cdb.cpp:2104, called from
-    /// every buffer-freeing command) — not only on a later drive periodic. An
-    /// end-of-range pause must stay paused.
+    /// every buffer-freeing command) — not only on a later drive periodic —
+    /// and the resume is a **timed re-seek** (`DRIVEPHASE_SEEK_START2`,
+    /// cdb.cpp:2454: settle + Δ=0 seek + one sector period), not an instant
+    /// hop back to `Play`. An end-of-range pause must stay paused.
     #[test]
     fn freeing_a_block_resumes_a_buffer_full_pause_immediately() {
         let mut c = CdBlock::new();
@@ -3395,14 +3439,20 @@ mod tests {
         c.cur_play_start = 0x80_0000 | 100;
         c.cur_play_end = 0x80_0000 | 1000;
         c.cd_curfad = 500; // end NOT met: buffer-full pause
+        c.drive_sector = 500;
         c.status = STAT_PAUSE;
         c.free_block(b);
         assert_eq!(
             c.drive_phase,
-            DrivePhase::Play,
-            "draining a block resumes the paused stream"
+            DrivePhase::SeekSettle,
+            "draining a block restarts the paused stream via the timed re-seek"
         );
         assert_eq!(c.status, STAT_BUSY);
+        assert_eq!(c.cd_curfad, 500, "the re-seek targets the held position");
+        assert_eq!(
+            c.drive_counter, SEEKSTART2_CYC as i64,
+            "the resume pays the full settle, not an instant hop"
+        );
 
         // An end-of-range pause does NOT resume on drain.
         let b = c.alloc_block().expect("block");
