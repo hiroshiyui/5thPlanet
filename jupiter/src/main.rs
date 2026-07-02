@@ -3395,6 +3395,13 @@ fn run(
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(0x40);
+    // Observer-only: `SAT_SAVESTATE_AT_FRAME=N SAT_SAVESTATE_OUT=path` writes a
+    // faithful (per-frame) save state at end of frame N — a foothold sdbg can
+    // load with the disc grafted, since sdbg's single `run_for` diverges.
+    let savestate_at_frame: Option<u32> = std::env::var("SAT_SAVESTATE_AT_FRAME")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let savestate_out = std::env::var("SAT_SAVESTATE_OUT").ok();
     for f in 0..headless_frames {
         apply_scripted_pad(&mut saturn, f);
         if cache_purge {
@@ -3406,16 +3413,10 @@ fn run(
             saturn.slave_mut().dbg_slow_fetch = slow_fetch;
         }
         dump_dims = saturn.run_frame(&mut framebuffer);
-        // Observer-only: `SAT_SAVESTATE_AT_FRAME=N SAT_SAVESTATE_OUT=path` writes a
-        // faithful (per-frame) save state at end of frame N — a foothold sdbg can
-        // load with the disc grafted, since sdbg's single `run_for` diverges.
-        if std::env::var("SAT_SAVESTATE_AT_FRAME")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            == Some(f)
-            && let Ok(path) = std::env::var("SAT_SAVESTATE_OUT")
+        if savestate_at_frame == Some(f)
+            && let Some(path) = savestate_out.as_deref()
         {
-            match fs::write(&path, saturn.save_state()) {
+            match fs::write(path, saturn.save_state()) {
                 Ok(()) => eprintln!("SAVESTATE wrote {path} at frame {f}"),
                 Err(e) => eprintln!("SAVESTATE write {path} failed: {e}"),
             }
@@ -3486,6 +3487,9 @@ fn run(
         }
         if sram_dump_frame == Some(f) {
             let ram = saturn.bus.scsp.ram.as_slice();
+            // Widen to usize up front: the env-supplied addr/len must not be able
+            // to overflow u32 offset arithmetic (a debug-build panic).
+            let addr = sram_dump_addr as usize;
             let mut nonzero = 0usize;
             // Stats over the full requested window (may be large; rows suppressed
             // when SAT_SRAM_DUMP_ROWS=0).
@@ -3494,10 +3498,13 @@ fn run(
             let mut prev = 0i32;
             let mut w = 0u32;
             while w < sram_dump_len / 2 {
-                let base = (sram_dump_addr + w * 2) as usize;
+                let base = addr + w as usize * 2;
                 let b0 = *ram.get(base).unwrap_or(&0);
                 let b1 = *ram.get(base + 1).unwrap_or(&0);
                 let s = i16::from_be_bytes([b0, b1]) as i32;
+                if s != 0 {
+                    nonzero += 1;
+                }
                 maxabs = maxabs.max(s.abs());
                 if w > 0 {
                     maxdelta = maxdelta.max((s - prev).abs());
@@ -3514,7 +3521,7 @@ fn run(
             );
             let mut off = 0u32;
             while off < sram_dump_len && (off / 16) < show_rows {
-                let base = (sram_dump_addr + off) as usize;
+                let base = addr + off as usize;
                 let mut bytes = String::new();
                 let mut words = String::new();
                 for w in 0..8u32 {
@@ -3522,13 +3529,10 @@ fn run(
                     let b1 = *ram.get(base + (w * 2 + 1) as usize).unwrap_or(&0);
                     // sound RAM is big-endian 16-bit
                     let s = i16::from_be_bytes([b0, b1]);
-                    if s != 0 {
-                        nonzero += 1;
-                    }
                     bytes.push_str(&format!("{b0:02X}{b1:02X} "));
                     words.push_str(&format!("{s:6} "));
                 }
-                eprintln!("  {:05X}: {bytes}| {words}", sram_dump_addr + off);
+                eprintln!("  {:05X}: {bytes}| {words}", addr + off as usize);
                 off += 16;
             }
             eprintln!("  (nonzero i16 words in window: {nonzero})");
