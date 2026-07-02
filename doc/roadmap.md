@@ -587,6 +587,26 @@ run the golden + savestate gates — a release-time step, not a checked-in `RUST
     glibc 2.35 floor). Windows x86_64 still queued (mark **experimental/
     untested** per "Linux-verified, others untested"). Phase 2 = macOS
     x86_64/arm64 (needs a tester) + optional musl fully-static Linux.
+  - **macOS x86_64 — DEFERRED (2026-07-02, not enough resources to own it now);
+    plan captured so it's a drop-in when picked up.** Free Intel runners exist
+    (`macos-15-intel`, also `macos-26-intel`; verified 2026-07 in
+    actions/runner-images), so CI can build natively AND run the built binary's
+    `jupiter doctor` 22-check battery — the deterministic core makes that catch
+    miscompile/UB/toolchain issues; the ONLY CI-unverifiable surface is the thin
+    SDL frontend layer (Metal window, CoreAudio, GameController input, retina).
+    Recipe: clone the Linux job — `sdl-static` works as-is (sdl3-sys CMake
+    supports macOS, links Apple frameworks; no apt step, Xcode CLT on runner),
+    swap the `ldd` gates for `otool -L` (assert no `libSDL3.dylib`/`libcdio`),
+    artifact `jupiter-macos-x64`. Ship **experimental/untested** with a
+    call-for-testers note. **Gatekeeper**: unsigned+unnotarized ⇒ users must
+    right-click→Open or `xattr -d com.apple.quarantine` — document in
+    README.txt (macOS section); Apple Developer ID signing ($99/yr) only if it
+    gets traction. Note Intel Macs are EOL-bound (macOS 26 = last Intel
+    release; x86_64 runs on Apple Silicon via Rosetta but the interpreter eats
+    the penalty) — when picked up, build arm64 alongside for ~free, universal2
+    as the polished endgame. Human verification options w/o owning a Mac:
+    community testers (best), MacinCloud hourly remote desktop for a one-off
+    GUI smoke test, EC2 Mac/MacStadium (overkill).
   - **Legal (non-negotiable, now ENFORCED by the workflow):** (1) the **BIOS is
     never shipped** — `bios/` + `roms/` ship empty with the "supply your own"
     READMEs; (2) **`physical-disc`/libcdio stays OFF** in every distributed
