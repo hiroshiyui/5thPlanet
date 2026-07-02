@@ -567,9 +567,10 @@ run the golden + savestate gates — a release-time step, not a checked-in `RUST
   workflow (`.github/workflows/package-linux.yml`, the repo's first CI) builds a
   `5thplanet-vX.Y.Z-linux-x64.tar.bz2` on every published release (+
   `workflow_dispatch` dry-runs), containing `jupiter-linux-x64`, empty `bios/` +
-  `roms/` (READMEs only), `doc/` (minus screenshots), `jupiter.toml.example`,
-  README.txt (`tools/package/README.txt`), MIT LICENSE + SDL3 zlib licence, and
-  `SHA256SUMS`, uploading archive + `.sha256` as release assets.
+  `roms/` (READMEs only), `jupiter.toml.example`, README.txt
+  (`tools/package/README.txt`), MIT LICENSE + SDL3 zlib licence, and
+  `SHA256SUMS`, uploading archive + `.sha256` as release assets (developer
+  `doc/` deliberately not shipped — not useful to end users).
   - **Crux — SDL3 linking: ✅ resolved as sketched.** The `jupiter` cargo
     feature **`sdl-static`** (= `sdl3/build-from-source-static`, vendored/CMake
     SDL3, statically linked) makes the release artifact self-contained — no
