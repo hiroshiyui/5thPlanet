@@ -563,29 +563,35 @@ run the golden + savestate gates — a release-time step, not a checked-in `RUST
 
 - **Precompiled binary packages (download-and-run distribution).** Ship
   self-contained `jupiter` frontend binaries on GitHub Releases so users don't
-  need a Rust toolchain.
-  - **Crux — SDL3 linking:** currently dynamic (`sdl3` via system pkg-config),
-    so a bare binary needs the host's `libSDL3`. Use `sdl3-sys`'s `static-link`
-    (with a vendored/CMake SDL3 build) so *release* artifacts statically link
-    SDL3 (self-contained, no system SDL3) while local dev keeps the fast dynamic
-    pkg-config build. Cost: a C toolchain/CMake in the build env, +~2–4 MB.
-  - **Automation:** no CI exists yet → use **cargo-dist (`dist`)**: one
-    `[workspace.metadata.dist]` block generates a GitHub Actions workflow that
-    builds the per-platform matrix on the `v*` tag push (which the
-    `release-engineering` flow already creates), making archives + SHA256 +
-    installers and uploading to the Release.
-  - **Platforms:** Phase 1 = Linux x86_64 + Windows x86_64 (free runners; mark
-    Windows **experimental/untested** per "Linux-verified, others untested").
-    Phase 2 = macOS x86_64/arm64 (needs a tester) + optional musl fully-static
-    Linux.
-  - **Legal (non-negotiable):** (1) the **BIOS is never shipped** — release notes
-    must state the user supplies their own legally-obtained dump (the `bios/`
-    policy); (2) keep **`physical-disc`/libcdio OFF** in every distributed binary
-    — libcdio is GPL and the project is MIT, so default-feature builds stay
-    MIT-clean (a release build must not enable it).
-  - Archive contents: the `jupiter` binary (optionally `sdbg`), README,
-    LICENSE (MIT) + bundled SDL3 zlib licence, the BIOS-not-included note,
-    SHA256SUMS.
+  need a Rust toolchain. **✅ Phase 1 (Linux x86_64) LANDED** — the `package`
+  workflow (`.github/workflows/package-linux.yml`, the repo's first CI) builds a
+  `5thplanet-vX.Y.Z-linux-x64.tar.bz2` on every published release (+
+  `workflow_dispatch` dry-runs), containing `jupiter-linux-x64`, empty `bios/` +
+  `roms/` (READMEs only), `doc/` (minus screenshots), `jupiter.toml.example`,
+  README.txt (`tools/package/README.txt`), MIT LICENSE + SDL3 zlib licence, and
+  `SHA256SUMS`, uploading archive + `.sha256` as release assets.
+  - **Crux — SDL3 linking: ✅ resolved as sketched.** The `jupiter` cargo
+    feature **`sdl-static`** (= `sdl3/build-from-source-static`, vendored/CMake
+    SDL3, statically linked) makes the release artifact self-contained — no
+    system `libSDL3` — while local dev keeps the fast dynamic pkg-config build
+    (sdl3-sys compiles the pkg-config path out under build-from-source, so the
+    additive features combine safely). Cost: cmake + the SDL Linux backend dev
+    headers in the build env.
+  - **Automation divergence:** built as a **hand-rolled workflow** (trigger
+    `release: published` + `workflow_dispatch`), not the sketched cargo-dist —
+    the custom bios/-roms/-doc/ hierarchy and the empty-dir legal layout don't
+    fit cargo-dist's archive model. cargo-dist remains an option for the
+    multi-platform Phase 2 matrix.
+  - **Platforms:** Phase 1 = Linux x86_64 ✅ (pinned `ubuntu-22.04` for the
+    glibc 2.35 floor). Windows x86_64 still queued (mark **experimental/
+    untested** per "Linux-verified, others untested"). Phase 2 = macOS
+    x86_64/arm64 (needs a tester) + optional musl fully-static Linux.
+  - **Legal (non-negotiable, now ENFORCED by the workflow):** (1) the **BIOS is
+    never shipped** — `bios/` + `roms/` ship empty with the "supply your own"
+    READMEs; (2) **`physical-disc`/libcdio stays OFF** in every distributed
+    binary — libcdio is GPL and the project is MIT; the workflow `ldd`-gates
+    the built binary against both `libcdio` and a still-dynamic `libSDL3`.
+  - Still open: attaching `sdbg`, Windows/macOS artifacts, musl.
 - **CRT-shader presentation via SDL_GPU.** **CRT shader v1: DONE** (`feat f635aea`,
   user-verified on the SEGA/SATURN splashes + Doukyuusei) — a single-pass, **flat**
   CRT (scanlines + aperture-grille mask + gamma; no curvature) on the SDL_GPU
