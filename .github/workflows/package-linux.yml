@@ -16,11 +16,22 @@ permissions:
 
 jobs:
   linux-x64:
-    name: Linux x86-64 tar.bz2
+    name: Linux x86-64 tar.bz2${{ matrix.variant }}
     # Pinned to 22.04 (glibc 2.35) for wider compat; SDL3 is built from source
     # (vendored, static) so the older image costs nothing. ubuntu-latest
     # (24.04) would raise the binary's glibc floor to 2.39.
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          # Standard package.
+          - variant: ""
+            features: sdl-static
+          # SDL_GPU/Vulkan presenter + CRT-shader variant (off-by-default
+          # build feature; still maturing — see ADR-0019). Same hierarchy,
+          # suffixed archive name.
+          - variant: _gpu-presenter
+            features: sdl-static,gpu-presenter
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +55,10 @@ jobs:
 
       # SHA-pinned (community action — supply-chain hygiene); the comment tracks
       # the release the SHA corresponds to. Also caches the cmake'd SDL3 in target/.
+      # Keyed per variant — the feature sets produce different dep graphs.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.features }}
 
       - name: Compute version
         id: ver
@@ -57,11 +71,11 @@ jobs:
             VERSION="v${CARGO_VER}-g$(git rev-parse --short HEAD)"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "pkg=5thplanet-${VERSION}-linux-x64" >> "$GITHUB_OUTPUT"
+          echo "pkg=5thplanet-${VERSION}-linux-x64${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
 
       - name: Build jupiter (release, static SDL3)
         run: |
-          cargo build --release -p jupiter --features sdl-static
+          cargo build --release -p jupiter --features '${{ matrix.features }}'
           BIN=target/release/jupiter
           # Static-link gate: no dynamic libSDL3 dependency may remain.
           if ldd "$BIN" | grep -qi 'libSDL3'; then

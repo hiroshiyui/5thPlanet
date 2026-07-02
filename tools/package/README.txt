@@ -40,6 +40,15 @@ created on first run; `jupiter.toml.example` documents every key). If no
 portable file exists and none can be created, the global
 `$XDG_CONFIG_HOME/5thplanet/jupiter.toml` is used instead.
 
+Build variants
+--------------
+Releases may also carry a `..._gpu-presenter` archive: the same package with
+the experimental SDL_GPU/Vulkan presenter compiled in — an alternative to the
+default presentation path, with an optional CRT shader (Settings -> Graphics ->
+Shaders, or the `gpu`/`shader` config keys; `gpu = off` by default, so it
+behaves like the standard build until enabled). It needs a Vulkan-capable GPU
+and driver; if unsure, use the standard archive.
+
 Licences and integrity
 ----------------------
   LICENSE            5thPlanet, MIT licence
