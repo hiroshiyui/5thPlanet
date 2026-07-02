@@ -509,6 +509,45 @@ forensic records below; append new cases at the end rather than renumbering.
   state that sdbg loads (disc grafted) for full `vdp2regs`/`cram`/`render`
   inspection; (5) render+look, never trust a pixel count for a screen ID.
 
+- **CASE#16: Super Robot Wars F — combat-scene livelock (CD drive timing phase).**
+  Entering combat: BGM played, screen black, stalled; Mednafen fine. The longest
+  hunt yet (8 agents over 3 waves) because every *value* was correct — the bug
+  was **phase**. Chain: the game streams a fragmented file as ~10
+  `Seek-pause`/`Seek`/`Play(count≤2)` extents through an 8-channel pipeline; its
+  streaming driver has a latent race (a per-frame chunk-submit poll must not run
+  between the pickups of an extent's two sectors — request state 0 means both
+  "idle" and "mid-request"). Our accumulated drive-timing drift walked the last
+  extent's pickup pair across a frame boundary; the driver re-initialized its
+  staging request mid-flight; sector 2 overwrote sector 1 in staging; the
+  request stayed 0x800 short forever → no completion → no more Plays → livelock
+  (slave SH-2 FTI-starved downstream; the 68k kept the BGM going). **Ruled out
+  en route** (all verified, kept as negative evidence): CD command/HIRQ
+  responses (byte-identical to Mednafen per command), sector data at the FIFO
+  *and* the WRAM destination (byte-perfect, game-programmed on-chip DMAC — not
+  SCU-DMA), Play range decode, cache staleness, interrupt/wakeup edges (the
+  game masks the CD interrupt and polls; the divergent branch was synchronous),
+  and the play-end-IRQ/buffer-resume fixes (real gaps, committed, but not this
+  root). **Root: three drive-timing infidelities** (fixed `ce0f7a4`): the seek
+  formula lacked Mednafen's direction split + conditional extra sector period
+  (cdb.cpp:2226-2230); Seek-pause `0xFFFFFF` was instant + dropped to the 60 Hz
+  idle report cadence instead of settling BUSY→PAUSE through the phase machine
+  at 150 Hz (cdb.cpp:2874-2885) — ×10 per load, the dominant lever; buffer-full
+  resume was an instant hop instead of a ~1.23M-CDB timed re-seek
+  (cdb.cpp:2454). With faithful timing the loader completes and combat renders
+  (verified visually). **Lessons:** (1) when every value matches the oracle but
+  behaviour diverges, the divergence is *timing phase* — audit the TIMING MODEL
+  constants/formulas against the reference as their own completeness sweep (the
+  timing-audit table now lives in the commit + this case); (2) a user-played
+  instrumented-oracle session (`mednafen -ss.dbg_mask cdb`, no code changes)
+  showed the reference *behaviour shape* (job boundaries mid-play, abandon+
+  retry reads) that static code-reading couldn't; (3) games contain latent
+  races that hardware timing never trips — "the game is never wrong" includes
+  *timing-dependent* game code, so the emulator's job is to keep the phase
+  inside the hardware envelope; (4) intervention-testing candidate fixes
+  (revert/apply + rerun the repro) separated "real fidelity gap" from "this
+  stall's root" twice. Residual (audited, deferred): zero per-command
+  processing time, Init parking the head at FAD 150, no STOPPED phase.
+
 ---
 
 ## Boot-blocker case files
