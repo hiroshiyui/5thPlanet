@@ -59,6 +59,12 @@ Task-by-task technical status lives in [`doc/roadmap.md`](doc/roadmap.md), and
 the per-title compatibility list in
 [`doc/compatible-game-titles.md`](doc/compatible-game-titles.md).
 
+## Demo video
+
+[![5thPlanet demo video](https://img.youtube.com/vi/brcUi0qSRI4/maxresdefault.jpg)](https://www.youtube.com/watch?v=brcUi0qSRI4)
+
+*(Click the thumbnail to watch on YouTube.)*
+
 ## Screenshots
 
 A few frames from the emulator running commercial games on the real-BIOS LLE
