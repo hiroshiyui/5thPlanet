@@ -63,7 +63,7 @@ the per-title compatibility list in
 
 [![5thPlanet demo video](https://img.youtube.com/vi/brcUi0qSRI4/hqdefault.jpg)](https://www.youtube.com/watch?v=brcUi0qSRI4)
 
-*(Click the thumbnail to watch on YouTube.)*
+*v0.20.0 demo video — click the thumbnail to watch on YouTube.*
 
 ## Screenshots
 
