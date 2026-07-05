@@ -65,6 +65,10 @@ the per-title compatibility list in
 
 *v0.20.0 demo video — click the thumbnail to watch on YouTube.*
 
+[![5thPlanet v0.20.0 demo: Virtua Fighter 2](https://img.youtube.com/vi/xOyC-BuPjYw/hqdefault.jpg)](https://www.youtube.com/watch?v=xOyC-BuPjYw)
+
+*5thPlanet v0.20.0 demo: Virtua Fighter 2 — click the thumbnail to watch on YouTube.*
+
 ## Screenshots
 
 A few frames from the emulator running commercial games on the real-BIOS LLE
