@@ -551,7 +551,7 @@ pub fn render_frame_weave(
 
     if !vdp2.regs.display_enabled() {
         // Opaque black so SDL doesn't show a transparent hole.
-        for px in out[..w * h * 4].chunks_exact_mut(4) {
+        for px in out[..w * h * 4].as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0, 0, 0, 0xFF]);
         }
         return (w, h);
@@ -2351,7 +2351,7 @@ mod tests {
         let v = Vdp2::new();
         let mut buf = fresh_buf();
         let (w, h) = render_frame(&v, None, &mut buf);
-        for chunk in buf[..w * h * 4].chunks_exact(4) {
+        for chunk in buf[..w * h * 4].as_chunks::<4>().0 {
             assert_eq!(chunk, &[0, 0, 0, 0xFF]);
         }
     }
@@ -2363,7 +2363,7 @@ mod tests {
         set_backdrop(&mut v, 0x001F); // back screen = red
         let mut buf = fresh_buf();
         let (w, h) = render_frame(&v, None, &mut buf);
-        for chunk in buf[..w * h * 4].chunks_exact(4) {
+        for chunk in buf[..w * h * 4].as_chunks::<4>().0 {
             assert_eq!(chunk, &[0xFF, 0, 0, 0xFF]);
         }
     }

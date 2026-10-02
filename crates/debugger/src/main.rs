@@ -592,7 +592,12 @@ impl Dbg {
         // into `fb`; VDP2 composites `display_fb()`. A strobing sprite layer
         // shows as the two checksums alternating frame-to-frame.
         let stats = |s: &[u8]| -> (usize, u64) {
-            let nb = s.chunks_exact(2).filter(|p| (p[0] | p[1]) != 0).count();
+            let nb = s
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|p| (p[0] | p[1]) != 0)
+                .count();
             let mut h = 0xcbf2_9ce4_8422_2325u64;
             for &b in s {
                 h ^= b as u64;

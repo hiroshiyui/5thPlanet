@@ -237,7 +237,7 @@ impl<'a> Canvas<'a> {
     /// Darken every pixel toward black by halving RGB — used to dim the frozen
     /// game frame behind the menu so the overlay reads clearly.
     pub fn dim(&mut self) {
-        for px in self.buf.chunks_exact_mut(4) {
+        for px in self.buf.as_chunks_mut::<4>().0.iter_mut() {
             px[0] >>= 1;
             px[1] >>= 1;
             px[2] >>= 1;
@@ -265,7 +265,12 @@ mod tests {
         let mut buf = blank(8, 8);
         Canvas::new(&mut buf, 8, 8, 1, 1).draw_char(0, 0, 'A', (10, 20, 30));
         // Some pixels are lit, and lit pixels carry the colour + opaque alpha.
-        let lit: Vec<_> = buf.chunks_exact(4).filter(|p| p[3] == 0xFF).collect();
+        let lit: Vec<_> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] == 0xFF)
+            .collect();
         assert!(!lit.is_empty(), "'A' lights pixels");
         assert!(lit.iter().all(|p| (p[0], p[1], p[2]) == (10, 20, 30)));
     }
@@ -277,7 +282,11 @@ mod tests {
         let lit_at = |sx: usize, sy: usize, pw: usize, ph: usize| {
             let mut buf = blank(pw, ph);
             Canvas::new(&mut buf, pw, ph, sx, sy).draw_char(0, 0, 'A', (255, 255, 255));
-            buf.chunks_exact(4).filter(|p| p[3] == 0xFF).count()
+            buf.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 0xFF)
+                .count()
         };
         let n = lit_at(1, 1, 8, 8);
         assert!(n > 0);

@@ -808,7 +808,9 @@ fn trace_master_pc_during_boot() {
     // Render one more frame and count non-black pixels.
     sat.run_frame(&mut fb);
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
         .count();
     println!(
@@ -1262,7 +1264,9 @@ fn splash_timeline() {
         if f % 20 == 0 || f <= 5 {
             let h = fnv(&fb);
             let nb = fb
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| p[0] | p[1] | p[2] != 0)
                 .count();
             let mark = if h == prev { " (stable)" } else { "" };
@@ -1323,12 +1327,14 @@ fn dump_framebuffer() {
         write!(out, "P6\n{w} {h}\n255\n").unwrap();
         // The renderer packs the active frame tightly at row stride = `w`, so
         // the image is the first `w*h` RGBA pixels (not the whole MAX buffer).
-        for px in fb.chunks_exact(4).take(w * h) {
+        for px in fb.as_chunks::<4>().0.iter().take(w * h) {
             out.write_all(&px[0..3]).unwrap();
         }
         out.flush().unwrap();
         let nonblack = fb
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(w * h)
             .filter(|p| p[0] | p[1] | p[2] != 0)
             .count();
@@ -1358,14 +1364,16 @@ fn check_splash_state() {
     );
     // Framebuffer non-black pixel count.
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] | p[1] | p[2] != 0)
         .count();
     println!("framebuffer: {nonblack}/{} pixels non-black", fb.len() / 4);
     // Histogram of the top distinct RGBA colors.
     use std::collections::HashMap;
     let mut hist: HashMap<[u8; 4], u32> = HashMap::new();
-    for p in fb.chunks_exact(4) {
+    for p in fb.as_chunks::<4>().0.iter() {
         *hist.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
     }
     let mut v: Vec<_> = hist.into_iter().collect();
@@ -2019,7 +2027,9 @@ fn pad_input_reacts() {
     let mut dims = (320usize, 224usize);
     let count = |fb: &[u8], w: usize, h: usize| {
         fb[..w * h * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| (p[0] | p[1] | p[2]) != 0)
             .count()
     };
@@ -2040,7 +2050,7 @@ fn pad_input_reacts() {
     {
         let mut o = std::fs::File::create("/tmp/pad_before.ppm").unwrap();
         write!(o, "P6\n{w} {h}\n255\n").unwrap();
-        for px in fb.chunks_exact(4).take(w * h) {
+        for px in fb.as_chunks::<4>().0.iter().take(w * h) {
             o.write_all(&px[0..3]).unwrap();
         }
     }
@@ -2060,7 +2070,7 @@ fn pad_input_reacts() {
     {
         let mut o = std::fs::File::create("/tmp/pad_after.ppm").unwrap();
         write!(o, "P6\n{w} {h}\n255\n").unwrap();
-        for px in fb.chunks_exact(4).take(w * h) {
+        for px in fb.as_chunks::<4>().0.iter().take(w * h) {
             o.write_all(&px[0..3]).unwrap();
         }
     }
@@ -2123,7 +2133,9 @@ fn vf2_render_state() {
         let (w, h) = sat.run_frame(&mut fb);
         if (f + 1) % 300 == 0 || f + 1 == frames {
             let nonblack = fb[..w * h * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| (p[0] | p[1] | p[2]) != 0)
                 .count();
             println!(
@@ -3676,7 +3688,7 @@ fn menu_savestate_probe() {
         let fbb = sat.bus.vdp1.display_fb().as_slice();
         let mut nonzero = 0usize;
         let mut distinct = std::collections::HashSet::new();
-        for px in fbb.chunks_exact(2) {
+        for px in fbb.as_chunks::<2>().0.iter() {
             let v = u16::from_be_bytes([px[0], px[1]]);
             if v != 0 {
                 nonzero += 1;
@@ -3707,7 +3719,7 @@ fn menu_savestate_probe() {
         );
         // Composited output frame: count non-zero pixels (what reaches the screen).
         let mut out_nonzero = 0usize;
-        for px in fb.chunks_exact(4) {
+        for px in fb.as_chunks::<4>().0.iter() {
             if px[0] != 0 || px[1] != 0 || px[2] != 0 {
                 out_nonzero += 1;
             }
@@ -4030,7 +4042,9 @@ fn doukyuusei_renders_non_black() {
         }
     }
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (p[0] | p[1] | p[2]) != 0)
         .count();
     println!(
@@ -4102,7 +4116,9 @@ fn vf2_renders_non_black() {
         }
     }
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (p[0] | p[1] | p[2]) != 0)
         .count();
     println!(
@@ -4176,7 +4192,9 @@ fn gn98_boots_to_title() {
         }
     }
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (p[0] | p[1] | p[2]) != 0)
         .count();
     println!(
@@ -4250,7 +4268,9 @@ fn pdz_renders_non_black() {
         }
     }
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (p[0] | p[1] | p[2]) != 0)
         .count();
     println!(
@@ -4323,7 +4343,9 @@ fn san5_renders_non_black() {
         }
     }
     let nonblack = fb
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| (p[0] | p[1] | p[2]) != 0)
         .count();
     println!(

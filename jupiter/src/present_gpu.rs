@@ -810,7 +810,7 @@ mod tests {
         fill_test_pattern(&mut a, w, h, 0);
         fill_test_pattern(&mut b, w, h, 100);
         // Every pixel is fully opaque (alpha = 255).
-        assert!(a.chunks_exact(4).all(|px| px[3] == 255));
+        assert!(a.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
         // The sweeping bar moves, so frame 0 and frame 100 differ — proves the
         // presenter would show live motion, not a static blit.
         assert_ne!(a, b);

@@ -856,10 +856,7 @@ impl Osd {
             Nav::Back => self.back(),
             Nav::Select => {
                 let idx = self.sel().min(n - 1);
-                let on_select = match self.items(screen, ctx).into_iter().nth(idx) {
-                    Some(it) => it.on_select,
-                    None => return None,
-                };
+                let on_select = self.items(screen, ctx).into_iter().nth(idx)?.on_select;
                 match on_select {
                     Select::Push(next) => {
                         self.stack.push((next, 0));

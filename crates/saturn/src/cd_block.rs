@@ -1750,7 +1750,7 @@ impl CdBlock {
         if disc.read_full_sector(fad, &mut buf) < 2352 {
             return false;
         }
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             self.cd_audio
                 .push_back(i16::from_le_bytes([frame[0], frame[1]]));
         }
@@ -3584,7 +3584,9 @@ mod tests {
                 .read_full_sector(start_fad + i)
                 .expect("audio sector present");
             expect.extend(
-                sec.chunks_exact(2)
+                sec.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| i16::from_le_bytes([b[0], b[1]])),
             );
         }

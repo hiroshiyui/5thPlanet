@@ -28,7 +28,7 @@ fn display_off_yields_opaque_black_frame_even_after_running() {
     let mut sat = Saturn::with_blank_bios();
     let mut out = vec![0u8; FRAMEBUFFER_BYTES];
     let (w, h) = sat.run_frame(&mut out);
-    for px in out[..w * h * 4].chunks_exact(4) {
+    for px in out[..w * h * 4].as_chunks::<4>().0.iter() {
         assert_eq!(px, &[0, 0, 0, 0xFF]);
     }
 }

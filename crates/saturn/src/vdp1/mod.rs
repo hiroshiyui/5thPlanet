@@ -72,7 +72,12 @@ fn weave_disabled() -> bool {
 /// between two values frame-to-frame.
 fn fb_stats(fb: &Framebuffer) -> (usize, u64) {
     let s = fb.as_slice();
-    let nb = s.chunks_exact(2).filter(|p| (p[0] | p[1]) != 0).count();
+    let nb = s
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|p| (p[0] | p[1]) != 0)
+        .count();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in s {
         h ^= b as u64;

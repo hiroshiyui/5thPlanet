@@ -438,7 +438,7 @@ impl Disc {
                     break;
                 }
                 let (mut ple, mut pbe) = (0i16, 0i16);
-                for (i, fr) in raw.chunks_exact(4).enumerate() {
+                for (i, fr) in raw.as_chunks::<4>().0.iter().enumerate() {
                     let le = i16::from_le_bytes([fr[0], fr[1]]);
                     let be = i16::from_be_bytes([fr[0], fr[1]]);
                     if i > 0 {
@@ -655,7 +655,7 @@ mod tests {
     fn detects_msb_first_audio_tracks() {
         fn audio_disc(fill: impl Fn(usize) -> [u8; 2]) -> Disc {
             let mut bin = vec![0u8; 2352 * 16];
-            for (i, fr) in bin.chunks_exact_mut(4).enumerate() {
+            for (i, fr) in bin.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let b = fill(i);
                 fr[0..2].copy_from_slice(&b);
                 fr[2..4].copy_from_slice(&b);

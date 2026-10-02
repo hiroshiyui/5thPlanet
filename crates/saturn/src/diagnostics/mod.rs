@@ -201,7 +201,9 @@ pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) ->
             }
         } else {
             let non_black = fb[..dims.0 * dims.1 * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| (p[0] | p[1] | p[2]) != 0)
                 .count();
             max_non_black = max_non_black.max(non_black);
