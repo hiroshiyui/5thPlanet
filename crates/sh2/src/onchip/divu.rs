@@ -9,8 +9,10 @@
 //!   0C  VCRDIV  interrupt vector number for overflow (low 8 bits)
 //!   10  DVDNTH  high half of the 64-bit dividend / remainder after divide
 //!   14  DVDNTL  low half — writing triggers 64/32 division
-//!   18  DVDNTUH mirror of DVDNTH
-//!   1C  DVDNTUL mirror of DVDNTL
+//!   18  DVDNTUH shadow of DVDNTH — a write stores only the shadow (no
+//!               divide); a read returns the shadow, which every divide
+//!               refreshes with its DVDNTH result (Mednafen `DVDNTH_Shadow`)
+//!   1C  DVDNTUL shadow of DVDNTL (likewise; Mednafen `DVDNTL_Shadow`)
 //! ```
 //!
 //! On overflow (divide-by-zero or a quotient that doesn't fit 32 bits signed)
@@ -45,6 +47,11 @@ pub struct Divu {
     pub dvdntl: u32,
     pub dvcr: u32,
     pub vcrdiv: u32,
+    /// DVDNTUH (0x18): shadow of DVDNTH. Written directly by software without
+    /// triggering a divide; overwritten with the result by every divide.
+    pub dvdnth_shadow: u32,
+    /// DVDNTUL (0x1C): shadow of DVDNTL, as [`Self::dvdnth_shadow`].
+    pub dvdntl_shadow: u32,
     /// Set by a triggering write to the latency (in CPU cycles) the divider
     /// will take; the interpreter consumes it via [`Divu::take_pending_latency`]
     /// right after the on-chip write to arm the pipeline divide-ready stall.
@@ -62,8 +69,10 @@ impl Divu {
             0x04 => self.dvdntl,
             0x08 => self.dvcr,
             0x0C => self.vcrdiv,
-            0x10 | 0x18 => self.dvdnth,
-            0x14 | 0x1C => self.dvdntl,
+            0x10 => self.dvdnth,
+            0x14 => self.dvdntl,
+            0x18 => self.dvdnth_shadow,
+            0x1C => self.dvdntl_shadow,
             _ => 0,
         }
     }
@@ -74,16 +83,29 @@ impl Divu {
             0x04 => {
                 self.dvdntl = val;
                 self.divide_32();
+                self.latch_shadows();
             }
             0x08 => self.dvcr = val & 0x3,
             0x0C => self.vcrdiv = val & 0xFFFF_007F,
-            0x10 | 0x18 => self.dvdnth = val,
-            0x14 | 0x1C => {
+            0x10 => self.dvdnth = val,
+            0x14 => {
                 self.dvdntl = val;
                 self.divide_64();
+                self.latch_shadows();
             }
+            // DVDNTUH/UL: shadow stores only — no divide (Mednafen
+            // `OnChipRegWrite` 0x18/0x1C).
+            0x18 => self.dvdnth_shadow = val,
+            0x1C => self.dvdntl_shadow = val,
             _ => {}
         }
+    }
+
+    /// Copy the just-computed DVDNTH/DVDNTL into the DVDNTUH/UL shadows
+    /// (Mednafen sets `DVDNT{H,L}_Shadow` at the end of both divide routines).
+    fn latch_shadows(&mut self) {
+        self.dvdnth_shadow = self.dvdnth;
+        self.dvdntl_shadow = self.dvdntl;
     }
 
     /// Take (and clear) the latency a just-triggered divide will run for, so
@@ -190,6 +212,32 @@ fn divu64_partial(mut dividend: u64, divisor: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dvdntuh_ul_are_shadow_registers() {
+        // Mednafen: a 0x18/0x1C write stores only the shadow (no divide); a
+        // read returns the shadow; every divide refreshes both shadows.
+        let mut d = Divu::new();
+        d.write32(0x00, 4); // DVSR
+        d.write32(0x18, 0x1111); // DVDNTUH shadow
+        d.write32(0x1C, 0x2222); // DVDNTUL shadow — must NOT divide
+        assert_eq!(d.take_pending_latency(), None, "no divide triggered");
+        assert_eq!(d.read32(0x18), 0x1111);
+        assert_eq!(d.read32(0x1C), 0x2222);
+        assert_eq!(d.read32(0x14), 0, "DVDNTL untouched by the shadow write");
+        // A 32/32 divide (25 / 4) refreshes both shadows with its results.
+        d.write32(0x04, 25);
+        assert_eq!(d.read32(0x18), 1, "shadow H = remainder");
+        assert_eq!(d.read32(0x1C), 6, "shadow L = quotient");
+        // A later DVDNTH write changes DVDNTH but not its shadow.
+        d.write32(0x10, 0xABCD);
+        assert_eq!(d.read32(0x10), 0xABCD);
+        assert_eq!(d.read32(0x18), 1);
+        // A 64/32 divide refreshes them too: (0:100) / 4.
+        d.write32(0x10, 0);
+        d.write32(0x14, 100);
+        assert_eq!((d.read32(0x18), d.read32(0x1C)), (0, 25));
+    }
 
     #[test]
     fn divide_32_positive() {
