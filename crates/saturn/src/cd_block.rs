@@ -76,6 +76,7 @@ const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
 // Further status bytes (high byte of the 16-bit status word, MAME `CD_STAT_*`).
 const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
+const STAT_WAIT: u16 = 0x8000; // CR1 "busy, retry" bit (Mednafen STATUS_WAIT)
 const STAT_SEEK: u8 = 0x04; // drive seeking
 const STAT_PLAY: u8 = 0x03; // read/playback in progress
 const STAT_STANDBY: u8 = 0x02; // drive stopped (MAME CD_STAT_STANDBY)
@@ -2299,26 +2300,32 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
             }
             0x03 => {
-                // Get session info (MAME `cmd_get_session_info`). CR1 low byte
-                // selects which session; the BIOS reads CR3 (session count in
-                // the high byte) and CR4. With a disc, session 0 ("total / disc
-                // end") returns the lead-out FAD; otherwise the disc start.
-                // (MAME warns CR4 must be > 1 and < 100 or the BIOS rejects the
-                // no-disc default — hence CR3=0x0100, CR4=0 there.)
-                let which = (self.cr1 & 0xFF) as u8;
-                self.status = STAT_PAUSE;
-                self.cr1 = (self.status as u16) << 8;
-                self.cr2 = 0x0000;
-                match (&self.disc, which) {
-                    (Some(d), 0) => {
-                        let lo = d.lead_out_fad();
-                        self.cr3 = 0x0100 | ((lo >> 16) & 0xFF) as u16;
-                        self.cr4 = lo as u16;
-                    }
-                    _ => {
-                        self.cr3 = 0x0100;
-                        self.cr4 = 0x0000;
-                    }
+                // Get session info (Mednafen `COMMAND_GET_SESSINFO`,
+                // cdb.cpp:2691). Read-only: the drive status is reported, never
+                // changed (forcing PAUSE here turned an empty tray's NODISC
+                // into a phantom disc). During recognition spin-up the block
+                // answers WAIT. Otherwise CR1 low byte selects the session:
+                // 0 = whole disc → session count 1 + the lead-out FAD;
+                // 1 → `rsw = 1`, FAD 0; anything else → `0xFF` / `0xFFFFFF`
+                // (single-session discs only). With no disc Mednafen's cleared
+                // TOC puts the lead-out at FAD 150.
+                if self.drive_phase == DrivePhase::Startup {
+                    self.cd_report();
+                    self.cr1 |= STAT_WAIT;
+                } else {
+                    let sess = self.cr1 & 0xFF;
+                    let (rsw, fad) = match sess {
+                        0 => (
+                            0x01u16,
+                            self.disc.as_ref().map_or(FAD_OFFSET, |d| d.lead_out_fad()),
+                        ),
+                        1 => (0x01, 0),
+                        _ => (0xFF, 0xFF_FFFF),
+                    };
+                    self.cr1 = self.cd_stat();
+                    self.cr2 = 0x0000;
+                    self.cr3 = (rsw << 8) | ((fad >> 16) & 0xFF) as u16;
+                    self.cr4 = fad as u16;
                 }
                 self.hirq |= HIRQ_CMOK;
             }
@@ -3878,13 +3885,39 @@ mod tests {
     fn get_session_returns_the_lead_out_fad() {
         let mut c = CdBlock::new();
         c.insert_disc(iso_disc()); // lead-out FAD = 150 + 4 = 154
+        // During recognition spin-up the block answers WAIT (Mednafen
+        // cdb.cpp:2693), without touching the drive status.
+        assert!(c.dbg_in_startup());
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(c.read16(0x0018) & STAT_WAIT, STAT_WAIT, "WAIT in Startup");
+        assert!(c.dbg_in_startup(), "Get Session doesn't end the spin-up");
+        c.tick(60_000_000); // settle the spin-up
+        assert!(!c.dbg_in_startup());
         // Get Session, session 0 (total / disc end): CR1 = 0x0300.
-        c.write16(0x0018, 0x0300);
-        c.write16(0x001C, 0x0000);
-        c.write16(0x0020, 0x0000);
-        c.write16(0x0024, 0x0000);
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(c.read16(0x0018) & STAT_WAIT, 0);
         assert_eq!(c.read16(0x0020), 0x0100, "1 session, lead-out FAD hi 0");
         assert_eq!(c.read16(0x0024), 154, "lead-out FAD 154");
+        // Session 1 → rsw 1, FAD 0; session 2+ → 0xFF / 0xFFFFFF.
+        cmd(&mut c, 0x0301, 0, 0, 0);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0x0100, 0x0000));
+        cmd(&mut c, 0x0302, 0, 0, 0);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0xFFFF, 0xFFFF));
+    }
+
+    /// Get Session Info is read-only: with an empty tray it must keep reporting
+    /// NODISC (it used to force PAUSE, a phantom disc), lead-out FAD 150.
+    #[test]
+    fn get_session_without_a_disc_keeps_nodisc() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(
+            c.read16(0x0018) >> 8,
+            STAT_NODISC as u16,
+            "status untouched"
+        );
+        assert_eq!(c.status, STAT_NODISC);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0x0100, 150));
     }
 
     /// Issue a full 4-CR command (high byte of CR1 = command) and run it.
