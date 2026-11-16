@@ -18,6 +18,19 @@ fn sat() -> Saturn {
 }
 
 #[test]
+fn a_degenerate_backup_ram_size_is_clamped_not_a_divide_by_zero() {
+    for size in [0usize, 1, 3] {
+        let mut s = sat();
+        s.insert_cartridge(Cartridge::backup_ram(size));
+        // Any access must not panic (it used to index `% 0`).
+        s.bus.write8(CART_BRAM_BASE + 1, 0x5A, AccessKind::Data);
+        let (v, _) = s.bus.read8(CART_BRAM_BASE + 1, AccessKind::Data);
+        assert_eq!(v, 0x5A, "size {size} → a usable one-word cart");
+        assert_eq!(s.cartridge_backup().unwrap().len() % 2, 0);
+    }
+}
+
+#[test]
 fn empty_slot_floats_high() {
     let mut s = sat();
     // No cart: ID byte and all cart space read 0xFF (A-bus pulled high).

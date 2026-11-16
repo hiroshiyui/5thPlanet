@@ -31,9 +31,19 @@ fn placeholder_bios() -> Vec<u8> {
 }
 
 impl BiosRom {
+    /// Wrap a BIOS image. **Panics** on an empty image (the mirror fold would
+    /// divide by zero); host-supplied images should go through
+    /// [`Self::try_new`] or be checked first.
     pub fn new(image: Vec<u8>) -> Self {
-        assert!(!image.is_empty(), "BIOS image must be non-empty");
-        Self { rom: image }
+        Self::try_new(image).expect("BIOS image must be non-empty")
+    }
+
+    /// Fallible [`Self::new`]: rejects an empty image instead of panicking.
+    pub fn try_new(image: Vec<u8>) -> Result<Self, &'static str> {
+        if image.is_empty() {
+            return Err("BIOS image must be non-empty");
+        }
+        Ok(Self { rom: image })
     }
 
     pub fn len(&self) -> usize {
@@ -303,6 +313,12 @@ mod tests {
     #[should_panic(expected = "BIOS image must be non-empty")]
     fn bios_rejects_empty_image() {
         let _ = BiosRom::new(Vec::new());
+    }
+
+    #[test]
+    fn bios_try_new_reports_an_empty_image_without_panicking() {
+        assert!(BiosRom::try_new(Vec::new()).is_err());
+        assert_eq!(BiosRom::try_new(vec![7]).unwrap().read8(3), 7);
     }
 
     // ---- Ram -------------------------------------------------------------

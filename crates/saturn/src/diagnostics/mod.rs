@@ -173,6 +173,16 @@ pub fn run_all() -> Vec<DiagOutcome> {
 /// worked). Answers "does my setup boot?", which is distinct from "is the
 /// emulator correct?".
 pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) -> Vec<DiagOutcome> {
+    // A host-supplied image may be empty (a 0-byte file): report a failed
+    // check instead of panicking inside `BiosRom::new`.
+    if bios.is_empty() {
+        return vec![DiagOutcome {
+            name: "bios_load",
+            category: "system",
+            passed: false,
+            detail: "the BIOS image is empty".into(),
+        }];
+    }
     // TOC facts are pure — read them before the disc is moved into the machine.
     let toc = disc
         .as_ref()
