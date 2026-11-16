@@ -50,7 +50,7 @@
 //! your own fallback renderer"). The whole path stays `unsafe`-free — sdl3-rs's
 //! `Setter`/`new_with_properties` wrap the FFI — so the workspace `forbid` holds.
 //! (We still can't *label* the chosen backend: `SDL_GetGPUDeviceDriver` isn't
-//! safe-wrapped in sdl3-rs 0.18.4 — a cosmetic follow-up, ADR-0019.)
+//! safe-wrapped in sdl3-rs 0.22.1 — a cosmetic follow-up, ADR-0019.)
 
 /// Whether to present via the SDL_GPU backend. Parsed from the `gpu` config key /
 /// `--gpu` flag (the CLI flag wins, like `--backend`).
@@ -217,6 +217,12 @@ impl ShaderKind {
 /// it only affects the Vulkan backend (ignored by D3D12/Metal). See ADR-0019.
 #[cfg(feature = "gpu-presenter")]
 const PROP_REQUIRE_HW_ACCEL: &str = "SDL.gpu.device.create.vulkan.requirehardwareacceleration";
+
+/// `SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN`: SDL_GPU's validation ("debug
+/// mode") layer, which SDL enables by default. Set to `cfg!(debug_assertions)` so
+/// release builds don't pay its per-call CPU cost.
+#[cfg(feature = "gpu-presenter")]
+const PROP_DEBUG_MODE: &str = "SDL.gpu.device.create.debugmode";
 
 /// Saturn lo-res frame shape the self-test uploads (mirrors the real
 /// framebuffer's 320×224 native layout and `[R, G, B, A]` byte order).
@@ -427,6 +433,9 @@ impl GpuPresenter {
         props
             .set(shader.create_prop_key(), true)
             .and_then(|()| props.set(PROP_REQUIRE_HW_ACCEL, true))
+            // SDL_GPU's validation layer ("debug mode") defaults ON and costs CPU
+            // on every call — keep it for debug builds only.
+            .and_then(|()| props.set(PROP_DEBUG_MODE, cfg!(debug_assertions)))
             .map_err(|e| format!("GPU device properties ({e:?})"))?;
         let device = Device::new_with_properties(props)
             .and_then(|d| d.with_window(&window))
@@ -617,9 +626,24 @@ impl GpuPresenter {
         } else {
             (0, 0, sw, sh)
         };
+        // From here on a swapchain texture is acquired, so the command buffer
+        // MUST be submitted: SDL (debug mode) asserts on cancelling a buffer
+        // that holds a swapchain image (`SDL_CancelGPUCommandBuffer`). Every
+        // early-out below therefore submits — a clear-only pass where possible,
+        // so the swapchain image isn't presented with undefined contents.
+        let clear = [ColorTargetInfo::default()
+            .with_texture(&swapchain)
+            .with_load_op(LoadOp::CLEAR)
+            .with_store_op(StoreOp::STORE)
+            .with_clear_color(sdl3::pixels::Color::RGB(0, 0, 0))];
         if dw == 0 || dh == 0 {
-            // Minimised / zero-sized drawable — nothing to present this frame.
-            draw_cmd.cancel();
+            // The letterbox rect rounds to nothing (a sliver of a window): present
+            // the image cleared and count the frame as skipped. (A minimised window
+            // never gets here — it's the `Ok(None)` acquire above.)
+            if let Ok(pass) = self.device.begin_render_pass(&draw_cmd, &clear, None) {
+                self.device.end_render_pass(pass);
+            }
+            let _ = draw_cmd.submit();
             return false;
         }
 
@@ -629,13 +653,9 @@ impl GpuPresenter {
             // the frame texture. (`crt`/`device`/`frame_tex`/`window` are distinct
             // shared borrows — see `ensure_crt`'s `bool` return.)
             let crt = self.crt.as_ref().expect("ensure_crt built it");
-            let color = [ColorTargetInfo::default()
-                .with_texture(&swapchain)
-                .with_load_op(LoadOp::CLEAR)
-                .with_store_op(StoreOp::STORE)
-                .with_clear_color(sdl3::pixels::Color::RGB(0, 0, 0))];
-            let Ok(pass) = self.device.begin_render_pass(&draw_cmd, &color, None) else {
-                draw_cmd.cancel();
+            let Ok(pass) = self.device.begin_render_pass(&draw_cmd, &clear, None) else {
+                // Can't cancel (swapchain acquired) — submit the empty buffer.
+                let _ = draw_cmd.submit();
                 return false;
             };
             self.device.set_viewport(
