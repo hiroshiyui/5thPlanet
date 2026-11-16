@@ -166,17 +166,34 @@ struct Xfer32 {
 /// SH-2 master clock (Hz) — sectors stream at 75×speed of these.
 const MASTER_HZ: u64 = 28_636_400;
 
-/// One ISO9660 directory record (MAME `direntryT`, fields we use).
+/// One ISO9660 directory record (MAME `direntryT` / Mednafen `FileInfoS`,
+/// the fields Change Directory, Get File Info, and Read File use).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct DirEntry {
     firstfad: u32,
     length: u32,
+    /// ISO9660 file flags (bit 1 = directory).
     flags: u8,
     file_unit_size: u8,
     interleave_gap_size: u8,
-    #[allow(dead_code)] // retained for Get File Info / debugging
-    name: Vec<u8>,
+    /// CD-XA file number from the record's system-use `XA` extension (0 if
+    /// none) — Mednafen `ReadRecord` `fnum`.
+    xa_fnum: u8,
+    /// Get File Info attribute byte: the directory flag plus the CD-XA
+    /// attribute bits (`Form1/Form2/interleave/CDDA`, `& 0xF8`) — Mednafen
+    /// `ReadRecord` `attr`.
+    attr: u8,
 }
+
+/// Upper bound on the bytes Change Directory reads for one directory. The
+/// directory length is an untrusted 32-bit field of the disc's records; a
+/// hostile or corrupt image could otherwise make us allocate gigabytes. 1 MiB
+/// (512 sectors, tens of thousands of records) is far beyond any real disc.
+const MAX_DIR_BYTES: u32 = 0x10_0000;
+
+/// Entries the Get File Info whole-directory form stages: Mednafen's file-info
+/// window holds `.`/`..` plus up to 254 records (`FileInfoValidCount`, a u8).
+const FILE_INFO_WINDOW: usize = 254;
 
 /// Clamp a commanded track number into `first..=last` without panicking when
 /// a malformed [`SectorSource`] reports `first > last` (`u8::clamp` asserts
@@ -1961,7 +1978,10 @@ impl CdBlock {
     /// Load a directory (MAME `read_new_dir`). `0xFFFFFF` finds the primary
     /// volume descriptor (FAD 166..200), parses the root record, and reads the
     /// root directory; otherwise it reads the sub-directory at entry `fileno`.
-    fn read_new_dir(&mut self, fileno: u32) {
+    /// Returns `false` (the command is rejected) when `fileno` is not a
+    /// directory entry of the current directory — Mednafen `COMMAND_CHANGE_DIR`
+    /// rejects an out-of-window id or a record without the directory attribute.
+    fn read_new_dir(&mut self, fileno: u32) -> bool {
         if fileno == 0xFF_FFFF {
             let mut pvd = None;
             if let Some(disc) = self.disc.as_ref() {
@@ -1982,32 +2002,50 @@ impl CdBlock {
                     }
                 }
             }
-            let Some(sect) = pvd else { return };
-            // Root directory record sits at offset 156 in the PVD.
+            let Some(sect) = pvd else { return true };
+            // Root directory record sits at offset 156 in the PVD. The FAD is
+            // `150 + extent` in 32-bit arithmetic (Mednafen `ReadRecord`).
             self.curroot = DirEntry {
-                firstfad: le32(&sect, 158) + FAD_OFFSET,
+                firstfad: le32(&sect, 158).wrapping_add(FAD_OFFSET),
                 length: le32(&sect, 166),
                 flags: *sect.get(181).unwrap_or(&0),
                 ..Default::default()
             };
-            self.make_dir_current(self.curroot.firstfad);
-        } else if let Some(e) = self.curdir.get(fileno as usize) {
-            let fad = e.firstfad;
-            self.make_dir_current(fad);
+            self.make_dir_current(self.curroot.firstfad, self.curroot.length);
+            true
+        } else {
+            match self.curdir.get(fileno as usize) {
+                Some(e) if e.flags & 0x02 != 0 => {
+                    // Read the *target* directory's own extent length
+                    // (Mednafen `FLS_Run` sizes the read from the selected
+                    // record, `fi->size()`), not the root's.
+                    let (fad, len) = (e.firstfad, e.length);
+                    self.make_dir_current(fad, len);
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
-    /// Parse the directory at `fad` into `curdir` (MAME `make_dir_current`):
-    /// variable-length records, jumping the 0-padded gap at each 0x800 sector
-    /// boundary; `firstfile` is the first non-directory entry.
-    fn make_dir_current(&mut self, fad: u32) {
-        let dirlen = self.curroot.length.max(2048) as usize;
+    /// Parse the `length`-byte directory at `fad` into `curdir` (MAME
+    /// `make_dir_current`): variable-length records, jumping the 0-padded gap
+    /// at each 0x800 sector boundary; `firstfile` is the first non-directory
+    /// entry. The read is capped at [`MAX_DIR_BYTES`] and at the disc's end.
+    fn make_dir_current(&mut self, fad: u32, length: u32) {
+        let disc_sectors = self
+            .disc
+            .as_ref()
+            .map_or(0, |d| d.lead_out_fad().saturating_sub(fad));
+        let dirlen = length
+            .clamp(2048, MAX_DIR_BYTES)
+            .min(disc_sectors.saturating_mul(2048).max(2048)) as usize;
         let nsect = dirlen.div_ceil(2048);
         let mut buf: Vec<u8> = Vec::with_capacity(nsect * 2048);
         if let Some(disc) = self.disc.as_ref() {
             let mut sect = [0u8; 2048];
             for i in 0..nsect as u32 {
-                if disc.read_sector(fad + i, &mut sect) {
+                if disc.read_sector(fad.wrapping_add(i), &mut sect) {
                     buf.extend_from_slice(&sect);
                 } else {
                     buf.resize(buf.len() + 2048, 0);
@@ -2020,7 +2058,7 @@ impl CdBlock {
         while pos < buf.len() {
             let rec = buf[pos] as usize;
             if rec == 0 {
-                if sector_number < self.curroot.length as usize {
+                if sector_number < dirlen {
                     sector_number += 0x800;
                     pos = sector_number;
                     continue;
@@ -2030,17 +2068,24 @@ impl CdBlock {
             if pos + 33 > buf.len() {
                 break;
             }
-            let namelen = buf[pos + 32] as usize;
+            let r = &buf[pos..(pos + rec).min(buf.len())];
+            let flags = buf[pos + 25];
+            // CD-XA system-use extension after the (odd-padded) name: `XA` at
+            // +6, attribute bits at +4, file number at +8 (Mednafen
+            // `ReadRecord`, cdb.cpp:1046).
+            let su_offs = 33 + (buf[pos + 32] as usize | 1);
+            let (xa_attr, xa_fnum) = match r.get(su_offs..) {
+                Some(su) if su.len() >= 14 && &su[6..8] == b"XA" => (su[4] & 0xF8, su[8]),
+                _ => (0, 0),
+            };
             entries.push(DirEntry {
-                firstfad: le32(&buf, pos + 2) + FAD_OFFSET,
+                firstfad: le32(&buf, pos + 2).wrapping_add(FAD_OFFSET),
                 length: le32(&buf, pos + 10),
                 file_unit_size: buf[pos + 26],
                 interleave_gap_size: buf[pos + 27],
-                flags: buf[pos + 25],
-                name: buf
-                    .get(pos + 33..pos + 33 + namelen)
-                    .unwrap_or(&[])
-                    .to_vec(),
+                flags,
+                xa_fnum,
+                attr: (flags & 0x02) | xa_attr,
             });
             pos += rec;
         }
@@ -2892,9 +2937,14 @@ impl CdBlock {
             0x70 => {
                 // Change directory: CR3 low + CR4 = file id (0xFFFFFF = root).
                 let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
-                self.read_new_dir(temp);
+                let ok = self.read_new_dir(temp);
                 self.cd_report();
-                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+                if ok {
+                    self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+                } else {
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x71 => {
                 // Read directory: just (re)connect the filter for the read.
@@ -2916,34 +2966,54 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
             }
             0x73 => {
-                // Get target file info: stage a 12-byte record for the host to
-                // read through the FIFO (FAD, length, gap/unit size, id, flags).
-                let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
-                if temp != 0xFF_FFFF {
-                    if let Some(e) = self.curdir.get(temp as usize) {
-                        let mut f = vec![0u8; 12];
-                        f[0..4].copy_from_slice(&e.firstfad.to_be_bytes());
-                        f[4..8].copy_from_slice(&e.length.to_be_bytes());
-                        f[8] = e.interleave_gap_size;
-                        f[9] = e.file_unit_size;
-                        f[10] = temp as u8;
-                        f[11] = e.flags;
-                        self.xfer = f;
-                        self.xfer_pos = 0;
-                    }
-                    self.xfer_done = 0;
-                    self.transfer_request = true;
-                    self.cr1 = self.cd_stat() | STAT_TRANS;
-                    self.cr2 = 6; // 6 words for a single file
+                // Get target file info (Mednafen `COMMAND_GET_FINFO`,
+                // cdb.cpp:3836): stage 12-byte records for the host to read
+                // through the FIFO — FAD, size (both big-endian), unit size,
+                // gap size, CD-XA file number, attribute. A single id stages
+                // its record (6 words); `0xFFFFFF` stages the whole listed
+                // directory from id 2 (6 words per entry, `.`/`..` excluded).
+                // An id outside the directory, the whole form of a directory
+                // with no files, or no directory loaded is rejected; a busy
+                // data transfer answers WAIT.
+                let id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                let listed = self.curdir.len().saturating_sub(2).min(FILE_INFO_WINDOW);
+                let entries: Option<&[DirEntry]> = if self.curdir.is_empty() {
+                    None
+                } else if id == 0xFF_FFFF {
+                    (listed > 0).then(|| &self.curdir[2..2 + listed])
                 } else {
+                    self.curdir.get(id as usize).map(core::slice::from_ref)
+                };
+                if self.xfer32.is_some() {
+                    self.cd_report();
+                    self.cr1 |= STAT_WAIT;
+                } else if let Some(entries) = entries {
+                    let mut f = Vec::with_capacity(entries.len() * 12);
+                    for e in entries {
+                        f.extend_from_slice(&e.firstfad.to_be_bytes());
+                        f.extend_from_slice(&e.length.to_be_bytes());
+                        f.extend_from_slice(&[
+                            e.file_unit_size,
+                            e.interleave_gap_size,
+                            e.xa_fnum,
+                            e.attr,
+                        ]);
+                    }
+                    let words = (f.len() / 2) as u16;
+                    self.xfer = f;
+                    self.xfer_pos = 0;
                     self.xfer_done = 0;
                     self.transfer_request = true;
                     self.cr1 = self.cd_stat() | STAT_TRANS;
-                    self.cr2 = 0x5F4; // all entries (whole-directory form)
+                    self.cr2 = words;
+                    self.cr3 = 0;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_DRDY;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
                 }
-                self.cr3 = 0;
-                self.cr4 = 0;
-                self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
+                self.hirq |= HIRQ_CMOK;
             }
             0x74 => {
                 // Read file: start the read pump over a file's sectors.
@@ -2952,7 +3022,9 @@ impl CdBlock {
                 let file_id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
                 if let Some(e) = self.curdir.get(file_id as usize) {
                     let nsect = e.length.div_ceil(self.sectlenin.max(1));
-                    let start_fad = e.firstfad + file_offset;
+                    // 24-bit FAD arithmetic (Mednafen `COMMAND_READ_FILE`
+                    // masks `fad + offset` with 0xFFFFFF, cdb.cpp:3918).
+                    let start_fad = e.firstfad.wrapping_add(file_offset) & 0xFF_FFFF;
                     let sec_count = nsect.saturating_sub(file_offset);
                     self.cd_device_filter = if (file_filter as usize) < MAX_FILTERS {
                         file_filter
@@ -3957,11 +4029,8 @@ mod tests {
         println!("numfiles={} firstfile={}", c.numfiles, c.firstfile);
         for (i, e) in c.curdir.iter().enumerate() {
             println!(
-                "  [{i:>2}] name={:<16?} firstfad=0x{:06X} len={:>8} flags=0x{:02X}",
-                String::from_utf8_lossy(&e.name),
-                e.firstfad,
-                e.length,
-                e.flags
+                "  [{i:>2}] firstfad=0x{:06X} len={:>8} flags=0x{:02X} attr=0x{:02X} fnum={}",
+                e.firstfad, e.length, e.flags, e.attr, e.xa_fnum
             );
         }
     }
@@ -5031,12 +5100,17 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(fs_disc());
         cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
-        // Get File Info (0x73) with id 0xFFFFFF = whole-directory form: CR2 is
-        // the all-entries word count (0x5F4), TRANS set, no per-file FAD staged.
+        // Get File Info (0x73) with id 0xFFFFFF = whole-directory form: one
+        // 6-word record per listed entry from id 2 (`.`/`..` excluded) — here
+        // just file "X" — actually staged, not stale FIFO data.
+        c.xfer = vec![0xEE; 64]; // stale bytes from an earlier transfer
+        c.xfer_pos = 40;
         cmd(&mut c, 0x7300, 0x0000, 0x00FF, 0xFFFF);
-        assert_eq!(c.read16(0x001C), 0x05F4, "whole-directory word count");
+        assert_eq!(c.read16(0x001C), 6, "6 words × 1 listed entry");
         assert!(c.transfer_request, "transfer pending");
         assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY);
+        let words: Vec<u16> = (0..6).map(|_| c.read16(0x8000)).collect();
+        assert_eq!(words, [0x0000, 0x00AA, 0x0000, 0x0800, 0x0000, 0x0000]);
     }
 
     #[test]
@@ -5047,14 +5121,156 @@ mod tests {
         // Get File Info for id 2 (the file "X" at FAD 170, length 2048).
         cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002);
         assert_eq!(c.read16(0x001C), 6, "CR2 = 6 words for a single file");
-        // The 12-byte record streams big-endian through the FIFO: FAD, length,
-        // gap/unit, id, flags.
+        // Mednafen `FileInfoS`: FAD, size, unit size, gap size, XA file
+        // number, attribute — streamed big-endian through the FIFO.
         assert_eq!(c.read16(0x8000), 0x0000, "FAD hi");
         assert_eq!(c.read16(0x8000), 0x00AA, "FAD lo = 170");
         assert_eq!(c.read16(0x8000), 0x0000, "length hi");
         assert_eq!(c.read16(0x8000), 0x0800, "length lo = 2048");
-        let _gap_unit = c.read16(0x8000); // gap/unit size bytes
-        assert_eq!(c.read16(0x8000) >> 8, 2, "id byte = 2");
+        assert_eq!(c.read16(0x8000), 0x0000, "unit / gap size");
+        assert_eq!(c.read16(0x8000), 0x0000, "no XA fnum, not a directory");
+        // id 0 (`.`) is a directory: attr bit 1.
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0000);
+        for _ in 0..5 {
+            let _ = c.read16(0x8000);
+        }
+        assert_eq!(c.read16(0x8000) & 0x00FF, 0x02, "`.` carries the dir attr");
+    }
+
+    /// Get File Info rejects (Mednafen `CDStatusResults(true)`) an id outside
+    /// the directory, and any id before a directory has been read — instead of
+    /// reporting a transfer of stale data.
+    #[test]
+    fn get_file_info_rejects_invalid_ids() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002); // no directory read yet
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert!(!c.transfer_request);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0063); // id 99
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert!(!c.transfer_request);
+        assert_eq!(c.hirq & HIRQ_DRDY, 0, "no data-ready for a reject");
+    }
+
+    /// One ISO9660 directory record with an optional system-use area.
+    fn dir_record(lba: u32, len: u32, flags: u8, name: &[u8], su: &[u8]) -> Vec<u8> {
+        let name_pad = name.len() | 1; // name + pad byte to an even offset
+        let mut r = vec![0u8; 33 + name_pad + su.len()];
+        r[0] = r.len() as u8;
+        r[2..6].copy_from_slice(&lba.to_le_bytes());
+        r[10..14].copy_from_slice(&len.to_le_bytes());
+        r[25] = flags;
+        r[32] = name.len() as u8;
+        r[33..33 + name.len()].copy_from_slice(name);
+        r[33 + name_pad..].copy_from_slice(su);
+        r
+    }
+
+    /// An ISO whose PVD (sector 16) roots at sector 17 with `root_len` bytes;
+    /// `dirs` places record lists at the given sectors.
+    fn iso_with_dirs(root_len: u32, dirs: &[(usize, Vec<Vec<u8>>)]) -> Disc {
+        let mut img = vec![0u8; 2048 * 24];
+        let pvd = 16 * 2048;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        let root = dir_record(17, root_len, 0x02, &[0], &[]);
+        img[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        for (sector, recs) in dirs {
+            let mut o = sector * 2048;
+            for r in recs {
+                img[o..o + r.len()].copy_from_slice(r);
+                o += r.len();
+            }
+        }
+        Disc::from_iso(img)
+    }
+
+    /// Change Directory into a subdirectory reads *that* directory's extent
+    /// length (Mednafen sizes the read from the selected record), not the
+    /// root's: here the root spans 2 sectors but the 1-sector subdirectory is
+    /// followed by a sector of record-shaped junk that must not be parsed.
+    /// A non-directory id is rejected.
+    #[test]
+    fn change_dir_reads_the_target_directorys_own_length() {
+        let su_xa = {
+            let mut su = [0u8; 14];
+            su[4] = 0x48; // XA attr: Form 1 (0x08) | CD-DA (0x40)
+            su[6..8].copy_from_slice(b"XA");
+            su[8] = 7; // XA file number
+            su
+        };
+        let disc = iso_with_dirs(
+            4096,
+            &[
+                (
+                    17,
+                    vec![
+                        dir_record(17, 4096, 0x02, &[0], &[]),
+                        dir_record(17, 4096, 0x02, &[1], &[]),
+                        dir_record(19, 2048, 0x02, b"SUB", &[]),
+                        dir_record(22, 100, 0x00, b"F", &su_xa),
+                    ],
+                ),
+                (
+                    19,
+                    vec![
+                        dir_record(19, 2048, 0x02, &[0], &[]),
+                        dir_record(17, 4096, 0x02, &[1], &[]),
+                        dir_record(23, 10, 0x00, b"A", &[]),
+                    ],
+                ),
+                // Sector 20: junk that parses as records if over-read.
+                (20, vec![dir_record(0, 0, 0, b"JUNK", &[])]),
+            ],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // root
+        assert_eq!(c.curdir.len(), 4);
+        // The XA extension feeds the file-info attribute + file number.
+        assert_eq!((c.curdir[3].attr, c.curdir[3].xa_fnum), (0x48, 7));
+        // Change into a file → rejected, directory unchanged.
+        cmd(&mut c, 0x7000, 0x0000, 0x0000, 0x0003);
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert_eq!(c.curdir.len(), 4);
+        // Change into SUB (id 2): only its own 2048-byte extent is parsed.
+        cmd(&mut c, 0x7000, 0x0000, 0x0000, 0x0002);
+        assert_ne!(c.read16(0x0018), STAT_REJECT);
+        assert_eq!(c.curdir.len(), 3, "the junk sector after SUB is not read");
+        assert_eq!(c.curdir[2].firstfad, 23 + 150);
+    }
+
+    /// A hostile root length (here 4 GiB) must not size the read buffer: the
+    /// directory read is capped (and clamped to the disc end).
+    #[test]
+    fn change_dir_caps_a_hostile_directory_length() {
+        let disc = iso_with_dirs(
+            u32::MAX,
+            &[(
+                17,
+                vec![
+                    dir_record(17, u32::MAX, 0x02, &[0], &[]),
+                    dir_record(17, u32::MAX, 0x02, &[1], &[]),
+                ],
+            )],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.curdir.len(), 2);
+        // A record whose extent wraps the 32-bit FAD doesn't overflow-panic.
+        let disc = iso_with_dirs(
+            2048,
+            &[(17, vec![dir_record(u32::MAX, 2048, 0x00, b"W", &[])])],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.curdir[0].firstfad, u32::MAX.wrapping_add(150));
+        // Reading that file computes `fad + offset` in 24 bits, no panic.
+        cmd(&mut c, 0x7400, 0x0000, 0x0000, 0x0000);
     }
 
     #[test]
