@@ -524,53 +524,6 @@ fn state_base_for(launched_spec: Option<&str>, bios_base: &std::path::Path) -> s
     }
 }
 
-/// Persist the currently-plugged backup cartridge (if any) to the active card's
-/// file, before switching cards or ejecting (ADR-0028).
-#[cfg(feature = "sdl-frontend")]
-fn persist_active_backup_card(saturn: &saturn::Saturn, sess: &mut Session) {
-    if let Some(bytes) = saturn.cartridge_backup() {
-        let path = cart_card_path(&sess.save_base, sess.cfg.cart_card);
-        sess.battery.persist_card(&path, bytes, true);
-    }
-}
-
-/// Load backup-cart card `card`'s file into the plugged cart (if both exist)
-/// and record it as already persisted, so the change tracker doesn't
-/// immediately re-write the image it just read.
-#[cfg(feature = "sdl-frontend")]
-fn load_backup_card(saturn: &mut saturn::Saturn, sess: &mut Session, card: u8) {
-    let path = cart_card_path(&sess.save_base, card);
-    if saturn.cartridge_backup().is_some()
-        && let Ok(bytes) = fs::read(&path)
-    {
-        saturn.load_cartridge_backup(&bytes);
-        if let Some(loaded) = saturn.cartridge_backup() {
-            sess.battery.note_card(&path, loaded);
-        }
-    }
-}
-
-/// Ensure the Backup RAM cartridge is plugged in, power-cycling into it when a
-/// different (or no) cart is present. A no-op when it is already the active
-/// cart, so switching cards mid-session hot-swaps the card contents without a
-/// machine reset (ADR-0028).
-#[cfg(feature = "sdl-frontend")]
-fn ensure_backup_cart(
-    saturn: &mut saturn::Saturn,
-    sess: &mut Session,
-    audio_tx: &std::sync::mpsc::Sender<AudioMsg>,
-) {
-    if saturn.cartridge_backup().is_some() {
-        return; // already a Backup RAM cart — just load the new card into it
-    }
-    sess.ui.cart = osd::OsdCart::BackupRam;
-    sess.cfg.cartridge = "bram".into();
-    saturn.reset();
-    saturn.set_region(osd_region_to_code(sess.ui.region));
-    saturn.insert_cartridge(osd_cart_to_cartridge(osd::OsdCart::BackupRam));
-    let _ = audio_tx.send(AudioMsg::Reset);
-}
-
 /// Subtract `n` from an atomic, clamping at 0. **Must saturate**: an
 /// `AudioMsg::Reset` zeroes `audio_inflight` (`store(0)`) and can race ahead of
 /// in-flight `Chunk` byte-count subtracts that were already queued, momentarily
@@ -3009,7 +2962,8 @@ fn pad_list_of(
 }
 
 /// Carry out a menu action against the running machine. Returns `true` if the
-/// emulator should quit. Save-state slots live at `<bios>.<n>.state`.
+/// emulator should quit. Save-state slots live beside the disc image
+/// (`<disc>.<n>.state`, see [`Session::state_base`]).
 #[cfg(feature = "sdl-frontend")]
 fn dispatch_osd(
     action: osd::OsdAction,
@@ -3020,367 +2974,465 @@ fn dispatch_osd(
     audio_tx: &std::sync::mpsc::Sender<AudioMsg>,
 ) -> bool {
     use osd::OsdAction;
+    let mut d = OsdDispatch {
+        osd,
+        saturn,
+        sess,
+        ui_tx,
+        audio_tx,
+    };
     match action {
-        OsdAction::Resume => osd.close(),
+        OsdAction::Resume => d.osd.close(),
         OsdAction::Quit => return true,
         OsdAction::Reset => {
-            saturn.reset();
-            let _ = audio_tx.send(AudioMsg::Reset);
-            osd.set_toast("Reset", 120);
-            osd.close();
+            d.saturn.reset();
+            let _ = d.audio_tx.send(AudioMsg::Reset);
+            d.osd.set_toast("Reset", 120);
+            d.osd.close();
         }
-        OsdAction::Save(n) => match write_atomic(&sess.slot_path(n), &saturn.save_state()) {
-            Ok(()) => osd.set_toast(format!("Saved slot {n}"), 120),
-            Err(e) => osd.set_toast(format!("Save failed: {e}"), 180),
+        OsdAction::Save(n) => match write_atomic(&d.sess.slot_path(n), &d.saturn.save_state()) {
+            Ok(()) => d.osd.set_toast(format!("Saved slot {n}"), 120),
+            Err(e) => d.osd.set_toast(format!("Save failed: {e}"), 180),
         },
-        OsdAction::Load(n) => {
-            let path = sess.slot_path(n);
-            match fs::read(&path) {
-                Ok(bytes) => match saturn.load_state(&bytes) {
-                    Ok(()) => {
-                        apply_ports(saturn, &sess.ports, ui_tx);
-                        let _ = audio_tx.send(AudioMsg::Reset);
-                        eprintln!("loaded slot {n}: {}", path.display());
-                        osd.set_toast(format!("Loaded slot {n}"), 120);
-                        osd.close();
-                    }
-                    Err(e) => {
-                        eprintln!("load slot {n} {} failed: {e}", path.display());
-                        osd.set_toast(format!("Load failed: {e}"), 180)
-                    }
-                },
-                Err(e) => {
-                    eprintln!("slot {n} empty at {} ({e})", path.display());
-                    osd.set_toast(format!("Slot {n} empty"), 120)
-                }
-            }
-        }
+        OsdAction::Load(n) => d.load_slot(n),
         OsdAction::EjectDisc => {
-            saturn.eject_disc();
-            osd.set_toast("Disc ejected", 120);
+            d.saturn.eject_disc();
+            d.osd.set_toast("Disc ejected", 120);
         }
-        OsdAction::ReinsertDisc => match &sess.launched_spec {
-            Some(spec) => match insert_from_spec(saturn, spec) {
-                Ok(()) => osd.set_toast("Disc inserted", 120),
-                Err(e) => osd.set_toast(format!("Insert failed: {e}"), 180),
+        OsdAction::ReinsertDisc => match &d.sess.launched_spec {
+            Some(spec) => match insert_from_spec(d.saturn, spec) {
+                Ok(()) => d.osd.set_toast("Disc inserted", 120),
+                Err(e) => d.osd.set_toast(format!("Insert failed: {e}"), 180),
             },
-            None => osd.set_toast("No disc to insert", 120),
+            None => d.osd.set_toast("No disc to insert", 120),
         },
-        OsdAction::BrowseEnter(i) => {
-            // Descend into / ascend out of a directory, then rebuild the listing.
-            if let Some(e) = sess.browse_entries.get(i).cloned() {
-                if e.name == ".." {
-                    if let Some(parent) = sess.browse_dir.parent() {
-                        sess.browse_dir = parent.to_path_buf();
-                    }
-                } else {
-                    sess.browse_dir.push(&e.name);
-                }
-                sess.refresh_browse();
-            }
-        }
-        OsdAction::LoadDisc(i) => {
-            // Resolve the chosen image, insert it, and power-cycle so the BIOS
-            // boots the new game (region + cart re-applied across the reset,
-            // mirroring SetRegion). The loaded disc becomes the session disc, so
-            // a later Reset / Insert Disc references it.
-            match sess.browse_entries.get(i) {
-                Some(e) if !e.is_dir => {
-                    let path = sess.browse_dir.join(&e.name);
-                    let spec = path.to_string_lossy().into_owned();
-                    match insert_from_spec(saturn, &spec) {
-                        Ok(()) => {
-                            saturn.reset();
-                            saturn.set_region(osd_region_to_code(sess.ui.region));
-                            saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
-                            let _ = audio_tx.send(AudioMsg::Reset);
-                            sess.launched_spec = Some(spec);
-                            osd.set_toast(format!("Loaded {}", e.name), 150);
-                            osd.close();
-                        }
-                        Err(err) => osd.set_toast(format!("Load failed: {err}"), 180),
-                    }
-                }
-                _ => osd.set_toast("No such disc", 120),
-            }
-        }
-        OsdAction::RunDiagnostics => {
-            // Runs ~6 tiny SH-2 programs on throwaway machines (sub-millisecond),
-            // synchronously here on the emu thread; it does NOT touch the live
-            // `saturn`. Results surface on the next draw via OsdCtx; the screen
-            // stays open. (`::saturn` — the param shadows the crate name.)
-            sess.diag_results = ::saturn::diagnostics::run_all();
-            let fails = sess.diag_results.iter().filter(|o| !o.passed).count();
-            let msg = if fails == 0 {
-                "Diagnostics: all passed".to_string()
-            } else {
-                format!("Diagnostics: {fails} failed")
-            };
-            osd.set_toast(msg, 150);
-        }
+        OsdAction::BrowseEnter(i) => d.browse_enter(i),
+        OsdAction::LoadDisc(i) => d.load_disc(i),
+        OsdAction::RunDiagnostics => d.run_diagnostics(),
         OsdAction::SetScale(s) => {
-            sess.ui.scale = s;
+            d.sess.ui.scale = s;
             // Window pixels = base 320×224 × scale; applied on the SDL main
             // thread (the canvas is not Send). The canvas stretches the
             // texture to fill, so no texture re-create is needed.
-            let _ = ui_tx.send(UiMsg::Scale(s));
-            sess.cfg.scale = s;
-            sess.cfg.save();
-            osd.set_toast(format!("Scale {s}x"), 90);
+            let _ = d.ui_tx.send(UiMsg::Scale(s));
+            d.sess.cfg.scale = s;
+            d.sess.cfg.save();
+            d.osd.set_toast(format!("Scale {s}x"), 90);
         }
-        OsdAction::ToggleFullscreen => {
-            sess.ui.fullscreen = !sess.ui.fullscreen;
-            let _ = ui_tx.send(UiMsg::Fullscreen(sess.ui.fullscreen));
-            sess.cfg.fullscreen = sess.ui.fullscreen;
-            sess.cfg.save();
-            osd.set_toast(
-                if sess.ui.fullscreen {
-                    "Fullscreen on"
-                } else {
-                    "Fullscreen off"
-                },
-                90,
-            );
-        }
-        OsdAction::ToggleScaling => {
-            sess.ui.sharp = !sess.ui.sharp;
-            let _ = ui_tx.send(UiMsg::Scaling(sess.ui.sharp));
-            sess.cfg.scaling = if sess.ui.sharp { "sharp" } else { "smooth" }.to_string();
-            sess.cfg.save();
-            osd.set_toast(
-                if sess.ui.sharp {
-                    "Pixels: Sharp"
-                } else {
-                    "Pixels: Smooth"
-                },
-                90,
-            );
-        }
-        OsdAction::ToggleAspect => {
-            sess.ui.keep_aspect = !sess.ui.keep_aspect;
-            let _ = ui_tx.send(UiMsg::Aspect(sess.ui.keep_aspect));
-            sess.cfg.aspect = if sess.ui.keep_aspect {
-                "keep"
-            } else {
-                "stretch"
-            }
-            .to_string();
-            sess.cfg.save();
-            osd.set_toast(
-                if sess.ui.keep_aspect {
-                    "Aspect: Keep ratio"
-                } else {
-                    "Aspect: Fit screen"
-                },
-                90,
-            );
-        }
+        OsdAction::ToggleFullscreen => d.toggle_fullscreen(),
+        OsdAction::ToggleScaling => d.toggle_scaling(),
+        OsdAction::ToggleAspect => d.toggle_aspect(),
         #[cfg(feature = "gpu-presenter")]
-        OsdAction::SetShader(crt) => {
-            // The SDL thread applies it to the live GpuPresenter (a no-op under the
-            // SDL_Renderer backend, which has no shader path — hence the toast hint).
-            sess.ui.shader_crt = crt;
-            let _ = ui_tx.send(UiMsg::SetShader(crt));
-            sess.cfg.shader = if crt { "crt" } else { "none" }.to_string();
-            sess.cfg.save();
-            osd.set_toast(
-                if crt {
-                    "Shader: CRT (SDL_GPU only)"
-                } else {
-                    "Shader: None"
-                },
-                90,
-            );
-        }
-        OsdAction::SetRegion(r) => {
-            // A region change is a hardware-level change: reset and re-apply the
-            // boot config (region + current cart). The disc stays inserted, so
-            // the machine re-boots from it under the new region.
-            sess.ui.region = r;
-            saturn.reset();
-            saturn.set_region(osd_region_to_code(r));
-            saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
-            let _ = audio_tx.send(AudioMsg::Reset);
-            sess.cfg.region = Some(osd_region_to_token(r).to_string());
-            sess.cfg.save();
-            let name = match r {
-                osd::OsdRegion::Japan => "Japan",
-                osd::OsdRegion::NorthAmerica => "North America",
-                osd::OsdRegion::EuropePal => "Europe (PAL)",
-                osd::OsdRegion::AsiaNtsc => "Asia (NTSC)",
-            };
-            osd.set_toast(format!("Region: {name} (reset)"), 150);
-            osd.close();
-        }
+        OsdAction::SetShader(crt) => d.set_shader(crt),
+        OsdAction::SetRegion(r) => d.set_region(r),
         OsdAction::SetBackend(b) => {
             // The SDL3 render driver is chosen when the window/canvas is built,
             // so a change can't take effect live — persist it and tell the user
             // it applies on the next launch.
             let tok = osd_backend_to_token(b);
-            sess.ui.backend = b;
-            sess.cfg.backend = tok.to_string();
-            sess.cfg.save();
-            osd.set_toast(format!("Renderer: {tok} (restart to apply)"), 180);
+            d.sess.ui.backend = b;
+            d.sess.cfg.backend = tok.to_string();
+            d.sess.cfg.save();
+            d.osd
+                .set_toast(format!("Renderer: {tok} (restart to apply)"), 180);
         }
-        OsdAction::SetBios(i) => {
-            let i = i as usize;
-            let Some(path) = sess.bios_paths.get(i).cloned() else {
-                osd.set_toast("No such BIOS image", 120);
-                return false;
-            };
-            match fs::read(&path) {
-                Err(e) => osd.set_toast(format!("BIOS read failed: {e}"), 180),
-                Ok(bytes) => {
-                    // Persist the outgoing machine's battery before it drops,
-                    // then power-cycle into the new image, mirroring the
-                    // launch path: region, ports, RTC, disc, cartridge. (A
-                    // `--cart=rom:` cart has no Settings equivalent and is
-                    // not re-created — same as the Cartridge screen.)
-                    persist_session_batteries(saturn, sess, true);
-                    *saturn = saturn::Saturn::new(bytes);
-                    saturn.reset();
-                    saturn.set_region(osd_region_to_code(sess.ui.region));
-                    apply_ports(saturn, &sess.ports, ui_tx);
-                    saturn.set_rtc_unix(host_unix_secs());
-                    if let Some(spec) = &sess.launched_spec
-                        && let Err(e) = insert_from_spec(saturn, spec)
-                    {
-                        osd.set_toast(format!("Disc re-insert failed: {e}"), 180);
-                    }
-                    saturn.insert_cartridge(osd_cart_to_cartridge(sess.ui.cart));
-                    // Save files re-key to the new image; adopt its battery.
-                    sess.save_base = path;
-                    sess.bios_active = i;
-                    let bup = battery_path(&sess.save_base);
-                    if let Ok(b) = fs::read(&bup) {
-                        saturn.load_internal_backup(&b);
-                        sess.battery.note_bup(&bup, saturn.internal_backup());
-                    }
-                    load_backup_card(saturn, sess, sess.cfg.cart_card);
-                    let _ = audio_tx.send(AudioMsg::Reset);
-                    osd.set_toast(format!("BIOS: {} (power cycle)", sess.bios_names[i]), 150);
-                    osd.close();
-                }
-            }
-        }
+        OsdAction::SetBios(i) => d.set_bios(i as usize),
         OsdAction::StartRebind(b) => {
             // Modal: the OSD shows "press a key" and swallows nav; the SDL
             // thread (which owns the keyboard) captures the next keypress and
             // answers with EmuIn::BindResult.
-            osd.begin_capture(b);
-            let _ = ui_tx.send(UiMsg::ArmRebind(b));
+            d.osd.begin_capture(b);
+            let _ = d.ui_tx.send(UiMsg::ArmRebind(b));
         }
         OsdAction::ResetBinds => {
-            sess.cfg.keys = config::DEFAULT_KEYS.map(str::to_string);
-            sess.cfg.save();
-            let _ = ui_tx.send(UiMsg::ResetKeymap);
-            osd.set_toast("Default keys restored", 120);
+            d.sess.cfg.keys = config::DEFAULT_KEYS.map(str::to_string);
+            d.sess.cfg.save();
+            let _ = d.ui_tx.send(UiMsg::ResetKeymap);
+            d.osd.set_toast("Default keys restored", 120);
         }
         OsdAction::StartGamepadRebind(b) => {
             // Modal like StartRebind, but the SDL thread captures the next
             // controller button/trigger and answers with GamepadBindResult.
-            osd.begin_capture(b);
-            let _ = ui_tx.send(UiMsg::ArmGamepadRebind(b));
+            d.osd.begin_capture(b);
+            let _ = d.ui_tx.send(UiMsg::ArmGamepadRebind(b));
         }
         OsdAction::ResetGamepadBinds => {
-            sess.cfg.gpad = config::DEFAULT_GPAD.map(str::to_string);
-            sess.cfg.save();
-            let _ = ui_tx.send(UiMsg::ResetGamepadMap);
-            osd.set_toast("Default gamepad binds restored", 120);
+            d.sess.cfg.gpad = config::DEFAULT_GPAD.map(str::to_string);
+            d.sess.cfg.save();
+            let _ = d.ui_tx.send(UiMsg::ResetGamepadMap);
+            d.osd.set_toast("Default gamepad binds restored", 120);
         }
-        OsdAction::SetCartridge(k) => {
-            // Persist the outgoing backup cartridge (if any) before it's swapped
-            // out, so switching carts doesn't lose its saves.
-            persist_active_backup_card(saturn, sess);
-            sess.ui.cart = k;
-            saturn.reset();
-            saturn.set_region(osd_region_to_code(sess.ui.region));
-            saturn.insert_cartridge(osd_cart_to_cartridge(k));
-            // Adopt the active card's persisted contents, if present.
-            load_backup_card(saturn, sess, sess.cfg.cart_card);
-            let _ = audio_tx.send(AudioMsg::Reset);
-            sess.cfg.cartridge = osd_cart_to_token(k).to_string();
-            sess.cfg.save();
-            let name = match k {
-                osd::OsdCart::None => "None",
-                osd::OsdCart::ExtRam1M => "Ext RAM 1M",
-                osd::OsdCart::ExtRam4M => "Ext RAM 4M",
-                osd::OsdCart::BackupRam => "Backup RAM",
-            };
-            osd.set_toast(format!("Cartridge: {name} (reset)"), 150);
-            osd.close();
-        }
-        OsdAction::SelectBackupCard(n) => {
-            let n = n.min(config::BACKUP_CARDS as u8 - 1);
-            // Persist the outgoing card, switch, ensure the Backup RAM cart is
-            // plugged, then load the selected card (ADR-0028).
-            persist_active_backup_card(saturn, sess);
-            sess.cfg.cart_card = n;
-            ensure_backup_cart(saturn, sess, audio_tx);
-            load_backup_card(saturn, sess, n);
-            sess.cfg.save();
-            osd.set_toast(format!("Backup Card {n} selected"), 150);
-            osd.close();
-        }
-        OsdAction::CreateBackupCard(n) => {
-            let n = n.min(config::BACKUP_CARDS as u8 - 1);
-            persist_active_backup_card(saturn, sess);
-            // Write a fresh, formatted card image to the slot's file.
-            let fresh = osd_cart_to_cartridge(osd::OsdCart::BackupRam);
-            if let Some(b) = fresh.bram_bytes()
-                && let Err(e) = write_atomic(&cart_card_path(&sess.save_base, n), b)
-            {
-                eprintln!("failed to create backup card {n}: {e}");
-            }
-            sess.cfg.cart_card = n;
-            ensure_backup_cart(saturn, sess, audio_tx);
-            // Load the just-created (fresh) card so the live cart matches its file.
-            load_backup_card(saturn, sess, n);
-            sess.cfg.save();
-            osd.set_toast(format!("Backup Card {n} created"), 150);
-            osd.close();
-        }
-        OsdAction::DeleteBackupCard(n) => {
-            let n = n.min(config::BACKUP_CARDS as u8 - 1);
-            let path = cart_card_path(&sess.save_base, n);
-            if let Err(e) = fs::remove_file(&path) {
-                eprintln!("failed to delete backup card {n}: {e}");
-            }
-            // Deleting the active, currently-plugged card ejects the cart — no
-            // active-but-fileless state, and we don't re-save the deleted card.
-            if n == sess.cfg.cart_card && saturn.cartridge_backup().is_some() {
-                sess.ui.cart = osd::OsdCart::None;
-                sess.cfg.cartridge = "none".into();
-                saturn.reset();
-                saturn.set_region(osd_region_to_code(sess.ui.region));
-                saturn.insert_cartridge(osd_cart_to_cartridge(osd::OsdCart::None));
-                let _ = audio_tx.send(AudioMsg::Reset);
-            }
-            sess.cfg.save();
-            osd.set_toast(format!("Backup Card {n} deleted"), 150);
-            osd.close();
-        }
-        OsdAction::CyclePort(p) => {
-            // Advance this port to its next source against the live device list
-            // (skipping whatever the other port already uses), persist the new
-            // token, and re-point the SMPC ports + the SDL mouse-capture gate.
-            let p = (p as usize) & 1;
-            sess.ports.cycle(p, &sess.pad_list);
-            let token = sess.ports.source[p].to_token();
-            if p == 0 {
-                sess.cfg.port1 = token;
-            } else {
-                sess.cfg.port2 = token;
-            }
-            sess.cfg.save();
-            apply_ports(saturn, &sess.ports, ui_tx);
-            osd.set_toast(
-                format!("Port {}: {}", p + 1, sess.ports.source[p].label()),
-                120,
-            );
-        }
+        OsdAction::SetCartridge(k) => d.set_cartridge(k),
+        OsdAction::SelectBackupCard(n) => d.select_backup_card(n),
+        OsdAction::CreateBackupCard(n) => d.create_backup_card(n),
+        OsdAction::DeleteBackupCard(n) => d.delete_backup_card(n),
+        OsdAction::CyclePort(p) => d.cycle_port(p),
     }
     false
+}
+
+/// Everything an OSD action may touch, bundled so each action's handler is a
+/// method rather than one arm of a 400-line `match`.
+#[cfg(feature = "sdl-frontend")]
+struct OsdDispatch<'a> {
+    osd: &'a mut osd::Osd,
+    saturn: &'a mut saturn::Saturn,
+    sess: &'a mut Session,
+    ui_tx: &'a std::sync::mpsc::Sender<UiMsg>,
+    audio_tx: &'a std::sync::mpsc::Sender<AudioMsg>,
+}
+
+#[cfg(feature = "sdl-frontend")]
+impl OsdDispatch<'_> {
+    /// Hardware-level reset re-applying the boot config — the session region
+    /// and cartridge — and restarting the audio timeline. A disc stays
+    /// inserted, so the machine re-boots from it.
+    fn power_cycle(&mut self) {
+        self.saturn.reset();
+        self.saturn
+            .set_region(osd_region_to_code(self.sess.ui.region));
+        self.saturn
+            .insert_cartridge(osd_cart_to_cartridge(self.sess.ui.cart));
+        let _ = self.audio_tx.send(AudioMsg::Reset);
+    }
+
+    fn load_slot(&mut self, n: u8) {
+        let path = self.sess.slot_path(n);
+        match fs::read(&path) {
+            Ok(bytes) => match self.saturn.load_state(&bytes) {
+                Ok(()) => {
+                    apply_ports(self.saturn, &self.sess.ports, self.ui_tx);
+                    let _ = self.audio_tx.send(AudioMsg::Reset);
+                    eprintln!("loaded slot {n}: {}", path.display());
+                    self.osd.set_toast(format!("Loaded slot {n}"), 120);
+                    self.osd.close();
+                }
+                Err(e) => {
+                    eprintln!("load slot {n} {} failed: {e}", path.display());
+                    self.osd.set_toast(format!("Load failed: {e}"), 180)
+                }
+            },
+            Err(e) => {
+                eprintln!("slot {n} empty at {} ({e})", path.display());
+                self.osd.set_toast(format!("Slot {n} empty"), 120)
+            }
+        }
+    }
+
+    /// Descend into / ascend out of a directory, then rebuild the listing.
+    fn browse_enter(&mut self, i: usize) {
+        if let Some(e) = self.sess.browse_entries.get(i).cloned() {
+            if e.name == ".." {
+                if let Some(parent) = self.sess.browse_dir.parent() {
+                    self.sess.browse_dir = parent.to_path_buf();
+                }
+            } else {
+                self.sess.browse_dir.push(&e.name);
+            }
+            self.sess.refresh_browse();
+        }
+    }
+
+    /// Resolve the chosen image, insert it, and power-cycle so the BIOS boots
+    /// the new game (region + cart re-applied across the reset, mirroring
+    /// SetRegion). The loaded disc becomes the session disc, so a later Reset
+    /// / Insert Disc references it.
+    fn load_disc(&mut self, i: usize) {
+        match self.sess.browse_entries.get(i) {
+            Some(e) if !e.is_dir => {
+                let name = e.name.clone();
+                let path = self.sess.browse_dir.join(&name);
+                let spec = path.to_string_lossy().into_owned();
+                match insert_from_spec(self.saturn, &spec) {
+                    Ok(()) => {
+                        self.power_cycle();
+                        self.sess.launched_spec = Some(spec);
+                        self.osd.set_toast(format!("Loaded {name}"), 150);
+                        self.osd.close();
+                    }
+                    Err(err) => self.osd.set_toast(format!("Load failed: {err}"), 180),
+                }
+            }
+            _ => self.osd.set_toast("No such disc", 120),
+        }
+    }
+
+    /// Runs ~6 tiny SH-2 programs on throwaway machines (sub-millisecond),
+    /// synchronously here on the emu thread; it does NOT touch the live
+    /// machine. Results surface on the next draw via OsdCtx; the screen stays
+    /// open.
+    fn run_diagnostics(&mut self) {
+        self.sess.diag_results = saturn::diagnostics::run_all();
+        let fails = self.sess.diag_results.iter().filter(|o| !o.passed).count();
+        let msg = if fails == 0 {
+            "Diagnostics: all passed".to_string()
+        } else {
+            format!("Diagnostics: {fails} failed")
+        };
+        self.osd.set_toast(msg, 150);
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        let on = !self.sess.ui.fullscreen;
+        self.sess.ui.fullscreen = on;
+        let _ = self.ui_tx.send(UiMsg::Fullscreen(on));
+        self.sess.cfg.fullscreen = on;
+        self.sess.cfg.save();
+        self.osd.set_toast(
+            if on {
+                "Fullscreen on"
+            } else {
+                "Fullscreen off"
+            },
+            90,
+        );
+    }
+
+    fn toggle_scaling(&mut self) {
+        let sharp = !self.sess.ui.sharp;
+        self.sess.ui.sharp = sharp;
+        let _ = self.ui_tx.send(UiMsg::Scaling(sharp));
+        self.sess.cfg.scaling = if sharp { "sharp" } else { "smooth" }.to_string();
+        self.sess.cfg.save();
+        self.osd.set_toast(
+            if sharp {
+                "Pixels: Sharp"
+            } else {
+                "Pixels: Smooth"
+            },
+            90,
+        );
+    }
+
+    fn toggle_aspect(&mut self) {
+        let keep = !self.sess.ui.keep_aspect;
+        self.sess.ui.keep_aspect = keep;
+        let _ = self.ui_tx.send(UiMsg::Aspect(keep));
+        self.sess.cfg.aspect = if keep { "keep" } else { "stretch" }.to_string();
+        self.sess.cfg.save();
+        self.osd.set_toast(
+            if keep {
+                "Aspect: Keep ratio"
+            } else {
+                "Aspect: Fit screen"
+            },
+            90,
+        );
+    }
+
+    /// The SDL thread applies it to the live GpuPresenter (a no-op under the
+    /// SDL_Renderer backend, which has no shader path — hence the toast hint).
+    #[cfg(feature = "gpu-presenter")]
+    fn set_shader(&mut self, crt: bool) {
+        self.sess.ui.shader_crt = crt;
+        let _ = self.ui_tx.send(UiMsg::SetShader(crt));
+        self.sess.cfg.shader = if crt { "crt" } else { "none" }.to_string();
+        self.sess.cfg.save();
+        self.osd.set_toast(
+            if crt {
+                "Shader: CRT (SDL_GPU only)"
+            } else {
+                "Shader: None"
+            },
+            90,
+        );
+    }
+
+    /// A region change is a hardware-level change: power-cycle under the new
+    /// region (the disc stays inserted and re-boots).
+    fn set_region(&mut self, r: osd::OsdRegion) {
+        self.sess.ui.region = r;
+        self.power_cycle();
+        self.sess.cfg.region = Some(osd_region_to_token(r).to_string());
+        self.sess.cfg.save();
+        let name = match r {
+            osd::OsdRegion::Japan => "Japan",
+            osd::OsdRegion::NorthAmerica => "North America",
+            osd::OsdRegion::EuropePal => "Europe (PAL)",
+            osd::OsdRegion::AsiaNtsc => "Asia (NTSC)",
+        };
+        self.osd.set_toast(format!("Region: {name} (reset)"), 150);
+        self.osd.close();
+    }
+
+    /// Power-cycle into sibling BIOS image `i`, mirroring the launch path:
+    /// region, ports, RTC, disc, cartridge. (A `--cart=rom:` cart has no
+    /// Settings equivalent and is not re-created — same as the Cartridge
+    /// screen.) The outgoing machine's batteries are persisted first; save
+    /// files then re-key to the new image, whose battery is adopted.
+    fn set_bios(&mut self, i: usize) {
+        let Some(path) = self.sess.bios_paths.get(i).cloned() else {
+            self.osd.set_toast("No such BIOS image", 120);
+            return;
+        };
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.osd.set_toast(format!("BIOS read failed: {e}"), 180);
+                return;
+            }
+        };
+        persist_session_batteries(self.saturn, self.sess, true);
+        *self.saturn = saturn::Saturn::new(bytes);
+        self.saturn.reset();
+        self.saturn
+            .set_region(osd_region_to_code(self.sess.ui.region));
+        apply_ports(self.saturn, &self.sess.ports, self.ui_tx);
+        self.saturn.set_rtc_unix(host_unix_secs());
+        if let Some(spec) = &self.sess.launched_spec
+            && let Err(e) = insert_from_spec(self.saturn, spec)
+        {
+            self.osd
+                .set_toast(format!("Disc re-insert failed: {e}"), 180);
+        }
+        self.saturn
+            .insert_cartridge(osd_cart_to_cartridge(self.sess.ui.cart));
+        // Save files re-key to the new image; adopt its battery.
+        self.sess.save_base = path;
+        self.sess.bios_active = i;
+        let bup = battery_path(&self.sess.save_base);
+        if let Ok(b) = fs::read(&bup) {
+            self.saturn.load_internal_backup(&b);
+            self.sess
+                .battery
+                .note_bup(&bup, self.saturn.internal_backup());
+        }
+        self.load_backup_card(self.sess.cfg.cart_card);
+        let _ = self.audio_tx.send(AudioMsg::Reset);
+        self.osd.set_toast(
+            format!("BIOS: {} (power cycle)", self.sess.bios_names[i]),
+            150,
+        );
+        self.osd.close();
+    }
+
+    /// Swap the cartridge (power cycle). The outgoing backup cartridge (if any)
+    /// is persisted first, so switching carts doesn't lose its saves.
+    fn set_cartridge(&mut self, k: osd::OsdCart) {
+        self.persist_active_backup_card();
+        self.sess.ui.cart = k;
+        self.power_cycle();
+        // Adopt the active card's persisted contents, if present.
+        self.load_backup_card(self.sess.cfg.cart_card);
+        self.sess.cfg.cartridge = osd_cart_to_token(k).to_string();
+        self.sess.cfg.save();
+        let name = match k {
+            osd::OsdCart::None => "None",
+            osd::OsdCart::ExtRam1M => "Ext RAM 1M",
+            osd::OsdCart::ExtRam4M => "Ext RAM 4M",
+            osd::OsdCart::BackupRam => "Backup RAM",
+        };
+        self.osd
+            .set_toast(format!("Cartridge: {name} (reset)"), 150);
+        self.osd.close();
+    }
+
+    /// Persist the outgoing card, switch, ensure the Backup RAM cart is
+    /// plugged, then load the selected card (ADR-0028).
+    fn select_backup_card(&mut self, n: u8) {
+        let n = n.min(config::BACKUP_CARDS as u8 - 1);
+        self.persist_active_backup_card();
+        self.sess.cfg.cart_card = n;
+        self.ensure_backup_cart();
+        self.load_backup_card(n);
+        self.sess.cfg.save();
+        self.osd.set_toast(format!("Backup Card {n} selected"), 150);
+        self.osd.close();
+    }
+
+    fn create_backup_card(&mut self, n: u8) {
+        let n = n.min(config::BACKUP_CARDS as u8 - 1);
+        self.persist_active_backup_card();
+        // Write a fresh, formatted card image to the slot's file.
+        let fresh = osd_cart_to_cartridge(osd::OsdCart::BackupRam);
+        if let Some(b) = fresh.bram_bytes()
+            && let Err(e) = write_atomic(&cart_card_path(&self.sess.save_base, n), b)
+        {
+            eprintln!("failed to create backup card {n}: {e}");
+        }
+        self.sess.cfg.cart_card = n;
+        self.ensure_backup_cart();
+        // Load the just-created (fresh) card so the live cart matches its file.
+        self.load_backup_card(n);
+        self.sess.cfg.save();
+        self.osd.set_toast(format!("Backup Card {n} created"), 150);
+        self.osd.close();
+    }
+
+    fn delete_backup_card(&mut self, n: u8) {
+        let n = n.min(config::BACKUP_CARDS as u8 - 1);
+        let path = cart_card_path(&self.sess.save_base, n);
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!("failed to delete backup card {n}: {e}");
+        }
+        // Deleting the active, currently-plugged card ejects the cart — no
+        // active-but-fileless state, and we don't re-save the deleted card.
+        if n == self.sess.cfg.cart_card && self.saturn.cartridge_backup().is_some() {
+            self.sess.ui.cart = osd::OsdCart::None;
+            self.sess.cfg.cartridge = "none".into();
+            self.power_cycle();
+        }
+        self.sess.cfg.save();
+        self.osd.set_toast(format!("Backup Card {n} deleted"), 150);
+        self.osd.close();
+    }
+
+    /// Advance port `p` to its next source against the live device list
+    /// (skipping whatever the other port already uses), persist the new token,
+    /// and re-point the SMPC ports + the SDL mouse-capture gate.
+    fn cycle_port(&mut self, p: u8) {
+        let p = (p as usize) & 1;
+        self.sess.ports.cycle(p, &self.sess.pad_list);
+        let token = self.sess.ports.source[p].to_token();
+        if p == 0 {
+            self.sess.cfg.port1 = token;
+        } else {
+            self.sess.cfg.port2 = token;
+        }
+        self.sess.cfg.save();
+        apply_ports(self.saturn, &self.sess.ports, self.ui_tx);
+        self.osd.set_toast(
+            format!("Port {}: {}", p + 1, self.sess.ports.source[p].label()),
+            120,
+        );
+    }
+
+    /// Persist the currently-plugged backup cartridge (if any) to the active
+    /// card's file, before switching cards or ejecting (ADR-0028).
+    fn persist_active_backup_card(&mut self) {
+        if let Some(bytes) = self.saturn.cartridge_backup() {
+            let path = cart_card_path(&self.sess.save_base, self.sess.cfg.cart_card);
+            self.sess.battery.persist_card(&path, bytes, true);
+        }
+    }
+
+    /// Load backup-cart card `card`'s file into the plugged cart (if both
+    /// exist) and record it as already persisted, so the change tracker
+    /// doesn't immediately re-write the image it just read.
+    fn load_backup_card(&mut self, card: u8) {
+        let path = cart_card_path(&self.sess.save_base, card);
+        if self.saturn.cartridge_backup().is_some()
+            && let Ok(bytes) = fs::read(&path)
+        {
+            self.saturn.load_cartridge_backup(&bytes);
+            if let Some(loaded) = self.saturn.cartridge_backup() {
+                self.sess.battery.note_card(&path, loaded);
+            }
+        }
+    }
+
+    /// Ensure the Backup RAM cartridge is plugged in, power-cycling into it
+    /// when a different (or no) cart is present. A no-op when it is already
+    /// the active cart, so switching cards mid-session hot-swaps the card
+    /// contents without a machine reset (ADR-0028).
+    fn ensure_backup_cart(&mut self) {
+        if self.saturn.cartridge_backup().is_some() {
+            return; // already a Backup RAM cart — just load the new card into it
+        }
+        self.sess.ui.cart = osd::OsdCart::BackupRam;
+        self.sess.cfg.cartridge = "bram".into();
+        self.power_cycle();
+    }
 }
 
 #[cfg(not(feature = "sdl-frontend"))]
