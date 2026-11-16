@@ -1838,10 +1838,13 @@ impl CdBlock {
 
     /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
     fn delete_partition_sectors(&mut self, buf: usize, ofs: usize, num: usize) {
-        let end = (ofs + num).min(self.partitions[buf].blocks.len());
-        if ofs > end {
+        let end = ofs
+            .saturating_add(num)
+            .min(self.partitions[buf].blocks.len());
+        if ofs >= end {
             return;
         }
+        self.xfer32_note_removal(buf, ofs, end - ofs);
         #[cfg(not(test))]
         if cd_xfer_trace() {
             eprintln!(
@@ -1870,7 +1873,17 @@ impl CdBlock {
             self.xfer32 = None;
             return 0xFFFF;
         }
-        let bi = self.partitions[x.part].blocks[x.pos + x.sect];
+        // The transfer addresses its blocks by partition position; if they have
+        // gone (a removal path that didn't adjust it), end the transfer rather
+        // than index out of bounds.
+        let Some(&bi) = self
+            .partitions
+            .get(x.part)
+            .and_then(|p| p.blocks.get(x.pos + x.sect))
+        else {
+            self.xfer32 = None;
+            return 0xFFFF;
+        };
         let size = self.blocks[bi].size.max(0) as usize;
         let o = x.offs;
         let d = &self.blocks[bi].data;
@@ -2095,8 +2108,34 @@ impl CdBlock {
         self.periodic_idle = PERIODIC_IDLE_CYC;
     }
 
+    /// Keep an in-flight sector transfer consistent when `cnt` blocks at `ofs`
+    /// are about to leave partition `part` by another path (Reset Selector,
+    /// Delete Sector Data). The transfer addresses blocks by partition
+    /// *position*, so a removal before its window shifts the window down, and
+    /// a removal overlapping it ends the data stream at the current sector (the
+    /// next data-port read returns the `0xFFFF` end marker) and drops its
+    /// pending get-and-delete, whose blocks are gone.
+    ///
+    /// Mednafen differs in mechanism, not outcome for a well-behaved host: its
+    /// transfer holds pool-buffer *indices* (`DT.BufList`, cdb.cpp:3533) and
+    /// keeps streaming the freed buffers' stale bytes. Real software doesn't
+    /// free a partition under its own transfer; this only has to stay sound.
+    fn xfer32_note_removal(&mut self, part: usize, ofs: usize, cnt: usize) {
+        let Some(x) = self.xfer32.as_mut().filter(|x| x.part == part) else {
+            return;
+        };
+        if ofs + cnt <= x.pos {
+            x.pos -= cnt;
+        } else if ofs < x.pos + x.num {
+            x.num = x.sect;
+            x.delete = false;
+        }
+    }
+
     /// Free every block held by partition `p` and empty it.
     fn clear_partition(&mut self, p: usize) {
+        let n = self.partitions[p].blocks.len();
+        self.xfer32_note_removal(p, 0, n);
         let idxs = core::mem::take(&mut self.partitions[p].blocks);
         for b in idxs {
             self.free_block(b);
@@ -4069,6 +4108,87 @@ mod tests {
         assert_eq!(c.read16(0x8000), 0x1234, "sector 1 high half");
         assert_eq!(c.read16(0x8000), 0x5678, "sector 1 low half");
         assert_eq!(c.xfer_done, 2052, "16-bit reads count transferred bytes");
+    }
+
+    /// Regression: Reset Selector (0x48) clearing the partition under an armed
+    /// Get Sector Data transfer must not leave the data port indexing removed
+    /// blocks (an out-of-bounds panic); the transfer ends with the `0xFFFF`
+    /// end marker instead, on both the 16- and 32-bit port widths.
+    #[test]
+    fn reset_selector_under_an_armed_transfer_ends_it_without_panicking() {
+        for wide in [false, true] {
+            let mut c = CdBlock::new();
+            c.insert_disc(data_disc());
+            play(&mut c, 150, 2);
+            pump(&mut c);
+            assert_eq!(c.partitions[0].blocks.len(), 2);
+            cmd(&mut c, 0x6300, 0x0000, 0x0000, 0x0002); // Get-and-delete 2
+            let _ = c.read16(0x8000); // mid-sector
+            cmd(&mut c, 0x4800, 0x0000, 0x0000, 0x0000); // Reset Selector: part 0
+            assert!(c.partitions[0].blocks.is_empty());
+            let free = c.free_blocks;
+            if wide {
+                assert_eq!(c.read32(0x8000), 0xFFFF_FFFF);
+            } else {
+                assert_eq!(c.read16(0x8000), 0xFFFF);
+            }
+            assert!(c.xfer32.is_none(), "transfer ended");
+            assert_eq!(c.free_blocks, free, "nothing double-freed");
+            // End Data Transfer afterwards is a no-op on the pool too.
+            cmd(&mut c, 0x0600, 0, 0, 0);
+            assert_eq!(c.free_blocks, free);
+        }
+    }
+
+    /// Delete Sector Data (0x62) under an armed transfer: deleting blocks
+    /// *before* the transfer window shifts it (the stream keeps its sectors);
+    /// deleting *inside* it ends the stream instead of reading freed blocks.
+    #[test]
+    fn delete_sector_data_under_an_armed_transfer_keeps_it_consistent() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        // Transfer only sector 1 (offset 1, count 1), then delete sector 0.
+        cmd(&mut c, 0x6100, 0x0001, 0x0000, 0x0001);
+        cmd(&mut c, 0x6200, 0x0000, 0x0000, 0x0001);
+        assert_eq!(c.partitions[0].blocks.len(), 1);
+        assert_eq!(
+            c.read32(0x8000),
+            0x1234_5678,
+            "window shifted: still streams FAD 151"
+        );
+        // Now delete the very sector being streamed.
+        cmd(&mut c, 0x6200, 0x0000, 0x0000, 0x0001);
+        assert!(c.partitions[0].blocks.is_empty());
+        assert_eq!(c.read16(0x8000), 0xFFFF, "stream ended, no panic");
+        assert!(c.xfer32.is_none());
+    }
+
+    /// The data port tolerates a transfer whose blocks vanished by a path
+    /// that did not adjust it: the read ends the transfer, never panics.
+    #[test]
+    fn data_port_read_of_a_missing_block_ends_the_transfer() {
+        let mut c = CdBlock::new();
+        c.xfer32 = Some(Xfer32 {
+            delete: true,
+            part: 3,
+            pos: 5,
+            num: 2,
+            sect: 0,
+            offs: 0,
+        });
+        assert_eq!(c.read16(0x8000), 0xFFFF);
+        assert!(c.xfer32.is_none());
+        c.xfer32 = Some(Xfer32 {
+            delete: false,
+            part: 99, // not even a partition
+            pos: 0,
+            num: 1,
+            sect: 0,
+            offs: 0,
+        });
+        assert_eq!(c.read16(0x8000), 0xFFFF);
     }
 
     #[test]
