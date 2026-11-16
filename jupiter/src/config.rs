@@ -179,10 +179,9 @@ impl Default for Config {
             port1: String::new(),
             port2: String::new(),
             backend: "auto".into(),
-            // TODO(gpu-presenter): flip to "auto" when the SDL_GPU CRT presenter
-            // consumes the probe verdict (ADR-0019). The flip also requires
-            // updating the `gpu_token_parses_and_defaults_to_off` test, the `gpu`
-            // field doc above, and `jupiter/jupiter.toml.example`.
+            // Off by default: the SDL_GPU presenter (+ its CRT shader, ADR-0019)
+            // is an opt-in, still-maturing backend behind the `gpu-presenter`
+            // build feature; the `SDL_Renderer` blit stays the default path.
             gpu: "off".into(),
             scaling: "sharp".into(),
             aspect: "keep".into(),
@@ -193,6 +192,27 @@ impl Default for Config {
     }
 }
 
+/// Drop a trailing `# comment` — but only a `#` **outside** a quoted string,
+/// so a binding to the SDL key named `"#"` (or `"Keypad #"`) survives the
+/// round-trip instead of parsing as an empty value.
+fn strip_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The path a failed portable-first save fell back to (see
+/// [`Config::save_targets`]), remembered so later saves in this session go
+/// straight there instead of re-failing on the executable's directory.
+#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+static SAVE_FALLBACK: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 impl Config {
     /// Parse the flat `key = value` text. Tolerant: unknown keys, blank
     /// lines, `#` comments and malformed lines are skipped, missing keys
@@ -200,7 +220,7 @@ impl Config {
     pub fn parse(text: &str) -> Self {
         let mut cfg = Self::default();
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
+            let line = strip_comment(line).trim();
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
@@ -350,6 +370,33 @@ impl Config {
         local.or(xdg)
     }
 
+    /// Where [`save`](Self::save) should try to write, in order. The first entry
+    /// is [`pick_path`](Self::pick_path)'s choice; when that is a *fresh*
+    /// portable file (none exists yet beside the executable) the XDG path is
+    /// appended as a fallback — on a system install (`/usr/bin`) the
+    /// executable's directory isn't writable, and without the fallback every
+    /// save would fail forever. An *existing* portable file gets no fallback:
+    /// it would keep winning on the next load, silently hiding the XDG copy.
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+    fn save_targets(
+        xdg: Option<PathBuf>,
+        local: Option<PathBuf>,
+        exists: impl Fn(&std::path::Path) -> bool,
+    ) -> Vec<PathBuf> {
+        let Some(primary) = Self::pick_path(xdg.clone(), local.clone(), &exists) else {
+            return Vec::new();
+        };
+        let fresh_portable = local.as_ref() == Some(&primary) && !exists(&primary);
+        let mut targets = vec![primary];
+        if fresh_portable
+            && let Some(x) = xdg
+            && x != targets[0]
+        {
+            targets.push(x);
+        }
+        targets
+    }
+
     /// Load from [`Config::path`]; a missing or unreadable file is the default.
     pub fn load() -> Self {
         Self::path()
@@ -360,19 +407,37 @@ impl Config {
 
     /// Persist to [`Config::path`], creating the directory. Errors are
     /// reported, not fatal — a read-only config dir shouldn't kill the session.
+    ///
+    /// Written atomically (temp file + rename), so a crash mid-save can't
+    /// leave a truncated config. If the portable target can't be written, falls
+    /// back to the XDG path ([`save_targets`](Self::save_targets)) and sticks
+    /// with it for the rest of the session.
     #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
     pub fn save(&self) {
-        let Some(path) = Self::path() else {
-            return;
+        let remembered = SAVE_FALLBACK.lock().ok().and_then(|g| g.clone());
+        let targets = match remembered {
+            Some(p) => vec![p],
+            None => Self::save_targets(Self::xdg_path(), Self::local_path(), |p| p.is_file()),
         };
-        if let Some(dir) = path.parent()
-            && let Err(e) = fs::create_dir_all(dir)
-        {
-            eprintln!("config: cannot create {}: {e}", dir.display());
-            return;
-        }
-        if let Err(e) = fs::write(&path, self.to_text()) {
-            eprintln!("config: cannot write {}: {e}", path.display());
+        let text = self.to_text();
+        for (i, path) in targets.iter().enumerate() {
+            let res = match path.parent() {
+                Some(dir) => fs::create_dir_all(dir),
+                None => Ok(()),
+            }
+            .and_then(|()| saturn::host_files::write_atomic(path, text.as_bytes()));
+            match res {
+                Ok(()) => {
+                    if i > 0 {
+                        eprintln!("config: saved to {} instead", path.display());
+                        if let Ok(mut g) = SAVE_FALLBACK.lock() {
+                            *g = Some(path.clone());
+                        }
+                    }
+                    return;
+                }
+                Err(e) => eprintln!("config: cannot write {}: {e}", path.display()),
+            }
         }
     }
 }
@@ -557,6 +622,47 @@ mod tests {
         assert_eq!(pick(&["/cfg/jupiter.toml"]), Some(xdg.clone()));
         // Neither exists yet -> a fresh write targets the portable path.
         assert_eq!(pick(&[]), Some(local));
+    }
+
+    #[test]
+    fn hash_inside_quotes_is_not_a_comment() {
+        let mut cfg = Config::default();
+        cfg.keys[4] = "#".into();
+        cfg.keys[5] = "Keypad #".into();
+        let back = Config::parse(&cfg.to_text());
+        assert_eq!(back.keys[4], "#");
+        assert_eq!(back.keys[5], "Keypad #");
+        assert_eq!(back, cfg);
+        // A trailing comment after a quoted value is still stripped.
+        assert_eq!(Config::parse("key_a = \"#\" # hash key\n").keys[4], "#");
+        assert_eq!(strip_comment("scale = 3 # x"), "scale = 3 ");
+    }
+
+    #[test]
+    fn save_falls_back_to_xdg_only_for_a_fresh_portable_file() {
+        let xdg = PathBuf::from("/xdg/5thplanet/jupiter.toml");
+        let local = PathBuf::from("/usr/bin/jupiter.toml");
+        // Nothing exists yet: portable first, XDG as the fallback.
+        assert_eq!(
+            Config::save_targets(Some(xdg.clone()), Some(local.clone()), |_| false),
+            vec![local.clone(), xdg.clone()]
+        );
+        // An existing portable file: no fallback (it would keep winning on load).
+        assert_eq!(
+            Config::save_targets(Some(xdg.clone()), Some(local.clone()), |p| p == local),
+            vec![local.clone()]
+        );
+        // An existing XDG file is the only target.
+        assert_eq!(
+            Config::save_targets(Some(xdg.clone()), Some(local.clone()), |p| p == xdg),
+            vec![xdg.clone()]
+        );
+        // No exe path: XDG only; nothing at all: no targets.
+        assert_eq!(
+            Config::save_targets(Some(xdg.clone()), None, |_| false),
+            vec![xdg]
+        );
+        assert!(Config::save_targets(None, None, |_| false).is_empty());
     }
 
     #[test]
