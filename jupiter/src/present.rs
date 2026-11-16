@@ -12,9 +12,9 @@
 //! accepted but maps to [`RenderBackend::Auto`]); Vulkan would need a separate
 //! `wgpu` backend, which is out of scope for this strategy.
 //!
-//! The driver must be chosen *before* the renderer is created
-//! (`Window::into_canvas` reads the hint), so [`build_canvas`] sets the hint and
-//! builds the canvas together, retrying the next candidate if creation fails.
+//! The driver is named at renderer creation (`sdl3::render::create_renderer`,
+//! which is fallible), so [`build_canvas`] builds window + renderer together,
+//! retrying the next candidate if either fails.
 
 /// A requested presentation backend, parsed from the `backend` config key /
 /// `--backend` flag and mapped to an SDL3 render-driver name.
@@ -212,13 +212,14 @@ pub fn apply_aspect(canvas: &mut sdl3::render::WindowCanvas, w: u32, h: u32, kee
 
 /// Build the SDL3 window + canvas, selecting the render driver per `pref` with a
 /// fallback chain. Returns the canvas and the driver name actually in use (the
-/// canvas's `renderer_name` field, so `auto` — which sets no hint — resolves to
-/// a real name like `opengl`). The `SDL_RENDER_DRIVER` hint is set before
-/// `into_canvas`. Candidates are pre-filtered to drivers SDL3 reports available,
-/// so the chosen one should create successfully; `into_canvas` is **infallible**
-/// in sdl3-rs (it panics on a renderer it cannot make), so there is no
-/// per-candidate renderer-creation retry — only a failed window build falls
-/// through to the next candidate. Vsync is intentionally not
+/// canvas's `renderer_name` field, so `auto` resolves to a real name like
+/// `opengl`). Each candidate (pre-filtered to drivers SDL3 reports available)
+/// is tried with the **fallible** `sdl3::render::create_renderer(window,
+/// Some(name))`, so a driver that is listed but fails to initialise (e.g. a
+/// broken GL stack) falls through to the next one instead of panicking; the
+/// final attempt passes no name, letting SDL3 pick its default (which still
+/// honours a user-set `SDL_RENDER_DRIVER` env var). `create_renderer` consumes
+/// the window, so each attempt builds a fresh one. Vsync is intentionally not
 /// requested: this frontend is audio-paced (see `main.rs`), not vsync-paced.
 #[cfg(feature = "sdl-frontend")]
 pub fn build_canvas(
@@ -232,30 +233,40 @@ pub fn build_canvas(
     let names: Vec<String> = sdl3::render::drivers().collect();
     let available: Vec<&str> = names.iter().map(String::as_str).collect();
     // Each available driver from the preference chain, then SDL3's default (no
-    // hint) as the ultimate fallback.
+    // name) as the ultimate fallback.
     let attempts = candidates(pref, &available)
         .into_iter()
         .map(Some)
         .chain(std::iter::once(None));
     for cand in attempts {
-        if let Some(driver) = cand {
-            sdl3::hint::set("SDL_RENDER_DRIVER", driver);
-        }
-        let Ok(window) = video
+        let Ok(name) = cand.map(std::ffi::CString::new).transpose() else {
+            continue; // a driver name with an interior NUL — skip it
+        };
+        let window = match video
             .window(title, width, height)
             .position_centered()
             .build()
-        else {
-            continue;
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("render backend: window create failed ({e})");
+                continue;
+            }
         };
-        let canvas = window.into_canvas();
-        // The driver the renderer actually created (a public field on the canvas).
-        let used = canvas.renderer_name.clone();
-        return (canvas, used);
+        match sdl3::render::create_renderer(window, name.as_deref()) {
+            Ok(canvas) => {
+                // The driver the renderer actually created (a public field).
+                let used = canvas.renderer_name.clone();
+                return (canvas, used);
+            }
+            Err(e) => eprintln!(
+                "render backend: {} failed ({e}); trying the next",
+                cand.unwrap_or("default")
+            ),
+        }
     }
     panic!("could not create any SDL3 renderer (no working video driver)");
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
