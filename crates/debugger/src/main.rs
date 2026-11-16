@@ -11,8 +11,12 @@
 //!
 //! Usage:
 //! ```sh
-//! cargo run -p sdbg -- <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>]
+//! cargo run -p sdbg -- <bios.bin> [disc.cue|.iso|.ccd] [--region=jp|us|eu] [--rtc=<unix>]
+//!     [--syms=<file>] [--cart=<kind>] [--card=N]
 //! ```
+//! The internal backup RAM (`<bios>.bup`) and, with a `--cart=bram*` cartridge,
+//! backup card N (`<bios>.<N>.crtbup`, default 0) are loaded from the same paths
+//! jupiter persists them to (`saturn::host_files`).
 //! Then type `help` at the `sdbg>` prompt.
 //!
 //! Stepping model: `si`/`c` drive only the **master** SH-2 (the slave is
@@ -26,7 +30,7 @@ use std::path::Path;
 mod m68k_disasm;
 
 use saturn::Saturn;
-use saturn::disc::Disc;
+
 use sh2::bus::{AccessKind, Bus};
 use sh2::debug::disasm;
 use sh2::decoder::decode;
@@ -65,6 +69,62 @@ fn parse_num(s: &str) -> Option<u32> {
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
     u32::from_str_radix(s, 16).ok()
+}
+
+/// A token that can only be an address: `0x`-prefixed hex, or bare hex of 5+
+/// digits (Saturn addresses are 8 digits in every map/`nm` dump). A short bare
+/// hex word (`add`, `dead`, `fade`) is ambiguous — it may well be a name.
+fn is_unambiguous_addr(tok: &str) -> bool {
+    let bare = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X"));
+    match bare {
+        Some(h) => !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()),
+        None => tok.len() >= 5 && tok.chars().all(|c| c.is_ascii_hexdigit()),
+    }
+}
+
+/// Parse one symbol-file line into `(name, addr)`. Both documented column
+/// orders work: `name addr` and `addr name`; `#` starts a comment. Which token
+/// is the address: an unambiguous address token (see [`is_unambiguous_addr`])
+/// wins; otherwise the documented primary order `name addr` is preferred when
+/// the second token parses as hex, so a hex-looking *name* (`dead 0600`) isn't
+/// mistaken for the address.
+fn parse_sym_line(line: &str) -> Option<(&str, u32)> {
+    let line = line.split('#').next().unwrap_or("").trim();
+    let mut it = line.split_whitespace();
+    let (a, b) = (it.next()?, it.next()?);
+    let (ua, ub) = (is_unambiguous_addr(a), is_unambiguous_addr(b));
+    match (ua, ub) {
+        (true, false) => Some((b, parse_num(a)?)),
+        (false, true) => Some((a, parse_num(b)?)),
+        _ => match (parse_num(a), parse_num(b)) {
+            (_, Some(x)) => Some((a, x)), // name addr (primary order)
+            (Some(x), None) => Some((b, x)),
+            (None, None) => None,
+        },
+    }
+}
+
+/// Upper bound on one `m` hex dump, so a typo'd length can't flood the
+/// terminal for minutes.
+const MAX_DUMP_BYTES: u32 = 0x1_0000;
+/// Upper bound on one `d` disassembly listing.
+const MAX_DISASM_INSNS: u32 = 0x1000;
+
+/// Row start addresses for a hex dump of `[addr, addr+len)`: 16-byte aligned,
+/// `len` capped at [`MAX_DUMP_BYTES`], and clipped at the top of the 32-bit
+/// address space instead of overflowing.
+fn dump_rows(addr: u32, len: u32) -> Vec<u32> {
+    let end = (addr as u64 + len.min(MAX_DUMP_BYTES) as u64).min(1 << 32);
+    (((addr & !0xF) as u64)..end)
+        .step_by(16)
+        .map(|a| a as u32)
+        .collect()
+}
+
+/// Instruction addresses for disassembling `n` SH-2 words from `addr`: `n`
+/// capped at [`MAX_DISASM_INSNS`], wrapping (not overflowing) past 0xFFFFFFFE.
+fn disasm_pcs(addr: u32, n: u32) -> impl Iterator<Item = u32> {
+    (0..n.min(MAX_DISASM_INSNS)).map(move |i| addr.wrapping_add(i * 2))
 }
 
 fn parse_dec(s: &str) -> Option<u64> {
@@ -239,22 +299,10 @@ impl Dbg {
         };
         let mut n = 0;
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
+            if let Some((name, addr)) = parse_sym_line(line) {
+                self.define_sym(name, addr);
+                n += 1;
             }
-            let mut it = line.split_whitespace();
-            let (Some(a), Some(b)) = (it.next(), it.next()) else {
-                continue;
-            };
-            // Accept either column order; the hex token is the address.
-            let (name, addr) = match (parse_num(a), parse_num(b)) {
-                (None, Some(x)) => (a, x), // name addr
-                (Some(x), _) => (b, x),    // addr name
-                (None, None) => continue,
-            };
-            self.define_sym(name, addr);
-            n += 1;
         }
         println!("loaded {n} symbols from {path}; {} total", self.syms.len());
     }
@@ -838,7 +886,10 @@ impl Dbg {
                 println!("  {a:08X}");
                 hits += 1;
             }
-            a += 4;
+            match a.checked_add(4) {
+                Some(n) => a = n,
+                None => break, // top of the address space
+            }
         }
         println!("{hits} match(es) for {value:08X} in [{start:08X}..{end:08X})");
     }
@@ -851,7 +902,7 @@ impl Dbg {
             if pat
                 .iter()
                 .enumerate()
-                .all(|(i, &b)| self.read_mem(a + i as u32, 1) as u8 == b)
+                .all(|(i, &b)| self.read_mem(a.wrapping_add(i as u32), 1) as u8 == b)
             {
                 println!("  {a:08X}");
                 hits += 1;
@@ -865,13 +916,11 @@ impl Dbg {
     }
 
     fn dump_mem(&mut self, addr: u32, len: u32) {
-        let mut a = addr & !0xF;
-        let end = addr + len;
-        while a < end {
+        for a in dump_rows(addr, len) {
             print!("{a:08X}: ");
             let mut ascii = String::new();
             for i in 0..16 {
-                let b = self.read_mem(a + i, 1) as u8;
+                let b = self.read_mem(a.wrapping_add(i), 1) as u8;
                 print!("{b:02X} ");
                 ascii.push(if (0x20..0x7F).contains(&b) {
                     b as char
@@ -880,7 +929,6 @@ impl Dbg {
                 });
             }
             println!(" {ascii}");
-            a += 16;
         }
     }
 
@@ -942,8 +990,7 @@ impl Dbg {
 
     fn dump_disasm(&mut self, addr: u32, n: u32) {
         let cur = self.sat.master().regs.pc;
-        for i in 0..n {
-            let pc = addr + i * 2;
+        for pc in disasm_pcs(addr, n) {
             let w = self.read_mem(pc, 2) as u16;
             let op = decode(w);
             let marker = if pc == cur { "=>" } else { "  " };
@@ -2012,35 +2059,9 @@ sdbg commands:
     );
 }
 
-fn load_disc(cue_path: &Path) -> Option<Disc> {
-    let cue = std::fs::read_to_string(cue_path).ok()?;
-    let dir = cue_path.parent().unwrap_or_else(|| Path::new("."));
-    match Disc::from_cue(&cue, |n| std::fs::read(dir.join(n)).ok()) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            eprintln!("cue parse failed: {e}");
-            None
-        }
-    }
-}
-
-/// Build a cartridge from a `--cart` spec, mirroring the jupiter frontend so a
-/// recorded input movie replays against the same machine config (the SAN5 menu
-/// reads a backup-RAM cart in its storage check).
-fn parse_cart(spec: &str) -> Option<saturn::cartridge::Cartridge> {
-    use saturn::cartridge::Cartridge;
-    match spec {
-        "ram1m" => Some(Cartridge::ext_ram_1mb()),
-        "ram4m" => Some(Cartridge::ext_ram_4mb()),
-        "bram" | "bram32" => Some(Cartridge::backup_ram(0x0040_0000)),
-        "bram4" => Some(Cartridge::backup_ram(0x0008_0000)),
-        "bram8" => Some(Cartridge::backup_ram(0x0010_0000)),
-        "bram16" => Some(Cartridge::backup_ram(0x0020_0000)),
-        _ => None,
-    }
-}
-
 fn main() {
+    use saturn::host_files;
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut bios_path = None;
     let mut disc_path = None;
@@ -2048,6 +2069,7 @@ fn main() {
     let mut rtc: u64 = 1_700_000_000;
     let mut syms_path: Option<String> = None;
     let mut cart_spec: Option<String> = None;
+    let mut card: u8 = 0;
     for a in &args {
         if let Some(r) = a.strip_prefix("--region=") {
             region = match r {
@@ -2061,6 +2083,11 @@ fn main() {
             syms_path = Some(t.to_string());
         } else if let Some(c) = a.strip_prefix("--cart=") {
             cart_spec = Some(c.to_string());
+        } else if let Some(n) = a.strip_prefix("--card=") {
+            match n.parse() {
+                Ok(n) => card = n,
+                Err(_) => eprintln!("bad --card={n} (expected a card number, e.g. 0); using 0"),
+            }
         } else if bios_path.is_none() {
             bios_path = Some(a.clone());
         } else if disc_path.is_none() {
@@ -2069,7 +2096,7 @@ fn main() {
     }
     let Some(bios_path) = bios_path else {
         eprintln!(
-            "usage: sdbg <bios.bin> [disc.cue] [--region=jp|us|eu] [--rtc=<unix>] [--syms=<file>] [--cart=bram|ram4m|...]"
+            "usage: sdbg <bios.bin> [disc.cue|.iso|.ccd] [--region=jp|us|eu] [--rtc=<unix>] [--syms=<file>] [--cart=bram|ram4m|...] [--card=N]"
         );
         std::process::exit(2);
     };
@@ -2084,29 +2111,52 @@ fn main() {
     sat.reset();
     sat.set_region(region);
     sat.set_rtc_unix(rtc);
+    // Save files are keyed to the BIOS path exactly as jupiter keys them (one
+    // shared helper), so a session replays against the same battery contents.
+    let save_base = Path::new(&bios_path);
     // Plug in a cartridge if requested — matches the frontend's `--cart`/config
     // so a movie recorded with a backup-RAM cart (the SAN5 menu's storage check
     // reads it) replays against the same machine. Determinism depends on this.
     if let Some(spec) = &cart_spec {
-        match parse_cart(spec) {
-            Some(cart) => {
+        match host_files::parse_cart(spec) {
+            Ok(cart) => {
                 sat.insert_cartridge(cart);
                 println!("cartridge inserted: {spec}");
             }
-            None => eprintln!("unknown --cart spec '{spec}' (bram|bram4|bram8|bram16|ram1m|ram4m)"),
+            Err(e) => eprintln!("bad --cart: {e}"),
         }
     }
-    // Battery file next to the BIOS, if present (matches the frontend/tests).
-    if let Ok(bup) = std::fs::read(format!("{bios_path}.bup")) {
+    // A backup-RAM cart loads its virtual memory card (`<bios>.<N>.crtbup`,
+    // card N from `--card=`, default 0 — jupiter's default card), like the
+    // frontend does at startup.
+    if sat.cartridge_backup().is_some() {
+        let card_path = host_files::cart_card_path(save_base, card);
+        match std::fs::read(&card_path) {
+            Ok(bytes) => {
+                sat.load_cartridge_backup(&bytes);
+                println!("backup card {card} loaded: {}", card_path.display());
+            }
+            Err(_) => println!(
+                "backup card {card}: no {} (blank card)",
+                card_path.display()
+            ),
+        }
+    } else if args.iter().any(|a| a.starts_with("--card=")) {
+        eprintln!("--card ignored: no backup-RAM cart (add --cart=bram)");
+    }
+    // Battery file next to the BIOS, if present (the path jupiter writes).
+    let bup_path = host_files::battery_path(save_base);
+    if let Ok(bup) = std::fs::read(&bup_path) {
         sat.load_internal_backup(&bup);
+        println!("backup RAM loaded: {}", bup_path.display());
     }
     if let Some(dp) = &disc_path {
-        match load_disc(Path::new(dp)) {
-            Some(d) => {
+        match host_files::load_image_disc(Path::new(dp)) {
+            Ok(d) => {
                 sat.insert_disc(d);
                 println!("disc inserted: {dp}");
             }
-            None => eprintln!("no disc loaded"),
+            Err(e) => eprintln!("no disc loaded ({dp}: {e})"),
         }
     }
     // CD command history on by default — the debugger's most-used view.
@@ -2158,8 +2208,53 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{collapse_should_log, parse_trace_pcs};
+    use super::{
+        MAX_DISASM_INSNS, MAX_DUMP_BYTES, collapse_should_log, disasm_pcs, dump_rows,
+        parse_sym_line, parse_trace_pcs,
+    };
     use std::collections::VecDeque;
+
+    #[test]
+    fn sym_lines_accept_both_orders_and_hex_looking_names() {
+        assert_eq!(parse_sym_line("main 06004000"), Some(("main", 0x0600_4000)));
+        assert_eq!(parse_sym_line("06004000 main"), Some(("main", 0x0600_4000)));
+        assert_eq!(
+            parse_sym_line("0x06004000 main"),
+            Some(("main", 0x0600_4000))
+        );
+        // Hex-looking names: the first token is NOT taken as the address.
+        assert_eq!(parse_sym_line("dead 06004000"), Some(("dead", 0x0600_4000)));
+        assert_eq!(parse_sym_line("add 0x10"), Some(("add", 0x10)));
+        assert_eq!(parse_sym_line("fade 1234"), Some(("fade", 0x1234)));
+        // ... but an unambiguous address in first position still wins.
+        assert_eq!(parse_sym_line("06004000 fade"), Some(("fade", 0x0600_4000)));
+        assert_eq!(
+            parse_sym_line("  loop 0600 # trailing"),
+            Some(("loop", 0x0600))
+        );
+        assert_eq!(parse_sym_line("# only a comment"), None);
+        assert_eq!(parse_sym_line("lonely"), None);
+        assert_eq!(parse_sym_line("foo bar"), None);
+    }
+
+    #[test]
+    fn dump_rows_clip_at_the_top_of_memory_and_cap_length() {
+        assert_eq!(
+            dump_rows(0x0600_0004, 0x20),
+            vec![0x0600_0000, 0x0600_0010, 0x0600_0020]
+        );
+        assert_eq!(dump_rows(0xFFFF_FFF8, 0x40), vec![0xFFFF_FFF0]);
+        assert_eq!(dump_rows(0xFFFF_FFFF, u32::MAX), vec![0xFFFF_FFF0]);
+        assert_eq!(dump_rows(0, u32::MAX).len() as u32, MAX_DUMP_BYTES / 16);
+        assert!(dump_rows(0x100, 0).is_empty());
+    }
+
+    #[test]
+    fn disasm_pcs_wrap_and_cap() {
+        let v: Vec<u32> = disasm_pcs(0xFFFF_FFFC, 4).collect();
+        assert_eq!(v, vec![0xFFFF_FFFC, 0xFFFF_FFFE, 0, 2]);
+        assert_eq!(disasm_pcs(0, u32::MAX).count() as u32, MAX_DISASM_INSNS);
+    }
 
     #[test]
     fn parse_trace_pcs_is_tolerant() {
