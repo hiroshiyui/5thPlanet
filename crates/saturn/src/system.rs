@@ -704,6 +704,15 @@ impl Saturn {
             .sh2_mut()
             .cpu
             .set_bsc_slave(true);
+        // The slave's NMI input is not driven on the Saturn (only the SMPC
+        // drives the master's), so its ICR.NMIL reads 0 — Mednafen leaves the
+        // slave's `NMILevel` at its power-on `false` (sh7095.inc:273) and only
+        // ever calls `CPU[0].SetNMI` (smpc.cpp). Also a pin property.
+        scheduler
+            .entity_mut(*slave_id)
+            .sh2_mut()
+            .cpu
+            .set_nmi_pin(false);
         // Real Saturn power-on: slave is held in reset until the BIOS
         // sends SMPC SSHON. Mirror that here.
         scheduler.entity_mut(*slave_id).sh2_mut().set_halted(true);

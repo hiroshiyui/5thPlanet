@@ -421,3 +421,26 @@ fn guarded_breakpoint_in_a_set_waits_for_its_register_value() {
         "fires on the iteration where R0 == the guard value"
     );
 }
+
+#[test]
+fn only_the_master_nmi_pin_is_driven_high() {
+    // ICR bit 15 (NMIL) reads the NMI pin. The SMPC drives the master's NMI
+    // line (idle high); the slave's is undriven and reads 0 (Mednafen only
+    // ever calls CPU[0].SetNMI). A pin property, so it survives reset.
+    // Like the BCR1 slave bit, it is applied by `reset()` (power-on), which
+    // every caller runs after `Saturn::new`.
+    let mut sat = Saturn::new(vec![0u8; 512 * 1024]);
+    for _ in 0..2 {
+        sat.reset();
+        assert!(
+            !sat.master().onchip.intc.nmi_pin_low,
+            "master NMI idles high"
+        );
+        assert!(
+            sat.slave().onchip.intc.nmi_pin_low,
+            "slave NMI undriven (low)"
+        );
+        assert_eq!(sat.master().onchip.intc.icr_read() >> 15, 1);
+        assert_eq!(sat.slave().onchip.intc.icr_read() >> 15, 0);
+    }
+}
