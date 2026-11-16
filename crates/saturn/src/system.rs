@@ -2093,7 +2093,7 @@ mod tests {
         sat.bus.scu.write32(0x08, 0x0000_0004); // D0C: one longword.
         sat.bus.scu.write32(0x0C, 0x0000_0001); // D0AD: fixed source, +2 dest.
         sat.bus.scu.write32(0x14, 0x0000_0007); // D0MD: manual start factor.
-        sat.bus.scu.write32(0x10, 1 << 8); // D0EN: DGO.
+        sat.bus.scu.write32(0x10, 0x101); // D0EN: enable + go.
         let halt = drain_dma(&mut sat.bus);
 
         assert_eq!(

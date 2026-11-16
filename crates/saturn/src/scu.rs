@@ -28,8 +28,9 @@
 //!   0xC8         VER  — version, reads 0x0000_0004 (read-only)
 //! ```
 //!
-//! DMA: a channel armed via `D*EN` (bit 8) transfers when its start factor
-//! (`D*MD` bits 2..0) fires — the manual factor (7) on the `D*EN` go bit, or a
+//! DMA: a channel enabled via `D*EN` bit 8 transfers when its start factor
+//! (`D*MD` bits 2..0) fires — the manual factor (7) on a write of the `D*EN`
+//! **go** bit (bit 0) while enabled (any access width; Mednafen `scu.inc`), or a
 //! hardware event (VBlank-IN/-OUT, HBlank, timers, sound-request,
 //! sprite-draw-end) routed through [`Scu::trigger_dma_factor`]. Both direct
 //! and indirect (table-driven) modes are supported, honouring the `D*AD`
@@ -44,8 +45,12 @@ pub const SCU_END: u32 = 0x05FE_00FF;
 
 const NUM_CHANNELS: usize = 3;
 const CHANNEL_STRIDE: u32 = 0x20;
-/// DGO ("DMA Go") enable bit in D*EN.
-const DGO_BIT: u32 = 1 << 8;
+/// `D*EN` bit 8 — the channel **enable**. Persists across completion: a
+/// hardware-factor channel re-fires on every matching event while it is set.
+pub const DMA_ENABLE_BIT: u32 = 1 << 8;
+/// `D*EN` bit 0 — the **go** strobe. Writing it (with the enable set, at any
+/// access width) starts a manual-factor (7) transfer; it is not stored state.
+pub const DMA_GO_BIT: u32 = 1 << 0;
 
 /// Sources the SCU's interrupt aggregator forwards to the master
 /// SH-2 as an `External(level)` IRL assertion. Hardware-fixed priority
@@ -156,7 +161,7 @@ impl DmaChannel {
     /// `D*EN` bit 8 — the channel is armed (enabled). A start factor / the go
     /// bit only triggers a transfer while this is set.
     fn armed(&self) -> bool {
-        self.enable & 0x100 != 0
+        self.enable & DMA_ENABLE_BIT != 0
     }
     /// Start factor (`D*MD` bits 2..0): 0 VBlank-IN, 1 VBlank-OUT, 2 HBlank-IN,
     /// 3 Timer0, 4 Timer1, 5 Sound-Req, 6 Sprite-draw-end, 7 manual (the go
@@ -217,12 +222,15 @@ pub struct Scu {
     /// aggregate drains this and runs the DSP at the top level, where its
     /// DMA can reach the system bus (it can't from inside the bus).
     dsp_run: bool,
-    /// Sources that have been asserted since the last drain. The
-    /// Saturn aggregate's `drain_scu_intc` pops one per call and
-    /// raises it on the master SH-2's INTC. Distinct from `ist`: `ist`
-    /// is software-visible state (cleared by write-0-clear from a handler);
-    /// `fresh_assertions` tracks edges so we don't re-fire on the SH-2
-    /// every batch while software is still handling the previous one.
+    /// Fresh interrupt-assertion edges not yet presented to the master SH-2.
+    /// [`Scu::take_pending_interrupt`] (sampled once per master instruction by
+    /// the Saturn aggregate) consumes one when it delivers it. Distinct from
+    /// `ist`: `ist` is the software-visible latch (cleared only by the guest's
+    /// write-0-clear, never by acceptance), while this tracks edges so a source
+    /// is not re-delivered every instruction while software is still handling
+    /// it. A guest IST clear also drops the matching pending edge
+    /// (`fresh_assertions &= ist`, Mednafen `IPending &= DB`), so a source
+    /// cleared while masked is never delivered later.
     fresh_assertions: u32,
     /// External-interrupt prohibit latch for the CD-block ([`Source::Cd`]):
     /// once the CD interrupt fires it is latched off until software writes the
@@ -311,7 +319,7 @@ impl Scu {
 
     pub fn write32(&mut self, offset: u32, val: u32) {
         match offset {
-            o if o < 0x60 => self.write_channel(o, val),
+            o if o < 0x60 => self.write_channel(o, val, !0),
             0x60 => self.dstp = val,
             0x7C => self.dsta = val,
             0x80 => self.dsp_ppaf_write(val), // program control: LEF / EXF
@@ -324,7 +332,14 @@ impl Scu {
             0xA0 => self.ims = val & 0xBFFF, // IMS is 16-bit; bit 14 is unused (scu.inc)
             // IST is write-AND-to-clear: a written 0 bit clears the flag,
             // a written 1 bit leaves it untouched (Mednafen `IPending &= DB`).
-            0xA4 => self.ist &= val,
+            // Mednafen has a single pending latch, so clearing it also cancels
+            // a not-yet-delivered assertion: drop the matching fresh edges too,
+            // or a source raised while masked and then cleared by software
+            // would still be delivered once unmasked.
+            0xA4 => {
+                self.ist &= val;
+                self.fresh_assertions &= self.ist;
+            }
             0xA8 => {
                 self.aiack = val;
                 // A-bus interrupt acknowledge: writing bit 0 clears the
@@ -369,45 +384,46 @@ impl Scu {
         }
     }
 
-    fn write_channel(&mut self, offset: u32, val: u32) {
+    /// Write the channel register at `offset` (a 4-byte-aligned offset below
+    /// 0x60), merging only the `mask`ed bits of `val` (already shifted into
+    /// its byte lane) — a port of Mednafen `SCU_RegRW_DB`'s per-width
+    /// `(reg & ~mask) | (DB & mask)` for the DMA registers (`scu.inc`).
+    ///
+    /// `D*EN` (0x10): bit 8 is the stored **enable**; bit 0 is the **go**
+    /// strobe. A write whose masked bits include go=1 starts the transfer iff
+    /// the channel is enabled and its start factor is manual (7)
+    /// (`(tmp & 0x1) && d.Enable && d.SF == 0x7`) — at any access width, so a
+    /// 16-bit write of 0x0101 to the low half starts it, while a write that
+    /// sets only the enable (0x100) merely arms the channel for a hardware
+    /// factor. A programmed count of 0 means the channel maximum (see
+    /// `system::dma_count`), so the go is not gated on a non-zero count.
+    fn write_channel(&mut self, offset: u32, val: u32, mask: u32) {
         let ch = (offset / CHANNEL_STRIDE) as usize;
         let in_ch = offset % CHANNEL_STRIDE;
         if ch >= NUM_CHANNELS {
             return;
         }
         let c = &mut self.channels[ch];
+        let merge = |old: u32| (old & !mask) | (val & mask);
         match in_ch {
-            0x00 => c.read_addr = val,
-            0x04 => c.write_addr = val,
-            // Channel 0 carries a 20-bit count; channels 1 and 2 carry
-            // 12 bits. Mask conservatively to the wider one — software
-            // writing larger values to ch1/2 would have been clipped
-            // by hardware anyway and we'd surface a real-world bug if
-            // we silently let it through unmasked.
+            // Addresses are 27-bit physical (Mednafen `& 0x07FFFFFF`).
+            0x00 => c.read_addr = merge(c.read_addr) & 0x07FF_FFFF,
+            0x04 => c.write_addr = merge(c.write_addr) & 0x07FF_FFFF,
+            // Level 0 carries a 20-bit count; levels 1 and 2 carry 12 bits.
             0x08 => {
-                c.transfer_count = if ch == 0 {
-                    val & 0x000F_FFFF
-                } else {
-                    val & 0x0000_0FFF
-                };
+                let width = if ch == 0 { 0x000F_FFFF } else { 0x0000_0FFF };
+                c.transfer_count = merge(c.transfer_count) & width;
             }
-            0x0C => c.add_value = val,
+            0x0C => c.add_value = merge(c.add_value),
             0x10 => {
-                c.enable = val;
-                // Only a channel set to the *manual* start factor (7) fires on
-                // the D*EN go bit. Channels configured for a hardware start
-                // factor (0..6) are merely armed here and wait for that event
-                // (see `trigger_factor`) — enabling them must NOT start a
-                // transfer immediately. Indirect transfers take their size
-                // from the table, so the count guard only applies to direct.
-                if val & DGO_BIT != 0
-                    && c.start_factor() == 7
-                    && (c.indirect() || c.transfer_count > 0)
-                {
+                // The go bit is a strobe, not stored state: keep the enable
+                // (and other written bits for read-back) but never the go.
+                c.enable = merge(c.enable) & !DMA_GO_BIT;
+                if val & mask & DMA_GO_BIT != 0 && c.armed() && c.start_factor() == 7 {
                     c.triggered = true;
                 }
             }
-            0x14 => c.mode = val,
+            0x14 => c.mode = merge(c.mode),
             _ => {}
         }
     }
@@ -492,47 +508,25 @@ impl Scu {
     pub fn write8(&mut self, offset: u32, val: u8) {
         let aligned = offset & !3;
         let shift = 8 * (3 - (offset & 3));
-        let cur = self.read32(aligned);
-        let mask = !(0xFFu32 << shift);
-        // Byte writes can't trigger DMA — the DGO check lives in the
-        // 32-bit write path. RMW just patches the byte without going
-        // through write32's side-effect logic.
-        let new = (cur & mask) | ((val as u32) << shift);
-        match aligned {
-            o if o < 0x60 => self.write_channel_raw(o, new),
-            _ => self.write32(aligned, new),
-        }
-    }
-    pub fn write16(&mut self, offset: u32, val: u16) {
-        self.write8(offset, (val >> 8) as u8);
-        self.write8(offset + 1, val as u8);
-    }
-
-    /// Channel register write that does NOT honour the DGO trigger.
-    /// Used by byte / halfword writes (which build up a 32-bit value
-    /// piece-by-piece and shouldn't fire DMA mid-construction).
-    fn write_channel_raw(&mut self, offset: u32, val: u32) {
-        let ch = (offset / CHANNEL_STRIDE) as usize;
-        let in_ch = offset % CHANNEL_STRIDE;
-        if ch >= NUM_CHANNELS {
+        if aligned < 0x60 {
+            // DMA registers honour the byte lane (Mednafen per-width mask).
+            self.write_channel(aligned, (val as u32) << shift, 0xFF << shift);
             return;
         }
-        let c = &mut self.channels[ch];
-        match in_ch {
-            0x00 => c.read_addr = val,
-            0x04 => c.write_addr = val,
-            0x08 => {
-                c.transfer_count = if ch == 0 {
-                    val & 0x000F_FFFF
-                } else {
-                    val & 0x0000_0FFF
-                };
-            }
-            0x0C => c.add_value = val,
-            0x10 => c.enable = val, // no trigger
-            0x14 => c.mode = val,
-            _ => {}
+        // Other registers: read-modify-write the containing longword.
+        let cur = self.read32(aligned);
+        let keep = !(0xFFu32 << shift);
+        self.write32(aligned, (cur & keep) | ((val as u32) << shift));
+    }
+    pub fn write16(&mut self, offset: u32, val: u16) {
+        let aligned = offset & !3;
+        if aligned < 0x60 {
+            let shift = 16 * (((offset >> 1) & 1) ^ 1);
+            self.write_channel(aligned, (val as u32) << shift, 0xFFFF << shift);
+            return;
         }
+        self.write8(offset, (val >> 8) as u8);
+        self.write8(offset + 1, val as u8);
     }
 
     /// Cheap hot-path probe: is any DMA channel triggered? Sampled once per
@@ -706,16 +700,11 @@ impl Scu {
     /// lands the instant the CD raises an unmasked HIRQ bit — the GFS file
     /// library polls nothing; it is driven by this interrupt.
     pub fn set_cd_int(&mut self, active: bool) {
-        static CD_NO_PROHIBIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let no_prohibit =
-            *CD_NO_PROHIBIT.get_or_init(|| std::env::var_os("SAT_CD_NO_PROHIBIT").is_some());
-        if active && (!self.cd_prohibit || no_prohibit) {
+        if active && !self.cd_prohibit {
             let bit = 1u32 << Source::Cd.bit();
             self.fresh_assertions |= bit;
             self.ist |= bit;
-            if !no_prohibit {
-                self.cd_prohibit = true;
-            }
+            self.cd_prohibit = true;
         }
     }
 
@@ -839,12 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn dgo_write_with_nonzero_count_queues_a_dma_request() {
+    fn enable_plus_go_queues_a_dma_request() {
         let mut s = Scu::new();
         s.write32(0x00, 0x0600_0000); // D0R
         s.write32(0x04, 0x0020_0000); // D0W
         s.write32(0x08, 0x100); // D0C
-        s.write32(0x10, DGO_BIT); // D0EN with DGO set
+        s.write32(0x10, DMA_ENABLE_BIT | DMA_GO_BIT); // D0EN 0x101
         let req = s.take_pending_dma().expect("DMA should be queued");
         assert_eq!(req.channel, 0);
         assert_eq!(req.src, 0x0600_0000);
@@ -854,27 +843,57 @@ mod tests {
     }
 
     #[test]
-    fn dgo_with_zero_count_does_not_trigger() {
+    fn enable_without_go_only_arms_the_channel() {
+        // Mednafen scu.inc: the transfer starts on `(v & 1) && Enable && SF==7`;
+        // 0x100 alone sets the enable but is not a go.
         let mut s = Scu::new();
-        s.write32(0x10, DGO_BIT);
-        assert!(s.take_pending_dma().is_none());
+        s.write32(0x08, 0x100);
+        s.write32(0x10, DMA_ENABLE_BIT);
+        assert!(s.take_pending_dma().is_none(), "0x100 must not start");
+        assert!(s.channels[0].armed(), "0x100 enables the channel");
     }
 
     #[test]
-    fn byte_writes_to_d0en_do_not_trigger_mid_construction() {
+    fn go_without_enable_does_not_start() {
         let mut s = Scu::new();
-        s.write32(0x08, 0x100); // non-zero count
-        // Build up DGO-bit via 4 byte writes — the high byte of the
-        // big-endian 0x0000_0100 lands at offset 0x12. We must not
-        // fire DMA partway through.
-        s.write8(0x10, 0x00);
-        s.write8(0x11, 0x00);
+        s.write32(0x08, 0x100);
+        s.write32(0x10, DMA_GO_BIT);
+        assert!(s.take_pending_dma().is_none(), "go needs the enable bit");
+    }
+
+    #[test]
+    fn go_with_zero_count_starts_a_maximum_length_transfer() {
+        // A programmed count of 0 means the channel maximum (Mednafen
+        // `!StartByteCount ? 0x100000/0x1000`), so the go is not count-gated.
+        let mut s = Scu::new();
+        s.write32(0x10, DMA_ENABLE_BIT | DMA_GO_BIT);
+        let req = s.take_pending_dma().expect("count 0 still starts");
+        assert_eq!(req.bytes, 0, "the drainer maps 0 to the level maximum");
+    }
+
+    #[test]
+    fn sixteen_bit_write_to_d0en_low_half_starts_the_transfer() {
+        let mut s = Scu::new();
+        s.write32(0x08, 0x100);
+        s.write16(0x12, 0x0101); // low half of D0EN: enable + go
+        assert!(s.take_pending_dma().is_some(), "16-bit write honoured");
+        // A 16-bit write to the high half can't carry the go bit.
+        s.write16(0x10, 0x0101);
+        assert!(s.take_pending_dma().is_none(), "high half has no go bit");
+    }
+
+    #[test]
+    fn byte_write_of_go_after_enable_starts_the_transfer() {
+        let mut s = Scu::new();
+        s.write32(0x08, 0x100);
+        s.write8(0x12, 0x01); // enable (bit 8) only
+        assert!(s.take_pending_dma().is_none(), "enable byte alone: no go");
+        s.write8(0x13, 0x01); // go strobe (bit 0), enable kept
+        assert!(s.take_pending_dma().is_some(), "byte go starts it");
+        // The go is a strobe: re-writing the enable byte doesn't re-fire.
         s.write8(0x12, 0x01);
-        s.write8(0x13, 0x00);
-        assert!(
-            s.take_pending_dma().is_none(),
-            "byte writes must not fire DMA — software is expected to use word writes"
-        );
+        assert!(s.take_pending_dma().is_none(), "go is not latched");
+        assert_eq!(s.channels[0].enable & DMA_GO_BIT, 0);
     }
 
     #[test]
@@ -985,7 +1004,7 @@ mod tests {
         // it — the per-transfer one-shot is the separate `triggered` flag.
         let mut s = Scu::new();
         s.channels[0].mode = 0; // start factor 0 (VBlank-IN), direct
-        s.channels[0].enable = DGO_BIT; // armed (bit 8), no immediate go
+        s.channels[0].enable = DMA_ENABLE_BIT; // armed (bit 8), no immediate go
         s.channels[0].transfer_count = 0x10;
         s.trigger_dma_factor(0);
         assert!(
@@ -1087,7 +1106,7 @@ mod tests {
         s.write32(0x0C, 0x100 | 0x2);
         // D0MD: manual (7) + indirect (bit24) + RUP (bit16) + WUP (bit8).
         s.write32(0x14, (1 << 24) | (1 << 16) | (1 << 8) | 7);
-        s.write32(0x10, DGO_BIT); // trigger (indirect ignores the count guard)
+        s.write32(0x10, DMA_ENABLE_BIT | DMA_GO_BIT); // trigger
         let req = s.take_pending_dma().expect("queued");
         assert_eq!(req.src_add, 4, "D*AD bit 8 → +4 source stride");
         assert_eq!(req.dst_add, 4, "D*AD code 2 → 2^2 = 4 byte dest stride");
@@ -1103,7 +1122,7 @@ mod tests {
         // D0AD: src bit 8 clear → fixed source; dst code 0 → 2^0 = 1 → fixed.
         s.write32(0x0C, 0x000);
         s.write32(0x14, 7); // manual
-        s.write32(0x10, DGO_BIT);
+        s.write32(0x10, DMA_ENABLE_BIT | DMA_GO_BIT);
         let req = s.take_pending_dma().expect("queued");
         assert_eq!(req.src_add, 0, "fixed source (e.g. a FIFO register)");
         assert_eq!(req.dst_add, 0, "code 0 → fixed destination");
@@ -1126,7 +1145,7 @@ mod tests {
         let mut s = Scu::new();
         s.write32(0x08, 0); // count 0
         s.write32(0x14, (1 << 24) | 7); // indirect + manual
-        s.write32(0x10, DGO_BIT);
+        s.write32(0x10, DMA_ENABLE_BIT | DMA_GO_BIT);
         assert!(
             s.take_pending_dma().is_some(),
             "indirect fires with count 0"
@@ -1139,7 +1158,7 @@ mod tests {
         // Arm channel 0 for start factor 0 (VBlank-IN); enabling must not fire.
         s.write32(0x14, 0); // D0MD: factor 0
         s.write32(0x08, 0x10);
-        s.write32(0x10, DGO_BIT); // armed
+        s.write32(0x10, DMA_ENABLE_BIT); // armed
         assert!(
             s.take_pending_dma().is_none(),
             "factor-0 channel waits for the event"
@@ -1176,7 +1195,7 @@ mod tests {
         let mut s = Scu::new();
         s.write32(0x14, 2); // D0MD: start factor 2 (HBlank-IN)
         s.write32(0x08, 0x10); // D0C: count
-        s.write32(0x10, DGO_BIT); // D0EN: arm
+        s.write32(0x10, DMA_ENABLE_BIT); // D0EN: arm
         assert!(s.take_pending_dma().is_none(), "armed; waits for the event");
         // An HBLANK rising edge (new_hb 0→1) fires it.
         s.tick_timers(1000, 455, 455, true, false);
@@ -1192,7 +1211,7 @@ mod tests {
         let mut s = Scu::new();
         s.write32(0x14, 4); // D0MD: start factor 4 (Timer1)
         s.write32(0x08, 0x10);
-        s.write32(0x10, DGO_BIT); // arm
+        s.write32(0x10, DMA_ENABLE_BIT); // arm
         s.write32(0x98, 1); // T1MD: TENB (timers enabled), mode 0
         s.write32(0x94, 2); // T1S: fire at H-position 2
         // hb_start reloads the Timer-1 down-counter from T1S (=2)...
@@ -1223,9 +1242,9 @@ mod tests {
             s.channels[0].read_addr, 0x0600_1000,
             "byte writes assemble the word"
         );
-        // A byte write to D0EN's DGO byte must NOT trigger.
+        // A byte write of only the enable (bit 8) arms but does not go.
         s.write8(0x12, 0x01); // bit 8 of the big-endian enable word
-        assert!(s.take_pending_dma().is_none(), "byte writes never fire DMA");
+        assert!(s.take_pending_dma().is_none(), "enable alone never fires");
     }
 
     #[test]
@@ -1374,5 +1393,46 @@ mod tests {
         // Writing 0 clears every pending bit.
         s.write32(0xA4, 0);
         assert_eq!(s.ist, 0);
+    }
+
+    #[test]
+    fn clearing_ist_while_masked_cancels_the_pending_delivery() {
+        // Mednafen keeps one pending latch (`IPending &= DB`): a source raised
+        // while masked and then cleared by software is never delivered.
+        let mut s = Scu::new();
+        s.ims = 0xBFFF; // everything masked
+        s.raise(Source::Timer0);
+        assert!(s.take_pending_interrupt(0).is_none(), "masked");
+        s.write32(0xA4, !(1 << Source::Timer0.bit())); // clear Timer0 in IST
+        s.write32(0xA0, 0); // unmask everything
+        assert!(
+            s.take_pending_interrupt(0).is_none(),
+            "a cleared source must not be delivered after unmasking"
+        );
+    }
+
+    #[test]
+    fn ist_clear_of_one_source_keeps_other_pending_edges() {
+        let mut s = Scu::new();
+        s.ims = 0;
+        s.raise(Source::Timer0);
+        s.raise(Source::SoundRequest);
+        s.write32(0xA4, !(1 << Source::Timer0.bit()));
+        assert_eq!(
+            s.take_pending_interrupt(0),
+            Some((Source::SoundRequest, Source::SoundRequest.priority()))
+        );
+        assert!(s.take_pending_interrupt(0).is_none());
+    }
+
+    #[test]
+    fn accepting_a_vector_does_not_clear_ist() {
+        // The SAN5 contract: delivery consumes only the fresh edge; IST stays
+        // latched for the ISR to read until the guest write-0-clears it.
+        let mut s = Scu::new();
+        s.ims = 0;
+        s.raise(Source::VBlankIn);
+        assert!(s.take_pending_interrupt(0).is_some());
+        assert_ne!(s.ist & (1 << Source::VBlankIn.bit()), 0);
     }
 }
