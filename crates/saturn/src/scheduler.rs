@@ -436,6 +436,15 @@ impl SaturnEntity {
             _ => panic!("scheduler entity is not an SH-2"),
         }
     }
+
+    /// Borrow the wrapped CD-block timer entity. Panics if this entity is not
+    /// the CD-block timer (see [`Self::sh2`] for why that is a caller bug).
+    pub fn cd_block_mut(&mut self) -> &mut CdBlockEntity {
+        match self {
+            SaturnEntity::CdBlock(e) => e,
+            _ => panic!("scheduler entity is not the CD-block timer"),
+        }
+    }
 }
 
 impl SchedEntity for SaturnEntity {

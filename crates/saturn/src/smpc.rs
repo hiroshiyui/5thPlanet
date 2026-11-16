@@ -381,6 +381,31 @@ impl Smpc {
         }
     }
 
+    /// System reset (Mednafen `SMPC_Reset`): clear the command machinery —
+    /// IREG/OREG/COMREG, SR, SF, any pending or executing command (incl. an
+    /// in-flight INTBACK and its CONTINUE staging) and the direct-mode port
+    /// registers. Kept: what the reset doesn't touch on hardware or what the
+    /// host configured — the battery-backed RTC and SMEM, the area code, the
+    /// plugged-in port devices and their live input state.
+    pub fn reset(&mut self) {
+        *self = Smpc {
+            region: self.region,
+            port1: self.port1,
+            port2: self.port2,
+            pad1: self.pad1,
+            pad2: self.pad2,
+            analog1: self.analog1,
+            analog2: self.analog2,
+            mouse_buttons: self.mouse_buttons,
+            mouse_dx: self.mouse_dx,
+            mouse_dy: self.mouse_dy,
+            rtc_secs: self.rtc_secs,
+            rtc_set_cycle: self.rtc_set_cycle,
+            smem: self.smem,
+            ..Smpc::default()
+        };
+    }
+
     /// Set the RTC to `unix_secs` (seconds since 1970-01-01), syncing the
     /// advance origin to the current global cycle `now`.
     pub fn set_rtc_unix(&mut self, unix_secs: u64, now: u64) {

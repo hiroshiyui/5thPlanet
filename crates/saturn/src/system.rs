@@ -425,6 +425,41 @@ fn indirect_count(size_word: u32) -> u32 {
     }
 }
 
+/// Lets a sector source that was moved out of a CD-block (`take_disc`) be
+/// re-inserted through the generic [`crate::cd_block::CdBlock::insert_disc`]
+/// — used by [`Saturn::reset`] to reset the CD-block engine while keeping the
+/// disc. Each reset adds one forwarding hop; sector reads are 75 Hz, so the
+/// indirection is immaterial.
+impl crate::disc::SectorSource for Box<dyn crate::disc::SectorSource> {
+    fn toc(&self) -> [u8; 408] {
+        (**self).toc()
+    }
+    fn first_track(&self) -> u8 {
+        (**self).first_track()
+    }
+    fn last_track(&self) -> u8 {
+        (**self).last_track()
+    }
+    fn lead_out_fad(&self) -> u32 {
+        (**self).lead_out_fad()
+    }
+    fn track_at_fad(&self, fad: u32) -> Option<crate::disc::TrackInfo> {
+        (**self).track_at_fad(fad)
+    }
+    fn read_sector(&self, fad: u32, out: &mut [u8]) -> bool {
+        (**self).read_sector(fad, out)
+    }
+    fn read_full_sector(&self, fad: u32, out: &mut [u8]) -> usize {
+        (**self).read_full_sector(fad, out)
+    }
+    fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
+        (**self).subheader(fad)
+    }
+    fn fingerprint(&self) -> u64 {
+        (**self).fingerprint()
+    }
+}
+
 /// One SCU DMA block transfer over the B-bus 16-bit data path, honouring the
 /// `D*AD` strides. Source read as 32-bit words split into big-endian 16-bit
 /// halves; the destination advances by `dst_add` (Work RAM H forces a 2-byte
@@ -575,11 +610,27 @@ impl Saturn {
         Self::new(vec![0u8; 512 * 1024])
     }
 
-    /// Pull PC and SP for both CPUs from the BIOS reset vector
-    /// (`0x00000000` for PC, `0x00000004` for SP) and clear pipeline
-    /// state. On real hardware the slave is held in reset until the
-    /// master writes the SMPC `SETSL` command — for M2 we bring both
-    /// up immediately; SMPC-driven slave hold-down arrives in M3.
+    /// System reset (Mednafen `SS_Reset(false)`): reset both SH-2s — PC/SP from
+    /// the BIOS reset vector (`0x00000000`/`0x00000004`), pipeline + cache
+    /// cleared — and return every peripheral to its power-on state (SCU incl.
+    /// DMA/IMS/IST, SMPC, VDP1, VDP2, SCSP + sound CPU off, the CD-block
+    /// engine). The slave is then held in reset until the BIOS releases it with
+    /// SMPC `SSHON`.
+    ///
+    /// **Time stays monotonic.** The global clock is *not* restarted: both
+    /// CPUs resume at the reset cycle, their lazy FRT/WDT epochs and the
+    /// CD-block timer are re-anchored there, and the bus timing restarts from
+    /// it. Restarting the CPUs at cycle 0 while the CD timer, SMPC INTBACK
+    /// completion, RTC origin and VDP1 draw timestamps kept their old values
+    /// froze the CD-block until the clock caught up and could make the lazy
+    /// FRT spin over a ~2^61-tick delta.
+    ///
+    /// Kept across the reset (they are media / battery-backed / host
+    /// configuration): the BIOS, the inserted disc (re-inserted into the reset
+    /// CD-block, so it is recognised again as at power-on), the cartridge,
+    /// internal backup RAM, work RAM contents, and the SMPC region, port
+    /// devices, pad/mouse state, RTC and SMEM. On a fresh machine (cycle 0)
+    /// this is exactly the power-on state.
     pub fn reset(&mut self) {
         // Destructure self into disjoint borrows so the bus borrow doesn't
         // collide with the scheduler-entity borrow.
@@ -588,14 +639,50 @@ impl Saturn {
             scheduler,
             master_id,
             slave_id,
+            cd_id,
+            scsp_debt,
             ..
         } = self;
-        // The CPUs' cycle counters restart at 0 (`Pipeline::new`), so the
-        // bus-timing timestamps anchored to them must restart too — a stale
-        // mem_ts far in the "future" would stall the reset machine for ages.
+        // The reset instant: no entity may move backwards past it.
+        let now = {
+            let m = scheduler.entity(*master_id).sh2();
+            let s = scheduler.entity(*slave_id).sh2();
+            let slave_cyc = if s.is_halted() {
+                0
+            } else {
+                s.cpu.pipeline.cycles
+            };
+            m.cpu.pipeline.cycles.max(slave_cyc).max(bus.cycle)
+        };
+        // Peripherals back to power-on. Media and battery state survive.
+        bus.scu.reset(now);
+        bus.smpc.reset();
+        bus.vdp1 = crate::vdp1::Vdp1::new();
+        bus.vdp2 = crate::vdp2::Vdp2::new();
+        bus.scsp = crate::scsp::Scsp::new();
+        *scsp_debt = 0;
+        let disc = bus.cd_block.take_disc();
+        bus.cd_block = crate::cd_block::CdBlock::new();
+        if let Some(disc) = disc {
+            bus.cd_block.insert_disc(disc);
+        }
+        scheduler.entity_mut(*cd_id).cd_block_mut().rebase(now);
+        bus.slave_input_capture = false;
+        bus.master_input_capture = false;
+        // The bus timeline restarts at the reset instant (a stale mem_ts or
+        // write-buffer completion would stall the reset machine).
         bus.timing = Default::default();
-        scheduler.entity_mut(*master_id).sh2_mut().cpu.reset(bus);
-        scheduler.entity_mut(*slave_id).sh2_mut().cpu.reset(bus);
+        bus.cycle = now;
+        for id in [*master_id, *slave_id] {
+            let cpu = &mut scheduler.entity_mut(id).sh2_mut().cpu;
+            cpu.reset(bus);
+            // `Cpu::reset` restarts the pipeline at cycle 0; resume at the
+            // reset instant and re-anchor the lazy FRT/WDT epoch there (as
+            // `release_slave` does), or the next timer update would see a
+            // delta from a stale `lastts`.
+            cpu.pipeline.cycles = now;
+            cpu.onchip.reset_timer_epoch(now);
+        }
         // The slave SH-2 reads BCR1 bit 15 (SH7604 master/slave bit) = 1, so the
         // BIOS cold-start takes the slave path and does NOT re-initialize work
         // RAM. Without this, an SSHON-released slave re-runs the WRAM init and
@@ -607,7 +694,7 @@ impl Saturn {
             .cpu
             .set_bsc_slave(true);
         // Real Saturn power-on: slave is held in reset until the BIOS
-        // sends SMPC SETSL. Mirror that here.
+        // sends SMPC SSHON. Mirror that here.
         scheduler.entity_mut(*slave_id).sh2_mut().set_halted(true);
         scheduler.entity_mut(*master_id).sh2_mut().set_halted(false);
     }

@@ -293,6 +293,16 @@ impl Scu {
         s
     }
 
+    /// System reset: back to the power-on register state ([`Scu::new`]) —
+    /// every DMA channel disabled and idle, IMS = 0xBFFF, IST and the pending
+    /// edges clear, the A-bus/CD prohibit latch clear, timers off — with the
+    /// sub-line timer clock anchored at global cycle `now` (time keeps running
+    /// across a reset). Mednafen `SCU_Reset`.
+    pub fn reset(&mut self, now: u64) {
+        *self = Scu::new();
+        self.timer_last_now = now;
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             o if o < 0x60 => self.read_channel(o),

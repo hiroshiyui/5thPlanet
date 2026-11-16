@@ -9,6 +9,7 @@
 //! stay robust to internal refactors.
 
 use saturn::Saturn;
+use saturn::SchedEntity;
 use saturn::cartridge::Cartridge;
 use saturn::savestate::SaveStateError;
 use sh2::bus::{AccessKind, Bus};
@@ -223,6 +224,45 @@ fn debug_step_slave_is_a_no_op_while_halted_then_runs_once_released() {
     let cost = sat.debug_step_slave();
     assert!(cost >= 1, "released slave steps");
     assert_eq!(sat.slave().pipeline.cycles, before + cost as u64);
+}
+
+#[test]
+fn reset_keeps_time_monotonic_and_restores_power_on_peripherals() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.insert_disc(saturn::disc::Disc::from_iso(vec![0u8; 2048 * 8]));
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
+    for _ in 0..60 {
+        sat.run_frame(&mut fb);
+    }
+    // Dirty some peripheral state the reset must clear.
+    sat.bus.scu.ims = 0;
+    sat.bus.scu.ist = 0xFFFF;
+    sat.bus.write8(0x0010_0063, 1, AccessKind::Data); // SMPC SF
+    sat.set_region(saturn::smpc::region::JAPAN);
+    let before = sat.now();
+
+    sat.reset();
+    assert!(sat.now() >= before, "reset never moves time backwards");
+    assert_eq!(sat.master().pipeline.cycles, sat.now());
+    assert!(sat.slave_is_halted(), "slave held until SSHON");
+    assert_eq!(sat.bus.scu.ims, 0xBFFF, "SCU back to power-on IMS");
+    assert_eq!(sat.bus.scu.ist, 0);
+    assert_eq!(sat.bus.smpc.sf, 0, "SMPC SF cleared");
+    assert_eq!(sat.bus.smpc.region, saturn::smpc::region::JAPAN, "kept");
+    assert!(sat.has_disc(), "the disc stays inserted");
+
+    // The CD-block timer was re-anchored: it keeps ticking with the CPU
+    // rather than waiting for the clock to catch up to a stale deadline.
+    let t0 = sat.now();
+    sat.run_frame(&mut fb);
+    let cd_next = sat.scheduler.entities()[2].next_deadline();
+    assert!(
+        cd_next > t0 && cd_next <= sat.now() + 2_000,
+        "CD timer ticks right after reset (next={cd_next}, now={})",
+        sat.now()
+    );
+    assert!(sat.now() >= t0 + 470_000, "a whole frame ran after reset");
 }
 
 #[test]
