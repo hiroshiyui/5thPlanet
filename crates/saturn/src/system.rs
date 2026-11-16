@@ -133,8 +133,9 @@ fn intc_trace_after() -> Option<u64> {
 /// cannot take an interrupt between a delayed branch and its slot, so while the
 /// next instruction is a delay slot the pending edge is left in the SCU for the
 /// next instruction boundary (forwarding a DMA-end into the `nop` slot after an
-/// `rte` corrupted SAN5's CD-DMA handshake). Any further "interrupt blocked"
-/// condition belongs here, next to `next_is_delay_slot()`.
+/// `rte` corrupted SAN5's CD-DMA handshake). The same holds for the boundary
+/// after an interrupt-disabled instruction (LDC/STC/LDS/STS and their `.L`
+/// forms, Mednafen `PART_OP_INTDIS`); `Cpu::can_accept_interrupt` covers both.
 #[inline]
 fn forward_scu_irq(bus: &mut SaturnBus, master: &mut Sh2Entity, site: &str) {
     // CD-block external interrupt (Source::Cd, vector 0x50, level 7): assert
@@ -145,7 +146,7 @@ fn forward_scu_irq(bus: &mut SaturnBus, master: &mut Sh2Entity, site: &str) {
     // Phase 2B: the SCU presents the highest-priority unmasked pending source
     // as an IRL the master samples every instruction at its current SR.imask.
     let cpu = &master.cpu;
-    if cpu.next_is_delay_slot() {
+    if !cpu.can_accept_interrupt() {
         return;
     }
     let imask = cpu.regs.sr.imask();
