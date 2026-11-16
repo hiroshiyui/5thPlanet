@@ -734,6 +734,9 @@ mod tests {
         );
     }
 
+    // The guard under test is a `debug_assert!`; release builds hit the plain
+    // slice bound first (a different panic message), so test it in debug only.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "out of range")]
     fn line_at_rejects_out_of_range_indices() {
