@@ -23,8 +23,12 @@
 //!   (`vdp1::plotter`) into a double-buffered frame buffer.
 //! - [`scsp`] — Sound Processor: 32-slot FM/PCM engine + SCSP-DSP +
 //!   the hosted MC68EC000 (`m68k` crate) in sound RAM.
-//! - [`cd_block`] — CD-block, high-level-emulated: the host-interface
-//!   command protocol is done; the full HLE engine is M7.
+//! - [`cd_block`] — CD-block, high-level-emulated (ADR-0015): the host
+//!   command interface, buffer/filter/partition engine, read pump + data
+//!   transfer, ISO9660 filesystem, authentication, and CD-DA into the SCSP.
+//! - [`cartridge`] — the rear expansion slot (Extension DRAM, battery
+//!   backup RAM, game ROM).
+//! - [`savestate`] — `Saturn::save_state` / `load_state`.
 //! - [`scheduler`] — `SchedEntity` trait + linear-scan `Scheduler`.
 //!   `Sh2Entity` wraps `sh2::Cpu`; `CdBlockEntity` is the CD-block's
 //!   sub-frame periodic-firmware timer; `SaturnEntity` is the
@@ -39,8 +43,9 @@
 //!
 //! # Milestone status
 //!
-//! - M1–M12 complete; M13 is a fidelity/feature backlog. Two commercial
-//!   games are fully playable: *Virtua Fighter 2* and *Doukyuusei ~if~*.
+//! - M1–M12 complete; M13 is a fidelity/feature backlog. Several commercial
+//!   games are playable (*Virtua Fighter 2*, *Doukyuusei ~if~*, *Sangokushi
+//!   V*, *Super Robot Wars F*, …).
 //!   Highlights: HLE CD-block + cartridge (M7), save states + battery
 //!   backup RAM (M8), the in-window OSD (M9), live disc + CDDA (M10),
 //!   commercial-game boot (M11), and the cycle-accuracy push (M12).

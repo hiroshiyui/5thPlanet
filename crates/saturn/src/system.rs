@@ -1,10 +1,12 @@
 //! Top-level Saturn aggregate: bus + scheduler + master/slave SH-2.
 //!
-//! This is the surface the frontend will hold in M3+. For M2 it stays
-//! deliberately thin — `new`/`reset`/`run_for` plus typed accessors for
-//! each CPU. Anything chip-specific (VDP2, SCSP, SMPC commands) gets
-//! added as a method on `Saturn` when the corresponding peripheral
-//! lands, so the frontend doesn't have to reach across module boundaries.
+//! [`Saturn`] is the surface the frontends hold: construction/reset, the run
+//! loop (`run_for` / `run_frame` / `advance_frame`, which steps the two SH-2s
+//! in Mednafen's master-leads-slave order and samples the SCU/CD interrupt
+//! lines per master instruction), the between-batch peripheral drains (raster
+//! timing, SMPC commands, SCU DMA/DSP, VDP1 draw-end, SCSP), media and input
+//! entry points, save states (`savestate.rs`), and the observer-only debug
+//! hooks used by `sdbg` and the trace harnesses.
 
 use sh2::Cpu;
 use sh2::bus::{AccessKind, Bus};
@@ -106,6 +108,99 @@ fn trace_scu_interrupt(
             source.vector()
         );
     }
+}
+
+/// Debug (`SAT_INTC_TRACE`): log each VBlank-OUT raise. The value, if numeric,
+/// is the global cycle to start logging from (default 0 = from power-on); read
+/// once and cached so the per-frame check is a single load when unset.
+fn intc_trace_after() -> Option<u64> {
+    use std::sync::OnceLock;
+    static AFTER: OnceLock<Option<u64>> = OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let v = std::env::var("SAT_INTC_TRACE").ok()?;
+        Some(v.trim().parse().unwrap_or(0))
+    })
+}
+
+/// Sample the CD-block external-interrupt level and the SCU interrupt line
+/// immediately before one **master** instruction and, if the master can accept
+/// an interrupt now, forward the highest-priority unmasked pending SCU source
+/// to its INTC (latching the SCU's fixed `0x40 + index` vector, not the
+/// auto-vector). Shared by the run loop ([`Saturn::step_cpus`]) and the
+/// single-step debug path so both deliver interrupts at the same instruction.
+///
+/// **This is the single acceptance gate** for SCU/CD interrupts: the SH-2
+/// cannot take an interrupt between a delayed branch and its slot, so while the
+/// next instruction is a delay slot the pending edge is left in the SCU for the
+/// next instruction boundary (forwarding a DMA-end into the `nop` slot after an
+/// `rte` corrupted SAN5's CD-DMA handshake). Any further "interrupt blocked"
+/// condition belongs here, next to `next_is_delay_slot()`.
+#[inline]
+fn forward_scu_irq(bus: &mut SaturnBus, master: &mut Sh2Entity, site: &str) {
+    // CD-block external interrupt (Source::Cd, vector 0x50, level 7): assert
+    // the SCU level from the live CD HIRQ before each instruction (Mednafen
+    // `RecalcIRQOut`). VF2's GFS file library is driven by this interrupt.
+    let cd_active = bus.cd_block.irq_active();
+    bus.scu.set_cd_int(cd_active);
+    // Phase 2B: the SCU presents the highest-priority unmasked pending source
+    // as an IRL the master samples every instruction at its current SR.imask.
+    let cpu = &master.cpu;
+    if cpu.next_is_delay_slot() {
+        return;
+    }
+    let imask = cpu.regs.sr.imask();
+    if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+        trace_scu_interrupt(
+            site,
+            source,
+            level,
+            imask,
+            cpu.regs.pc,
+            cpu.pipeline.cycles,
+            bus.scu.ims,
+            bus.scu.ist,
+        );
+        master
+            .cpu
+            .onchip
+            .intc
+            .raise_external(level, source.vector());
+    }
+}
+
+/// Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
+/// instruction flagged on the bus: pulse the target core's FRT now so it sees
+/// the input-capture on its next instruction, not up to a batch later (M13 A1,
+/// FTI as a per-instruction event).
+#[inline]
+fn apply_fti(
+    bus: &mut SaturnBus,
+    scheduler: &mut Scheduler<SaturnEntity>,
+    master_id: EntityId,
+    slave_id: EntityId,
+) {
+    if core::mem::take(&mut bus.slave_input_capture) {
+        scheduler
+            .entity_mut(slave_id)
+            .sh2_mut()
+            .cpu
+            .fti_input_capture();
+    }
+    if core::mem::take(&mut bus.master_input_capture) {
+        scheduler
+            .entity_mut(master_id)
+            .sh2_mut()
+            .cpu
+            .fti_input_capture();
+    }
+}
+
+/// `SR` after the final INTBACK peripheral block (Mednafen `smpc.cpp`, end of
+/// the JR loop): bit 7 set, NPE (bit 5) clear — no more data — PDL (bit 6) set
+/// because the report is the first and only block, the port modes in the low
+/// nibble, and the RESB bit (4) left as is.
+fn intback_last_block_sr(s: &crate::smpc::Smpc) -> u8 {
+    (s.sr & 0x10) | 0x80 | 0x40 | (s.pmode & 0x0F)
 }
 
 /// INTBACK SF-busy time in microseconds, computed from the request.
@@ -223,25 +318,39 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             // Folding only the payload accesses in `scu_transfer` is not
             // sufficient: descriptor reads must be folded too, or every entry
             // reads as zero and the walker runs to its safety limit.
-            let mut index = req.dst & 0x07FF_FFFF;
+            //
+            // Mednafen `NextIndirect` (scu.inc): the table pointer is the
+            // longword-aligned `D*W` and advances 4 per word **only when
+            // ReadAdd (`D*AD` bit 8) is set**; each size word is masked to 20
+            // bits with 0 meaning 0x100000 — for every level, unlike direct
+            // mode's per-level maximum; and each triplet goes through the
+            // `StartDMATransfer` legality check (an illegal triplet moves
+            // nothing; the walk continues).
+            let table_step = if req.src_add != 0 { 4 } else { 0 };
+            let mut index = req.dst & 0x07FF_FFFC;
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
             loop {
-                let (size, s0) = bus.read32(index, AccessKind::Dma);
-                let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
-                let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                let _ = (s0, s1, s2);
+                let mut word = || {
+                    let (v, _) = bus.read32(index, AccessKind::Dma);
+                    index = index.wrapping_add(table_step);
+                    v
+                };
+                let size = word();
+                let idst = word() & 0x07FF_FFFF;
+                let isrc_raw = word();
                 let last = isrc_raw & 0x8000_0000 != 0;
                 let isrc = isrc_raw & 0x07FF_FFFF;
-                let idst = idst & 0x07FF_FFFF;
-                let count = dma_count(req.channel, size);
-                if !bios_src(isrc) {
+                let count = indirect_count(size);
+                if !bios_src(isrc) && !scu_dma_illegal(isrc, idst) {
                     let mut cost = 0u64;
                     scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
                 }
-                index = index.wrapping_add(0xC);
                 walked += 1;
-                if last || walked >= MAX_INDIRECT_TRIPLETS {
+                // A non-advancing table (ReadAdd clear) re-reads the same
+                // triplet forever on hardware; one pass already produced the
+                // observable result, so stop instead of hanging the host.
+                if last || walked >= MAX_INDIRECT_TRIPLETS || table_step == 0 {
                     break;
                 }
             }
@@ -301,8 +410,10 @@ fn scu_dma_illegal(src: u32, dst: u32) -> bool {
     )
 }
 
-/// SCU DMA byte count: a programmed 0 means the channel's maximum (1 MiB for
-/// level 0, 4 KiB for levels 1/2), per the SCU manual.
+/// Direct-mode SCU DMA byte count: a programmed 0 means the channel's maximum
+/// (1 MiB for level 0, 4 KiB for levels 1/2) — Mednafen `CheckDMAStart`
+/// `(!StartByteCount) ? ((level) ? 0x1000 : 0x100000)`. The register write
+/// already masks the count to the level's 20/12-bit width.
 fn dma_count(channel: usize, programmed: u32) -> u32 {
     if programmed != 0 {
         programmed
@@ -310,6 +421,52 @@ fn dma_count(channel: usize, programmed: u32) -> u32 {
         0x0010_0000
     } else {
         0x0000_1000
+    }
+}
+
+/// Indirect-mode SCU DMA byte count from a table size word: masked to 20 bits,
+/// 0 meaning 0x100000 for **every** level (Mednafen `NextIndirect`:
+/// `tmp[0] &= 0xFFFFF; if(!tmp[0]) tmp[0] = 0x100000;`). Unmasked, a size word
+/// with high bits set would request a multi-gigabyte transfer.
+fn indirect_count(size_word: u32) -> u32 {
+    match size_word & 0x000F_FFFF {
+        0 => 0x0010_0000,
+        n => n,
+    }
+}
+
+/// Lets a sector source that was moved out of a CD-block (`take_disc`) be
+/// re-inserted through the generic [`crate::cd_block::CdBlock::insert_disc`]
+/// — used by [`Saturn::reset`] to reset the CD-block engine while keeping the
+/// disc. Each reset adds one forwarding hop; sector reads are 75 Hz, so the
+/// indirection is immaterial.
+impl crate::disc::SectorSource for Box<dyn crate::disc::SectorSource> {
+    fn toc(&self) -> [u8; 408] {
+        (**self).toc()
+    }
+    fn first_track(&self) -> u8 {
+        (**self).first_track()
+    }
+    fn last_track(&self) -> u8 {
+        (**self).last_track()
+    }
+    fn lead_out_fad(&self) -> u32 {
+        (**self).lead_out_fad()
+    }
+    fn track_at_fad(&self, fad: u32) -> Option<crate::disc::TrackInfo> {
+        (**self).track_at_fad(fad)
+    }
+    fn read_sector(&self, fad: u32, out: &mut [u8]) -> bool {
+        (**self).read_sector(fad, out)
+    }
+    fn read_full_sector(&self, fad: u32, out: &mut [u8]) -> usize {
+        (**self).read_full_sector(fad, out)
+    }
+    fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
+        (**self).subheader(fad)
+    }
+    fn fingerprint(&self) -> u64 {
+        (**self).fingerprint()
     }
 }
 
@@ -330,8 +487,8 @@ fn scu_transfer(
     // A 32-bit source read feeds two 16-bit bus writes; side-effecting sources
     // like the CD data port must not be re-read for the low half.
     let mut src_word: Option<(u32, u32)> = None;
-    let mut i = 0u32;
-    while i < bytes {
+    let mut i = 0u64;
+    while i < u64::from(bytes) {
         let src_addr = src & 0x07FF_FFFC;
         let word = match src_word {
             Some((addr, word)) if addr == src_addr => word,
@@ -463,11 +620,27 @@ impl Saturn {
         Self::new(vec![0u8; 512 * 1024])
     }
 
-    /// Pull PC and SP for both CPUs from the BIOS reset vector
-    /// (`0x00000000` for PC, `0x00000004` for SP) and clear pipeline
-    /// state. On real hardware the slave is held in reset until the
-    /// master writes the SMPC `SETSL` command — for M2 we bring both
-    /// up immediately; SMPC-driven slave hold-down arrives in M3.
+    /// System reset (Mednafen `SS_Reset(false)`): reset both SH-2s — PC/SP from
+    /// the BIOS reset vector (`0x00000000`/`0x00000004`), pipeline + cache
+    /// cleared — and return every peripheral to its power-on state (SCU incl.
+    /// DMA/IMS/IST, SMPC, VDP1, VDP2, SCSP + sound CPU off, the CD-block
+    /// engine). The slave is then held in reset until the BIOS releases it with
+    /// SMPC `SSHON`.
+    ///
+    /// **Time stays monotonic.** The global clock is *not* restarted: both
+    /// CPUs resume at the reset cycle, their lazy FRT/WDT epochs and the
+    /// CD-block timer are re-anchored there, and the bus timing restarts from
+    /// it. Restarting the CPUs at cycle 0 while the CD timer, SMPC INTBACK
+    /// completion, RTC origin and VDP1 draw timestamps kept their old values
+    /// froze the CD-block until the clock caught up and could make the lazy
+    /// FRT spin over a ~2^61-tick delta.
+    ///
+    /// Kept across the reset (they are media / battery-backed / host
+    /// configuration): the BIOS, the inserted disc (re-inserted into the reset
+    /// CD-block, so it is recognised again as at power-on), the cartridge,
+    /// internal backup RAM, work RAM contents, and the SMPC region, port
+    /// devices, pad/mouse state, RTC and SMEM. On a fresh machine (cycle 0)
+    /// this is exactly the power-on state.
     pub fn reset(&mut self) {
         // Destructure self into disjoint borrows so the bus borrow doesn't
         // collide with the scheduler-entity borrow.
@@ -476,14 +649,50 @@ impl Saturn {
             scheduler,
             master_id,
             slave_id,
+            cd_id,
+            scsp_debt,
             ..
         } = self;
-        // The CPUs' cycle counters restart at 0 (`Pipeline::new`), so the
-        // bus-timing timestamps anchored to them must restart too — a stale
-        // mem_ts far in the "future" would stall the reset machine for ages.
+        // The reset instant: no entity may move backwards past it.
+        let now = {
+            let m = scheduler.entity(*master_id).sh2();
+            let s = scheduler.entity(*slave_id).sh2();
+            let slave_cyc = if s.is_halted() {
+                0
+            } else {
+                s.cpu.pipeline.cycles
+            };
+            m.cpu.pipeline.cycles.max(slave_cyc).max(bus.cycle)
+        };
+        // Peripherals back to power-on. Media and battery state survive.
+        bus.scu.reset(now);
+        bus.smpc.reset();
+        bus.vdp1 = crate::vdp1::Vdp1::new();
+        bus.vdp2 = crate::vdp2::Vdp2::new();
+        bus.scsp = crate::scsp::Scsp::new();
+        *scsp_debt = 0;
+        let disc = bus.cd_block.take_disc();
+        bus.cd_block = crate::cd_block::CdBlock::new();
+        if let Some(disc) = disc {
+            bus.cd_block.insert_disc(disc);
+        }
+        scheduler.entity_mut(*cd_id).cd_block_mut().rebase(now);
+        bus.slave_input_capture = false;
+        bus.master_input_capture = false;
+        // The bus timeline restarts at the reset instant (a stale mem_ts or
+        // write-buffer completion would stall the reset machine).
         bus.timing = Default::default();
-        scheduler.entity_mut(*master_id).sh2_mut().cpu.reset(bus);
-        scheduler.entity_mut(*slave_id).sh2_mut().cpu.reset(bus);
+        bus.cycle = now;
+        for id in [*master_id, *slave_id] {
+            let cpu = &mut scheduler.entity_mut(id).sh2_mut().cpu;
+            cpu.reset(bus);
+            // `Cpu::reset` restarts the pipeline at cycle 0; resume at the
+            // reset instant and re-anchor the lazy FRT/WDT epoch there (as
+            // `release_slave` does), or the next timer update would see a
+            // delta from a stale `lastts`.
+            cpu.pipeline.cycles = now;
+            cpu.onchip.reset_timer_epoch(now);
+        }
         // The slave SH-2 reads BCR1 bit 15 (SH7604 master/slave bit) = 1, so the
         // BIOS cold-start takes the slave path and does NOT re-initialize work
         // RAM. Without this, an SSHON-released slave re-runs the WRAM init and
@@ -495,7 +704,7 @@ impl Saturn {
             .cpu
             .set_bsc_slave(true);
         // Real Saturn power-on: slave is held in reset until the BIOS
-        // sends SMPC SETSL. Mirror that here.
+        // sends SMPC SSHON. Mirror that here.
         scheduler.entity_mut(*slave_id).sh2_mut().set_halted(true);
         scheduler.entity_mut(*master_id).sh2_mut().set_halted(false);
     }
@@ -804,62 +1013,52 @@ impl Saturn {
             bus,
             scheduler,
             master_id,
+            slave_id,
             ..
         } = self;
-        // Phase 2B: sample the SCU IRL before the instruction, exactly as
-        // `step_cpus` does on the real run, so the single-step debug path and
-        // `run_for` deliver SCU interrupts at the same (per-instruction) point.
-        let cd_active = bus.cd_block.irq_active();
-        bus.scu.set_cd_int(cd_active);
-        let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
-        let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
-        let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
-        let in_delay_slot = scheduler.entity(*master_id).sh2().cpu.next_is_delay_slot();
-        if !in_delay_slot && let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
-            trace_scu_interrupt(
-                "step",
-                source,
-                level,
-                imask,
-                pc,
-                cycle,
-                bus.scu.ims,
-                bus.scu.ist,
-            );
-            scheduler
-                .entity_mut(*master_id)
-                .sh2_mut()
-                .cpu
-                .onchip
-                .intc
-                .raise_external(level, source.vector());
+        // Exactly the per-instruction sequence `step_cpus` runs for the master:
+        // interrupt sampling (the shared gate), the step itself (which publishes
+        // the cycle + PC to the bus and honours breakpoints), the FTI pulse and
+        // the trigger-point DMA drain — so single-stepping delivers interrupts
+        // and side effects at the same instruction as `run_for`.
+        forward_scu_irq(bus, scheduler.entity_mut(*master_id).sh2_mut(), "step");
+        let before = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+        bus.cur_is_slave = false;
+        scheduler.entity_mut(*master_id).step(bus);
+        apply_fti(bus, scheduler, *master_id, *slave_id);
+        if bus.scu.dma_pending() {
+            drain_dma(bus);
         }
-        let cpu = &mut scheduler.entity_mut(*master_id).sh2_mut().cpu;
-        // Mirror Sh2Entity::step: publish the current cycle to the bus so
-        // time-varying peripheral reads (SMPC SF INTBACK completion) settle
-        // at the exact instruction that reads them.
-        bus.cycle = cpu.pipeline.cycles;
-        cpu.step(bus)
+        let after = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+        (after - before) as u32
     }
 
     /// Debug-only: step the **slave** SH-2 one instruction (master frozen),
     /// for inspecting slave code. Returns 0 if the slave is halted. The slave
-    /// receives no SCU interrupt (those go to the master), so this is a plain
-    /// step; bus writes still trigger the `bw` watchpoint with the slave's PC.
+    /// receives no SCU interrupt (those go to the master); otherwise it runs
+    /// the same per-instruction sequence as in `step_cpus` (FTI pulse,
+    /// trigger-point DMA drain), and bus writes still trigger the `bw`
+    /// watchpoint with the slave's PC.
     pub fn debug_step_slave(&mut self) -> u32 {
         let Self {
             bus,
             scheduler,
+            master_id,
             slave_id,
             ..
         } = self;
-        let s = scheduler.entity_mut(*slave_id).sh2_mut();
-        if s.is_halted() {
+        if scheduler.entity(*slave_id).sh2().is_halted() {
             return 0;
         }
-        bus.cycle = s.cpu.pipeline.cycles;
-        bus.step_pc = s.cpu.regs.pc;
-        s.cpu.step(bus)
+        let before = scheduler.entity(*slave_id).sh2().cpu.pipeline.cycles;
+        bus.cur_is_slave = true;
+        scheduler.entity_mut(*slave_id).step(bus);
+        apply_fti(bus, scheduler, *master_id, *slave_id);
+        if bus.scu.dma_pending() {
+            drain_dma(bus);
+        }
+        let after = scheduler.entity(*slave_id).sh2().cpu.pipeline.cycles;
+        (after - before) as u32
     }
 
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
@@ -897,13 +1096,6 @@ impl Saturn {
         }
     }
 
-    /// Recompute the VDP2 raster-timing registers — `VCNT` and the
-    /// `TVSTAT` VBLANK/HBLANK/ODD-field bits — from the global cycle,
-    /// and raise the SCU VBlank-IN interrupt on the active→VBLANK edge.
-    /// The BIOS polls these to synchronize with the display; a static
-    /// stub leaves it unable to sync (it spins after INTBACK). Called
-    /// between scheduler batches, so the registers track the raster to
-    /// ~`SMPC_POLL_QUANTUM` granularity.
     /// The cycle-exact raster register state at global cycle `now` for the given
     /// horizontal resolution: `(vcnt, tvstat_raster_bits)`, where the bits are
     /// VBLANK (0x0008) | HBLANK (0x0004) | ODD (0x0002). The raster registers are
@@ -937,6 +1129,13 @@ impl Saturn {
         (line as u16, bits)
     }
 
+    /// Recompute the VDP2 raster-timing registers — `VCNT` and the
+    /// `TVSTAT` VBLANK/HBLANK/ODD-field bits — from the global cycle, and
+    /// raise the raster-driven SCU interrupts / DMA factors on their edges
+    /// (VBlank-IN/-OUT, Timer 0/1, HBlank-IN). The BIOS polls these to
+    /// synchronize with the display. Called between scheduler batches, which
+    /// are clamped to the VBlank edges, so VBLANK is cycle-exact and the
+    /// other bits track the raster to ≤ `SMPC_POLL_QUANTUM` granularity.
     fn update_video_timing(&mut self) {
         let now = self.now();
         let prev = self.bus.vdp2.regs.read16(0x004);
@@ -974,8 +1173,9 @@ impl Saturn {
         if !vblank && (prev & 0x0008) != 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankOut);
             self.bus.scu.trigger_dma_factor(1);
-            #[cfg(not(test))]
-            if std::env::var_os("SAT_INTC_TRACE").is_some() && now > 130_000_000 {
+            if let Some(after) = intc_trace_after()
+                && now >= after
+            {
                 eprintln!("RAISE VBlankOut now={now} IMS={:08X}", self.bus.scu.ims);
             }
         }
@@ -1077,6 +1277,12 @@ impl Saturn {
         let mut next =
             Self::cycles_to_next_vblank_in(now).min(Self::cycles_to_next_vblank_out(now));
         if let Some(t) = self.bus.smpc.intback_complete_at
+            && t > now
+        {
+            next = next.min(t - now);
+        }
+        // The INTBACK phase-end interrupt lands at its exact cycle too.
+        if let Some(t) = self.bus.smpc.intback_irq_at
             && t > now
         {
             next = next.min(t - now);
@@ -1186,25 +1392,10 @@ impl Saturn {
             };
         }
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
-        // instruction flagged on the bus — pulse the *sibling's* FRT now so it
-        // sees the input-capture on its next instruction, not up to a batch
-        // (≤256 cy) later (M13 A1, incremental: FTI as a per-instruction event).
+        // instruction flagged on the bus (see [`apply_fti`]).
         macro_rules! apply_fti {
             () => {
-                if core::mem::take(&mut bus.slave_input_capture) {
-                    scheduler
-                        .entity_mut(*slave_id)
-                        .sh2_mut()
-                        .cpu
-                        .fti_input_capture();
-                }
-                if core::mem::take(&mut bus.master_input_capture) {
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .fti_input_capture();
-                }
+                apply_fti(bus, scheduler, *master_id, *slave_id)
             };
         }
         // Timing-sensitivity probe knob: run up to `batch` master instructions
@@ -1226,50 +1417,9 @@ impl Saturn {
                 while scheduler.entity(*cd_id).next_deadline() <= mcyc {
                     scheduler.entity_mut(*cd_id).step(bus);
                 }
-                // CD-block external interrupt (Source::Cd, vector 0x50, level 7):
-                // assert/deassert the SCU level from the live CD HIRQ before each
-                // instruction (Mednafen `RecalcIRQOut`). VF2's GFS file library is
-                // driven by this interrupt; without it the intro loops forever.
-                let cd_active = bus.cd_block.irq_active();
-                bus.scu.set_cd_int(cd_active);
-                // Phase 2B: sample the SCU interrupt line at the master's *current*
-                // SR.imask, every instruction. The SCU presents the highest-priority
-                // unmasked pending source as an IRL the master samples each cycle, so
-                // an interrupt becomes deliverable at the exact instruction imask
-                // drops below its level — not up to a full batch late, as the old
-                // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
-                // per-source vector (0x40 + index) is latched, not the 64+level
-                // auto-vector.
-                // One borrow of the master entity per instruction for the two
-                // gating reads (imask + delay-slot). `pc`/`cycle` are only needed
-                // for the interrupt-fire trace, so they're read inside that (rare)
-                // branch — not on every instruction.
-                let master = scheduler.entity(*master_id).sh2();
-                let imask = master.cpu.regs.sr.imask();
-                let in_delay_slot = master.cpu.next_is_delay_slot();
-                if !in_delay_slot
-                    && let Some((source, level)) = bus.scu.take_pending_interrupt(imask)
-                {
-                    let master = scheduler.entity(*master_id).sh2();
-                    let (pc, cycle) = (master.cpu.regs.pc, master.cpu.pipeline.cycles);
-                    trace_scu_interrupt(
-                        "run",
-                        source,
-                        level,
-                        imask,
-                        pc,
-                        cycle,
-                        bus.scu.ims,
-                        bus.scu.ist,
-                    );
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .onchip
-                        .intc
-                        .raise_external(level, source.vector());
-                }
+                // Sample the CD/SCU interrupt lines and forward a pending source
+                // unless the master is in a delay slot (the single gate).
+                forward_scu_irq(bus, scheduler.entity_mut(*master_id).sh2_mut(), "run");
                 // Master leads by one instruction.
                 before_master(scheduler.entity(*master_id).sh2());
                 // Debug master PC+cycle stream (cost-lockstep vs Mednafen), capped.
@@ -1360,29 +1510,39 @@ impl Saturn {
             // cycle-exactly rather than up to a batch late — see `batch_size`.
             let batch = self.batch_size(now, remaining);
             self.step_cpus(now + batch);
-            // Feed the SCSP the master's ACTUAL advance, not the planned batch:
-            // the last instruction overshoots the batch edge by its cost (up to
-            // ~50 cycles of M12-t8 wait-states against a <=256-cycle batch), and
-            // a per-batch `run(batch)` dropped that overshoot from the SCSP
-            // timeline forever - in VF2 fights (mailbox polls at +48/read) the
-            // sound subsystem fell ~25% behind real time: slow BGM, and audio
-            // production of ~553 samples/frame vs 738 starved the frontend's
-            // pacing reserve (the user-felt "FPS downgrade").
-            self.scsp_debt += self.now() - now;
-            const SCSP_CHUNK: u64 = 256;
-            while self.scsp_debt >= SCSP_CHUNK {
-                self.feed_cd_audio(SCSP_CHUNK);
-                self.bus.scsp.run(SCSP_CHUNK);
-                self.scsp_debt -= SCSP_CHUNK;
-            }
-            self.update_video_timing();
-            self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
-            self.drain_scu_dsp();
-            self.drain_vdp1();
-            self.drain_scsp();
-            self.drain_input_capture();
+            self.post_batch(now);
         }
+    }
+
+    /// The between-batch work shared by [`run_for`](Self::run_for) and
+    /// [`run_for_traced`](Self::run_for_traced) (one definition so the trace
+    /// tool can never diverge from the real run): pay the SCSP the master's
+    /// actual advance since `batch_start`, settle the raster, then run the
+    /// peripheral drains.
+    fn post_batch(&mut self, batch_start: u64) {
+        // Feed the SCSP the master's ACTUAL advance, not the planned batch:
+        // the last instruction overshoots the batch edge by its cost (up to
+        // ~50 cycles of M12-t8 wait-states against a <=256-cycle batch), and
+        // a per-batch `run(batch)` dropped that overshoot from the SCSP
+        // timeline forever - in VF2 fights (mailbox polls at +48/read) the
+        // sound subsystem fell ~25% behind real time: slow BGM, and audio
+        // production of ~553 samples/frame vs 738 starved the frontend's
+        // pacing reserve (the user-felt "FPS downgrade"). The debt is banked
+        // and paid in fixed chunks (see `scsp_debt`).
+        self.scsp_debt += self.now() - batch_start;
+        const SCSP_CHUNK: u64 = 256;
+        while self.scsp_debt >= SCSP_CHUNK {
+            self.feed_cd_audio(SCSP_CHUNK);
+            self.bus.scsp.run(SCSP_CHUNK);
+            self.scsp_debt -= SCSP_CHUNK;
+        }
+        self.update_video_timing();
+        self.drain_smpc();
+        let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
+        self.drain_scu_dsp();
+        self.drain_vdp1();
+        self.drain_scsp();
+        self.drain_input_capture();
     }
 
     /// Debug-only: like [`run_for`](Self::run_for), but append the master
@@ -1409,21 +1569,7 @@ impl Saturn {
                     pcs.push(cpu.regs.pc);
                 }
             });
-            // See run_for: banked debt, paid in fixed chunks.
-            self.scsp_debt += self.now() - now;
-            const SCSP_CHUNK: u64 = 256;
-            while self.scsp_debt >= SCSP_CHUNK {
-                self.feed_cd_audio(SCSP_CHUNK);
-                self.bus.scsp.run(SCSP_CHUNK);
-                self.scsp_debt -= SCSP_CHUNK;
-            }
-            self.update_video_timing();
-            self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
-            self.drain_scu_dsp();
-            self.drain_vdp1();
-            self.drain_scsp();
-            self.drain_input_capture();
+            self.post_batch(now);
         }
     }
 
@@ -1431,8 +1577,13 @@ impl Saturn {
     /// effect. Called from `run_for` between scheduler batches.
     fn drain_smpc(&mut self) {
         // Fallback: drop SF once a pending INTBACK's execution time has
-        // elapsed, in case nothing read SMPC to settle it on-access.
-        self.bus.smpc.settle_intback(self.now());
+        // elapsed, and raise its phase-end interrupt, in case nothing read
+        // SMPC to settle it on-access (the batch is clamped to both edges).
+        let now = self.now();
+        self.bus.smpc.settle_intback(now);
+        if self.bus.smpc.take_intback_irq(now) {
+            self.bus.scu.raise(crate::scu::Source::Smpc);
+        }
         while let Some(cmd) = self.bus.smpc.take_pending() {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
@@ -1461,15 +1612,17 @@ impl Saturn {
                     // is `(SR & ~0x80 & ~NPE) | 0x0F`, with NPE (0x20) set iff
                     // peripheral data was also requested — *not* the old
                     // `0x40 | stage<<5` (bit 6 set, low nibble 0), which the
-                    // BIOS's INTBACK state machine reads. Raise the SMPC
-                    // interrupt now so the response is ready the moment SF
-                    // drops, and keep SF busy for the request-dependent
-                    // execution time (`intback_busy_us`); `settle_intback`
+                    // BIOS's INTBACK state machine reads. Schedule the SMPC
+                    // interrupt for the end of the phase that filled OREG
+                    // (Mednafen raises it after the phase's clocks, not at
+                    // dispatch; a request for neither phase raises none), and
+                    // keep SF busy for the request-dependent execution time
+                    // (`intback_busy_us`); `settle_intback`
                     // clears it on the exact instruction that reads SMPC past
                     // completion.
                     let ireg0 = self.bus.smpc.ireg[0];
                     let ireg1 = self.bus.smpc.ireg[1];
-                    self.bus.smpc.pmode = ireg0 >> 4;
+                    self.bus.smpc.pmode = ireg1 >> 4;
                     // The status phase runs ONLY if IREG0's low nibble requests
                     // it (Mednafen `if(IREG[0] & 0xF)`); SR_NPE ("peripheral data
                     // follows, await CONTINUE") is set ONLY inside it. A
@@ -1493,19 +1646,30 @@ impl Saturn {
                         // staged CONTINUE handshake.
                         self.bus.smpc.intback_stage = want_periph as u8;
                     } else if want_periph {
-                        // Peripheral-only: fill OREG from byte 0 now; SR = "last
-                        // data" (0x80 | pmode); no CONTINUE expected.
+                        // Peripheral-only: fill OREG from byte 0 now; SR = the
+                        // final-block value; no CONTINUE expected.
                         self.respond_to_intback_peripheral();
-                        self.bus.smpc.sr = 0x80 | self.bus.smpc.pmode;
+                        self.bus.smpc.sr = intback_last_block_sr(&self.bus.smpc);
                         self.bus.smpc.intback_stage = 0;
                     } else {
                         // Neither status nor peripheral requested: a bare ack.
                         self.bus.smpc.sr &= !0xA0;
                         self.bus.smpc.intback_stage = 0;
                     }
+                    let now = self.now();
                     let busy = us_to_cycles(intback_busy_us(ireg0, ireg1));
-                    self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
-                    self.bus.scu.raise(crate::scu::Source::Smpc);
+                    self.bus.smpc.intback_complete_at = Some(now.saturating_add(busy));
+                    // The status phase ends after its own clocks even when
+                    // peripheral data follows on CONTINUE.
+                    let irq_phase = if want_status {
+                        Some(intback_busy_us(ireg0, 0))
+                    } else if want_periph {
+                        Some(intback_busy_us(0, ireg1))
+                    } else {
+                        None
+                    };
+                    self.bus.smpc.intback_irq_at =
+                        irq_phase.map(|us| now.saturating_add(us_to_cycles(us)));
                     continue; // do NOT mark_command_done (SF stays busy)
                 }
                 SmpcCommand::SetTime => {
@@ -1532,7 +1696,10 @@ impl Saturn {
                 // hits — SYS slot 0x320). We don't model the 26/28 MHz divisor
                 // switch, but we reproduce the observable handshake: halt the
                 // slave and NMI the master so the SYS call returns.
+                SmpcCommand::CdOn => self.bus.smpc.cd_on = true,
+                SmpcCommand::CdOff => self.bus.smpc.cd_on = false,
                 SmpcCommand::CkChg352 | SmpcCommand::CkChg320 => {
+                    self.bus.smpc.clock_352 = cmd == SmpcCommand::CkChg352;
                     self.halt_slave();
                     self.master_mut()
                         .onchip
@@ -1546,23 +1713,21 @@ impl Saturn {
             self.bus.smpc.mark_command_done();
         }
 
-        // INTBACK peripheral continuation (MAME `intback_continue_request`),
-        // requested by the host writing the CONTINUE bit to IREG0. Fill the
-        // peripheral OREG and advance the staged SR: `0xC0 | pmode` ("more
-        // data", stage 1 → 2) then `0x80 | pmode` ("last", stage 2 → 0).
+        // INTBACK peripheral continuation, requested by the host writing the
+        // CONTINUE bit to IREG0 after a status phase that set SR.NPE. Mednafen
+        // `smpc.cpp` (the JR loop) writes the peripheral report and asks for
+        // another CONTINUE only when it overflows the 32-byte OREG block; every
+        // device we model fits in one block (two 3D pads = 16 bytes), so this
+        // single phase is the last: SR.NPE clear, PDL set, sequence over. (It
+        // used to stage a second, redundant phase that re-read — and zeroed —
+        // the mouse deltas.)
         if self.bus.smpc.take_intback_continue() {
             self.respond_to_intback_peripheral();
-            let pmode = self.bus.smpc.pmode;
-            if self.bus.smpc.intback_stage == 2 {
-                self.bus.smpc.sr = 0x80 | pmode;
-                self.bus.smpc.intback_stage = 0;
-            } else {
-                self.bus.smpc.sr = 0xC0 | pmode;
-                self.bus.smpc.intback_stage += 1;
-            }
-            let busy = us_to_cycles(700);
-            self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
-            self.bus.scu.raise(crate::scu::Source::Smpc);
+            self.bus.smpc.sr = intback_last_block_sr(&self.bus.smpc);
+            self.bus.smpc.intback_stage = 0;
+            let done = self.now().saturating_add(us_to_cycles(700));
+            self.bus.smpc.intback_complete_at = Some(done);
+            self.bus.smpc.intback_irq_at = Some(done); // raised at the phase end
         }
     }
 
@@ -1571,20 +1736,26 @@ impl Saturn {
     /// system state". Peripheral data is *not* here — it comes in the
     /// separate continuation phase ([`respond_to_intback_peripheral`]).
     ///
+    /// OREG10/11 are computed live from the machine state (Mednafen `smpc.cpp`
+    /// CMD_INTBACK): OREG10 = `0x24 | 28MHz<<6 | slave_on<<4 | 1<<3 (MSHNMI) |
+    /// 1<<1 (SYSRES) | sound_on`, OREG11 = `cd_on<<6 | 1<<1`.
+    ///
     /// ```text
     ///   OREG0      bit7 STE (RTC valid) | bit6 RESD (reset disabled)
     ///   OREG1..7   RTC, BCD: year-hi, year-lo, weekday<<4|month, day,
     ///              hour, minute, second
     ///   OREG8      cartridge code (none)
     ///   OREG9      area code — 0x04 = North America (BIOS halts on mismatch)
-    ///   OREG10     system status 1 — 0x34 (MSHNMI/SYSRES/SOUNDRES)
-    ///   OREG11     system status 2 (CDRES) — 0
+    ///   OREG10     system status 1 (DOTSEL/SLAVE/MSHNMI/SYSRES/SNDRES)
+    ///   OREG11     system status 2 (CDRES)
     ///   OREG12..15 SMEM (SMPC backup memory) — 0 (none stored)
     ///   OREG16..30 undefined — 0xFF (MAME)
     ///   OREG31     0x10 — echo of the issued command (INTBACK)
     /// ```
     fn respond_to_intback_status(&mut self) {
         let now = self.now();
+        let slave_on = !self.slave_is_halted();
+        let sound_on = self.bus.scsp.running;
         let s = &mut self.bus.smpc;
         s.oreg[0] = 0x80;
         // OREG1..7 — live RTC, advanced from the (host- or SETTIME-set) base
@@ -1594,12 +1765,13 @@ impl Saturn {
         s.oreg[8] = 0x00; // cartridge
         // OREG9 area code — meaningful: the BIOS halts on a region mismatch.
         s.oreg[9] = s.region;
-        // REVIEW(magic): OREG10 = 0x34 (MSHNMI|SYSRES|SOUNDRES, dot-select 0)
-        // is taken literally from MAME `resolve_intback`. The bit meanings are
-        // spec-defined (SMPC manual), but this exact post-reset value is
-        // unverified vs hardware and had no observed boot effect.
-        s.oreg[10] = 0x34; // system status 1
-        s.oreg[11] = 0x00; // system status 2
+        s.oreg[10] = 0x24
+            | (u8::from(s.clock_352) << 6)
+            | (u8::from(slave_on) << 4)
+            | (1 << 3) // master NMI
+            | (1 << 1) // SYSRES
+            | u8::from(sound_on); // system status 1
+        s.oreg[11] = (u8::from(s.cd_on) << 6) | (1 << 1); // system status 2
         // OREG12..15 — SMPC backup memory (SMEM), as written by SETSMEM.
         s.oreg[12..16].copy_from_slice(&s.smem);
         // OREG16..30 — undefined; MAME writes 0xFF.
@@ -1732,9 +1904,10 @@ impl Saturn {
         self.bus.smpc.set_rtc_unix(unix_secs, now);
     }
 
-    /// Insert a disc image into the CD-block. The drive moves to PAUSE at the
-    /// start of the disc; the BIOS/game can then read the TOC, query sessions,
-    /// and (in later M7 phases) read sectors and boot the game.
+    /// Insert a disc image (or live drive) into the CD-block. The drive spins
+    /// up (reporting BUSY for ~1 s, as at power-on) and settles to PAUSE at the
+    /// start of the disc; the BIOS/game then reads the TOC, authenticates and
+    /// boots it.
     pub fn insert_disc<S: crate::disc::SectorSource + 'static>(&mut self, source: S) {
         self.bus.cd_block.insert_disc(source);
     }
@@ -1927,18 +2100,6 @@ impl Saturn {
         self.scheduler.now()
     }
 
-    /// Run one NTSC frame (≈476 932 SH-2 cycles at 60 Hz) and produce
-    /// the rendered framebuffer. The VDP2 raster registers (VCNT /
-    /// TVSTAT) and the VBlank-IN interrupt are maintained by
-    /// [`Self::update_video_timing`] from the run loop, so this just
-    /// runs the active region, snapshots the frame at the active→VBLANK
-    /// boundary, and runs the VBLANK region.
-    ///
-    /// Writes RGBA8888 into `out`, which must be at least
-    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes. Returns the active display size
-    /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
-    /// pixels are packed tightly with row stride = `width`, so the caller uploads
-    /// `width × height` with a `width × 4` pitch.
     /// Advance one NTSC frame of emulation **without rendering** — the compute
     /// half of [`Self::run_frame`]. The frontend's render-pipeline worker
     /// composites the frame on another core from a cloned VDP snapshot, so the
@@ -1949,20 +2110,20 @@ impl Saturn {
         self.run_for(CYCLES_PER_FRAME);
     }
 
-    /// Advance one NTSC frame and composite it into `out`, returning the active
-    /// `(width, height)`. A single `run_for(CYCLES_PER_FRAME)` followed by a
-    /// render — see the note below on why the frame must not be split.
+    /// Advance one NTSC frame (`CYCLES_PER_FRAME` ≈ 479 151 SH-2 cycles,
+    /// ≈59.76 Hz) and composite it into `out`, returning the active
+    /// `(width, height)`. The VDP2 raster registers and the raster interrupts
+    /// are maintained by [`Self::update_video_timing`] from the run loop.
+    ///
+    /// Writes RGBA8888 into `out`, which must be at least
+    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes. Returns the active display size
+    /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
+    /// pixels are packed tightly with row stride = `width`, so the caller
+    /// uploads `width × height` with a `width × 4` pitch.
+    ///
+    /// The frame is exactly **one** `run_for(CYCLES_PER_FRAME)` followed by a
+    /// read-only render — never split; see the note in the body.
     pub fn run_frame(&mut self, out: &mut [u8]) -> (usize, usize) {
-        // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
-        // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short
-        // (per-line integer truncation — the very drift `VBLANK_IN_CYCLE`'s
-        // doc-comment warns about), so it forces a drain at a point that is
-        // NOT an event-clamp edge, forwarding SCU interrupts ~194 cycles early
-        // and diverging master-SH-2 execution from `run_for(CYCLES_PER_FRAME)`.
-        // That divergence sent VF2 down a different CD-read path that stalled.
-        // Splitting at the VBlank-IN edge (which `run_for` clamps to anyway)
-        // makes `run_frame` == `run_for(full frame)` + a read-only render at
-        // the active→VBLANK boundary.
         // Advance the WHOLE frame in one `run_for`, then render. Do NOT split
         // into run_for(active)+run_for(vblank): `run_for`'s `SMPC_POLL_QUANTUM`
         // batch grid (hence its drain/interrupt-forwarding points) is anchored
@@ -2009,7 +2170,8 @@ impl Saturn {
 mod tests {
     use super::{
         CYCLES_PER_FRAME, CYCLES_PER_LINE, LINES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count,
-        drain_dma, hblank_active, intback_busy_us, scu_dma_bus, scu_dma_illegal, us_to_cycles,
+        drain_dma, hblank_active, indirect_count, intback_busy_us, scu_dma_bus, scu_dma_illegal,
+        us_to_cycles,
     };
 
     #[test]
@@ -2040,6 +2202,70 @@ mod tests {
         assert_eq!(dma_count(0, 0), 0x0010_0000);
         assert_eq!(dma_count(1, 0), 0x0000_1000);
         assert_eq!(dma_count(2, 0), 0x0000_1000);
+    }
+
+    #[test]
+    fn indirect_count_masks_to_20_bits_with_zero_as_one_mib() {
+        assert_eq!(indirect_count(0x40), 0x40);
+        assert_eq!(indirect_count(0xFFF0_0010), 0x10, "high bits ignored");
+        assert_eq!(indirect_count(0), 0x0010_0000);
+        assert_eq!(
+            indirect_count(0x0010_0000),
+            0x0010_0000,
+            "bit 20 masked → 0 → max"
+        );
+    }
+
+    /// Program SCU level-1 indirect DMA over a table at High WRAM 0x0600_0000
+    /// and drain it. `ad` is D1AD (bit 8 = ReadAdd).
+    fn run_indirect(sat: &mut Saturn, table: &[u32], ad: u32) {
+        for (i, w) in table.iter().enumerate() {
+            sat.bus.high_wram.write32(i as u32 * 4, *w);
+        }
+        sat.bus.scu.write32(0x24, 0x0600_0000); // D1W = table base
+        sat.bus.scu.write32(0x2C, ad); // D1AD
+        sat.bus.scu.write32(0x34, (1 << 24) | (1 << 8) | 7); // indirect, WUP, manual
+        sat.bus.scu.write32(0x30, 0x101); // enable + go
+        drain_dma(&mut sat.bus);
+    }
+
+    #[test]
+    fn indirect_dma_masks_the_table_size_word() {
+        let mut sat = Saturn::with_blank_bios();
+        for i in 0..0x20u32 {
+            sat.bus.low_wram.write8(0x100 + i, 0xA0 + i as u8);
+        }
+        // Size word with garbage high bits: only the low 20 bits (0x10) count.
+        run_indirect(
+            &mut sat,
+            &[0xFFF0_0010, 0x05E0_0000, 0x8020_0100],
+            0x100 | 0x01, // ReadAdd, write +2
+        );
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_0000), 0xA0);
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_000F), 0xAF, "16 bytes copied");
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_0010), 0, "not one byte more");
+        // WUP writes back the advanced table pointer (3 words read).
+        assert_eq!(sat.bus.scu.channels[1].write_addr, 0x0600_000C);
+    }
+
+    #[test]
+    fn indirect_table_pointer_advances_only_with_read_add() {
+        let mut sat = Saturn::with_blank_bios();
+        sat.bus.low_wram.write8(0x100, 0x5A);
+        // ReadAdd clear: every word of the "triplet" is read from the same
+        // table address (Mednafen `CurTableAddr += ReadAdd ? 4 : 0`), and the
+        // written-back pointer stays at the base.
+        run_indirect(&mut sat, &[0x8020_0100], 0x01);
+        assert_eq!(sat.bus.scu.channels[1].write_addr, 0x0600_0000);
+    }
+
+    #[test]
+    fn indirect_dma_skips_an_illegal_same_bus_triplet() {
+        let mut sat = Saturn::with_blank_bios();
+        sat.bus.high_wram.write32(0x1000, 0xDEAD_BEEF);
+        // HWRAM -> HWRAM is a same-bus (C-bus) DMA: illegal, moves nothing.
+        run_indirect(&mut sat, &[4, 0x0600_2000, 0x8600_1000], 0x100 | 0x02);
+        assert_eq!(sat.bus.high_wram.read32(0x2000), 0);
     }
 
     #[test]
@@ -2093,7 +2319,7 @@ mod tests {
         sat.bus.scu.write32(0x08, 0x0000_0004); // D0C: one longword.
         sat.bus.scu.write32(0x0C, 0x0000_0001); // D0AD: fixed source, +2 dest.
         sat.bus.scu.write32(0x14, 0x0000_0007); // D0MD: manual start factor.
-        sat.bus.scu.write32(0x10, 1 << 8); // D0EN: DGO.
+        sat.bus.scu.write32(0x10, 0x101); // D0EN: enable + go.
         let halt = drain_dma(&mut sat.bus);
 
         assert_eq!(

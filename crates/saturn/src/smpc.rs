@@ -36,6 +36,11 @@
 //! bytes + [`analog`] X/Y/L/R channels; M13 E2). Unrecognised commands are queued and complete as no-ops so
 //! BIOS init code doesn't deadlock.
 //!
+//! The register file repeats every 0x80 bytes across the whole SMPC window
+//! (Mednafen `ss.cpp`: `SMPC_A = (A & 0x7F) >> 1`). Only the odd byte lane
+//! carries data: an even byte reads `0xFF` and a byte write to it is dropped
+//! (`DB = 0xFF00 | SMPC_Read(..)`; writes land only when 16-bit or odd).
+//!
 //! Register layout (offsets from `SMPC_BASE = 0x0010_0000`):
 //!
 //! ```text
@@ -61,19 +66,20 @@ pub enum Command {
     SshOn = 0x02,
     /// SSHOFF — halt the slave SH-2.
     SshOff = 0x03,
-    /// SNDON / SNDOFF — sound subsystem control. M3 no-op.
+    /// SNDON / SNDOFF — release / re-hold the SCSP's sound 68k.
     SndOn = 0x06,
     SndOff = 0x07,
-    /// CDON / CDOFF — CD block control. M3 no-op.
+    /// CDON / CDOFF — CD block on/off (reported in INTBACK OREG11).
     CdOn = 0x08,
     CdOff = 0x09,
-    /// SYSRES — system reset. M3 no-op; M4+ will route to Saturn::reset().
+    /// SYSRES — system reset. Recognised; not yet routed to `Saturn::reset`.
     SysRes = 0x0D,
-    /// CKCHG352 / CKCHG320 — clock change (PAL / NTSC). M3 no-op.
+    /// CKCHG352 / CKCHG320 — dot-clock change (352/704 vs 320/640 modes):
+    /// halts the slave and NMIs the master; the divisor is reported in INTBACK.
     CkChg352 = 0x0E,
     CkChg320 = 0x0F,
-    /// INTBACK — peripheral data fetch. M4 returns "no controller"
-    /// (see [`crate::system::Saturn`] INTBACK handling).
+    /// INTBACK — status and/or peripheral data fetch (see
+    /// [`crate::system::Saturn`]'s `drain_smpc`).
     IntBack = 0x10,
     /// SETTIME — set the RTC from IREG0..6 (see `system` command handling).
     SetTime = 0x16,
@@ -81,7 +87,7 @@ pub enum Command {
     SetSMem = 0x17,
     /// NMIREQ — assert NMI to master SH-2. Routed via INTC.
     NmiReq = 0x18,
-    /// RESENAB / RESDISA — reset button enable/disable. M3 no-op.
+    /// RESENAB / RESDISA — reset button enable/disable. Recognised, no effect.
     ResEnab = 0x19,
     ResDisa = 0x1A,
 }
@@ -132,7 +138,8 @@ pub struct Smpc {
     /// write; never cleared automatically. Useful for trace tooling.
     pub last_unknown_command: Option<u8>,
     /// Command queued by a write to COMREG, waiting for the Saturn
-    /// aggregate to process it. SF stays at 1 while this is `Some`.
+    /// aggregate to process it. (SF is whatever software pre-wrote; the
+    /// COMREG write does not set it.)
     pending: Option<Command>,
     /// INTBACK has a non-trivial execution time: the SMPC keeps SF busy for
     /// a request-dependent interval (see `system::intback_busy_us`) before it
@@ -144,14 +151,28 @@ pub struct Smpc {
     /// reference-derived and unverified — see the `REVIEW(magic)` on
     /// `intback_busy_us`.)
     pub intback_complete_at: Option<u64>,
-    /// INTBACK staged-peripheral protocol state (matches MAME `smpc.cpp`).
-    /// 0 = not in an INTBACK peripheral sequence; non-zero = a peripheral
-    /// transfer phase is in progress (the value drives the next `SR`). The
-    /// status phase sets it to `(IREG1 & 8) >> 3`; each CONTINUE advances it
-    /// (1 → 2 → 0), and BREAK clears it.
+    /// Global cycle at which the in-flight INTBACK phase raises the SCU SMPC
+    /// interrupt: the **end** of the phase that filled OREG (status: 92 + 952
+    /// SMPC clocks; peripheral: its scan), as Mednafen's `SCU_SetInt(SMPC)`
+    /// sits after each phase's `SMPC_EAT_CLOCKS` — not the instant the command
+    /// is dequeued. Taken by [`Smpc::take_intback_irq`].
+    pub intback_irq_at: Option<u64>,
+    /// INTBACK staged-peripheral protocol state. 0 = not in an INTBACK
+    /// peripheral sequence; 1 = the status phase returned and peripheral data
+    /// follows on the host's CONTINUE (`SR.NPE` set). The status phase sets it
+    /// to `(IREG1 & 8) >> 3`; the CONTINUE's peripheral phase — which always
+    /// fits in one OREG block for the devices we model — and BREAK clear it.
     pub intback_stage: u8,
-    /// Pad mode echoed back in the peripheral-phase `SR` (`IREG0 >> 4`).
+    /// Port modes echoed in the low nibble of the peripheral-phase `SR`:
+    /// `IREG1 >> 4` (port 1 in bits 1..0, port 2 in bits 3..2 — Mednafen
+    /// `SR |= Mode[0] | Mode[1] << 2`, `Mode[n] = (IREG1 >> (4 + 2n)) & 3`).
     pub pmode: u8,
+    /// `CDON`/`CDOFF` state, reported in INTBACK OREG11 bit 6 (Mednafen
+    /// `CDOn`, true after reset).
+    pub cd_on: bool,
+    /// `CKCHG352` selected the 28 MHz (352-dot) clock; `CKCHG320` the 26 MHz
+    /// one (the reset default). Reported in INTBACK OREG10 bit 6.
+    pub clock_352: bool,
     /// Set when the host writes IREG0 with the CONTINUE bit (0x80) during an
     /// INTBACK peripheral sequence; the Saturn aggregate drains it to run the
     /// next peripheral phase. Mirrors MAME scheduling `intback_continue_request`.
@@ -372,8 +393,35 @@ impl Smpc {
             // Deterministic default clock: 1996-01-01 00:00:00. The frontend
             // overrides it with the host time via `set_rtc_unix`.
             rtc_secs: days_from_civil(1996, 1, 1) as u64 * 86_400,
+            cd_on: true,
             ..Default::default()
         }
+    }
+
+    /// System reset (Mednafen `SMPC_Reset`): clear the command machinery —
+    /// IREG/OREG/COMREG, SR, SF, any pending or executing command (incl. an
+    /// in-flight INTBACK and its CONTINUE staging) and the direct-mode port
+    /// registers; the CD is on and the clock back at 320 mode. Kept: what the reset doesn't touch on hardware or what the
+    /// host configured — the battery-backed RTC and SMEM, the area code, the
+    /// plugged-in port devices and their live input state.
+    pub fn reset(&mut self) {
+        *self = Smpc {
+            region: self.region,
+            port1: self.port1,
+            port2: self.port2,
+            pad1: self.pad1,
+            pad2: self.pad2,
+            analog1: self.analog1,
+            analog2: self.analog2,
+            mouse_buttons: self.mouse_buttons,
+            mouse_dx: self.mouse_dx,
+            mouse_dy: self.mouse_dy,
+            rtc_secs: self.rtc_secs,
+            rtc_set_cycle: self.rtc_set_cycle,
+            smem: self.smem,
+            cd_on: true,
+            ..Smpc::default()
+        };
     }
 
     /// Set the RTC to `unix_secs` (seconds since 1970-01-01), syncing the
@@ -444,6 +492,7 @@ impl Smpc {
     /// mode) is visible. Golden-safe (env-gated, no core behaviour change).
     #[doc(hidden)]
     pub fn read8(&self, offset: u32) -> u8 {
+        let offset = offset & 0x7F; // the register file mirrors every 0x80 bytes
         let v = match offset {
             0x01 => self.ireg[0],
             0x03 => self.ireg[1],
@@ -455,13 +504,18 @@ impl Smpc {
             0x1F => self.comreg,
             o if (0x21..=0x5F).contains(&o) && (o & 1) == 1 => self.oreg[((o - 0x21) / 2) as usize],
             0x61 => self.sr,
-            0x63 => self.sf,
+            // SF reads back only bit 0 (Mednafen `SMPC_Read` 0x31:
+            // `ret &= ~1; ret |= SF`).
+            0x63 => self.sf & 1,
             0x75 => self.pdr1,
             0x77 => self.pdr2,
             0x79 => self.ddr1,
             0x7B => self.ddr2,
             0x7D => self.iosel,
             0x7F => self.exle,
+            // The even byte lane is not driven by the SMPC: it reads 0xFF
+            // (`ss.cpp`: `DB = 0xFF00 | SMPC_Read(..)`).
+            o if o & 1 == 0 => 0xFF,
             _ => 0,
         };
         if smpclog_on() {
@@ -474,6 +528,7 @@ impl Smpc {
     }
 
     pub fn write8(&mut self, offset: u32, val: u8) {
+        let offset = offset & 0x7F; // the register file mirrors every 0x80 bytes
         if smpclog_on() {
             eprintln!(
                 "SMPC W {:>5}@{offset:02X} <- {val:02X}",
@@ -511,7 +566,11 @@ impl Smpc {
                 self.oreg[((o - 0x21) / 2) as usize] = val;
             }
             0x61 => self.sr = val,
-            0x63 => self.sf = val,
+            // Any write to SF sets it to 1 — the software "busy" pre-write
+            // (Mednafen `SMPC_Write` 0x31: `SF = true`, the value is ignored).
+            // SF is cleared only by the SMPC when a command completes. NB: a
+            // COMREG write never sets SF (see `queue_command`).
+            0x63 => self.sf = 1,
             0x75 => self.pdr1 = val,
             0x77 => self.pdr2 = val,
             0x79 => self.ddr1 = val,
@@ -584,14 +643,28 @@ impl Smpc {
         self.sf = 0;
     }
 
+    /// `true` exactly once, when the in-flight INTBACK phase's interrupt time
+    /// (`intback_irq_at`) has been reached at global `cycle`; the caller raises
+    /// the SCU SMPC source.
+    pub fn take_intback_irq(&mut self, cycle: u64) -> bool {
+        match self.intback_irq_at {
+            Some(t) if cycle >= t => {
+                self.intback_irq_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve a pending INTBACK against the current global cycle: once
     /// the command's execution time has elapsed (`intback_complete_at`),
     /// drop SF so the BIOS's poll loop sees "done". Called on every SMPC
     /// access so SF clears at the *exact* instruction that reads it,
     /// rather than at a coarse drain boundary — the BIOS polls SF tightly
     /// and a late clear desyncs it from the raster (Yabause reference-diff
-    /// at the 0x1D64 SF poll). OREG and the SMPC interrupt are filled when
-    /// the command is dequeued, so the response is ready before SF drops.
+    /// at the 0x1D64 SF poll). OREG is filled when the command is dequeued, so
+    /// the response is ready before SF drops; the SMPC interrupt is raised at
+    /// the phase end (`intback_irq_at`).
     pub fn settle_intback(&mut self, cycle: u64) {
         if let Some(done_at) = self.intback_complete_at
             && cycle >= done_at
@@ -660,8 +733,40 @@ mod tests {
         s.write8(0x07, 0xCD);
         assert_eq!(s.read8(0x01), 0xAB);
         assert_eq!(s.read8(0x07), 0xCD);
-        // Even-offset slot is reserved → reads as 0.
-        assert_eq!(s.read8(0x02), 0);
+        // Even-offset lane is not driven → reads as 0xFF.
+        assert_eq!(s.read8(0x02), 0xFF);
+    }
+
+    #[test]
+    fn any_sf_write_sets_sf_and_reads_return_bit0_only() {
+        let mut s = Smpc::new();
+        s.write8(0x63, 0x00); // the value is ignored: a write always sets SF
+        assert_eq!(s.sf, 1);
+        assert_eq!(s.read8(0x63), 1);
+        s.sf = 0xFE; // only bit 0 is architectural
+        assert_eq!(s.read8(0x63), 0);
+    }
+
+    #[test]
+    fn registers_mirror_every_0x80_bytes() {
+        let mut s = Smpc::new();
+        s.write8(0x80 + 0x01, 0x5A); // IREG0 through the first mirror
+        assert_eq!(s.ireg[0], 0x5A);
+        assert_eq!(s.read8(0x7_FF80 + 0x01), 0x5A, "deep mirror of IREG0");
+        s.oreg[0] = 0x33;
+        assert_eq!(s.read8(0x100 + 0x21), 0x33, "OREG0 mirrored");
+        s.write8(0x80 + 0x1F, 0x02); // COMREG via a mirror
+        assert_eq!(s.take_pending(), Some(Command::SshOn));
+    }
+
+    #[test]
+    fn word_and_long_reads_carry_0xff_in_the_even_lane() {
+        let mut s = Smpc::new();
+        s.oreg[0] = 0x12;
+        s.oreg[1] = 0x34;
+        // A 16-bit read at the even address: 0xFF high, register low.
+        assert_eq!(s.read16(0x20), 0xFF12);
+        assert_eq!(s.read32(0x20), 0xFF12_FF34);
     }
 
     #[test]
@@ -857,11 +962,11 @@ mod tests {
         s.write8(0x23, 0x34);
         s.write8(0x25, 0x56);
         s.write8(0x27, 0x78);
-        // read16 spans an odd register and the reserved even byte after it.
-        assert_eq!(s.read16(0x21), 0x1200, "OREG0 high, reserved low");
-        // read32 covers 0x21(OREG0)/0x22(reserved)/0x23(OREG1)/0x24(reserved):
-        // the odd bytes carry data, the even ones read 0.
-        assert_eq!(s.read32(0x21), 0x1200_3400);
+        // read16 spans an odd register and the undriven even byte after it.
+        assert_eq!(s.read16(0x21), 0x12FF, "OREG0 high, undriven low");
+        // read32 covers 0x21(OREG0)/0x22/0x23(OREG1)/0x24: the odd bytes carry
+        // data, the even ones read 0xFF.
+        assert_eq!(s.read32(0x21), 0x12FF_34FF);
     }
 
     #[test]
@@ -894,12 +999,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_even_offsets_read_zero() {
-        let s = Smpc::new();
-        assert_eq!(s.read8(0x00), 0, "even IREG slot reserved");
-        assert_eq!(s.read8(0x20), 0, "even OREG slot reserved");
-        assert_eq!(s.read8(0x62), 0, "even byte by SR reserved");
-        assert_eq!(s.read8(0xFF), 0, "unmapped offset reads 0");
+    fn even_offsets_read_0xff_and_drop_writes() {
+        let mut s = Smpc::new();
+        assert_eq!(s.read8(0x00), 0xFF, "even IREG lane");
+        assert_eq!(s.read8(0x20), 0xFF, "even OREG lane");
+        assert_eq!(s.read8(0x62), 0xFF, "even byte by SR");
+        s.write8(0x62, 0x01); // even lane: dropped, SF untouched
+        assert_eq!(s.sf, 0);
+        // An unmapped odd offset reads 0.
+        assert_eq!(s.read8(0x11), 0);
     }
 
     #[test]

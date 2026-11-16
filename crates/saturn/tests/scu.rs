@@ -15,7 +15,10 @@ const D0C: u32 = SCU_BASE + 0x08;
 const D0AD: u32 = SCU_BASE + 0x0C;
 const D0EN: u32 = SCU_BASE + 0x10;
 const D0MD: u32 = SCU_BASE + 0x14;
-const DGO: u32 = 1 << 8;
+/// D0EN enable (bit 8) + go strobe (bit 0) — Mednafen `scu.inc` starts a manual
+/// DMA on `(v & 1) && Enable`; an arm-only write for a hardware factor is the
+/// same value (go is ignored unless the start factor is manual).
+const DGO: u32 = 0x101;
 /// D*AD for a contiguous copy: read +4 per source word (bit 8), write +2
 /// (16-bit B-bus step, code 1).
 const AD_CONTIGUOUS: u32 = 0x100 | 0x01;
@@ -163,16 +166,25 @@ fn dma_with_a_partial_longword_count() {
 }
 
 #[test]
-fn dma_with_zero_count_does_not_trigger() {
+fn level1_dma_with_zero_count_transfers_the_level_maximum() {
+    // A programmed count of 0 is the level maximum (4 KiB for levels 1/2,
+    // Mednafen `!StartByteCount ? 0x1000`), not "do nothing".
     let mut sat = build();
-    sat.bus.write32(D0R, WRAM, AccessKind::Data);
-    sat.bus.write32(D0W, 0x0020_3000, AccessKind::Data);
-    sat.bus.write32(D0C, 0, AccessKind::Data);
-    sat.bus.write32(D0MD, 7, AccessKind::Data);
-    sat.bus.write32(D0EN, DGO, AccessKind::Data);
+    plant(&mut sat, WRAM + 0x0FFC, 4); // the last word of a 4 KiB block
+    plant(&mut sat, WRAM + 0x1000, 4); // one past the end: must NOT copy
+    sat.bus.write32(SCU_BASE + 0x20, WRAM, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x24, 0x0020_8000, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x28, 0, AccessKind::Data);
+    sat.bus
+        .write32(SCU_BASE + 0x2C, AD_CONTIGUOUS, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x34, 7, AccessKind::Data);
+    sat.bus.write32(SCU_BASE + 0x30, DGO, AccessKind::Data);
     sat.run_for(512);
-    let (b, _) = sat.bus.read8(0x0020_3000, AccessKind::Data);
-    assert_eq!(b, 0);
+    let (last, _) = sat.bus.read8(0x0020_8000 + 0x0FFC, AccessKind::Data);
+    assert_eq!(last, 0x10, "the 4 KiB block's last word was copied");
+    let (past, _) = sat.bus.read8(0x0020_8000 + 0x1000, AccessKind::Data);
+    assert_eq!(past, 0, "nothing past the 4 KiB maximum");
 }
 
 #[test]

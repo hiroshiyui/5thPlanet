@@ -208,6 +208,38 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
 }
 
 #[test]
+fn intback_interrupt_fires_at_the_phase_end_not_at_dispatch() {
+    // Mednafen raises SCU_INT_SMPC after the status phase's 92 + 952 SMPC
+    // clocks (~261 µs ≈ 7_475 cycles), not when the command is dequeued.
+    let smpc_bit = 1u32 << saturn::ScuSource::Smpc.bit();
+    let mut sat = build();
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x00, AccessKind::Data);
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data);
+    sat.run_for(2_000);
+    assert_eq!(sat.bus.scu.ist & smpc_bit, 0, "not yet at dispatch");
+    sat.run_for(8_000);
+    assert_ne!(sat.bus.scu.ist & smpc_bit, 0, "raised at the phase end");
+}
+
+#[test]
+fn intback_system_status_reflects_the_live_machine() {
+    // OREG10/11 track CKCHG / SSHON / SNDON / CDOFF (Mednafen CMD_INTBACK).
+    let mut sat = build();
+    for cmd in [0x0E, 0x02, 0x06, 0x09] {
+        // CKCHG352, SSHON, SNDON, CDOFF
+        sat.bus.write8(COMREG, cmd, AccessKind::Data);
+        sat.run_for(4_000);
+    }
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x00, AccessKind::Data);
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data);
+    sat.run_for(16_000);
+    assert_eq!(sat.bus.smpc.oreg[10], 0x7F, "28 MHz | slave | sound on");
+    assert_eq!(sat.bus.smpc.oreg[11], 0x02, "CD off");
+}
+
+#[test]
 fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     let mut sat = build();
     // Status-only INTBACK (IREG1 & 8 == 0 → no peripheral phase).
@@ -218,10 +250,13 @@ fn intback_status_phase_fills_oreg_and_raises_smpc_source() {
     let (sf, _) = sat.bus.read8(SF, AccessKind::Data);
     assert_eq!(sf, 0, "SF clears after INTBACK status phase");
     // RTC is OREG1..7; OREG9 = area code (North America NTSC = 0x04);
-    // OREG10 = system status 1 (0x34, MAME); OREG31 = command echo (0x10).
+    // OREG10/11 = live system status (Mednafen: 0x24 | 28MHz<<6 | slave<<4 |
+    // MSHNMI | SYSRES | sound; CDOn<<6 | 2) — after reset: 26 MHz, slave and
+    // sound CPU off, CD on; OREG31 = command echo (0x10).
     assert_eq!(sat.bus.smpc.oreg[7], 0x00);
     assert_eq!(sat.bus.smpc.oreg[9], 0x04);
-    assert_eq!(sat.bus.smpc.oreg[10], 0x34);
+    assert_eq!(sat.bus.smpc.oreg[10], 0x2E);
+    assert_eq!(sat.bus.smpc.oreg[11], 0x42);
     assert_eq!(sat.bus.smpc.oreg[31], 0x10);
     // Status SR with no peripheral requested = 0x0F (Mednafen `(SR&~0x80&~NPE)
     // | 0x0F`; NPE/0x20 only set when peripheral data is also requested).
@@ -494,9 +529,19 @@ fn intback_peripheral_reports_the_shuttle_mouse() {
     );
     assert_eq!(sat.bus.smpc.oreg[5], 0xF0, "port 2: no peripheral");
 
-    // The report consumed the deltas: a second phase reports zero motion
+    // Everything fit in one OREG block, so that phase was the last: SR.NPE
+    // clear (bit 7 + PDL set) and a further CONTINUE runs no second phase.
+    let (sr, _) = sat.bus.read8(SR, AccessKind::Data);
+    assert_eq!(sr & 0xE0, 0xC0, "last block: NPE clear, PDL set");
+    sat.bus.write8(0x0010_0001, 0x00, AccessKind::Data);
+    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // stray CONTINUE
+    sat.run_for(40_000);
+    assert_eq!(sat.bus.smpc.oreg[3], 5, "no redundant second phase");
+
+    // The report consumed the deltas: the next INTBACK reports zero motion
     // (buttons are level state, still held).
-    sat.bus.write8(0x0010_0001, 0x80, AccessKind::Data); // CONTINUE (last)
+    sat.bus.write8(0x0010_0001, 0x00, AccessKind::Data); // IREG0: no status
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data); // peripheral-only INTBACK
     sat.run_for(40_000);
     assert_eq!(
         sat.bus.smpc.oreg[2],

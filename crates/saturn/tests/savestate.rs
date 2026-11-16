@@ -158,3 +158,70 @@ fn disc_mismatch_is_rejected() {
     b.reset();
     assert_eq!(b.load_state(&snapshot), Err(SaveStateError::DiscMismatch));
 }
+
+#[test]
+fn an_older_version_is_rejected_by_version_before_decoding_the_rest() {
+    // An old file's header/body shapes differ, so the version must be checked
+    // from the leading magic + version alone: even with nothing after them the
+    // result is VersionMismatch, never a Decode error.
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    let blob = sat.save_state();
+    let mut old = blob[..5].to_vec(); // magic[4] + varint version (1 byte)
+    old[4] = 16;
+    assert!(matches!(
+        sat.load_state(&old),
+        Err(SaveStateError::VersionMismatch { found: 16, .. })
+    ));
+}
+
+#[test]
+fn cartridge_kind_mismatch_is_rejected() {
+    let mut a = Saturn::with_blank_bios();
+    a.reset();
+    a.insert_cartridge(Cartridge::ext_ram_1mb());
+    let snapshot = a.save_state();
+
+    let mut b = Saturn::with_blank_bios();
+    b.reset(); // empty slot
+    assert_eq!(b.load_state(&snapshot), Err(SaveStateError::CartMismatch));
+    // A different DRAM size is a different cart too.
+    b.insert_cartridge(Cartridge::ext_ram_4mb());
+    assert_eq!(b.load_state(&snapshot), Err(SaveStateError::CartMismatch));
+    b.insert_cartridge(Cartridge::ext_ram_1mb());
+    assert_eq!(b.load_state(&snapshot), Ok(()));
+}
+
+#[test]
+fn rom_cartridge_fingerprint_mismatch_is_rejected() {
+    let mut a = Saturn::with_blank_bios();
+    a.reset();
+    a.insert_cartridge(Cartridge::rom(vec![0x11; 4096]));
+    let snapshot = a.save_state();
+
+    let mut b = Saturn::with_blank_bios();
+    b.reset();
+    b.insert_cartridge(Cartridge::rom(vec![0x22; 4096]));
+    assert_eq!(b.load_state(&snapshot), Err(SaveStateError::CartMismatch));
+    b.insert_cartridge(Cartridge::rom(vec![0x11; 4096]));
+    assert_eq!(b.load_state(&snapshot), Ok(()));
+    let (v, _) = b.bus.read8(0x0200_0000, AccessKind::Data);
+    assert_eq!(v, 0x11, "the live ROM is re-grafted");
+}
+
+#[test]
+fn a_state_with_a_wrong_sized_region_is_rejected_not_installed() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.bus.low_wram = saturn::Ram::new(0);
+    let bad = sat.save_state();
+    let mut b = Saturn::with_blank_bios();
+    b.reset();
+    assert!(matches!(
+        b.load_state(&bad),
+        Err(SaveStateError::Invalid(_))
+    ));
+    // The running machine is untouched (and still usable).
+    assert_eq!(b.bus.low_wram.len(), 1024 * 1024);
+    b.bus.write8(LOW_WRAM, 1, AccessKind::Data);
+}

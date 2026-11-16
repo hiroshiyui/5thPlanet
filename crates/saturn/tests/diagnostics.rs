@@ -35,6 +35,15 @@ fn load_bios() -> Option<Vec<u8>> {
 }
 
 #[test]
+fn run_system_reports_an_empty_bios_as_a_failed_check() {
+    // A 0-byte BIOS file must not panic the diagnostics (BiosRom::new asserts).
+    let outcomes = run_system(Vec::new(), None, saturn::smpc::region::NORTH_AMERICA);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].name, "bios_load");
+    assert!(!outcomes[0].passed);
+}
+
+#[test]
 fn run_system_reports_bios_video() {
     let Some(bios) = load_bios() else {
         println!("no Saturn BIOS in bios/ (see bios/README.md); run_system smoke skipped.");

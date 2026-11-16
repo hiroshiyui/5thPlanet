@@ -104,6 +104,50 @@ fn bios_boots_to_stable_framebuffer_hash() {
     }
 }
 
+/// A mid-run `Saturn::reset()` must re-boot the BIOS to the splash: time keeps
+/// running (monotonic), the CD-block timer and the CPUs' lazy timers are
+/// re-anchored, and every peripheral is back at power-on — so nothing waits
+/// for the clock to "catch up" to stale timestamps.
+#[test]
+fn reset_mid_run_reboots_to_the_splash() {
+    let Some((bios, _)) = load_first_available_bios() else {
+        println!("no Saturn BIOS found in bios/; reset re-boot test skipped.");
+        return;
+    };
+    let mut sat = Saturn::new(bios);
+    sat.reset();
+    let mut fb = vec![0u8; FRAMEBUFFER_BYTES];
+    for _ in 0..60 {
+        sat.run_frame(&mut fb);
+    }
+    let before = sat.now();
+    sat.reset();
+    assert!(sat.now() >= before, "time is monotonic across reset");
+    let mut dims = (0usize, 0usize);
+    for _ in 0..FRAMES_TO_RUN {
+        dims = sat.run_frame(&mut fb);
+    }
+    let non_black = fb[..dims.0 * dims.1 * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| (p[0] | p[1] | p[2]) != 0)
+        .count();
+    let hash = fnv1a_64(&fb[..dims.0 * dims.1 * 4]);
+    println!("reset re-boot: {non_black} non-black px, hash 0x{hash:016X}");
+    assert!(
+        non_black > 1000,
+        "the BIOS did not re-boot to the splash after a reset"
+    );
+    // A reset is a clean re-boot: it reaches the very same splash frame as a
+    // cold boot (the golden), not merely "some" picture.
+    let golden_full = workspace_root().join("crates/saturn").join(GOLDEN_PATH);
+    if let Ok(s) = std::fs::read_to_string(&golden_full) {
+        let golden = parse_hex_u64(s.trim()).expect("golden file must hold a hex u64");
+        assert_eq!(hash, golden, "reset re-boot diverged from the cold boot");
+    }
+}
+
 fn load_first_available_bios() -> Option<(Vec<u8>, PathBuf)> {
     let root = workspace_root();
     for rel in BIOS_CANDIDATES {

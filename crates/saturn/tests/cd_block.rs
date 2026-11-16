@@ -101,14 +101,14 @@ fn insert_then_eject_round_trips_to_nodisc() {
 #[test]
 fn cd_block_does_not_collide_with_scu_or_vdp2() {
     let mut sat = Saturn::with_blank_bios();
-    sat.bus.write32(0x05FE_0000, 0xAAAA_BBBB, AccessKind::Data); // SCU D0R
+    sat.bus.write32(0x05FE_0000, 0x06AA_BBBB, AccessKind::Data); // SCU D0R (27-bit)
     sat.bus
         .write32(0x05E0_0000 + 0x100, 0xCCCC_DDDD, AccessKind::Data); // VDP2 VRAM
     // Writing CR1 alone (no CR4) does not trigger a command, so it holds.
     sat.bus.write16(CR1, 0xEEEE, AccessKind::Data);
 
     let (scu_d0r, _) = sat.bus.read32(0x05FE_0000, AccessKind::Data);
-    assert_eq!(scu_d0r, 0xAAAA_BBBB);
+    assert_eq!(scu_d0r, 0x06AA_BBBB);
     let (vdp2_vram, _) = sat.bus.read32(0x05E0_0000 + 0x100, AccessKind::Data);
     assert_eq!(vdp2_vram, 0xCCCC_DDDD);
     let (cd_cr1, _) = sat.bus.read16(CR1, AccessKind::Data);

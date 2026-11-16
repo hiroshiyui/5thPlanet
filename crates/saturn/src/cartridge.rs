@@ -101,8 +101,11 @@ impl Cartridge {
     /// Battery backup-RAM cart of `bytes` total capacity (must be one of
     /// 512 KiB / 1 / 2 / 4 MiB to map to a real cart-ID). The cart is
     /// pre-formatted with the BIOS "BackUpRam Format" signature so the
-    /// backup manager treats it as initialised.
+    /// backup manager treats it as initialised. A nonsensical size is clamped
+    /// to a usable one — rounded down to whole 16-bit words, at least one
+    /// word — so the odd-byte packing never indexes modulo zero.
     pub fn backup_ram(size: usize) -> Self {
+        let size = (size & !1).max(2);
         let id = match size {
             0x0008_0000 => ID_BRAM_4MBIT,
             0x0010_0000 => ID_BRAM_8MBIT,
@@ -214,8 +217,8 @@ impl Cartridge {
         let Cartridge::Bram { bytes, .. } = self else {
             return 0xFF;
         };
-        if bytes.is_empty() {
-            return 0xFF;
+        if bytes.len() < 2 {
+            return 0xFF; // no whole word (only a hand-built cart can get here)
         }
         let nwords = (bytes.len() / 2) as u32;
         let w = (off / 4 % nwords) as usize;
@@ -230,7 +233,7 @@ impl Cartridge {
         let Cartridge::Bram { bytes, .. } = self else {
             return;
         };
-        if bytes.is_empty() {
+        if bytes.len() < 2 {
             return;
         }
         let nwords = (bytes.len() / 2) as u32;

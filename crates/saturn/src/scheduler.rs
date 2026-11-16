@@ -12,10 +12,10 @@
 //! the same sequence of steps across runs and across machines. The
 //! deterministic-replay test asserts this.
 //!
-//! For M2 the only entities are the master and slave SH-2 cores. The
-//! linear scan over entities is O(n) per step; with n=2 that's fine.
-//! Once VDP/SCU/SCSP arrive in M3+ and n grows past a handful, swap
-//! the scan for a `BinaryHeap` keyed on `(deadline, insertion_order)`.
+//! The live entities are the master and slave SH-2 cores plus the CD-block
+//! periodic timer. The linear scan over entities is O(n) per step; with n=3
+//! that's fine. If n ever grows past a handful, swap the scan for a
+//! `BinaryHeap` keyed on `(deadline, insertion_order)`.
 //!
 //! **Saturn stepping (Phase-2 Mednafen alignment).** The live machine no
 //! longer steps the two SH-2s by this most-behind rule: [`Saturn::step_cpus`]
@@ -137,7 +137,10 @@ pub struct EntityId(pub(crate) usize);
 /// A captured breakpoint hit: the `pc` it fired at (so a caller with several
 /// breakpoints armed knows *which* one), R0..R15, PR, GBR, 48 code words at the
 /// bp PC, and the probe value — the bus (raw-WRAM) read of the configured
-/// [`Sh2Entity::set_bp_probe`] address at the hit cycle (0 if unset).
+/// [`Sh2Entity::set_bp_probe`] address at the hit cycle (0 if unset). Both the
+/// code words and the probe are captured with side-effect-free peeks (see
+/// [`crate::SaturnBus::peek32`]): an unpeekable address (a register window)
+/// reads 0.
 #[derive(Clone, Debug)]
 pub struct BpHit {
     pub pc: u32,
@@ -154,7 +157,7 @@ pub struct BpHit {
 /// halted — that way the scheduler's "most-behind wins" rule naturally
 /// skips a halted CPU (it's "infinitely ahead") without any special-
 /// casing in the scheduler. The slave SH-2 lives in this halted state
-/// from power-on until SMPC's `SETSL` command releases it.
+/// from power-on until SMPC's `SSHON` command releases it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Sh2Entity {
     pub cpu: sh2::Cpu,
@@ -184,8 +187,9 @@ pub struct Sh2Entity {
     #[serde(skip)]
     bp_hit: Option<BpHit>,
     /// Optional memory probe: when set, a breakpoint hit also captures the
-    /// 32-bit value at this address read **through the bus** (raw WRAM, *not*
-    /// the CPU cache). Lets a debugger compare what a CPU loaded (via its cache /
+    /// 32-bit value at this address peeked from the **backing memory** (raw
+    /// WRAM/ROM, *not* the CPU cache), with no bus-timing or peripheral side
+    /// effects. Lets a debugger compare what a CPU loaded (via its cache /
     /// cache-through) against the true backing memory at the exact bp cycle —
     /// the decisive test for a cache-coherency vs torn-write bug. `#[serde(skip)]`.
     #[serde(skip)]
@@ -197,19 +201,6 @@ impl Sh2Entity {
         Self {
             cpu,
             halted: false,
-            pc_trace: None,
-            trace_freeze: (0x0602_0000, 0x0605_0000),
-            bps: Vec::new(),
-            bp_hit: None,
-            bp_probe: None,
-        }
-    }
-
-    /// Construct already-halted — what the slave starts as on power-on.
-    pub fn new_halted(cpu: sh2::Cpu) -> Self {
-        Self {
-            cpu,
-            halted: true,
             pc_trace: None,
             trace_freeze: (0x0602_0000, 0x0605_0000),
             bps: Vec::new(),
@@ -313,17 +304,14 @@ impl SchedEntity for Sh2Entity {
             if let Some(bp) = bp
                 && self.bp_hit.is_none()
             {
-                use sh2::bus::{AccessKind, Bus};
-                let mut code = Vec::with_capacity(48);
-                for i in 0..48u32 {
-                    code.push(ctx.read16(bp + i * 2, AccessKind::Data).0);
-                }
-                // Probe the backing memory through the bus (raw WRAM, no CPU
-                // cache) at the exact bp cycle — for cache/torn-write diagnosis.
-                let probe = self
-                    .bp_probe
-                    .map(|a| ctx.read32(a, AccessKind::Data).0)
-                    .unwrap_or(0);
+                // Observer-only: peek (no BusTiming charge, no watchpoint, no
+                // FIFO pop), so arming a breakpoint never perturbs the run.
+                let code = (0..48u32)
+                    .map(|i| ctx.peek16(bp.wrapping_add(i * 2)).unwrap_or(0))
+                    .collect();
+                // Probe the backing memory (raw WRAM, no CPU cache) at the
+                // exact bp cycle — for cache/torn-write diagnosis.
+                let probe = self.bp_probe.and_then(|a| ctx.peek32(a)).unwrap_or(0);
                 self.bp_hit = Some(BpHit {
                     pc: bp,
                     regs: self.cpu.regs.r,
@@ -357,9 +345,9 @@ impl SchedEntity for Sh2Entity {
 // ---- Concrete entity: CD-block periodic-firmware timer. ------------------
 
 /// Schedulable timer that drives the CD-block's periodic firmware
-/// behaviour. The CD-block is not (yet) a CPU — the real SH-1 + CD-ROM
-/// firmware lands in a later milestone — so for now its only time-varying
-/// behaviour is the periodic status report it emits roughly once per frame.
+/// behaviour. The CD-block is high-level-emulated, not an SH-1 core (its
+/// firmware is undumped — ADR-0015), so its time-varying behaviour (the
+/// periodic status report, the drive/read pump) advances from this timer.
 ///
 /// Modelling it as a scheduler entity (rather than a single poke at the
 /// VBlank edge) ticks [`CdBlock::tick`](crate::cd_block::CdBlock::tick) on a
@@ -367,8 +355,7 @@ impl SchedEntity for Sh2Entity {
 /// *within* the frame that the reference produces it — which the BIOS's
 /// phase-sensitive CD-firmware liveness poll depends on. The entity itself
 /// owns no CD state: it holds only its tick cadence and reaches the CD-block
-/// through the shared bus context. When the full CD-block arrives, a proper
-/// SH-1 core entity replaces this timer.
+/// through the shared bus context.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CdBlockEntity {
     /// Global cycle of the next tick.
@@ -388,6 +375,13 @@ impl CdBlockEntity {
             interval,
         }
     }
+
+    /// Re-anchor the next tick one interval after global cycle `now` — used by
+    /// a system reset, which keeps the global clock running (time stays
+    /// monotonic) instead of restarting it at 0.
+    pub fn rebase(&mut self, now: u64) {
+        self.next = now + self.interval;
+    }
 }
 
 impl SchedEntity for CdBlockEntity {
@@ -405,9 +399,9 @@ impl SchedEntity for CdBlockEntity {
 
 // ---- Heterogeneous Saturn entity. ----------------------------------------
 
-/// The Saturn scheduler runs a heterogeneous set of entities — today the
-/// two SH-2 cores plus the CD-block periodic timer; as more time-driven
-/// chips land (SCSP M68k, the real CD-block SH-1) they join here. Wrapping
+/// The Saturn scheduler runs a heterogeneous set of entities — the two
+/// SH-2 cores plus the CD-block periodic timer (the SCSP 68k is run from the
+/// aggregate's batch loop instead). Wrapping
 /// them in one enum keeps [`Scheduler`] a single generic over one entity
 /// type, so the determinism contract (ties broken by insertion order) has
 /// exactly one definition. Dispatch is a thin match.
@@ -440,6 +434,15 @@ impl SaturnEntity {
         match self {
             SaturnEntity::Sh2(e) => e,
             _ => panic!("scheduler entity is not an SH-2"),
+        }
+    }
+
+    /// Borrow the wrapped CD-block timer entity. Panics if this entity is not
+    /// the CD-block timer (see [`Self::sh2`] for why that is a caller bug).
+    pub fn cd_block_mut(&mut self) -> &mut CdBlockEntity {
+        match self {
+            SaturnEntity::CdBlock(e) => e,
+            _ => panic!("scheduler entity is not the CD-block timer"),
         }
     }
 }

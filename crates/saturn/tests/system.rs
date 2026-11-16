@@ -9,6 +9,7 @@
 //! stay robust to internal refactors.
 
 use saturn::Saturn;
+use saturn::SchedEntity;
 use saturn::cartridge::Cartridge;
 use saturn::savestate::SaveStateError;
 use sh2::bus::{AccessKind, Bus};
@@ -225,6 +226,80 @@ fn debug_step_slave_is_a_no_op_while_halted_then_runs_once_released() {
     assert_eq!(sat.slave().pipeline.cycles, before + cost as u64);
 }
 
+#[test]
+fn reset_keeps_time_monotonic_and_restores_power_on_peripherals() {
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.insert_disc(saturn::disc::Disc::from_iso(vec![0u8; 2048 * 8]));
+    let mut fb = vec![0u8; saturn::vdp2::FRAMEBUFFER_BYTES];
+    for _ in 0..60 {
+        sat.run_frame(&mut fb);
+    }
+    // Dirty some peripheral state the reset must clear.
+    sat.bus.scu.ims = 0;
+    sat.bus.scu.ist = 0xFFFF;
+    sat.bus.write8(0x0010_0063, 1, AccessKind::Data); // SMPC SF
+    sat.set_region(saturn::smpc::region::JAPAN);
+    let before = sat.now();
+
+    sat.reset();
+    assert!(sat.now() >= before, "reset never moves time backwards");
+    assert_eq!(sat.master().pipeline.cycles, sat.now());
+    assert!(sat.slave_is_halted(), "slave held until SSHON");
+    assert_eq!(sat.bus.scu.ims, 0xBFFF, "SCU back to power-on IMS");
+    assert_eq!(sat.bus.scu.ist, 0);
+    assert_eq!(sat.bus.smpc.sf, 0, "SMPC SF cleared");
+    assert_eq!(sat.bus.smpc.region, saturn::smpc::region::JAPAN, "kept");
+    assert!(sat.has_disc(), "the disc stays inserted");
+
+    // The CD-block timer was re-anchored: it keeps ticking with the CPU
+    // rather than waiting for the clock to catch up to a stale deadline.
+    let t0 = sat.now();
+    sat.run_frame(&mut fb);
+    let cd_next = sat.scheduler.entities()[2].next_deadline();
+    assert!(
+        cd_next > t0 && cd_next <= sat.now() + 2_000,
+        "CD timer ticks right after reset (next={cd_next}, now={})",
+        sat.now()
+    );
+    assert!(sat.now() >= t0 + 470_000, "a whole frame ran after reset");
+}
+
+#[test]
+fn single_step_applies_fti_and_trigger_point_dma_like_run_for() {
+    // The single-step path must run the same per-instruction side effects as
+    // `step_cpus`: a DMA started by the stepped store completes at once, and
+    // an FTI pulse reaches the sibling's FRT without a drain.
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.bus.high_wram.write32(0x100, 0x1234_5678);
+    let scu = 0x05FE_0000;
+    sat.bus.write32(scu, 0x0600_0100, AccessKind::Data); // D0R
+    sat.bus.write32(scu + 0x04, 0x05E0_0000, AccessKind::Data); // D0W (VDP2)
+    sat.bus.write32(scu + 0x08, 4, AccessKind::Data); // D0C
+    sat.bus.write32(scu + 0x0C, 0x101, AccessKind::Data); // D0AD
+    sat.bus.write32(scu + 0x14, 7, AccessKind::Data); // D0MD manual
+    let pc = 0x0020_1000u32;
+    sat.bus.write16(pc, 0x2212, AccessKind::Data); // MOV.L R1,@R2 (D0EN)
+    sat.bus.write16(pc + 2, 0x2431, AccessKind::Data); // MOV.W R3,@R4 (FTI)
+    sat.master_mut().regs.pc = pc;
+    sat.master_mut().regs.r[1] = 0x101; // enable + go
+    sat.master_mut().regs.r[2] = scu + 0x10;
+    sat.master_mut().regs.r[4] = 0x0100_0000; // slave FTI window
+    sat.debug_step_master_nodrain();
+    assert_eq!(
+        sat.bus.vdp2.read32(0x05E0_0000),
+        0x1234_5678,
+        "the DMA ran at the triggering instruction"
+    );
+    sat.release_slave();
+    sat.debug_step_master_nodrain();
+    assert!(
+        !sat.bus.slave_input_capture,
+        "the FTI pulse was applied by the step itself"
+    );
+}
+
 // ---- run-loop drains observed end-to-end ----------------------------------
 
 #[test]
@@ -315,4 +390,39 @@ fn take_audio_returns_interleaved_stereo_after_a_frame() {
     // buffer is interleaved L,R so its length is even and non-trivial.
     assert!(!audio.is_empty(), "audio drained for the frame");
     assert_eq!(audio.len() % 2, 0, "interleaved stereo → even length");
+}
+
+/// A BIOS image whose reset vector runs `ADD #1,R0 ; BRA -> ADD ; NOP` at
+/// 0x100 (executed uncached from the BIOS ROM, so every fetch is a timed bus
+/// access).
+fn counting_loop_bios() -> Vec<u8> {
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&0x0000_0100u32.to_be_bytes()); // PC
+    bios[4..8].copy_from_slice(&0x0600_8000u32.to_be_bytes()); // SP
+    for (i, w) in [0x7001u16, 0xAFFD, 0x0009].iter().enumerate() {
+        bios[0x100 + i * 2..0x102 + i * 2].copy_from_slice(&w.to_be_bytes());
+    }
+    bios
+}
+
+#[test]
+fn a_breakpoint_hit_does_not_perturb_the_run() {
+    // The bp capture (48 code words + the probe) must be observer-only: no
+    // BusTiming charge, no FIFO pop. An instrumented run must stay
+    // bit-identical to an un-instrumented one.
+    let mut plain = Saturn::new(counting_loop_bios());
+    plain.reset();
+    let mut traced = Saturn::new(counting_loop_bios());
+    traced.reset();
+    traced.set_master_bp(0x0000_0102);
+    traced.set_master_bp_probe(Some(0x0600_0000));
+    plain.run_for(20_000);
+    traced.run_for(20_000);
+    let hit = traced.take_master_bp_hit().expect("breakpoint fired");
+    assert_eq!(hit.code[0], 0xAFFD, "code captured by peek");
+    assert_eq!(
+        plain.save_state(),
+        traced.save_state(),
+        "breakpoint capture changed machine state"
+    );
 }

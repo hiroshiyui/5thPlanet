@@ -14,9 +14,14 @@
 //! the running instance, and a small FNV-1a fingerprint of the BIOS/disc in
 //! the header guards against restoring a state onto the wrong media.
 //!
-//! The on-disk layout is `(Header, Saturn)` bincode-encoded; the header's
-//! magic + version make a stale or foreign file fail cleanly rather than
-//! decode into garbage.
+//! The on-disk layout is `(Header, Saturn)` bincode-encoded. Loading decodes
+//! the header's leading magic + version **first** (so a stale or foreign file
+//! fails cleanly with [`SaveStateError::BadMagic`] /
+//! [`SaveStateError::VersionMismatch`] instead of a decode error), then the
+//! media fingerprints (BIOS, disc, cartridge kind + ROM), and only then the
+//! machine — whose memory regions are size-checked before it replaces the
+//! running one, so a corrupt file can never install a zero-length region (a
+//! `% 0` panic on the next access).
 
 use core::fmt;
 
@@ -60,7 +65,22 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// `dma_exec`/`dma_dir`/`dma_gate`, regs 0x412–0x416). v16 added the SMPC
 /// 3D Control Pad analog channels (`Smpc::analog1`/`analog2`, the `[X, Y, L, R]`
 /// bytes reported after the digital buttons by a `ThreeDPad` port — M13 E2).
-const VERSION: u32 = 16;
+/// v17 (one bump for the 2026-11 review-fix round): the header gained the
+/// cartridge identity (kind, cart-ID, ROM fingerprint) and is now validated
+/// prefix-first; the SMPC gained `cd_on`/`clock_352` (live INTBACK OREG10/11)
+/// and `intback_irq_at` (the phase-end interrupt time); the concurrent sh2
+/// (on-chip reset state) and CD-block/VDP1 fixes of the same round changed
+/// their serialized shapes.
+const VERSION: u32 = 17;
+
+/// The header's leading fields, identical in every version — decoded on its
+/// own first so a file from another version is rejected by version, not by a
+/// decode failure of a reshaped header.
+#[derive(Serialize, Deserialize)]
+struct Prefix {
+    magic: [u8; 4],
+    version: u32,
+}
 
 /// Fixed-size prologue identifying the format and the media the state was
 /// taken against.
@@ -72,6 +92,32 @@ struct Header {
     bios_fp: u64,
     /// FNV-1a of the disc image, or `None` if no disc was inserted.
     disc_fp: Option<u64>,
+    /// What was plugged into the cartridge slot (see [`cart_identity`]).
+    cart: CartIdentity,
+}
+
+/// The cartridge slot's identity: its kind, the cart-ID byte, and — for a ROM
+/// cart, whose bytes are external media re-grafted on load — the image's
+/// FNV-1a. A state only loads onto a machine with the same cart plugged in.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct CartIdentity {
+    kind: u8,
+    id: u8,
+    rom_fp: Option<u64>,
+}
+
+fn cart_identity(cart: &Cartridge) -> CartIdentity {
+    let (kind, rom_fp) = match cart {
+        Cartridge::None => (0, None),
+        Cartridge::Dram { .. } => (1, None),
+        Cartridge::Bram { .. } => (2, None),
+        Cartridge::Rom { bytes } => (3, Some(fnv1a(bytes))),
+    };
+    CartIdentity {
+        kind,
+        id: cart.cart_id(),
+        rom_fp,
+    }
 }
 
 /// Why a [`Saturn::load_state`] failed. Save never fails on valid state.
@@ -85,6 +131,11 @@ pub enum SaveStateError {
     BiosMismatch,
     /// The state was taken against a different disc (or disc vs. no disc).
     DiscMismatch,
+    /// The state was taken with a different cartridge (kind, size or ROM).
+    CartMismatch,
+    /// The payload decoded but describes an impossible machine (a memory
+    /// region of the wrong size).
+    Invalid(String),
     /// The payload couldn't be decoded (truncated / corrupt).
     Decode(String),
 }
@@ -102,6 +153,10 @@ impl fmt::Display for SaveStateError {
             SaveStateError::DiscMismatch => {
                 write!(f, "save state was taken with a different disc")
             }
+            SaveStateError::CartMismatch => {
+                write!(f, "save state was taken with a different cartridge")
+            }
+            SaveStateError::Invalid(e) => write!(f, "invalid save state: {e}"),
             SaveStateError::Decode(e) => write!(f, "corrupt save state: {e}"),
         }
     }
@@ -123,6 +178,50 @@ fn bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
 
+/// Reject a decoded machine whose memory regions don't have their hardware
+/// sizes. Everything indexes these modulo their length, so a zero-length (or
+/// otherwise wrong-sized) region from a corrupt file would panic or alias.
+fn validate_regions(sat: &Saturn) -> Result<(), SaveStateError> {
+    let check = |name: &str, len: usize, ok: bool| {
+        if ok {
+            Ok(())
+        } else {
+            Err(SaveStateError::Invalid(format!("{name} is {len} bytes")))
+        }
+    };
+    const MIB: usize = 1024 * 1024;
+    let b = &sat.bus;
+    check("low work RAM", b.low_wram.len(), b.low_wram.len() == MIB)?;
+    check("high work RAM", b.high_wram.len(), b.high_wram.len() == MIB)?;
+    check(
+        "internal backup RAM",
+        b.backup.bytes().len(),
+        b.backup.bytes().len() == crate::memory::INTERNAL_BACKUP_BYTES,
+    )?;
+    check(
+        "sound RAM",
+        b.scsp.ram.len(),
+        b.scsp.ram.len() == crate::scsp::SOUND_RAM_BYTES,
+    )?;
+    match &b.cartridge {
+        Cartridge::Dram { bank0, bank1, .. } => {
+            let ok = |n: usize| n == 512 * 1024 || n == 2 * MIB;
+            check("cartridge DRAM bank 0", bank0.len(), ok(bank0.len()))?;
+            check(
+                "cartridge DRAM bank 1",
+                bank1.len(),
+                bank1.len() == bank0.len(),
+            )?;
+        }
+        Cartridge::Bram { bytes, .. } => {
+            let n = bytes.len();
+            check("backup cartridge", n, n >= 2 && n % 2 == 0)?;
+        }
+        Cartridge::None | Cartridge::Rom { .. } => {}
+    }
+    Ok(())
+}
+
 impl Saturn {
     /// Serialize the full machine state to a `bincode` blob. External media
     /// (BIOS / disc / ROM cart) is referenced by fingerprint, not embedded.
@@ -132,6 +231,7 @@ impl Saturn {
             version: VERSION,
             bios_fp: fnv1a(self.bus.bios.image()),
             disc_fp: self.bus.cd_block.disc().map(|d| d.fingerprint()),
+            cart: cart_identity(&self.bus.cartridge),
         };
         // (&Header, &Saturn) so the decode side reads them back in order.
         bincode::serde::encode_to_vec((&header, self), bincode_config())
@@ -144,19 +244,22 @@ impl Saturn {
     /// state was captured with — it is re-grafted onto the decoded state,
     /// which never carries those (skipped) bytes itself.
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), SaveStateError> {
-        let ((header, mut loaded), _read): ((Header, Saturn), usize) =
-            bincode::serde::decode_from_slice(bytes, bincode_config())
-                .map_err(|e| SaveStateError::Decode(e.to_string()))?;
-
-        if header.magic != MAGIC {
+        let decode_err = |e: bincode::error::DecodeError| SaveStateError::Decode(e.to_string());
+        // 1. Magic + version, before anything version-dependent.
+        let (prefix, _): (Prefix, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode_config()).map_err(decode_err)?;
+        if prefix.magic != MAGIC {
             return Err(SaveStateError::BadMagic);
         }
-        if header.version != VERSION {
+        if prefix.version != VERSION {
             return Err(SaveStateError::VersionMismatch {
-                found: header.version,
+                found: prefix.version,
                 expected: VERSION,
             });
         }
+        // 2. The media the state was taken against.
+        let (header, header_len): (Header, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode_config()).map_err(decode_err)?;
         if header.bios_fp != fnv1a(self.bus.bios.image()) {
             return Err(SaveStateError::BiosMismatch);
         }
@@ -164,6 +267,14 @@ impl Saturn {
         if header.disc_fp != current_disc_fp {
             return Err(SaveStateError::DiscMismatch);
         }
+        if header.cart != cart_identity(&self.bus.cartridge) {
+            return Err(SaveStateError::CartMismatch);
+        }
+        // 3. The machine itself, validated before it replaces the running one.
+        let (mut loaded, _): (Saturn, usize) =
+            bincode::serde::decode_from_slice(&bytes[header_len..], bincode_config())
+                .map_err(decode_err)?;
+        validate_regions(&loaded)?;
 
         // Move the live external media into the decoded state (it carries only
         // placeholders for these). Order matters: take from `self` before the

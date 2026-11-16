@@ -173,6 +173,16 @@ pub fn run_all() -> Vec<DiagOutcome> {
 /// worked). Answers "does my setup boot?", which is distinct from "is the
 /// emulator correct?".
 pub fn run_system(bios: Vec<u8>, disc: Option<crate::disc::Disc>, region: u8) -> Vec<DiagOutcome> {
+    // A host-supplied image may be empty (a 0-byte file): report a failed
+    // check instead of panicking inside `BiosRom::new`.
+    if bios.is_empty() {
+        return vec![DiagOutcome {
+            name: "bios_load",
+            category: "system",
+            passed: false,
+            detail: "the BIOS image is empty".into(),
+        }];
+    }
     // TOC facts are pure — read them before the disc is moved into the machine.
     let toc = disc
         .as_ref()
@@ -489,7 +499,7 @@ fn cpu_shift_ops() -> (bool, String) {
 /// SCU **DMA** (the Saturn system peripheral, not an SH-2 on-chip block):
 /// program channel 0 to copy the sentinel one word from one Low-WRAM address to
 /// another and verify it moved. Mirrors `tests/scu.rs`'s proven manual-trigger
-/// sequence: D0R/D0W/D0C/D0AD/D0MD, then a 32-bit write to D0EN with the DGO bit
+/// sequence: D0R/D0W/D0C/D0AD/D0MD, then a 32-bit write to D0EN with the enable + go bits
 /// fires it (the engine drains within `run_for`). Source `0x0020_0200` →
 /// dest `0x0020_0300` (both Low WRAM — a legal DMA source, not the BIOS A-bus).
 fn scu_dma_copy() -> (bool, String) {
@@ -508,7 +518,7 @@ fn scu_dma_alias_fold() -> (bool, String) {
 /// Shared SCU-DMA channel-0 word copy `0x0020_0200` → `0x0020_0300` (both Low
 /// WRAM — a legal DMA source, not the BIOS A-bus). Mirrors `tests/scu.rs`'s
 /// manual-trigger sequence: D0R/D0W/D0C/D0AD/D0MD, then a 32-bit write to D0EN
-/// with the DGO bit fires it (the engine drains within `run_for`). When
+/// with the enable + go bits fires it (the engine drains within `run_for`). When
 /// `alias_dest`, the D0W pointer is the cache-through alias of the destination,
 /// which the engine must fold — see [`scu_dma_alias_fold`].
 fn run_scu_dma_copy(alias_dest: bool) -> Saturn {
@@ -566,10 +576,11 @@ fn run_scu_dma_copy(alias_dest: bool) -> Saturn {
         add(4, 1),
         movl_store(4, 5),
     ]);
-    // D0EN (base+0x10) = DGO (0x100) — triggers the transfer
+    // D0EN (base+0x10) = enable (0x100) | go (0x001) — triggers the transfer
     code.extend([
         mov_imm(5, 1),
         shll8(5),
+        add_imm(5, 1),
         mov_imm(4, 0x10),
         add(4, 1),
         movl_store(4, 5),
