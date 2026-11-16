@@ -43,13 +43,13 @@ fn bgon_through_bus_then_per_layer_decode() {
 
 #[test]
 fn vdp2_addresses_do_not_collide_with_existing_regions() {
-    // Write a sentinel into SCU's version-register-adjacent space and
-    // verify VDP2 didn't capture it.
+    // Write a sentinel into SCU space (D0EN, go bit clear so it reads back
+    // verbatim) and verify VDP2 didn't capture it.
     let mut sat = Saturn::with_blank_bios();
-    sat.bus.write32(0x05FE_0010, 0xAAAA_BBBB, AccessKind::Data);
+    sat.bus.write32(0x05FE_0010, 0xAAAA_BBBA, AccessKind::Data);
     // VDP2 regs end at 0x05F8_01FF — 0x05FE_xxxx is SCU territory.
     let (v, _) = sat.bus.read32(0x05FE_0010, AccessKind::Data);
-    assert_eq!(v, 0xAAAA_BBBB);
+    assert_eq!(v, 0xAAAA_BBBA);
     // And VDP2 didn't see anything.
     assert_eq!(sat.bus.vdp2.regs.read32(0x1F0), 0);
 }
