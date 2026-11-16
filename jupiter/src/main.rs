@@ -1156,6 +1156,7 @@ fn run(
             let mut pl_last = std::time::Instant::now();
             let mut audio_pacing_idle_since: Option<std::time::Instant> = None;
             let mut next_movie_probe = movie_probe.filter(|&period| period != 0);
+            let mut render_death_shown = false;
 
             // Optional input recording (SAT_INPUT_REC=<path>): an "input movie"
             // for deterministic headless replay (sdbg `replay`). Writes the RTC
@@ -1544,6 +1545,12 @@ fn run(
                         pipe.recycle(b);
                     }
                     pipe.submit(&saturn);
+                    // A compositor panic killed the render worker: the pipe now
+                    // renders inline (logged on stderr) — tell the user once.
+                    if pipe.is_dead() && !render_death_shown {
+                        render_death_shown = true;
+                        osd.set_toast("Render worker crashed - see log", 300);
+                    }
                 } else {
                     // Audio reserve full: nothing to do until it drains a bit.
                     // If the SDL queue mirror/in-flight accounting ever gets

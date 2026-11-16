@@ -15,6 +15,11 @@
 //! shown changes — so accuracy and the `bios_boot` golden are unaffected (the
 //! core's `run_frame` is untouched; this path is frontend-only).
 //!
+//! If the worker dies (a panic inside the compositor), the pipe logs it once,
+//! reports it via [`RenderPipe::is_dead`], and degrades to compositing inline
+//! on the caller's thread — the display keeps updating instead of freezing
+//! silently on the last frame.
+//!
 //! The module is `sdl`-free (operates on `Saturn` + `Vec<u8>` + channels), so
 //! the buffer/handshake logic is unit-tested without a window.
 
@@ -53,6 +58,12 @@ pub struct RenderPipe {
     /// True between [`submit`] and the matching [`wait`].
     in_flight: bool,
     worker: Option<JoinHandle<()>>,
+    /// Set (and reported once on stderr) when the worker has gone away — it
+    /// panicked inside `render_frame`. From then on [`submit`](Self::submit)
+    /// renders inline into [`ready`](Self::ready).
+    dead: bool,
+    /// A frame rendered inline (dead-worker fallback), handed out by `wait`.
+    ready: Option<Done>,
 }
 
 impl RenderPipe {
@@ -85,6 +96,8 @@ impl RenderPipe {
             spare: Some(vec![0u8; buf_bytes]),
             in_flight: false,
             worker: Some(worker),
+            dead: false,
+            ready: None,
         }
     }
 
@@ -96,6 +109,9 @@ impl RenderPipe {
         let Some(out) = self.spare.take() else {
             return false;
         };
+        if self.dead {
+            return self.render_inline(sat, out);
+        }
         let job = Job {
             vdp2: sat.bus.vdp2.clone(),
             sprite_fb: sat.bus.vdp1.display_fb().clone(),
@@ -112,9 +128,9 @@ impl RenderPipe {
                 true
             }
             Err(e) => {
-                // Worker gone: reclaim the buffer so we don't lose it.
-                self.spare = Some(e.0.out);
-                false
+                // Worker gone: reclaim the buffer and render this frame inline.
+                self.mark_dead();
+                self.render_inline(sat, e.0.out)
             }
         }
     }
@@ -128,10 +144,51 @@ impl RenderPipe {
             return None;
         }
         self.in_flight = false;
+        if let Some(done) = self.ready.take() {
+            return Some((done.out, done.dims));
+        }
         match self.done_rx.recv() {
             Ok(done) => Some((done.out, done.dims)),
-            Err(_) => None, // worker died
+            Err(_) => {
+                // The worker died mid-render, taking that frame's buffer with
+                // it; the caller's spare-feed path supplies a new one.
+                self.mark_dead();
+                None
+            }
         }
+    }
+
+    /// Whether the render worker has died (a panic in the compositor); the pipe
+    /// is now compositing on the caller's thread. The frontend reports it.
+    // Only the SDL3 main loop reports it.
+    #[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    /// Record the worker's death, logging it the first time only.
+    fn mark_dead(&mut self) {
+        if !self.dead {
+            self.dead = true;
+            eprintln!(
+                "render worker died (panic in the VDP compositor); compositing on the emulation thread instead"
+            );
+        }
+    }
+
+    /// Dead-worker fallback: composite `sat`'s current frame into `out` on this
+    /// thread (the same pure `render_frame_weave` the worker runs) and queue it
+    /// for the next [`wait`](Self::wait).
+    fn render_inline(&mut self, sat: &Saturn, mut out: Vec<u8>) -> bool {
+        let dims = saturn::vdp2::render_frame_weave(
+            &sat.bus.vdp2,
+            Some(sat.bus.vdp1.display_fb()),
+            sat.bus.vdp1.weave_source(),
+            &mut out,
+        );
+        self.ready = Some(Done { out, dims });
+        self.in_flight = true;
+        true
     }
 
     /// Whether the pipe has neither a spare buffer nor a render in flight —
@@ -193,6 +250,27 @@ mod tests {
         let (buf, dims) = pipe.wait().expect("a frame comes back");
         assert_eq!(buf.len(), FRAMEBUFFER_BYTES);
         assert!(dims.0 > 0 && dims.1 > 0, "valid dims {dims:?}");
+    }
+
+    #[test]
+    fn a_dead_worker_is_reported_and_rendering_continues_inline() {
+        // A buffer too small for the frame makes render_frame panic in the
+        // worker — the stand-in for any compositor panic.
+        let mut pipe = RenderPipe::new(16);
+        let sat = booted();
+        assert!(!pipe.is_dead());
+        assert!(pipe.submit(&sat));
+        assert!(pipe.wait().is_none(), "the panicked frame never comes back");
+        assert!(pipe.is_dead());
+        // The caller's spare-feed path hands in a proper buffer; frames keep
+        // coming, composited inline.
+        assert!(pipe.needs_spare());
+        pipe.recycle(vec![0u8; FRAMEBUFFER_BYTES]);
+        assert!(pipe.submit(&sat));
+        let (buf, dims) = pipe.wait().expect("inline frame");
+        assert_eq!(buf.len(), FRAMEBUFFER_BYTES);
+        assert!(dims.0 > 0 && dims.1 > 0);
+        assert!(pipe.wait().is_none(), "one frame per submit");
     }
 
     #[test]
