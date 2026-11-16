@@ -1,11 +1,14 @@
-//! Minimal CD-block command interface at `0x0589_0000..0x0589_FFFF`.
+//! The CD-block at `0x0589_0000..0x0589_FFFF`, **high-level emulated**
+//! (ADR-0015).
 //!
-//! **NOT a CD-block emulation.** The Saturn CD-block is itself a complete
-//! subsystem — an SH-1 running CD-ROM firmware that handles disc reading,
-//! sub-Q, error correction, audio CD playback. The real thing lands in a
-//! later milestone. For M4 we model *just enough* of the host-interface
-//! register protocol that BIOS init detects "a CD-block is present, no
-//! disc inserted" and proceeds toward the splash instead of hanging.
+//! The real CD-block is an SH-1 running undumped CD-ROM firmware, so instead
+//! of the SH-1 we model what the host observes, after Mednafen `cdb.cpp` (the
+//! oracle) and MAME `saturn_cd_hle.cpp`: the host command interface (HIRQ,
+//! CR1–CR4, periodic status reports), the drive-phase machine (spin-up, seek
+//! timing, 75 Hz × speed sector reads), the 200-block buffer pool with its 24
+//! filters/partitions, the sector-data transfer port, the ISO9660 filesystem
+//! commands, CD-DA playback into the SCSP, and disc authentication — reading
+//! sectors from a [`SectorSource`] (a disc image or a live drive).
 //!
 //! Register layout (host interface; offsets relative to `0x0589_0000`,
 //! matching the Saturn CD-block / SCSP manual and Yabause's `cs2.c`).
@@ -29,8 +32,9 @@
 //! `hirqreg = 0`); the BIOS reads this signature to detect the subsystem.
 //! Thereafter the host drives commands by writing all four of CR1..CR4 —
 //! the block processes the command (`CR1 >> 8`), writes a response back
-//! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
-//! status is `PAUSE`.
+//! into CR1..CR4, and sets `HIRQ.CMOK`. With no disc the status is
+//! `NODISC`; a disc reports `BUSY` through its recognition spin-up, then
+//! `PAUSE` until commanded.
 
 use std::collections::VecDeque;
 
@@ -1786,8 +1790,8 @@ impl CdBlock {
     /// few seconds so the buffer can't grow unbounded if the host stops draining
     /// audio, while still absorbing the read pump's sector-burst fills (the
     /// scheduler ticks the drive in batches, so several sectors can decode in one
-    /// step; a tight cap would drop them and the audio would gap — see
-    /// [`Self::take_cd_audio`]'s jitter buffer).
+    /// step; a tight cap would drop them and the audio would gap — see the
+    /// jitter buffer in [`Self::take_cd_audio_buffered`]).
     fn read_cd_audio_sector(&mut self, fad: u32) -> bool {
         let Some(disc) = self.disc.as_ref() else {
             return false;
@@ -2254,9 +2258,11 @@ impl CdBlock {
     /// synchronously and set CMOK immediately, which is observationally
     /// equivalent for the BIOS (it polls HIRQ for CMOK after issuing).
     ///
-    /// Only the commands BIOS init issues with no disc present are
-    /// modelled; everything else falls back to a plain status report,
-    /// which is what most CD-block commands return.
+    /// [`Self::dispatch_inner`] implements the host command set the BIOS and
+    /// games use (status/TOC/session, Init, Play/Seek, the filter/partition
+    /// and sector-data commands, the filesystem commands, authentication);
+    /// an unimplemented command (the MPEG card, copy/move sector data) falls
+    /// back to a plain status report.
     fn execute(&mut self) {
         let command = (self.cr1 >> 8) as u8;
         let cr_in = [self.cr1, self.cr2, self.cr3, self.cr4];
