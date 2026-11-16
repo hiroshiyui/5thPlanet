@@ -761,6 +761,43 @@ impl Op {
         )
     }
 
+    /// True for the SH-2 **interrupt-disabled instructions** — `LDC`, `LDC.L`,
+    /// `STC`, `STC.L`, `LDS`, `LDS.L`, `STS`, `STS.L` (SH-2 programming manual
+    /// §4 "Interrupt-disabled instructions"; Mednafen `PART_OP_INTDIS`,
+    /// `sh7095_ops.inc`). No maskable interrupt is accepted between one of
+    /// these and the following instruction: Mednafen decodes the next
+    /// instruction with the pending-interrupt bit stripped (`DoIDIF(true)`).
+    pub fn is_interrupt_disabling(&self) -> bool {
+        use Op::*;
+        matches!(
+            self,
+            LdcSr { .. }
+                | LdcGbr { .. }
+                | LdcVbr { .. }
+                | LdcLSr { .. }
+                | LdcLGbr { .. }
+                | LdcLVbr { .. }
+                | LdsMach { .. }
+                | LdsMacl { .. }
+                | LdsPr { .. }
+                | LdsLMach { .. }
+                | LdsLMacl { .. }
+                | LdsLPr { .. }
+                | StcSr { .. }
+                | StcGbr { .. }
+                | StcVbr { .. }
+                | StcLSr { .. }
+                | StcLGbr { .. }
+                | StcLVbr { .. }
+                | StsMach { .. }
+                | StsMacl { .. }
+                | StsPr { .. }
+                | StsLMach { .. }
+                | StsLMacl { .. }
+                | StsLPr { .. }
+        )
+    }
+
     /// True if this instruction must not appear in a delay slot
     /// (SH-2 software manual §6, "Delayed Branch Instructions").
     /// Only the *branch* family qualifies — Bx/BxS, BRA/BRAF, BSR/BSRF,

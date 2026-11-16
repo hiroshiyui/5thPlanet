@@ -10,7 +10,7 @@
 use crate::bus::{AccessKind, Bus};
 use crate::cache::{self, Cache};
 use crate::isa::Op;
-use crate::onchip::OnChip;
+use crate::onchip::{OnChip, Source};
 use crate::pipeline::Pipeline;
 use crate::regs::{Registers, Sr};
 
@@ -100,6 +100,19 @@ pub struct Cpu {
     /// very next instruction that reads it pays a 1-cycle stall, then
     /// this is cleared regardless.
     pub(crate) load_dest_pending: Option<u8>,
+    /// Set when the instruction just retired was an **interrupt-disabled**
+    /// one ([`Op::is_interrupt_disabling`]: LDC/STC/LDS/STS and their `.L`
+    /// forms): the next instruction boundary does not accept a maskable
+    /// interrupt (NMI is unaffected — Mednafen strips only `PEX_INT` in
+    /// `DoID(true)`). Consumed at that boundary. Serialized: it is live
+    /// pipeline state between two instructions.
+    pub(crate) int_block: bool,
+    /// True while the core is in the SLEEP power-down state. Mednafen
+    /// re-executes `SLEEP` (3 cycles, PC held) until an exception is pending;
+    /// we model that as a 3-cycle idle step that keeps the on-chip timers and
+    /// DMAC running, leaving `regs.pc` already past the SLEEP so an accepted
+    /// interrupt saves the address of the following instruction. Serialized.
+    pub(crate) sleeping: bool,
     /// Debug only: the last CPU *exception* taken as `(vector, faulting PC)` —
     /// illegal (4) / slot-illegal (6) / address-error (9/10) / TRAPA, but not
     /// hardware interrupts. Used to diagnose spurious faults; not serialized.
@@ -219,6 +232,8 @@ impl Cpu {
             pending_branch: None,
             in_delay_slot: false,
             load_dest_pending: None,
+            int_block: false,
+            sleeping: false,
             last_fault: None,
             last_illegal_word: None,
             dbg_detect_stale: false,
@@ -277,6 +292,8 @@ impl Cpu {
         self.pending_branch = None;
         self.in_delay_slot = false;
         self.load_dest_pending = None;
+        self.int_block = false;
+        self.sleeping = false;
         // A reset must leave the core fetching *current* code, not its pre-reset
         // cache. The SH7604 disables the cache on reset (CCR.CE=0) and clears the
         // address array, so we invalidate the lines and clear CCR. This is
@@ -316,6 +333,30 @@ impl Cpu {
     /// emulators that execute the delay slot inside the branch handler.
     pub fn next_is_delay_slot(&self) -> bool {
         self.pending_branch.is_some()
+    }
+
+    /// True when the instruction just retired was an SH-2 interrupt-disabled
+    /// instruction (LDC/STC/LDS/STS and `.L` forms — [`Op::is_interrupt_disabling`]),
+    /// so the next instruction boundary will not accept a maskable interrupt
+    /// (SH-2 programming manual "interrupt-disabled instructions"; Mednafen
+    /// `PART_OP_INTDIS`).
+    pub fn interrupt_blocked(&self) -> bool {
+        self.int_block
+    }
+
+    /// True when the core can accept a **maskable** interrupt at the next
+    /// instruction boundary: not in a branch delay slot and not right after an
+    /// interrupt-disabled instruction. Host glue that forwards a level/edge
+    /// interrupt into the INTC per instruction (the Saturn SCU → master IRL)
+    /// should gate on this rather than [`Self::next_is_delay_slot`] alone, so a
+    /// request is not consumed at a boundary where the CPU cannot take it.
+    pub fn can_accept_interrupt(&self) -> bool {
+        self.pending_branch.is_none() && !self.int_block
+    }
+
+    /// True while the core is in the SLEEP power-down state (see `sleeping`).
+    pub fn is_sleeping(&self) -> bool {
+        self.sleeping
     }
 
     /// Apply an inter-CPU FRT input-capture (FTI) edge, materializing the lazy
@@ -388,10 +429,18 @@ impl Cpu {
     fn step_instruction(&mut self, bus: &mut impl Bus) -> u32 {
         // ---- Interrupt boundary: check pending INTC sources first ----
         // SH-2 only accepts interrupts at instruction boundaries (never
-        // inside a delay slot — that's a hardware invariant).
+        // inside a delay slot — that's a hardware invariant), and not right
+        // after an interrupt-disabled instruction (LDC/STC/LDS/STS family —
+        // Mednafen `PART_OP_INTDIS`), which blocks maskable interrupts but
+        // not NMI. The block applies to exactly one boundary.
+        let int_blocked = core::mem::take(&mut self.int_block);
         if self.pending_branch.is_none()
             && let Some((src, level)) = self.onchip.intc.next_pending(self.regs.sr.imask())
+            && (!int_blocked || src == Source::Nmi)
         {
+            // An accepted interrupt ends SLEEP; `regs.pc` already points past
+            // the SLEEP, which is the PC the hardware saves.
+            self.sleeping = false;
             let vector = self.onchip.intc.vector_for(src);
             self.onchip.intc.acknowledge(src);
             // External (level-triggered) sources stay asserted until the
@@ -407,6 +456,17 @@ impl Cpu {
             let cost = self.take_exception(vector, Some(level.min(15)), bus);
             self.pipeline.advance(cost);
             return cost;
+        }
+
+        // ---- SLEEP power-down ----
+        // Mednafen `SLEEP`: while no exception is pending the instruction
+        // re-executes in place (`goto SkipPCInc`) costing 3 cycles each time,
+        // with no new fetch. The on-chip FRT/WDT/DMAC keep running (driven by
+        // `Cpu::step` after this returns), so a timer/DMA interrupt — or an
+        // external one the host raises — wakes the core at the boundary above.
+        if self.sleeping {
+            self.pipeline.advance(3);
+            return 3;
         }
 
         let instr_pc = self.regs.pc;
@@ -462,6 +522,9 @@ impl Cpu {
             self.regs.pc = target;
         }
         self.in_delay_slot = false;
+
+        // Interrupt-disabled instruction: block acceptance at the next boundary.
+        self.int_block = op.is_interrupt_disabling();
 
         // ---- Post-dispatch scoreboard updates ----
         if let Some(rn) = op.load_dest() {
@@ -539,9 +602,26 @@ impl Cpu {
                 self.regs.macl = 0;
                 1
             }
-            // SLEEP halts the CPU until an interrupt or NMI. For M1 we model
-            // it as a 3-cycle NOP — wake-up plumbing arrives with task #7.
-            Sleep => 3,
+            // SLEEP (SH-2 programming manual; Mednafen `SLEEP`,
+            // `sh7095_ops.inc`): if no interrupt is pending, enter the
+            // power-down state — 3 cycles now and 3 per idle step until an
+            // interrupt is accepted (see `step_instruction`). If one is
+            // already pending (possible right after an interrupt-disabled
+            // instruction), SLEEP falls through at the cost of the next fetch.
+            // Standby mode (SBYCR.SBY) is not modelled.
+            Sleep => {
+                if self
+                    .onchip
+                    .intc
+                    .next_pending(self.regs.sr.imask())
+                    .is_some()
+                {
+                    1
+                } else {
+                    self.sleeping = true;
+                    3
+                }
+            }
 
             // ============================================================
             // Data transfer
