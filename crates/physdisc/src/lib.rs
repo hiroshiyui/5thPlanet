@@ -14,6 +14,8 @@
 //! the crate links nothing, so `cargo build --workspace` / CI need no libcdio.
 //! With it on, the FFI to libcdio is `unsafe`; this crate is the **only** place
 //! in the workspace that opts out of `unsafe_code = "forbid"` (see ADR-0009).
+//! Even here it is `deny`'d crate-wide and allowed only on the private `ffi`
+//! module, where every `unsafe` block carries a `// SAFETY:` justification.
 //!
 //! Build with it: `cargo build -p physdisc --features libcdio` (needs
 //! `libcdio-dev` / `pkgconf libcdio`), or via the frontend's `physical-disc`
@@ -22,6 +24,9 @@
 // Several constants/helpers are used only on the `libcdio` path; in the default
 // stub build they're intentionally unused.
 #![cfg_attr(not(feature = "libcdio"), allow(dead_code))]
+// The workspace `forbid` doesn't reach this crate (see Cargo.toml); keep unsafe
+// out of everything but the `ffi` module anyway.
+#![deny(unsafe_code)]
 
 use saturn::disc::{SectorSource, TrackInfo};
 
@@ -29,6 +34,27 @@ use saturn::disc::{SectorSource, TrackInfo};
 const FAD_OFFSET: u32 = 150;
 const SECTOR_USER: usize = 2048;
 const SECTOR_RAW: usize = 2352;
+/// A Mode-2 sector minus its 16-byte sync + header: the 8-byte subheader
+/// (written twice) + 2328 bytes of user data / EDC (libcdio `M2RAW_SECTOR_SIZE`).
+const M2RAW: usize = 2336;
+/// Sync + header bytes that precede the Mode-2 payload in a raw sector.
+const RAW_HEADER: usize = SECTOR_RAW - M2RAW;
+
+/// Rebuild the full 2352-byte raw image of a Mode-2 sector at `fad` from its
+/// 2336-byte post-header payload: the 12-byte sync pattern, the BCD MSF address
+/// and mode byte 2, then the payload (subheader at raw offset 16, Form-2 user
+/// data at 24 — where `saturn::disc::Disc` images keep them).
+fn mode2_raw_sector(fad: u32, m2: &[u8], out: &mut [u8]) {
+    let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+    out[0] = 0x00;
+    out[1..11].fill(0xFF);
+    out[11] = 0x00;
+    out[12] = bcd(fad / (75 * 60));
+    out[13] = bcd((fad / 75) % 60);
+    out[14] = bcd(fad % 75);
+    out[15] = 2; // mode
+    out[RAW_HEADER..SECTOR_RAW].copy_from_slice(&m2[..M2RAW]);
+}
 
 /// A Saturn disc read live from a host optical drive.
 pub struct PhysicalDisc {
@@ -42,8 +68,16 @@ pub struct PhysicalDisc {
     /// the TOC and for CD-DA (audio) extraction.
     #[cfg(feature = "libcdio")]
     dev_file: Option<std::fs::File>,
+    /// The last Mode-2 sector read raw (`(lsn, 2336-byte payload)`), so the
+    /// CD-block's per-sector `subheader` probe and the following data read
+    /// cost one drive read, not two.
+    #[cfg(feature = "libcdio")]
+    m2_cache: std::sync::Mutex<Option<(i32, Box<[u8; M2RAW]>)>>,
     /// Cached track table (number, ctrl/addr, audio?, start FAD, length).
     tracks: Vec<TrackInfo>,
+    /// Per track (index-matched with `tracks`): a Mode-2 (CD-ROM XA) data
+    /// track, whose sectors carry a subheader (and may be Form-2).
+    xa: Vec<bool>,
     lead_out_fad: u32,
     /// Stable identity for save-state media validation (FNV-1a of the TOC).
     fingerprint: u64,
@@ -64,15 +98,46 @@ impl PhysicalDisc {
     #[cfg(feature = "libcdio")]
     pub fn open(device: &str) -> Result<Self, String> {
         let inner = ffi::Cdio::open(device)?;
-        let (tracks, lead_out_fad) = inner.read_toc()?;
+        let ffi::Toc {
+            tracks,
+            xa,
+            lead_out_fad,
+        } = inner.read_toc()?;
         let fingerprint = toc_fingerprint(&tracks, lead_out_fad);
         Ok(Self {
             inner,
             dev_file: open_block_device(device),
+            m2_cache: std::sync::Mutex::new(None),
             tracks,
+            xa,
             lead_out_fad,
             fingerprint,
         })
+    }
+
+    /// Whether `fad` lies in a Mode-2 (XA) data track.
+    fn is_xa(&self, fad: u32) -> bool {
+        self.tracks
+            .iter()
+            .zip(&self.xa)
+            .any(|(t, &xa)| xa && fad >= t.start_fad && fad < t.start_fad + t.length)
+    }
+
+    /// Run `f` over the 2336-byte post-header payload of the Mode-2 sector at
+    /// `lsn` (served from a one-sector cache). `None` if libcdio can't read it
+    /// raw — e.g. the drive needs `CAP_SYS_RAWIO` for `READ CD` — in which case
+    /// callers fall back to the cooked 2048-byte path.
+    #[cfg(feature = "libcdio")]
+    fn with_mode2<R>(&self, lsn: i32, f: impl FnOnce(&[u8; M2RAW]) -> R) -> Option<R> {
+        let mut cache = self.m2_cache.lock().ok()?;
+        if cache.as_ref().is_none_or(|(l, _)| *l != lsn) {
+            let mut buf = Box::new([0u8; M2RAW]);
+            if !self.inner.read_mode2_raw(lsn, &mut buf[..]) {
+                return None;
+            }
+            *cache = Some((lsn, buf));
+        }
+        cache.as_ref().map(|(_, b)| f(b))
     }
 
     /// Cooked positioned read of one 2048-byte data sector via the block device
@@ -238,6 +303,17 @@ impl SectorSource for PhysicalDisc {
                 None => return 0,
             };
             let lsn = fad as i32 - FAD_OFFSET as i32;
+            // A Mode-2 (XA) sector: rebuild the full raw sector so the CD-block
+            // finds the subheader + a Form-2 sector's 2324-byte payload where
+            // an image keeps them.
+            if self.is_xa(fad)
+                && out.len() >= SECTOR_RAW
+                && self
+                    .with_mode2(lsn, |m2| mode2_raw_sector(fad, m2, out))
+                    .is_some()
+            {
+                return SECTOR_RAW;
+            }
             if t.is_audio {
                 // Red Book: a full 2352-byte audio sector via DAE.
                 if self.inner.read_audio(lsn, &mut out[..SECTOR_RAW]) {
@@ -259,10 +335,17 @@ impl SectorSource for PhysicalDisc {
         0
     }
 
-    fn subheader(&self, _fad: u32) -> Option<(u8, u8, u8, u8)> {
-        // Mode-2 subheader filtering isn't reconstructed from a live drive's
-        // cooked reads; games that boot don't rely on it. (Image-based discs
-        // still expose it via `saturn::disc::Disc`.)
+    fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
+        // Only Mode-2 (XA) sectors have one; it is the first 4 bytes of the
+        // raw post-header payload — `(file, channel, submode, coding)` on
+        // disc, returned as `(chan, fnum, subm, cinf)` like `Disc::subheader`.
+        // Without raw-read access it stays `None` (cooked-only behaviour).
+        #[cfg(feature = "libcdio")]
+        if self.is_xa(fad) {
+            let lsn = fad as i32 - FAD_OFFSET as i32;
+            return self.with_mode2(lsn, |m2| (m2[1], m2[0], m2[2], m2[3]));
+        }
+        let _ = fad;
         None
     }
 
@@ -275,6 +358,59 @@ impl SectorSource for PhysicalDisc {
 mod libcdio_tests {
     use super::*;
     use std::io::Write;
+
+    /// libcdio's driver/image initialisation is not thread-safe: opening two
+    /// images concurrently (parallel tests) intermittently fails, so each test
+    /// holds this lock for its duration.
+    static LIBCDIO_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The workspace `tmp/` (the project's temp-file convention, gitignored),
+    /// plus the serialization guard.
+    fn scratch_dir() -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        let guard = LIBCDIO_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/physdisc_tests");
+        std::fs::create_dir_all(&d).unwrap();
+        (guard, d)
+    }
+
+    /// A Mode-2 (XA) track through libcdio: the subheader is exposed and a
+    /// Form-2 sector comes back as a full raw sector with its 2324-byte payload
+    /// at offset 24. `cargo test -p physdisc --features libcdio -- --ignored`.
+    #[test]
+    #[ignore = "needs libcdio; reads a synthetic Mode-2 CUE/BIN image"]
+    fn exposes_mode2_subheaders_from_a_cue_image() {
+        let (_serial, dir) = scratch_dir();
+        let bin = dir.join("physdisc_m2.bin");
+        let cue = dir.join("physdisc_m2.cue");
+        let mut data = vec![0u8; SECTOR_RAW * 4];
+        for s in 0..4usize {
+            let raw = &mut data[s * SECTOR_RAW..(s + 1) * SECTOR_RAW];
+            mode2_raw_sector(FAD_OFFSET + s as u32, &[0u8; M2RAW], raw);
+            // Subheader (twice): file 1, channel 3, submode (Form-2 on odd
+            // sectors), coding 0.
+            let subm = if s % 2 == 1 { 0x20 } else { 0x08 };
+            for rep in [16, 20] {
+                raw[rep..rep + 4].copy_from_slice(&[1, 3, subm, 0]);
+            }
+            raw[24..30].copy_from_slice(b"M2DATA");
+            raw[30] = s as u8;
+        }
+        std::fs::write(&bin, &data).unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"physdisc_m2.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        let disc = PhysicalDisc::open(cue.to_str().unwrap()).expect("open cue via libcdio");
+        assert_eq!(disc.subheader(FAD_OFFSET), Some((3, 1, 0x08, 0)));
+        assert_eq!(disc.subheader(FAD_OFFSET + 1), Some((3, 1, 0x20, 0)));
+        let mut raw = [0u8; SECTOR_RAW];
+        assert_eq!(disc.read_full_sector(FAD_OFFSET + 1, &mut raw), SECTOR_RAW);
+        assert_eq!(&raw[24..30], b"M2DATA");
+        assert_eq!(raw[30], 1);
+        assert_eq!(raw[15], 2, "mode byte");
+        assert_eq!(&raw[12..15], &[0x00, 0x02, 0x01], "BCD MSF of FAD 151");
+    }
 
     /// TEMP manual probe of a real drive (`SAT_CDROM`, default `/dev/sr0`):
     /// dumps the TOC and checks the Saturn IP header at FAD 150.
@@ -338,7 +474,7 @@ mod libcdio_tests {
     #[test]
     #[ignore = "needs libcdio; reads a synthetic CUE/BIN image"]
     fn reads_toc_and_sector_from_a_cue_image() {
-        let dir = std::env::temp_dir();
+        let (_serial, dir) = scratch_dir();
         let bin = dir.join("physdisc_t.bin");
         let cue = dir.join("physdisc_t.cue");
         // Two tracks in one BIN: 4 Mode-1/2352 data sectors (user marker at the
@@ -370,6 +506,11 @@ mod libcdio_tests {
         let disc = PhysicalDisc::open(cue.to_str().unwrap()).expect("open cue via libcdio");
         assert_eq!(disc.first_track(), 1);
         assert_eq!(disc.last_track(), 2);
+        // 8 sectors from LSN 0: the lead-out starts at LSN 8 = FAD 158, right
+        // after the last track's last sector.
+        assert_eq!(disc.lead_out_fad(), FAD_OFFSET + 8);
+        let t2 = disc.track_at_fad(FAD_OFFSET + 4).unwrap();
+        assert_eq!(t2.start_fad + t2.length, disc.lead_out_fad());
         assert!(
             !disc.track_at_fad(FAD_OFFSET).unwrap().is_audio,
             "track 1 is data"
@@ -405,9 +546,10 @@ mod libcdio_tests {
 /// libcdio FFI — the only `unsafe` in the workspace (ADR-0009). Confined here,
 /// behind the `libcdio` feature, and wrapped in a safe [`Cdio`] handle.
 #[cfg(feature = "libcdio")]
+#[allow(unsafe_code)]
 mod ffi {
-    use super::{FAD_OFFSET, SECTOR_RAW, SECTOR_USER, TrackInfo};
-    use core::ffi::{CStr, c_char, c_int, c_void};
+    use super::{FAD_OFFSET, M2RAW, SECTOR_RAW, SECTOR_USER, TrackInfo};
+    use core::ffi::{c_char, c_int, c_void};
     use std::ffi::CString;
 
     // libcdio opaque handle + the small slice of its C API we use. Signatures
@@ -428,7 +570,6 @@ mod ffi {
         fn cdio_get_track_lsn(p: *const CdIoT, track: u8) -> i32;
         fn cdio_get_track_last_lsn(p: *const CdIoT, track: u8) -> i32;
         fn cdio_get_track_format(p: *const CdIoT, track: u8) -> c_int;
-        fn cdio_get_disc_last_lsn(p: *const CdIoT) -> i32;
         fn cdio_read_audio_sectors(
             p: *const CdIoT,
             buf: *mut c_void,
@@ -442,19 +583,40 @@ mod ffi {
             form2: bool,
             blocks: u32,
         ) -> c_int;
+        fn cdio_read_mode2_sector(
+            p: *const CdIoT,
+            buf: *mut c_void,
+            lsn: i32,
+            form2: bool,
+        ) -> c_int;
     }
 
+    // <cdio/track.h> `track_format_t`: AUDIO, CDI, XA (Mode 2), DATA (Mode 1), …
     const TRACK_FORMAT_AUDIO: c_int = 0;
+    const TRACK_FORMAT_XA: c_int = 2;
     const DRIVER_OP_SUCCESS: c_int = 0;
     const CDIO_INVALID_LSN: i32 = -1;
+    /// `CDIO_CDROM_LEADOUT_TRACK`: `cdio_get_track_lsn` on it returns the
+    /// lead-out's starting LSN (<cdio/track.h>).
+    const CDIO_CDROM_LEADOUT_TRACK: u8 = 0xAA;
+
+    /// The disc's TOC as libcdio reports it.
+    pub struct Toc {
+        pub tracks: Vec<TrackInfo>,
+        /// Index-matched with `tracks`: a Mode-2 (XA) data track.
+        pub xa: Vec<bool>,
+        pub lead_out_fad: u32,
+    }
 
     /// A safe owner of a libcdio handle.
     pub struct Cdio {
         p: *mut CdIoT,
     }
 
-    // The handle is used single-threaded behind `&self` reads; the bus is
-    // `Send` but never shares the CD-block across threads concurrently.
+    // SAFETY: the handle is exclusively owned (never cloned or aliased) and is
+    // only used through `&self` reads from the one thread that owns the CD-block
+    // at a time; moving it to another thread is fine because libcdio handles
+    // carry no thread affinity. It is deliberately NOT `Sync`.
     unsafe impl Send for Cdio {}
 
     impl Cdio {
@@ -463,30 +625,44 @@ mod ffi {
         pub fn open(device: &str) -> Result<Self, String> {
             let c = CString::new(device).map_err(|_| "device path has a NUL byte".to_string())?;
             // driver_id 0 = DRIVER_UNKNOWN → libcdio auto-detects.
+            // SAFETY: `c` is a valid NUL-terminated string that outlives the
+            // call (libcdio copies the source name); a NULL return is handled.
             let p = unsafe { cdio_open(c.as_ptr(), 0) };
             if p.is_null() {
-                let _ = unsafe { CStr::from_ptr(c.as_ptr()) }; // keep `c` alive
                 return Err(format!("libcdio could not open '{device}'"));
             }
             Ok(Self { p })
         }
 
         /// Read the TOC into our [`TrackInfo`] table + lead-out FAD.
-        pub fn read_toc(&self) -> Result<(Vec<TrackInfo>, u32), String> {
+        pub fn read_toc(&self) -> Result<Toc, String> {
+            // SAFETY (every call in this fn): `self.p` is a live, non-NULL
+            // handle from `cdio_open` (checked there, freed only in `Drop`);
+            // these getters only read the cached TOC.
             let first = unsafe { cdio_get_first_track_num(self.p) };
+            // SAFETY: as above.
             let last = unsafe { cdio_get_last_track_num(self.p) };
             if first == 0 || first == 0xFF || last == 0xFF || last < first {
                 return Err("libcdio returned no readable TOC".into());
             }
             let mut tracks = Vec::new();
+            let mut xa = Vec::new();
             for n in first..=last {
+                // SAFETY: as above; `n` is within the reported track range.
                 let lsn = unsafe { cdio_get_track_lsn(self.p, n) };
+                // SAFETY: as above.
                 let last_lsn = unsafe { cdio_get_track_last_lsn(self.p, n) };
-                if lsn == CDIO_INVALID_LSN {
+                if lsn == CDIO_INVALID_LSN || lsn < 0 {
                     continue;
                 }
-                let is_audio = unsafe { cdio_get_track_format(self.p, n) } == TRACK_FORMAT_AUDIO;
-                let length = (last_lsn - lsn + 1).max(0) as u32;
+                // SAFETY: as above.
+                let format = unsafe { cdio_get_track_format(self.p, n) };
+                let is_audio = format == TRACK_FORMAT_AUDIO;
+                let length = if last_lsn == CDIO_INVALID_LSN {
+                    0
+                } else {
+                    (last_lsn - lsn + 1).max(0) as u32
+                };
                 tracks.push(TrackInfo {
                     number: n,
                     ctrl_addr: if is_audio { 0x01 } else { 0x41 },
@@ -494,13 +670,26 @@ mod ffi {
                     start_fad: lsn as u32 + FAD_OFFSET,
                     length,
                 });
+                xa.push(format == TRACK_FORMAT_XA);
             }
             if tracks.is_empty() {
                 return Err("libcdio TOC had no usable tracks".into());
             }
-            let lead_lsn = unsafe { cdio_get_disc_last_lsn(self.p) };
-            let lead_out_fad = lead_lsn as u32 + FAD_OFFSET + 1;
-            Ok((tracks, lead_out_fad))
+            // The lead-out's *starting* LSN — i.e. one past the last sector —
+            // which is exactly the TOC lead-out address (FAD = LSN + 150). The
+            // old `cdio_get_disc_last_lsn() + 1` relied on that function's
+            // loosely documented "lsn of the end of the CD" (its drivers return
+            // the lead-out LSN itself, which made the `+ 1` one sector late).
+            // SAFETY: as above; 0xAA is libcdio's documented lead-out track.
+            let lead_lsn = unsafe { cdio_get_track_lsn(self.p, CDIO_CDROM_LEADOUT_TRACK) };
+            if lead_lsn == CDIO_INVALID_LSN || lead_lsn < 0 {
+                return Err("libcdio returned no lead-out address".into());
+            }
+            Ok(Toc {
+                tracks,
+                xa,
+                lead_out_fad: lead_lsn as u32 + FAD_OFFSET,
+            })
         }
 
         /// Read one cooked 2048-byte Mode-1/2 data sector at `lsn`.
@@ -508,8 +697,24 @@ mod ffi {
             if out.len() < SECTOR_USER || lsn < 0 {
                 return false;
             }
+            // SAFETY: `self.p` is live (see `read_toc`); `out` is checked above to
+            // hold ≥ 2048 bytes, exactly one cooked Mode-1 block (form2 = false).
             let rc =
                 unsafe { cdio_read_mode1_sectors(self.p, out.as_mut_ptr().cast(), lsn, false, 1) };
+            rc == DRIVER_OP_SUCCESS
+        }
+
+        /// Read the 2336-byte post-header payload of one Mode-2 sector at
+        /// `lsn` (subheader ×2 + user data/EDC; `form2 = true` = no Form-1
+        /// cooking). Needs raw `READ CD` access on a live drive.
+        pub fn read_mode2_raw(&self, lsn: i32, out: &mut [u8]) -> bool {
+            if out.len() < M2RAW || lsn < 0 {
+                return false;
+            }
+            // SAFETY: `self.p` is live (see `read_toc`); `out` is checked above
+            // to hold ≥ M2RAW (2336) bytes, the size libcdio writes for one
+            // sector with `form2 = true`.
+            let rc = unsafe { cdio_read_mode2_sector(self.p, out.as_mut_ptr().cast(), lsn, true) };
             rc == DRIVER_OP_SUCCESS
         }
 
@@ -518,6 +723,8 @@ mod ffi {
             if out.len() < SECTOR_RAW || lsn < 0 {
                 return false;
             }
+            // SAFETY: `self.p` is live (see `read_toc`); `out` is checked above to
+            // hold ≥ 2352 bytes, one raw Red Book frame.
             let rc = unsafe { cdio_read_audio_sectors(self.p, out.as_mut_ptr().cast(), lsn, 1) };
             rc == DRIVER_OP_SUCCESS
         }
@@ -526,6 +733,8 @@ mod ffi {
     impl Drop for Cdio {
         fn drop(&mut self) {
             if !self.p.is_null() {
+                // SAFETY: `self.p` came from `cdio_open`, is non-NULL, and is
+                // destroyed exactly once (here, as the sole owner).
                 unsafe { cdio_destroy(self.p) };
             }
         }
