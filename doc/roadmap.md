@@ -429,16 +429,42 @@ contradict an existing ✅ — they are *refinements* of a tier marked done):
 
 - **SH-2:** ✅ **misaligned cached read no longer panics** (`de9a1b2`) — force-align `mem_read/write16/32` (`A &= ~(size-1)`, Mednafen `MemRead`), removing the out-of-bounds cache-line slice; golden-safe. ✅ **DIVU overflow writes a saturated quotient** (`114ec6b`, refines D1) — faithful `DIVU_S32_S32`/`S64_S32` incl. the `DIVU64_Partial` high-half + dropping the spurious `i32::MIN/-1` overflow. ⬜ *deferred:* address-error exceptions (vec 9/10) — the force-align captures the safe data-path half; raising the exception is unsafe (would trap on our own emulator bugs, and the oracle flags its address-error timing as approximate).
 - **VDP2:** ✅ **bitmap palette-bank + colour-calc window done** (`9eac9a9`) — a ≤8bpp bitmap NBG folds its BMPNA/B palette bank into the CRAM index [10:8], and colour calc is gated by the WCTLD-hi-byte window; both inert at defaults. (MSB self-shadow 2× was fixed in H2d.) ✅ **blend ratio ÷31→÷32** (`30753c6`) — the hardware `(fore·(31−ratio) + below·(1+ratio)) >> 5`; a fully-opaque blend leaks 1/32 of the layer below. Pixel-visible; **play-test verified** (Wachenröder dialog + VF2). ⬜ *deferred:* CCRTMD (ratio-from-2nd-layer, CCCTL bit 9 — needs a per-pixel `Dot.cc_ratio`).
-- **VDP1:** ✅ **mesh-phase, RGB-direct transparency, end-code truncation done** — mesh checkerboard phase corrected (`72bbe16`, `(x^y)&1 != 0` transparent); RGB-direct transparency = `raw < 0x4000` + end-code band `(raw & 0xC000) == 0x4000` (`b830aa6`); an end-code now truncates the rest of its textured row/span (`5b0e02e`). All pixel-visible; **play-test verified** in VF2. ⬜ *deferred:* user-clip "outside" mode (CMDPMOD bit 9, additive/low-value).
+- **VDP1:** ✅ **mesh-phase, RGB-direct transparency, end-code truncation done** — mesh checkerboard phase corrected (`72bbe16`, `(x^y)&1 != 0` transparent); RGB-direct transparency = `raw < 0x4000` + end-code band `(raw & 0xC000) == 0x4000` (`b830aa6`); an end-code now truncates the rest of its textured row/span (`5b0e02e`). All pixel-visible; **play-test verified** in VF2. ✅ user-clip "outside" mode (CMDPMOD bit 9) landed in Tier I (`b529000`).
 - **SCU-DSP** (least oracle-faithful SCU area): ✅ **ALU flags + V-sticky + count fixed** (`0057146`) — ADD/SUB carry/sign/zero on the native 32-bit width (not sign-extended i64), the V overflow flag is sticky (`|=`, cleared only by a status read), and a DMA `count==0` moves 256 words; golden-safe. ⬜ *deferred:* the MAME→Mednafen direction-dependent stride table (couples to the host `add>>2` writeback feeding the golden-sensitive boot-jingle DMA); program-RAM DMA (`drw==4`) folds to data bank 0 (needs a PRAM-staging buffer + savestate bump).
 - **SCSP:** ✅ **SBXOR (PCM taps) + SoundDirect done** (`b9d06d7`) — SBXOR now XORs the PCM interpolation taps too (completing the H2a noise/zero path), and SoundDirect (reg6 bit 8) sends raw PCM at full level, bypassing EG/TL; both inert unless the bit is set. ⬜ *deferred:* AttackLoopLink, EGBypass, ShortWave (need new per-slot key-on state, rare in real games); EG/pan are float-table approximations, not bit-exact (a dedicated integer-EG refactor, bundle with EGBypass).
 - **SMPC:** SYSRES (0x0D) decoded but a no-op (`// M4+ will route to reset()` — never did); direct-mode PDR/DDR peripheral I/O is store-only (no TH/TR handshake); SMEM (the BIOS language/setup byte) not persisted to a host file.
 
 **Needs verification before acting** (agent-reported, inspection inconclusive):
 VDP2 "2048-colour (depth 2) → 4bpp garbage" (the code has *partial* depth-2
-awareness); VDP1 command-0xB severity (whether shipping games emit it — but our
-plotter ends the list on 0xB while our timing model treats it as a clip command,
-so the two halves disagree); SMPC per-command SF-busy durations.
+awareness); ~~VDP1 command-0xB severity~~ (resolved in Tier I `b529000`: 0xB is a
+user-clip alias in both the plotter and the timing model; only 0xC–0xF end the
+list, per Mednafen); SMPC per-command SF-busy durations.
+
+**Tier I — full-workspace code review (2026-11-16).** ✅ **All findings
+fixed.** A four-reviewer, per-subsystem review (CPU cores / Saturn system /
+VDP1+CD+disc / frontend+tooling) after the Rust 1.100 + sdl3 0.22 upgrade
+(`cfb4bc7`), each finding re-verified against the Mednafen oracle before fixing.
+**Golden-safe throughout:** `bios_boot` `0x0B1BA6E5180766F7` and the four game
+render goldens (SAN5 71680, VF2 53413, Doukyuusei 143341, PDZ 274464 px)
+unchanged. **Savestate v16 → v17.**
+
+| # | Area | Fix |
+|---|------|-----|
+| I1 | Crash/hang | CD data-port OOB panic after Reset Selector/Delete (`17f3f4e`); indirect SCU-DMA size word unmasked → hang (`617397a`); `Saturn::reset` zeroed CPU clocks only → CD freeze + ~2^61-tick FRT spin, now monotonic + full peripheral reset (`b94ebf9`, `1518dc0`); malformed CUE/CCD track numbers and overflow panics (`1acf43c`); hostile root-directory length allocation (`118c965`) |
+| I2 | SH-2 | FRT vectors (OCIA/OCIB share VCRC[6:0], OVI = VCRD[14:8]), IRL wins priority ties, CHCR.TE/DMAOR.AE clear-only, on-chip reset (`1518dc0`); ICR.NMIL reads the NMI pin (`52ea74e`, slave undriven `c93fb83`); SLEEP power-down + interrupt-disabled LDC/STC/LDS/STS (`8b676b2`, gate `5bdbd12`); slot-illegal vector/PC + MAC.L S=1 (`d3f61c9`); CCR.ID/OD replacement-disable + write-hit LRU (`342384c`); DIVU shadow regs (`eaadacf`); FTCSR read latch serialized (`f735748`) |
+| I3 | SCU-DSP | `SR` carry = LSB, `MOV MUL,P` on demand, ALU = AC per word, D1 same-bank write suppression, CT increments after D1, AD2 carry (`e681064`) |
+| I4 | SCU / SMPC / bus | D*EN go (bit 0) vs Enable (bit 8) + sub-width writes, IST write cancels pending edge, `SAT_CD_NO_PROHIBIT` removed (`45b8411`); work-RAM mirrors over the full window + side-effect-free bp capture (`debb211`); SMPC SF write-sets, mirroring, even bytes 0xFF (`bf342d5`); INTBACK IRQ at phase end (`41f6de8`), single CONTINUE phase + live OREG10/11 (`1151f59`); save-state prefix-first + size + cart checks (`5030d60`); one shared interrupt gate (`56e0099`) |
+| I5 | VDP1 / CD / disc | Persistent shared clip/local registers + Mednafen two-test clip incl. PMOD bit 9 (`b529000`); FADs accumulated per track for mixed sector sizes, MODE2/2336 (`1acf43c`); Get Session Info read-only (`31ae96b`); Get File Info Mednafen layout + Change Dir own length (`118c965`); filter-id rejects (`684aa2e`); sub-pre-roll CD-DA plays out (`551bdc5`) |
+| I6 | Frontend / tooling | GPU swapchain never cancelled after acquire (`3840bff`); SDL3 window-event flush removed (`cf24be3`); atomic save writes + change-driven battery persistence (`0fe6ff9`, `0838705`); renderer fallback survives a failing driver (`5376998`); config XDG fallback + quoted `#` (`70480cb`); render-worker death visible (`45f1419`); sdbg save paths/`--card`/overflow/symbols (`22a4b40`, shared `saturn::host_files` `37d8a97`); physdisc unsafe confined + lead-out + Mode-2 subheaders (`c544f30`); long `run`/`exec`/`dispatch_osd` split (`0838705`, `21b6402`, `43fad37`) |
+| I7 | CI | `.github/workflows/ci.yml` — fmt, clippy (workspace, headless, gpu-presenter), tests on push/PR (`5738a98`) |
+
+⬜ *Left as found (outside the review's findings):* CD Read File 0x74 offset
+decode (MAME `(CR1&0xFF)<<8 \| CR2&0xFF` vs Mednafen `<<16 \| CR2`); 0x43/0x45
+still raise ESEL (Mednafen: CMOK only); Read Directory 0x71 / Get FS Scope 0x72
+use the MAME window model; 0x61 doesn't answer WAIT during an active transfer;
+INTBACK OREG0 bit 6 (reset-NMI enable); SMPC BusBuffer read-back. **Needs a
+play-test:** anything using VDP1 user clipping (clip registers now power on at
+0) or the 0x73 file-info records (new field layout).
 
 **Already tracked on this backlog (not repeated here):** SCSP G2/G3/G4; VDP1
 erase/BEF G5; VDP2 VBLANK-clear/ODD G6; rendering C5 (dual-window coeff,
@@ -448,7 +474,8 @@ screen-over mode 1), C6 (TVM=3), C9 (line-colour EXCC + gradient), C10
 move/copy sector ops), F3 (SH-2 cache address/data-array spaces).
 
 **Confirmed faithful (audit cleared, for the record):** SH-2 ISA decoder (all
-~142 encodings) + illegal-slot table + cache (LRU/purge/CCR width) +
+~142 encodings) + illegal-slot table (refined in Tier I: undefined slot ops,
+saved PC) + cache (LRU/purge/CCR width; ID/OD semantics refined in Tier I) +
 FRT/WDT/INTC/DMAC-run-condition + DIVU non-overflow; **M68k ISA essentially
 complete**; **SCSP-DSP a faithful `RunDSP` port**; VDP2 windows / mosaic / the 16
 sprite-type bit-splits / special-priority+CC / coefficient table (incl. the new

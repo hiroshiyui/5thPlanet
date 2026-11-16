@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A **full-workspace code review**, every finding fixed and re-verified against
+the Mednafen oracle (roadmap M13 Tier I), on top of a toolchain/dependency
+upgrade. The `bios_boot` golden `0x0B1BA6E5180766F7` and the game render
+goldens are unchanged. **The savestate format moves to v17** — 0.20.0 states
+are rejected with a version mismatch.
+
+### Changed
+
+- Rust toolchain 1.98.1 → **1.100.0**; **sdl3 0.18.4 → 0.22.1** (SDL 3.4.20),
+  png 0.17 → 0.18, plus semver-compatible updates. bincode stays on 2.x (its
+  3.0.0 is a `compile_error!` tombstone).
+- Battery saves (`.bup`/`.crtbup`) are written as soon as they change (checked
+  every ~5 s) instead of only at exit, and every save file is written
+  atomically (temp file + rename).
+- `sdbg` loads the same `<bios>.bup` jupiter writes, gains `--card=N`, and
+  accepts `.iso`/`.ccd` discs.
+- A push/PR CI workflow now runs fmt, clippy and the test suite.
+
+### Fixed
+
+- **Crashes and hangs:** a CD data-port read after Reset Selector/Delete
+  Sector Data panicked; a bad indirect SCU-DMA table hung the emulator;
+  OSD Reset / Load Disc / Region / Cart changes could freeze the CD-block or
+  spin the SH-2 timers; malformed CUE/CCD files and hostile disc directories
+  could panic or force huge allocations; SDL could assert in the GPU presenter.
+- **SH-2:** FRT interrupt vectors, IRL-vs-on-chip priority ties, DMAC TE/AE
+  clear-only flags, on-chip reset, ICR.NMIL, SLEEP, interrupt-disabled
+  instructions, slot-illegal vector and saved PC, MAC.L saturation, CCR.ID/OD
+  semantics and write-hit LRU, DIVU shadow registers.
+- **SCU-DSP:** `SR` carry, `MOV MUL,P`, ALU/AC per word, D1 bank-write
+  suppression, CT increment order, AD2 carry.
+- **SCU / SMPC / bus:** D*EN go vs enable bits (and sub-width writes), IST
+  writes cancel pending interrupts, full work-RAM mirrors, SMPC SF/mirroring,
+  INTBACK interrupt timing and status bytes, save-state validation (incl. the
+  cartridge).
+- **VDP1 / CD:** persistent clip/local registers and the two-test clip (incl.
+  draw-outside-user-clip), mixed-sector-size CUE track positions, MODE2/2336
+  tracks, Get Session Info, Get File Info, short CD-DA plays, live-disc Mode-2
+  subheaders and lead-out.
+- **Frontend:** window events were discarded each frame (breaking the 4:3
+  resize snap), a failing render driver panicked instead of falling back,
+  config keys bound to `#` reverted, settings never saved on a read-only
+  install directory, and a dead render worker froze the display silently.
+
 ## [0.20.0] - 2026-07-02
 
 The **Super Robot Wars F / F Final release**: the three emulation gaps that
