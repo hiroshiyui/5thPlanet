@@ -316,3 +316,38 @@ fn take_audio_returns_interleaved_stereo_after_a_frame() {
     assert!(!audio.is_empty(), "audio drained for the frame");
     assert_eq!(audio.len() % 2, 0, "interleaved stereo → even length");
 }
+
+/// A BIOS image whose reset vector runs `ADD #1,R0 ; BRA -> ADD ; NOP` at
+/// 0x100 (executed uncached from the BIOS ROM, so every fetch is a timed bus
+/// access).
+fn counting_loop_bios() -> Vec<u8> {
+    let mut bios = vec![0u8; 512 * 1024];
+    bios[0..4].copy_from_slice(&0x0000_0100u32.to_be_bytes()); // PC
+    bios[4..8].copy_from_slice(&0x0600_8000u32.to_be_bytes()); // SP
+    for (i, w) in [0x7001u16, 0xAFFD, 0x0009].iter().enumerate() {
+        bios[0x100 + i * 2..0x102 + i * 2].copy_from_slice(&w.to_be_bytes());
+    }
+    bios
+}
+
+#[test]
+fn a_breakpoint_hit_does_not_perturb_the_run() {
+    // The bp capture (48 code words + the probe) must be observer-only: no
+    // BusTiming charge, no FIFO pop. An instrumented run must stay
+    // bit-identical to an un-instrumented one.
+    let mut plain = Saturn::new(counting_loop_bios());
+    plain.reset();
+    let mut traced = Saturn::new(counting_loop_bios());
+    traced.reset();
+    traced.set_master_bp(0x0000_0102);
+    traced.set_master_bp_probe(Some(0x0600_0000));
+    plain.run_for(20_000);
+    traced.run_for(20_000);
+    let hit = traced.take_master_bp_hit().expect("breakpoint fired");
+    assert_eq!(hit.code[0], 0xAFFD, "code captured by peek");
+    assert_eq!(
+        plain.save_state(),
+        traced.save_state(),
+        "breakpoint capture changed machine state"
+    );
+}

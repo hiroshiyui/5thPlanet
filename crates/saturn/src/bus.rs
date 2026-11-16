@@ -1,9 +1,10 @@
 //! Saturn-wide memory bus seen by both SH-2 cores.
 //!
-//! [`SaturnBus`] implements `sh2::Bus`. It dispatches every access by
-//! the top 8 bits of the address, after the CPU has already stripped
-//! the cached/cache-through indicator. Anything outside the modeled
-//! region map reads as 0 and ignores writes (open-bus behaviour).
+//! [`SaturnBus`] implements `sh2::Bus`. It dispatches every access through
+//! one `match` over the physical region ranges below (`*_BASE..=*_END`),
+//! after the CPU has already stripped the cached/cache-through indicator.
+//! Anything outside the modeled region map reads as 0 and ignores writes
+//! (open-bus behaviour).
 //!
 //! Memory map (physical, after CPU `classify()`):
 //!
@@ -11,17 +12,22 @@
 //!   0x0000_0000..0x000F_FFFF   BIOS ROM (mirrored)
 //!   0x0010_0000..0x0017_FFFF   SMPC (System Manager & Peripheral Control)
 //!   0x0018_0000..0x001F_FFFF   Backup RAM (32 KiB, mirrored)
-//!   0x0020_0000..0x002F_FFFF   Low work RAM (1 MiB)
+//!   0x0020_0000..0x003F_FFFF   Low work RAM (1 MiB, mirrored ×2)
 //!   0x0040_0000..0x004F_FFFF   Sound area (still a stub register bank)
 //!   0x0500_0000..0x05FF_FFFF   A-Bus / B-Bus: VDP1, VDP2 and SCSP (sound RAM
 //!                              + regs) routed to their own sub-regions; the
 //!                              leftover A/B-bus space is an open/stub bank
-//!   0x0600_0000..0x06FF_FFFF   High work RAM (1 MiB)
+//!   0x0600_0000..0x07FF_FFFF   High work RAM (1 MiB, mirrored ×32)
 //!   everything else            open bus (0 on read, drop writes)
 //! ```
 //!
-//! Wait-state numbers are conservative defaults; software can later
-//! override them via the SH-2 `BSC` registers (out of M2 scope).
+//! Both work-RAM windows mirror across their full chip-select range, as in
+//! Mednafen (`ss.cpp`: `SS_SetPhysMemMap(0x00200000, 0x003FFFFF, WorkRAML…)`,
+//! `(0x06000000, 0x07FFFFFF, WorkRAMH…)`).
+//!
+//! Access timing is the per-access SH7604 BSC model in [`BusTiming`] /
+//! [`SaturnBus::charge`] (a port of Mednafen's `BSC_BusRead`/`BusWrite` and
+//! the A/B-bus costs from `scu.inc`), shared by both SH-2s.
 
 use sh2::bus::{AccessKind, Bus};
 
@@ -47,7 +53,8 @@ pub const SMPC_END: u32 = 0x0017_FFFF;
 pub const BACKUP_BASE: u32 = 0x0018_0000;
 pub const BACKUP_END: u32 = 0x001F_FFFF;
 pub const LOW_WRAM_BASE: u32 = 0x0020_0000;
-pub const LOW_WRAM_END: u32 = 0x002F_FFFF;
+/// Low work RAM mirrors across the full 2 MiB window (Mednafen `ss.cpp`).
+pub const LOW_WRAM_END: u32 = 0x003F_FFFF;
 pub const SOUND_BASE: u32 = 0x0040_0000;
 pub const SOUND_END: u32 = 0x004F_FFFF;
 /// SCSP sound RAM: 512 KiB at 0x05A0_0000, mirrored through the 1 MiB window,
@@ -67,7 +74,8 @@ pub const SLAVE_FTI_END: u32 = 0x017F_FFFF;
 pub const MASTER_FTI_BASE: u32 = 0x0180_0000;
 pub const MASTER_FTI_END: u32 = 0x01FF_FFFF;
 pub const HIGH_WRAM_BASE: u32 = 0x0600_0000;
-pub const HIGH_WRAM_END: u32 = 0x06FF_FFFF;
+/// High work RAM mirrors across the full 32 MiB CS3 window (Mednafen `ss.cpp`).
+pub const HIGH_WRAM_END: u32 = 0x07FF_FFFF;
 
 /// SH7604 BSC external-bus timing state (M12 task #8) — a faithful port of
 /// Mednafen's per-access model (`sh7095.inc` `BSC_BusRead`/`BSC_BusWrite` +
@@ -290,6 +298,28 @@ pub struct SaturnBus {
 }
 
 impl SaturnBus {
+    /// Side-effect-free 16-bit peek of the backing-memory regions (BIOS ROM and
+    /// both work RAMs): touches no bus timing, watchpoint, FIFO or peripheral
+    /// state. Other regions return `None` (registers have no stable value to
+    /// read without side effects). Backs [`sh2::bus::Bus::peek16`] and the
+    /// debugger's breakpoint capture.
+    pub fn peek16(&self, addr: u32) -> Option<u16> {
+        match addr {
+            BIOS_BASE..=BIOS_END => Some(self.bios.read16(addr - BIOS_BASE)),
+            LOW_WRAM_BASE..=LOW_WRAM_END => Some(self.low_wram.read16(addr - LOW_WRAM_BASE)),
+            HIGH_WRAM_BASE..=HIGH_WRAM_END => Some(self.high_wram.read16(addr - HIGH_WRAM_BASE)),
+            _ => None,
+        }
+    }
+
+    /// Side-effect-free 32-bit peek (two [`Self::peek16`] halves; `None` unless
+    /// both halves are peekable memory).
+    pub fn peek32(&self, addr: u32) -> Option<u32> {
+        let hi = self.peek16(addr)?;
+        let lo = self.peek16(addr.wrapping_add(2))?;
+        Some((u32::from(hi) << 16) | u32::from(lo))
+    }
+
     /// Pop the last-noted raster-register read `(reg_offset, stored_value)` (M13
     /// A1 jitter probe). The aggregate drains this after each instruction.
     pub fn take_raster_read(&mut self) -> Option<(u32, u16, u32, u64)> {
@@ -723,12 +753,7 @@ impl Bus for SaturnBus {
     /// (registers, open bus) return `None` — there's no stable value to
     /// compare a cached line against. Touches no timing/watch state.
     fn peek16(&self, addr: u32) -> Option<u16> {
-        match addr {
-            BIOS_BASE..=BIOS_END => Some(self.bios.read16(addr - BIOS_BASE)),
-            LOW_WRAM_BASE..=LOW_WRAM_END => Some(self.low_wram.read16(addr - LOW_WRAM_BASE)),
-            HIGH_WRAM_BASE..=HIGH_WRAM_END => Some(self.high_wram.read16(addr - HIGH_WRAM_BASE)),
-            _ => None,
-        }
+        SaturnBus::peek16(self, addr)
     }
 
     fn read32(&mut self, addr: u32, k: AccessKind) -> (u32, u32) {
