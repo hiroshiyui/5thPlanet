@@ -193,6 +193,14 @@ fn apply_fti(
     }
 }
 
+/// `SR` after the final INTBACK peripheral block (Mednafen `smpc.cpp`, end of
+/// the JR loop): bit 7 set, NPE (bit 5) clear — no more data — PDL (bit 6) set
+/// because the report is the first and only block, the port modes in the low
+/// nibble, and the RESB bit (4) left as is.
+fn intback_last_block_sr(s: &crate::smpc::Smpc) -> u8 {
+    (s.sr & 0x10) | 0x80 | 0x40 | (s.pmode & 0x0F)
+}
+
 /// INTBACK SF-busy time in microseconds, computed from the request.
 ///
 /// Reconciled against Mednafen (the LLE reference), which models INTBACK as a
@@ -1599,7 +1607,7 @@ impl Saturn {
                     // completion.
                     let ireg0 = self.bus.smpc.ireg[0];
                     let ireg1 = self.bus.smpc.ireg[1];
-                    self.bus.smpc.pmode = ireg0 >> 4;
+                    self.bus.smpc.pmode = ireg1 >> 4;
                     // The status phase runs ONLY if IREG0's low nibble requests
                     // it (Mednafen `if(IREG[0] & 0xF)`); SR_NPE ("peripheral data
                     // follows, await CONTINUE") is set ONLY inside it. A
@@ -1623,10 +1631,10 @@ impl Saturn {
                         // staged CONTINUE handshake.
                         self.bus.smpc.intback_stage = want_periph as u8;
                     } else if want_periph {
-                        // Peripheral-only: fill OREG from byte 0 now; SR = "last
-                        // data" (0x80 | pmode); no CONTINUE expected.
+                        // Peripheral-only: fill OREG from byte 0 now; SR = the
+                        // final-block value; no CONTINUE expected.
                         self.respond_to_intback_peripheral();
-                        self.bus.smpc.sr = 0x80 | self.bus.smpc.pmode;
+                        self.bus.smpc.sr = intback_last_block_sr(&self.bus.smpc);
                         self.bus.smpc.intback_stage = 0;
                     } else {
                         // Neither status nor peripheral requested: a bare ack.
@@ -1662,7 +1670,10 @@ impl Saturn {
                 // hits — SYS slot 0x320). We don't model the 26/28 MHz divisor
                 // switch, but we reproduce the observable handshake: halt the
                 // slave and NMI the master so the SYS call returns.
+                SmpcCommand::CdOn => self.bus.smpc.cd_on = true,
+                SmpcCommand::CdOff => self.bus.smpc.cd_on = false,
                 SmpcCommand::CkChg352 | SmpcCommand::CkChg320 => {
+                    self.bus.smpc.clock_352 = cmd == SmpcCommand::CkChg352;
                     self.halt_slave();
                     self.master_mut()
                         .onchip
@@ -1676,20 +1687,18 @@ impl Saturn {
             self.bus.smpc.mark_command_done();
         }
 
-        // INTBACK peripheral continuation (MAME `intback_continue_request`),
-        // requested by the host writing the CONTINUE bit to IREG0. Fill the
-        // peripheral OREG and advance the staged SR: `0xC0 | pmode` ("more
-        // data", stage 1 → 2) then `0x80 | pmode` ("last", stage 2 → 0).
+        // INTBACK peripheral continuation, requested by the host writing the
+        // CONTINUE bit to IREG0 after a status phase that set SR.NPE. Mednafen
+        // `smpc.cpp` (the JR loop) writes the peripheral report and asks for
+        // another CONTINUE only when it overflows the 32-byte OREG block; every
+        // device we model fits in one block (two 3D pads = 16 bytes), so this
+        // single phase is the last: SR.NPE clear, PDL set, sequence over. (It
+        // used to stage a second, redundant phase that re-read — and zeroed —
+        // the mouse deltas.)
         if self.bus.smpc.take_intback_continue() {
             self.respond_to_intback_peripheral();
-            let pmode = self.bus.smpc.pmode;
-            if self.bus.smpc.intback_stage == 2 {
-                self.bus.smpc.sr = 0x80 | pmode;
-                self.bus.smpc.intback_stage = 0;
-            } else {
-                self.bus.smpc.sr = 0xC0 | pmode;
-                self.bus.smpc.intback_stage += 1;
-            }
+            self.bus.smpc.sr = intback_last_block_sr(&self.bus.smpc);
+            self.bus.smpc.intback_stage = 0;
             let busy = us_to_cycles(700);
             self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
             self.bus.scu.raise(crate::scu::Source::Smpc);
@@ -1701,20 +1710,26 @@ impl Saturn {
     /// system state". Peripheral data is *not* here — it comes in the
     /// separate continuation phase ([`respond_to_intback_peripheral`]).
     ///
+    /// OREG10/11 are computed live from the machine state (Mednafen `smpc.cpp`
+    /// CMD_INTBACK): OREG10 = `0x24 | 28MHz<<6 | slave_on<<4 | 1<<3 (MSHNMI) |
+    /// 1<<1 (SYSRES) | sound_on`, OREG11 = `cd_on<<6 | 1<<1`.
+    ///
     /// ```text
     ///   OREG0      bit7 STE (RTC valid) | bit6 RESD (reset disabled)
     ///   OREG1..7   RTC, BCD: year-hi, year-lo, weekday<<4|month, day,
     ///              hour, minute, second
     ///   OREG8      cartridge code (none)
     ///   OREG9      area code — 0x04 = North America (BIOS halts on mismatch)
-    ///   OREG10     system status 1 — 0x34 (MSHNMI/SYSRES/SOUNDRES)
-    ///   OREG11     system status 2 (CDRES) — 0
+    ///   OREG10     system status 1 (DOTSEL/SLAVE/MSHNMI/SYSRES/SNDRES)
+    ///   OREG11     system status 2 (CDRES)
     ///   OREG12..15 SMEM (SMPC backup memory) — 0 (none stored)
     ///   OREG16..30 undefined — 0xFF (MAME)
     ///   OREG31     0x10 — echo of the issued command (INTBACK)
     /// ```
     fn respond_to_intback_status(&mut self) {
         let now = self.now();
+        let slave_on = !self.slave_is_halted();
+        let sound_on = self.bus.scsp.running;
         let s = &mut self.bus.smpc;
         s.oreg[0] = 0x80;
         // OREG1..7 — live RTC, advanced from the (host- or SETTIME-set) base
@@ -1724,12 +1739,13 @@ impl Saturn {
         s.oreg[8] = 0x00; // cartridge
         // OREG9 area code — meaningful: the BIOS halts on a region mismatch.
         s.oreg[9] = s.region;
-        // REVIEW(magic): OREG10 = 0x34 (MSHNMI|SYSRES|SOUNDRES, dot-select 0)
-        // is taken literally from MAME `resolve_intback`. The bit meanings are
-        // spec-defined (SMPC manual), but this exact post-reset value is
-        // unverified vs hardware and had no observed boot effect.
-        s.oreg[10] = 0x34; // system status 1
-        s.oreg[11] = 0x00; // system status 2
+        s.oreg[10] = 0x24
+            | (u8::from(s.clock_352) << 6)
+            | (u8::from(slave_on) << 4)
+            | (1 << 3) // master NMI
+            | (1 << 1) // SYSRES
+            | u8::from(sound_on); // system status 1
+        s.oreg[11] = (u8::from(s.cd_on) << 6) | (1 << 1); // system status 2
         // OREG12..15 — SMPC backup memory (SMEM), as written by SETSMEM.
         s.oreg[12..16].copy_from_slice(&s.smem);
         // OREG16..30 — undefined; MAME writes 0xFF.

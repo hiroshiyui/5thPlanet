@@ -149,14 +149,22 @@ pub struct Smpc {
     /// reference-derived and unverified — see the `REVIEW(magic)` on
     /// `intback_busy_us`.)
     pub intback_complete_at: Option<u64>,
-    /// INTBACK staged-peripheral protocol state (matches MAME `smpc.cpp`).
-    /// 0 = not in an INTBACK peripheral sequence; non-zero = a peripheral
-    /// transfer phase is in progress (the value drives the next `SR`). The
-    /// status phase sets it to `(IREG1 & 8) >> 3`; each CONTINUE advances it
-    /// (1 → 2 → 0), and BREAK clears it.
+    /// INTBACK staged-peripheral protocol state. 0 = not in an INTBACK
+    /// peripheral sequence; 1 = the status phase returned and peripheral data
+    /// follows on the host's CONTINUE (`SR.NPE` set). The status phase sets it
+    /// to `(IREG1 & 8) >> 3`; the CONTINUE's peripheral phase — which always
+    /// fits in one OREG block for the devices we model — and BREAK clear it.
     pub intback_stage: u8,
-    /// Pad mode echoed back in the peripheral-phase `SR` (`IREG0 >> 4`).
+    /// Port modes echoed in the low nibble of the peripheral-phase `SR`:
+    /// `IREG1 >> 4` (port 1 in bits 1..0, port 2 in bits 3..2 — Mednafen
+    /// `SR |= Mode[0] | Mode[1] << 2`, `Mode[n] = (IREG1 >> (4 + 2n)) & 3`).
     pub pmode: u8,
+    /// `CDON`/`CDOFF` state, reported in INTBACK OREG11 bit 6 (Mednafen
+    /// `CDOn`, true after reset).
+    pub cd_on: bool,
+    /// `CKCHG352` selected the 28 MHz (352-dot) clock; `CKCHG320` the 26 MHz
+    /// one (the reset default). Reported in INTBACK OREG10 bit 6.
+    pub clock_352: bool,
     /// Set when the host writes IREG0 with the CONTINUE bit (0x80) during an
     /// INTBACK peripheral sequence; the Saturn aggregate drains it to run the
     /// next peripheral phase. Mirrors MAME scheduling `intback_continue_request`.
@@ -377,6 +385,7 @@ impl Smpc {
             // Deterministic default clock: 1996-01-01 00:00:00. The frontend
             // overrides it with the host time via `set_rtc_unix`.
             rtc_secs: days_from_civil(1996, 1, 1) as u64 * 86_400,
+            cd_on: true,
             ..Default::default()
         }
     }
@@ -384,7 +393,7 @@ impl Smpc {
     /// System reset (Mednafen `SMPC_Reset`): clear the command machinery —
     /// IREG/OREG/COMREG, SR, SF, any pending or executing command (incl. an
     /// in-flight INTBACK and its CONTINUE staging) and the direct-mode port
-    /// registers. Kept: what the reset doesn't touch on hardware or what the
+    /// registers; the CD is on and the clock back at 320 mode. Kept: what the reset doesn't touch on hardware or what the
     /// host configured — the battery-backed RTC and SMEM, the area code, the
     /// plugged-in port devices and their live input state.
     pub fn reset(&mut self) {
@@ -402,6 +411,7 @@ impl Smpc {
             rtc_secs: self.rtc_secs,
             rtc_set_cycle: self.rtc_set_cycle,
             smem: self.smem,
+            cd_on: true,
             ..Smpc::default()
         };
     }
