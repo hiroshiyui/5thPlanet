@@ -87,9 +87,9 @@ fn scsp_ram_round_trip_and_mirrors() {
 }
 
 #[test]
-fn smpc_sound_abus_bbus_stubs_return_zero() {
+fn sound_abus_bbus_stubs_return_zero() {
     let mut bus = fresh();
-    for &base in &[SMPC_BASE, SOUND_BASE, ABUS_BBUS_BASE] {
+    for &base in &[SOUND_BASE, ABUS_BBUS_BASE] {
         bus.write32(base + 0x100, 0xAAAA_BBBB, AccessKind::Data);
         let (v, _) = bus.read32(base + 0x100, AccessKind::Data);
         assert_eq!(v, 0, "stub region returns 0 even after a write");
@@ -97,14 +97,66 @@ fn smpc_sound_abus_bbus_stubs_return_zero() {
 }
 
 #[test]
+fn smpc_registers_mirror_every_0x80_bytes_and_even_lanes_read_ff() {
+    let mut bus = fresh();
+    bus.write8(SMPC_BASE + 0x100 + 0x01, 0xAB, AccessKind::Data); // IREG0 mirror
+    assert_eq!(bus.smpc.ireg[0], 0xAB);
+    assert_eq!(bus.read8(SMPC_BASE + 0x01, AccessKind::Data).0, 0xAB);
+    assert_eq!(bus.read16(SMPC_BASE, AccessKind::Data).0, 0xFFAB);
+}
+
+#[test]
+fn work_rams_mirror_across_their_full_windows() {
+    // Mednafen ss.cpp maps Low WRAM over 0x0020_0000..0x003F_FFFF and High
+    // WRAM over 0x0600_0000..0x07FF_FFFF.
+    let mut bus = fresh();
+    bus.write32(LOW_WRAM_BASE + 0x10, 0x1122_3344, AccessKind::Data);
+    assert_eq!(
+        bus.read32(0x0030_0010, AccessKind::Data).0,
+        0x1122_3344,
+        "Low WRAM upper mirror"
+    );
+    bus.write32(0x003F_FFF0, 0x5566_7788, AccessKind::Data);
+    assert_eq!(
+        bus.read32(LOW_WRAM_BASE + 0x0F_FFF0, AccessKind::Data).0,
+        0x5566_7788
+    );
+    bus.write32(HIGH_WRAM_BASE + 0x20, 0xCAFE_BABE, AccessKind::Data);
+    assert_eq!(
+        bus.read32(0x07F0_0020, AccessKind::Data).0,
+        0xCAFE_BABE,
+        "High WRAM mirror at the top of CS3"
+    );
+    bus.write16(0x0710_0040, 0xBEEF, AccessKind::Data);
+    assert_eq!(
+        bus.read16(HIGH_WRAM_BASE + 0x40, AccessKind::Data).0,
+        0xBEEF
+    );
+}
+
+#[test]
+fn peeks_have_no_side_effects_and_cover_only_memory() {
+    let mut bus = fresh();
+    bus.write32(HIGH_WRAM_BASE + 0x100, 0x0102_0304, AccessKind::Data);
+    assert_eq!(bus.peek32(HIGH_WRAM_BASE + 0x100), Some(0x0102_0304));
+    assert_eq!(bus.peek32(0x0710_0100), Some(0x0102_0304), "mirror");
+    assert_eq!(
+        bus.peek16(SMPC_BASE + 0x21),
+        None,
+        "registers are not peekable"
+    );
+    assert_eq!(bus.peek32(0x05FE_00A4), None);
+}
+
+#[test]
 fn unmapped_address_reads_zero() {
     let mut bus = fresh();
-    // Between low WRAM end (0x002F_FFFF) and sound base (0x0040_0000)
-    // is unmodeled space.
-    let (v, _) = bus.read32(0x0035_0000, AccessKind::Data);
+    // Between the sound stub end (0x004F_FFFF) and the FTI window
+    // (0x0100_0000) is unmodeled space.
+    let (v, _) = bus.read32(0x0080_0000, AccessKind::Data);
     assert_eq!(v, 0);
-    bus.write32(0x0035_0000, 0xFFFF_FFFF, AccessKind::Data);
-    let (v2, _) = bus.read32(0x0035_0000, AccessKind::Data);
+    bus.write32(0x0080_0000, 0xFFFF_FFFF, AccessKind::Data);
+    let (v2, _) = bus.read32(0x0080_0000, AccessKind::Data);
     assert_eq!(v2, 0, "writes to unmapped space are dropped");
 }
 
@@ -251,10 +303,10 @@ fn backup_ram_round_trip_via_16_and_32_bit_bus() {
 
 #[test]
 fn unmapped_space_is_open_bus_at_all_widths() {
-    // The gap between low WRAM and the sound area is unmodeled: reads 0, drops
-    // writes, at every access width.
+    // The gap above the sound stub is unmodeled: reads 0, drops writes, at
+    // every access width.
     let mut bus = fresh();
-    let gap = 0x0035_0000;
+    let gap = 0x0080_0000;
     bus.write8(gap, 0xFF, AccessKind::Data);
     bus.write16(gap, 0xFFFF, AccessKind::Data);
     bus.write32(gap, 0xFFFF_FFFF, AccessKind::Data);

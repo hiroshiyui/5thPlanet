@@ -36,6 +36,11 @@
 //! bytes + [`analog`] X/Y/L/R channels; M13 E2). Unrecognised commands are queued and complete as no-ops so
 //! BIOS init code doesn't deadlock.
 //!
+//! The register file repeats every 0x80 bytes across the whole SMPC window
+//! (Mednafen `ss.cpp`: `SMPC_A = (A & 0x7F) >> 1`). Only the odd byte lane
+//! carries data: an even byte reads `0xFF` and a byte write to it is dropped
+//! (`DB = 0xFF00 | SMPC_Read(..)`; writes land only when 16-bit or odd).
+//!
 //! Register layout (offsets from `SMPC_BASE = 0x0010_0000`):
 //!
 //! ```text
@@ -444,6 +449,7 @@ impl Smpc {
     /// mode) is visible. Golden-safe (env-gated, no core behaviour change).
     #[doc(hidden)]
     pub fn read8(&self, offset: u32) -> u8 {
+        let offset = offset & 0x7F; // the register file mirrors every 0x80 bytes
         let v = match offset {
             0x01 => self.ireg[0],
             0x03 => self.ireg[1],
@@ -455,13 +461,18 @@ impl Smpc {
             0x1F => self.comreg,
             o if (0x21..=0x5F).contains(&o) && (o & 1) == 1 => self.oreg[((o - 0x21) / 2) as usize],
             0x61 => self.sr,
-            0x63 => self.sf,
+            // SF reads back only bit 0 (Mednafen `SMPC_Read` 0x31:
+            // `ret &= ~1; ret |= SF`).
+            0x63 => self.sf & 1,
             0x75 => self.pdr1,
             0x77 => self.pdr2,
             0x79 => self.ddr1,
             0x7B => self.ddr2,
             0x7D => self.iosel,
             0x7F => self.exle,
+            // The even byte lane is not driven by the SMPC: it reads 0xFF
+            // (`ss.cpp`: `DB = 0xFF00 | SMPC_Read(..)`).
+            o if o & 1 == 0 => 0xFF,
             _ => 0,
         };
         if smpclog_on() {
@@ -474,6 +485,7 @@ impl Smpc {
     }
 
     pub fn write8(&mut self, offset: u32, val: u8) {
+        let offset = offset & 0x7F; // the register file mirrors every 0x80 bytes
         if smpclog_on() {
             eprintln!(
                 "SMPC W {:>5}@{offset:02X} <- {val:02X}",
@@ -511,7 +523,11 @@ impl Smpc {
                 self.oreg[((o - 0x21) / 2) as usize] = val;
             }
             0x61 => self.sr = val,
-            0x63 => self.sf = val,
+            // Any write to SF sets it to 1 — the software "busy" pre-write
+            // (Mednafen `SMPC_Write` 0x31: `SF = true`, the value is ignored).
+            // SF is cleared only by the SMPC when a command completes. NB: a
+            // COMREG write never sets SF (see `queue_command`).
+            0x63 => self.sf = 1,
             0x75 => self.pdr1 = val,
             0x77 => self.pdr2 = val,
             0x79 => self.ddr1 = val,
@@ -660,8 +676,40 @@ mod tests {
         s.write8(0x07, 0xCD);
         assert_eq!(s.read8(0x01), 0xAB);
         assert_eq!(s.read8(0x07), 0xCD);
-        // Even-offset slot is reserved → reads as 0.
-        assert_eq!(s.read8(0x02), 0);
+        // Even-offset lane is not driven → reads as 0xFF.
+        assert_eq!(s.read8(0x02), 0xFF);
+    }
+
+    #[test]
+    fn any_sf_write_sets_sf_and_reads_return_bit0_only() {
+        let mut s = Smpc::new();
+        s.write8(0x63, 0x00); // the value is ignored: a write always sets SF
+        assert_eq!(s.sf, 1);
+        assert_eq!(s.read8(0x63), 1);
+        s.sf = 0xFE; // only bit 0 is architectural
+        assert_eq!(s.read8(0x63), 0);
+    }
+
+    #[test]
+    fn registers_mirror_every_0x80_bytes() {
+        let mut s = Smpc::new();
+        s.write8(0x80 + 0x01, 0x5A); // IREG0 through the first mirror
+        assert_eq!(s.ireg[0], 0x5A);
+        assert_eq!(s.read8(0x7_FF80 + 0x01), 0x5A, "deep mirror of IREG0");
+        s.oreg[0] = 0x33;
+        assert_eq!(s.read8(0x100 + 0x21), 0x33, "OREG0 mirrored");
+        s.write8(0x80 + 0x1F, 0x02); // COMREG via a mirror
+        assert_eq!(s.take_pending(), Some(Command::SshOn));
+    }
+
+    #[test]
+    fn word_and_long_reads_carry_0xff_in_the_even_lane() {
+        let mut s = Smpc::new();
+        s.oreg[0] = 0x12;
+        s.oreg[1] = 0x34;
+        // A 16-bit read at the even address: 0xFF high, register low.
+        assert_eq!(s.read16(0x20), 0xFF12);
+        assert_eq!(s.read32(0x20), 0xFF12_FF34);
     }
 
     #[test]
@@ -857,11 +905,11 @@ mod tests {
         s.write8(0x23, 0x34);
         s.write8(0x25, 0x56);
         s.write8(0x27, 0x78);
-        // read16 spans an odd register and the reserved even byte after it.
-        assert_eq!(s.read16(0x21), 0x1200, "OREG0 high, reserved low");
-        // read32 covers 0x21(OREG0)/0x22(reserved)/0x23(OREG1)/0x24(reserved):
-        // the odd bytes carry data, the even ones read 0.
-        assert_eq!(s.read32(0x21), 0x1200_3400);
+        // read16 spans an odd register and the undriven even byte after it.
+        assert_eq!(s.read16(0x21), 0x12FF, "OREG0 high, undriven low");
+        // read32 covers 0x21(OREG0)/0x22/0x23(OREG1)/0x24: the odd bytes carry
+        // data, the even ones read 0xFF.
+        assert_eq!(s.read32(0x21), 0x12FF_34FF);
     }
 
     #[test]
@@ -894,12 +942,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_even_offsets_read_zero() {
-        let s = Smpc::new();
-        assert_eq!(s.read8(0x00), 0, "even IREG slot reserved");
-        assert_eq!(s.read8(0x20), 0, "even OREG slot reserved");
-        assert_eq!(s.read8(0x62), 0, "even byte by SR reserved");
-        assert_eq!(s.read8(0xFF), 0, "unmapped offset reads 0");
+    fn even_offsets_read_0xff_and_drop_writes() {
+        let mut s = Smpc::new();
+        assert_eq!(s.read8(0x00), 0xFF, "even IREG lane");
+        assert_eq!(s.read8(0x20), 0xFF, "even OREG lane");
+        assert_eq!(s.read8(0x62), 0xFF, "even byte by SR");
+        s.write8(0x62, 0x01); // even lane: dropped, SF untouched
+        assert_eq!(s.sf, 0);
+        // An unmapped odd offset reads 0.
+        assert_eq!(s.read8(0x11), 0);
     }
 
     #[test]
