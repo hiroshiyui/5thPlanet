@@ -26,7 +26,7 @@
 //! `(0x06000000, 0x07FFFFFF, WorkRAMH…)`).
 //!
 //! Access timing is the per-access SH7604 BSC model in [`BusTiming`] /
-//! [`SaturnBus::charge`] (a port of Mednafen's `BSC_BusRead`/`BusWrite` and
+//! `SaturnBus::charge` (a port of Mednafen's `BSC_BusRead`/`BusWrite` and
 //! the A/B-bus costs from `scu.inc`), shared by both SH-2s.
 
 use sh2::bus::{AccessKind, Bus};

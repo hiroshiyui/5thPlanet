@@ -1,14 +1,12 @@
 //! Typed memory regions backing the Saturn bus.
 //!
 //! Each struct owns its bytes and exposes `read8/16/32` + `write8/16/32`
-//! at *region-local* offsets — that is, an offset already reduced modulo
-//! the region size by the caller. Endianness is big-endian throughout
-//! (SH-2 / Saturn convention).
-//!
-//! Wait-state values are conservative best-case numbers from the SH7604
-//! `BSC` defaults and the *ST-V Service Manual* memory-map appendix.
-//! Real software can change them by writing the BSC's `WCR`; that
-//! refinement is queued for a later milestone.
+//! at *region-local* offsets (the bus subtracts the region base; each
+//! region folds an out-of-range offset modulo its own size, so smaller images
+//! and RAMs mirror across their window). Endianness is big-endian throughout
+//! (SH-2 / Saturn convention). The region map follows the *ST-V Service
+//! Manual* memory-map appendix. Access timing is not modelled here — the bus
+//! charges it per access (`bus::BusTiming`, the SH7604 BSC model).
 
 /// Read-only BIOS ROM. Mirrors to fill its addressable window: the real
 /// Saturn 512 KiB BIOS appears twice across the 1 MiB region at
@@ -239,9 +237,9 @@ impl BackupRam {
     }
 }
 
-/// Stand-in for a region of registers that hasn't been modeled yet
-/// (SMPC, SCU, VDP1/2, SCSP, A-bus, etc.). Reads return 0; writes are
-/// dropped. Holds a name for traceable debug output.
+/// Stand-in for an address window with no modelled device behind it (the
+/// `0x0040_0000` CS0 area and the leftover A/B-bus space). Reads return 0;
+/// writes are dropped. Holds a name for traceable debug output.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StubRegisterBank {
     // Debug-only label, and a borrowed `&'static str` at that, so it's not

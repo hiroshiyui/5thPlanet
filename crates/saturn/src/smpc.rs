@@ -66,19 +66,20 @@ pub enum Command {
     SshOn = 0x02,
     /// SSHOFF — halt the slave SH-2.
     SshOff = 0x03,
-    /// SNDON / SNDOFF — sound subsystem control. M3 no-op.
+    /// SNDON / SNDOFF — release / re-hold the SCSP's sound 68k.
     SndOn = 0x06,
     SndOff = 0x07,
-    /// CDON / CDOFF — CD block control. M3 no-op.
+    /// CDON / CDOFF — CD block on/off (reported in INTBACK OREG11).
     CdOn = 0x08,
     CdOff = 0x09,
-    /// SYSRES — system reset. M3 no-op; M4+ will route to Saturn::reset().
+    /// SYSRES — system reset. Recognised; not yet routed to `Saturn::reset`.
     SysRes = 0x0D,
-    /// CKCHG352 / CKCHG320 — clock change (PAL / NTSC). M3 no-op.
+    /// CKCHG352 / CKCHG320 — dot-clock change (352/704 vs 320/640 modes):
+    /// halts the slave and NMIs the master; the divisor is reported in INTBACK.
     CkChg352 = 0x0E,
     CkChg320 = 0x0F,
-    /// INTBACK — peripheral data fetch. M4 returns "no controller"
-    /// (see [`crate::system::Saturn`] INTBACK handling).
+    /// INTBACK — status and/or peripheral data fetch (see
+    /// [`crate::system::Saturn`]'s `drain_smpc`).
     IntBack = 0x10,
     /// SETTIME — set the RTC from IREG0..6 (see `system` command handling).
     SetTime = 0x16,
@@ -86,7 +87,7 @@ pub enum Command {
     SetSMem = 0x17,
     /// NMIREQ — assert NMI to master SH-2. Routed via INTC.
     NmiReq = 0x18,
-    /// RESENAB / RESDISA — reset button enable/disable. M3 no-op.
+    /// RESENAB / RESDISA — reset button enable/disable. Recognised, no effect.
     ResEnab = 0x19,
     ResDisa = 0x1A,
 }
@@ -137,7 +138,8 @@ pub struct Smpc {
     /// write; never cleared automatically. Useful for trace tooling.
     pub last_unknown_command: Option<u8>,
     /// Command queued by a write to COMREG, waiting for the Saturn
-    /// aggregate to process it. SF stays at 1 while this is `Some`.
+    /// aggregate to process it. (SF is whatever software pre-wrote; the
+    /// COMREG write does not set it.)
     pending: Option<Command>,
     /// INTBACK has a non-trivial execution time: the SMPC keeps SF busy for
     /// a request-dependent interval (see `system::intback_busy_us`) before it

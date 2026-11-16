@@ -1,10 +1,12 @@
 //! Top-level Saturn aggregate: bus + scheduler + master/slave SH-2.
 //!
-//! This is the surface the frontend will hold in M3+. For M2 it stays
-//! deliberately thin — `new`/`reset`/`run_for` plus typed accessors for
-//! each CPU. Anything chip-specific (VDP2, SCSP, SMPC commands) gets
-//! added as a method on `Saturn` when the corresponding peripheral
-//! lands, so the frontend doesn't have to reach across module boundaries.
+//! [`Saturn`] is the surface the frontends hold: construction/reset, the run
+//! loop (`run_for` / `run_frame` / `advance_frame`, which steps the two SH-2s
+//! in Mednafen's master-leads-slave order and samples the SCU/CD interrupt
+//! lines per master instruction), the between-batch peripheral drains (raster
+//! timing, SMPC commands, SCU DMA/DSP, VDP1 draw-end, SCSP), media and input
+//! entry points, save states (`savestate.rs`), and the observer-only debug
+//! hooks used by `sdbg` and the trace harnesses.
 
 use sh2::Cpu;
 use sh2::bus::{AccessKind, Bus};
@@ -1094,13 +1096,6 @@ impl Saturn {
         }
     }
 
-    /// Recompute the VDP2 raster-timing registers — `VCNT` and the
-    /// `TVSTAT` VBLANK/HBLANK/ODD-field bits — from the global cycle,
-    /// and raise the SCU VBlank-IN interrupt on the active→VBLANK edge.
-    /// The BIOS polls these to synchronize with the display; a static
-    /// stub leaves it unable to sync (it spins after INTBACK). Called
-    /// between scheduler batches, so the registers track the raster to
-    /// ~`SMPC_POLL_QUANTUM` granularity.
     /// The cycle-exact raster register state at global cycle `now` for the given
     /// horizontal resolution: `(vcnt, tvstat_raster_bits)`, where the bits are
     /// VBLANK (0x0008) | HBLANK (0x0004) | ODD (0x0002). The raster registers are
@@ -1134,6 +1129,13 @@ impl Saturn {
         (line as u16, bits)
     }
 
+    /// Recompute the VDP2 raster-timing registers — `VCNT` and the
+    /// `TVSTAT` VBLANK/HBLANK/ODD-field bits — from the global cycle, and
+    /// raise the raster-driven SCU interrupts / DMA factors on their edges
+    /// (VBlank-IN/-OUT, Timer 0/1, HBlank-IN). The BIOS polls these to
+    /// synchronize with the display. Called between scheduler batches, which
+    /// are clamped to the VBlank edges, so VBLANK is cycle-exact and the
+    /// other bits track the raster to ≤ `SMPC_POLL_QUANTUM` granularity.
     fn update_video_timing(&mut self) {
         let now = self.now();
         let prev = self.bus.vdp2.regs.read16(0x004);
@@ -1902,9 +1904,10 @@ impl Saturn {
         self.bus.smpc.set_rtc_unix(unix_secs, now);
     }
 
-    /// Insert a disc image into the CD-block. The drive moves to PAUSE at the
-    /// start of the disc; the BIOS/game can then read the TOC, query sessions,
-    /// and (in later M7 phases) read sectors and boot the game.
+    /// Insert a disc image (or live drive) into the CD-block. The drive spins
+    /// up (reporting BUSY for ~1 s, as at power-on) and settles to PAUSE at the
+    /// start of the disc; the BIOS/game then reads the TOC, authenticates and
+    /// boots it.
     pub fn insert_disc<S: crate::disc::SectorSource + 'static>(&mut self, source: S) {
         self.bus.cd_block.insert_disc(source);
     }
@@ -2097,18 +2100,6 @@ impl Saturn {
         self.scheduler.now()
     }
 
-    /// Run one NTSC frame (≈476 932 SH-2 cycles at 60 Hz) and produce
-    /// the rendered framebuffer. The VDP2 raster registers (VCNT /
-    /// TVSTAT) and the VBlank-IN interrupt are maintained by
-    /// [`Self::update_video_timing`] from the run loop, so this just
-    /// runs the active region, snapshots the frame at the active→VBLANK
-    /// boundary, and runs the VBLANK region.
-    ///
-    /// Writes RGBA8888 into `out`, which must be at least
-    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes. Returns the active display size
-    /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
-    /// pixels are packed tightly with row stride = `width`, so the caller uploads
-    /// `width × height` with a `width × 4` pitch.
     /// Advance one NTSC frame of emulation **without rendering** — the compute
     /// half of [`Self::run_frame`]. The frontend's render-pipeline worker
     /// composites the frame on another core from a cloned VDP snapshot, so the
@@ -2119,20 +2110,20 @@ impl Saturn {
         self.run_for(CYCLES_PER_FRAME);
     }
 
-    /// Advance one NTSC frame and composite it into `out`, returning the active
-    /// `(width, height)`. A single `run_for(CYCLES_PER_FRAME)` followed by a
-    /// render — see the note below on why the frame must not be split.
+    /// Advance one NTSC frame (`CYCLES_PER_FRAME` ≈ 479 151 SH-2 cycles,
+    /// ≈59.76 Hz) and composite it into `out`, returning the active
+    /// `(width, height)`. The VDP2 raster registers and the raster interrupts
+    /// are maintained by [`Self::update_video_timing`] from the run loop.
+    ///
+    /// Writes RGBA8888 into `out`, which must be at least
+    /// [`crate::vdp2::FRAMEBUFFER_BYTES`] bytes. Returns the active display size
+    /// `(width, height)` from TVMD (320/352/640/704 × 224/240/256[×2]); the
+    /// pixels are packed tightly with row stride = `width`, so the caller
+    /// uploads `width × height` with a `width × 4` pitch.
+    ///
+    /// The frame is exactly **one** `run_for(CYCLES_PER_FRAME)` followed by a
+    /// read-only render — never split; see the note in the body.
     pub fn run_frame(&mut self, out: &mut [u8]) -> (usize, usize) {
-        // Split at the EXACT VBlank-IN edge (`VBLANK_IN_CYCLE`), NOT
-        // `ACTIVE_LINES * CYCLES_PER_LINE`. The latter is ~194 cycles short
-        // (per-line integer truncation — the very drift `VBLANK_IN_CYCLE`'s
-        // doc-comment warns about), so it forces a drain at a point that is
-        // NOT an event-clamp edge, forwarding SCU interrupts ~194 cycles early
-        // and diverging master-SH-2 execution from `run_for(CYCLES_PER_FRAME)`.
-        // That divergence sent VF2 down a different CD-read path that stalled.
-        // Splitting at the VBlank-IN edge (which `run_for` clamps to anyway)
-        // makes `run_frame` == `run_for(full frame)` + a read-only render at
-        // the active→VBLANK boundary.
         // Advance the WHOLE frame in one `run_for`, then render. Do NOT split
         // into run_for(active)+run_for(vblank): `run_for`'s `SMPC_POLL_QUANTUM`
         // batch grid (hence its drain/interrupt-forwarding points) is anchored
