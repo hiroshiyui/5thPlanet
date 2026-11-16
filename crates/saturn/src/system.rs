@@ -223,25 +223,39 @@ fn drain_dma(bus: &mut SaturnBus) -> u64 {
             // Folding only the payload accesses in `scu_transfer` is not
             // sufficient: descriptor reads must be folded too, or every entry
             // reads as zero and the walker runs to its safety limit.
-            let mut index = req.dst & 0x07FF_FFFF;
+            //
+            // Mednafen `NextIndirect` (scu.inc): the table pointer is the
+            // longword-aligned `D*W` and advances 4 per word **only when
+            // ReadAdd (`D*AD` bit 8) is set**; each size word is masked to 20
+            // bits with 0 meaning 0x100000 — for every level, unlike direct
+            // mode's per-level maximum; and each triplet goes through the
+            // `StartDMATransfer` legality check (an illegal triplet moves
+            // nothing; the walk continues).
+            let table_step = if req.src_add != 0 { 4 } else { 0 };
+            let mut index = req.dst & 0x07FF_FFFC;
             const MAX_INDIRECT_TRIPLETS: u32 = 0x1_0000;
             let mut walked = 0u32;
             loop {
-                let (size, s0) = bus.read32(index, AccessKind::Dma);
-                let (idst, s1) = bus.read32(index.wrapping_add(4), AccessKind::Dma);
-                let (isrc_raw, s2) = bus.read32(index.wrapping_add(8), AccessKind::Dma);
-                let _ = (s0, s1, s2);
+                let mut word = || {
+                    let (v, _) = bus.read32(index, AccessKind::Dma);
+                    index = index.wrapping_add(table_step);
+                    v
+                };
+                let size = word();
+                let idst = word() & 0x07FF_FFFF;
+                let isrc_raw = word();
                 let last = isrc_raw & 0x8000_0000 != 0;
                 let isrc = isrc_raw & 0x07FF_FFFF;
-                let idst = idst & 0x07FF_FFFF;
-                let count = dma_count(req.channel, size);
-                if !bios_src(isrc) {
+                let count = indirect_count(size);
+                if !bios_src(isrc) && !scu_dma_illegal(isrc, idst) {
                     let mut cost = 0u64;
                     scu_transfer(bus, isrc, idst, count, req.src_add, req.dst_add, &mut cost);
                 }
-                index = index.wrapping_add(0xC);
                 walked += 1;
-                if last || walked >= MAX_INDIRECT_TRIPLETS {
+                // A non-advancing table (ReadAdd clear) re-reads the same
+                // triplet forever on hardware; one pass already produced the
+                // observable result, so stop instead of hanging the host.
+                if last || walked >= MAX_INDIRECT_TRIPLETS || table_step == 0 {
                     break;
                 }
             }
@@ -301,8 +315,10 @@ fn scu_dma_illegal(src: u32, dst: u32) -> bool {
     )
 }
 
-/// SCU DMA byte count: a programmed 0 means the channel's maximum (1 MiB for
-/// level 0, 4 KiB for levels 1/2), per the SCU manual.
+/// Direct-mode SCU DMA byte count: a programmed 0 means the channel's maximum
+/// (1 MiB for level 0, 4 KiB for levels 1/2) — Mednafen `CheckDMAStart`
+/// `(!StartByteCount) ? ((level) ? 0x1000 : 0x100000)`. The register write
+/// already masks the count to the level's 20/12-bit width.
 fn dma_count(channel: usize, programmed: u32) -> u32 {
     if programmed != 0 {
         programmed
@@ -310,6 +326,17 @@ fn dma_count(channel: usize, programmed: u32) -> u32 {
         0x0010_0000
     } else {
         0x0000_1000
+    }
+}
+
+/// Indirect-mode SCU DMA byte count from a table size word: masked to 20 bits,
+/// 0 meaning 0x100000 for **every** level (Mednafen `NextIndirect`:
+/// `tmp[0] &= 0xFFFFF; if(!tmp[0]) tmp[0] = 0x100000;`). Unmasked, a size word
+/// with high bits set would request a multi-gigabyte transfer.
+fn indirect_count(size_word: u32) -> u32 {
+    match size_word & 0x000F_FFFF {
+        0 => 0x0010_0000,
+        n => n,
     }
 }
 
@@ -330,8 +357,8 @@ fn scu_transfer(
     // A 32-bit source read feeds two 16-bit bus writes; side-effecting sources
     // like the CD data port must not be re-read for the low half.
     let mut src_word: Option<(u32, u32)> = None;
-    let mut i = 0u32;
-    while i < bytes {
+    let mut i = 0u64;
+    while i < u64::from(bytes) {
         let src_addr = src & 0x07FF_FFFC;
         let word = match src_word {
             Some((addr, word)) if addr == src_addr => word,
@@ -2009,7 +2036,8 @@ impl Saturn {
 mod tests {
     use super::{
         CYCLES_PER_FRAME, CYCLES_PER_LINE, LINES_PER_FRAME, SH2_CLOCK_HZ, Saturn, dma_count,
-        drain_dma, hblank_active, intback_busy_us, scu_dma_bus, scu_dma_illegal, us_to_cycles,
+        drain_dma, hblank_active, indirect_count, intback_busy_us, scu_dma_bus, scu_dma_illegal,
+        us_to_cycles,
     };
 
     #[test]
@@ -2040,6 +2068,70 @@ mod tests {
         assert_eq!(dma_count(0, 0), 0x0010_0000);
         assert_eq!(dma_count(1, 0), 0x0000_1000);
         assert_eq!(dma_count(2, 0), 0x0000_1000);
+    }
+
+    #[test]
+    fn indirect_count_masks_to_20_bits_with_zero_as_one_mib() {
+        assert_eq!(indirect_count(0x40), 0x40);
+        assert_eq!(indirect_count(0xFFF0_0010), 0x10, "high bits ignored");
+        assert_eq!(indirect_count(0), 0x0010_0000);
+        assert_eq!(
+            indirect_count(0x0010_0000),
+            0x0010_0000,
+            "bit 20 masked → 0 → max"
+        );
+    }
+
+    /// Program SCU level-1 indirect DMA over a table at High WRAM 0x0600_0000
+    /// and drain it. `ad` is D1AD (bit 8 = ReadAdd).
+    fn run_indirect(sat: &mut Saturn, table: &[u32], ad: u32) {
+        for (i, w) in table.iter().enumerate() {
+            sat.bus.high_wram.write32(i as u32 * 4, *w);
+        }
+        sat.bus.scu.write32(0x24, 0x0600_0000); // D1W = table base
+        sat.bus.scu.write32(0x2C, ad); // D1AD
+        sat.bus.scu.write32(0x34, (1 << 24) | (1 << 8) | 7); // indirect, WUP, manual
+        sat.bus.scu.write32(0x30, 0x101); // enable + go
+        drain_dma(&mut sat.bus);
+    }
+
+    #[test]
+    fn indirect_dma_masks_the_table_size_word() {
+        let mut sat = Saturn::with_blank_bios();
+        for i in 0..0x20u32 {
+            sat.bus.low_wram.write8(0x100 + i, 0xA0 + i as u8);
+        }
+        // Size word with garbage high bits: only the low 20 bits (0x10) count.
+        run_indirect(
+            &mut sat,
+            &[0xFFF0_0010, 0x05E0_0000, 0x8020_0100],
+            0x100 | 0x01, // ReadAdd, write +2
+        );
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_0000), 0xA0);
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_000F), 0xAF, "16 bytes copied");
+        assert_eq!(sat.bus.vdp2.read8(0x05E0_0010), 0, "not one byte more");
+        // WUP writes back the advanced table pointer (3 words read).
+        assert_eq!(sat.bus.scu.channels[1].write_addr, 0x0600_000C);
+    }
+
+    #[test]
+    fn indirect_table_pointer_advances_only_with_read_add() {
+        let mut sat = Saturn::with_blank_bios();
+        sat.bus.low_wram.write8(0x100, 0x5A);
+        // ReadAdd clear: every word of the "triplet" is read from the same
+        // table address (Mednafen `CurTableAddr += ReadAdd ? 4 : 0`), and the
+        // written-back pointer stays at the base.
+        run_indirect(&mut sat, &[0x8020_0100], 0x01);
+        assert_eq!(sat.bus.scu.channels[1].write_addr, 0x0600_0000);
+    }
+
+    #[test]
+    fn indirect_dma_skips_an_illegal_same_bus_triplet() {
+        let mut sat = Saturn::with_blank_bios();
+        sat.bus.high_wram.write32(0x1000, 0xDEAD_BEEF);
+        // HWRAM -> HWRAM is a same-bus (C-bus) DMA: illegal, moves nothing.
+        run_indirect(&mut sat, &[4, 0x0600_2000, 0x8600_1000], 0x100 | 0x02);
+        assert_eq!(sat.bus.high_wram.read32(0x2000), 0);
     }
 
     #[test]
