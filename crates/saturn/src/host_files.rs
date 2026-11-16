@@ -155,7 +155,19 @@ pub fn load_image_disc(path: &Path) -> Result<Disc, String> {
 /// directory, flush it to disk, then atomically rename it over `path`. A crash
 /// or power loss mid-write leaves either the old file or the new one — never a
 /// truncated save (which a plain truncating `fs::write` can).
+///
+/// A `path` that is a symlink is resolved first, so the link's *target* is
+/// replaced (as `fs::write` would have written through it) rather than the
+/// link itself being swapped for a regular file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let resolved;
+    let path = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            resolved = fs::canonicalize(path)?;
+            resolved.as_path()
+        }
+        _ => path,
+    };
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -254,6 +266,25 @@ mod tests {
         .unwrap();
         let err = load_image_disc(&cue).unwrap_err();
         assert!(err.contains("escapes"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_writes_through_a_symlink() {
+        let d = scratch("symlink");
+        let real = d.join("real.bup");
+        let link = d.join("link.bup");
+        fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&real).unwrap(), b"new");
         let _ = fs::remove_dir_all(&d);
     }
 
