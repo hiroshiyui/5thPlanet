@@ -622,7 +622,7 @@ fn ensure_backup_cart(
 #[cfg(feature = "sdl-frontend")]
 fn atomic_saturating_sub(v: &std::sync::atomic::AtomicU32, n: u32) {
     use std::sync::atomic::Ordering;
-    let _ = v.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+    let _ = v.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         Some(cur.saturating_sub(n))
     });
 }
@@ -634,11 +634,15 @@ fn atomic_saturating_sub(v: &std::sync::atomic::AtomicU32, n: u32) {
 #[cfg(feature = "sdl-frontend")]
 fn set_window_icon(window: &mut sdl3::video::Window) {
     const ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
-    let decoder = png::Decoder::new(ICON_PNG);
+    // png 0.18's decoder needs `BufRead + Seek`; a `Cursor` provides both.
+    let decoder = png::Decoder::new(std::io::Cursor::new(ICON_PNG));
     let Ok(mut reader) = decoder.read_info() else {
         return;
     };
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let Some(size) = reader.output_buffer_size() else {
+        return;
+    };
+    let mut buf = vec![0u8; size];
     let Ok(info) = reader.next_frame(&mut buf) else {
         return;
     };
@@ -1783,32 +1787,25 @@ fn run(
                     } if mouse_port.is_some() => {
                         mouse_capture_enabled = !mouse_capture_enabled;
                     }
-                    // Game-controller hot-plug. `which` is a joystick index on
-                    // Added but an instance id on Removed (SDL semantics); the
-                    // dedupe guard makes a startup enumeration + the init-time
-                    // Added events idempotent.
-                    Event::ControllerDeviceAdded { which, .. } => {
-                        // SDL3's JoystickId is a newtype around the u32 the event carries.
-                        let jid = sdl3::sys::joystick::SDL_JoystickID(which);
-                        match controller_subsystem.open(jid) {
-                            Ok(c) => {
-                                if !controllers.iter().any(|o| o.id().ok() == c.id().ok()) {
-                                    eprintln!(
-                                        "controller connected: {}",
-                                        c.name().unwrap_or_default()
-                                    );
-                                    controllers.push(c);
-                                    let _ = emu_tx.send(EmuIn::PadList(pad_list_of(
-                                        &controllers,
-                                        &controller_subsystem,
-                                    )));
-                                }
+                    // Game-controller hot-plug. `which` is the joystick instance
+                    // id on both Added and Removed (SDL3 semantics); the dedupe
+                    // guard makes a startup enumeration + the init-time Added
+                    // events idempotent.
+                    Event::GamepadAdded { which, .. } => match controller_subsystem.open(which) {
+                        Ok(c) => {
+                            if !controllers.iter().any(|o| o.id().ok() == c.id().ok()) {
+                                eprintln!("controller connected: {}", c.name().unwrap_or_default());
+                                controllers.push(c);
+                                let _ = emu_tx.send(EmuIn::PadList(pad_list_of(
+                                    &controllers,
+                                    &controller_subsystem,
+                                )));
                             }
-                            Err(e) => eprintln!("controller open failed: {e}"),
                         }
-                    }
-                    Event::ControllerDeviceRemoved { which, .. } => {
-                        controllers.retain(|c| c.id().ok().map(|j| j.0) != Some(which));
+                        Err(e) => eprintln!("controller open failed: {e}"),
+                    },
+                    Event::GamepadRemoved { which, .. } => {
+                        controllers.retain(|c| c.id().ok() != Some(which));
                         let _ = emu_tx.send(EmuIn::PadList(pad_list_of(
                             &controllers,
                             &controller_subsystem,
@@ -1819,13 +1816,13 @@ fn run(
                     // key-capture rebind is armed (that modal owns the input).
                     // An armed gamepad rebind captures the next controller
                     // button (or a trigger, below) — before the nav arm.
-                    Event::ControllerButtonDown { button, .. } if gpad_rebind_target.is_some() => {
+                    Event::GamepadButtonDown { button, .. } if gpad_rebind_target.is_some() => {
                         let b = gpad_rebind_target.take().expect("armed");
                         let tok = button.string();
                         gpad_map[b as usize % config::PAD_BUTTONS] = tok.clone();
                         let _ = emu_tx.send(EmuIn::GamepadBindResult(b, Some(tok)));
                     }
-                    Event::ControllerAxisMotion { axis, value, .. }
+                    Event::GamepadAxisMotion { axis, value, .. }
                         if gpad_rebind_target.is_some()
                             && matches!(
                                 axis,
@@ -1839,7 +1836,7 @@ fn run(
                         gpad_map[b as usize % config::PAD_BUTTONS] = tok.clone();
                         let _ = emu_tx.send(EmuIn::GamepadBindResult(b, Some(tok)));
                     }
-                    Event::ControllerButtonDown { button, .. }
+                    Event::GamepadButtonDown { button, .. }
                         if osd_open.load(Ordering::Relaxed)
                             && rebind_target.is_none()
                             && gpad_rebind_target.is_none() =>

@@ -409,12 +409,10 @@ impl Cache {
             return None;
         }
         let (tag, set_idx) = decompose(addr);
-        for way in 0..WAYS {
-            if self.sets[set_idx][way].valid && self.sets[set_idx][way].tag == tag {
-                return Some((set_idx, way));
-            }
-        }
-        None
+        self.sets[set_idx]
+            .iter()
+            .position(|line| line.valid && line.tag == tag)
+            .map(|way| (set_idx, way))
     }
 
     fn pick_victim(&self, set_idx: usize) -> u8 {

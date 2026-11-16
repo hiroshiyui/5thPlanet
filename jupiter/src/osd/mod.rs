@@ -457,8 +457,7 @@ impl Osd {
             ],
             Screen::Slots { saving } => {
                 let mut v = Vec::with_capacity(SLOTS + 1);
-                for s in 0..SLOTS {
-                    let used = ctx.slot_used[s];
+                for (s, &used) in ctx.slot_used.iter().enumerate() {
                     let mark = if used { "*" } else { "-" };
                     let label = format!("Slot {s} [{mark}]");
                     let act = if saving {

@@ -606,7 +606,8 @@ impl GpuPresenter {
         let Ok(mut draw_cmd) = self.device.acquire_command_buffer() else {
             return false;
         };
-        let Ok(swapchain) = draw_cmd.wait_and_acquire_swapchain_texture(&self.window) else {
+        // `Ok(None)` = no swapchain image this frame (e.g. a minimized window).
+        let Ok(Some(swapchain)) = draw_cmd.wait_and_acquire_swapchain_texture(&self.window) else {
             draw_cmd.cancel();
             return false;
         };

@@ -21,3 +21,8 @@ libcdio = []
 # requires `unsafe`. This is the documented exception; see ADR-0009. The unsafe
 # is confined to this one feature-gated crate; the cores + `saturn` stay
 # forbid-unsafe.
+#
+# A `[lints]` table without `workspace = true` keeps that exception while
+# acknowledging Cargo's `missing_lints_inheritance` check (Rust 1.100+).
+[lints.cargo]
+missing_lints_inheritance = "allow"
