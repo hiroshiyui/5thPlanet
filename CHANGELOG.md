@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.0] - 2026-11-16
 
-A **full-workspace code review**, every finding fixed and re-verified against
-the Mednafen oracle (roadmap M13 Tier I), on top of a toolchain/dependency
-upgrade. The `bios_boot` golden `0x0B1BA6E5180766F7` and the game render
-goldens are unchanged. **The savestate format moves to v17** — 0.20.0 states
-are rejected with a version mismatch.
+The **code-review release**: a full-workspace review, every finding fixed and
+re-verified against the Mednafen oracle (roadmap M13 Tier I), on top of a
+toolchain/dependency upgrade (Rust 1.100, SDL3 bindings 0.22). The
+`bios_boot` golden `0x0B1BA6E5180766F7` and the game render goldens are
+unchanged. **The savestate format moves to v17** — 0.20.0 states are rejected
+with a version mismatch.
 
 ### Changed
 

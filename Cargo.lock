@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "jupiter"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "physdisc",
  "png",
@@ -113,7 +113,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "m68k"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "serde",
 ]
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "physdisc"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "saturn",
 ]
@@ -190,7 +190,7 @@ checksum = "5a2d2f3481209a6b42eec2fbb49063fb4e8d35b57023401495d4fe0f85c817f0"
 
 [[package]]
 name = "saturn"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "bincode",
  "m68k",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "scu_dsp"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "serde",
  "serde-big-array",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "sdbg"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "saturn",
  "sh2",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "sh2"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "bincode",
  "serde",
