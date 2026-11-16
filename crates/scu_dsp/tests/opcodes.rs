@@ -447,14 +447,18 @@ fn alu_ad2_adds_full_48bit_p_and_ac() {
 
 #[test]
 fn alu_unknown_code_is_a_noop() {
-    // ALU code 0x7 is undefined → no ALU register / flag change.
+    // ALU code 0x7 is undefined → behaves as NOP: no flag change, and the ALU
+    // is simply this word's copy of AC (Mednafen `DSPR48 ALU = DSP.AC`), not a
+    // stale value from an earlier word.
     let mut d = Dsp::new();
     d.regs.acl = 0x1234;
     d.regs.alu = 0x5555;
+    d.regs.flags.z = true;
     d.load_program(0, &[op_alu(0x7), END]);
     d.start(0);
     d.run_until_stopped(16);
-    assert_eq!(d.regs.alu, 0x5555, "unknown ALU op leaves ALU untouched");
+    assert_eq!(d.regs.alu, 0x1234, "unknown ALU op yields ALU = AC");
+    assert!(d.regs.flags.z, "flags untouched");
 }
 
 // ---- X/Y-bus MOV [s],P and MOV [s],A ----
@@ -507,9 +511,11 @@ fn mc_bank_read_by_both_x_and_y_increments_ct_once() {
 
 #[test]
 fn d1_source_all_reads_alu_low32() {
-    // ALL (D1 source 0x9) = ALU low 32 bits.
+    // ALL (D1 source 0x9) = ALU low 32 bits. Under an ALU NOP this word's ALU
+    // is AC (Mednafen `GeneralInstr`), so seed the accumulator.
     let mut d = Dsp::new();
-    d.regs.alu = 0x0000_1234_5678_9ABC_u64 as i64;
+    d.regs.ach = 0x1234;
+    d.regs.acl = 0x5678_9ABC;
     // MOV [ALL],RX
     d.load_program(0, &[op_alu(0) | d1_mov_s_d(DEST_RX, 0x9), END]);
     d.start(0);
@@ -519,9 +525,10 @@ fn d1_source_all_reads_alu_low32() {
 
 #[test]
 fn d1_source_alh_reads_alu_bits_47_16() {
-    // ALH (D1 source 0xA) = ALU bits 47..16.
+    // ALH (D1 source 0xA) = ALU bits 47..16 (ALU = AC under an ALU NOP).
     let mut d = Dsp::new();
-    d.regs.alu = 0x1234_5678_9ABC_u64 as i64;
+    d.regs.ach = 0x1234;
+    d.regs.acl = 0x5678_9ABC;
     d.load_program(0, &[op_alu(0) | d1_mov_s_d(DEST_RX, 0xA), END]);
     d.start(0);
     d.run_until_stopped(16);
@@ -529,14 +536,18 @@ fn d1_source_alh_reads_alu_bits_47_16() {
 }
 
 #[test]
-fn d1_source_undefined_reads_zero() {
-    // D1 source 0xB is not a defined source → reads 0.
+fn d1_source_undefined_reads_all_ones() {
+    // D1 source 0xB is not a defined source → reads 0xFFFFFFFF (Mednafen
+    // `scu_dsp_gen.cpp`: sources 0x8 and 0xB..0xF yield all-ones).
     let mut d = Dsp::new();
     d.regs.rx = 0xDEAD;
     d.load_program(0, &[op_alu(0) | d1_mov_s_d(DEST_RX, 0xB), END]);
     d.start(0);
     d.run_until_stopped(16);
-    assert_eq!(d.regs.rx, 0, "undefined D1 source yields 0");
+    assert_eq!(
+        d.regs.rx, 0xFFFF_FFFF,
+        "undefined D1 source yields all-ones"
+    );
 }
 
 // ---- D1/MVI destination selectors not covered elsewhere ----
@@ -881,4 +892,188 @@ fn dma_count_zero_transfers_256_words() {
     d.start(0);
     d.step();
     assert_eq!(d.take_dma().unwrap().size, 256, "count 0 means 256 words");
+}
+
+// ---- Mednafen `GeneralInstr` fidelity (scu_dsp_gen.cpp) ----
+
+#[test]
+fn alu_sr_carry_is_the_lsb_shifted_out() {
+    // SR: C = bit 0 (the bit shifted OUT), not bit 31 (Mednafen
+    // `new_C = ALU.L & 0x1`). 0x0000_0001 → result 0, C set, Z set.
+    let d = run_alu(0x0000_0001, 0, 0x8);
+    assert_eq!(d.regs.alu as u64 & 0xFFFF_FFFF, 0);
+    assert!(d.regs.flags.c, "LSB 1 shifted out → C");
+    assert!(d.regs.flags.z);
+    // 0x8000_0000 → 0xC000_0000 (sign kept), LSB 0 → C clear despite MSB set.
+    let d = run_alu(0x8000_0000, 0, 0x8);
+    assert_eq!(d.regs.alu as u64 & 0xFFFF_FFFF, 0xC000_0000);
+    assert!(
+        !d.regs.flags.c,
+        "LSB 0 shifted out → C clear (MSB irrelevant)"
+    );
+    assert!(d.regs.flags.s);
+}
+
+#[test]
+fn alu_32bit_op_keeps_upper_16_from_ach() {
+    // The ALU starts each word as a copy of AC, so a 32-bit op only replaces
+    // the low 32 bits; MOV ALU,A then carries ACH through unchanged.
+    let mut d = Dsp::new();
+    d.regs.ach = 0x00AB;
+    d.regs.acl = 0b1100;
+    d.regs.alu = 0x7777_0000_0000; // stale upper bits from an earlier word
+    d.load_program(0, &[mvi(DEST_PL, 0b1010), op_alu(0x1) | MOV_ALU_A, END]);
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.acl, 0b1000);
+    assert_eq!(d.regs.ach, 0x00AB, "upper 16 come from AC, not a stale ALU");
+}
+
+#[test]
+fn alu_nop_with_mov_alu_a_leaves_accumulator_unchanged() {
+    // An ADD in word 1 (result not moved), then an ALU-NOP word with MOV ALU,A:
+    // the NOP word's ALU is AC, so A is unchanged (no stale ADD result).
+    let mut d = Dsp::new();
+    d.regs.acl = 10;
+    d.load_program(
+        0,
+        &[mvi(DEST_PL, 5), op_alu(0x4), op_alu(0) | MOV_ALU_A, END],
+    );
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.acl, 10, "NOP's ALU = AC, not the previous ADD's 15");
+}
+
+#[test]
+fn alu_ad2_carry_is_bit_48_of_the_unsigned_sum() {
+    // AD2 of AC = -1 (48-bit all-ones) and P = 1: the unsigned 48-bit sum is
+    // 0x1_0000_0000_0000 → C set, result 0, Z set.
+    let mut d = Dsp::new();
+    d.regs.ach = 0xFFFF;
+    d.regs.acl = 0xFFFF_FFFF;
+    d.regs.ph = 0;
+    d.regs.pl = 1;
+    d.load_program(0, &[op_alu(0x6) | MOV_ALU_A, END]);
+    d.start(0);
+    d.run_until_stopped(16);
+    assert!(d.regs.flags.c, "carry out of bit 47");
+    assert!(d.regs.flags.z);
+    assert_eq!((d.regs.ach, d.regs.acl), (0, 0));
+}
+
+#[test]
+fn mov_mul_p_sees_rx_written_by_d1_and_ry_by_mvi() {
+    // RX loaded by a D1 move and RY by MVI (neither through the X/Y buses):
+    // MOV MUL,P must use the current RX×RY, never a stale cached product.
+    let mut d = Dsp::new();
+    d.regs.rx = 2;
+    d.regs.ry = 3;
+    d.load_program(
+        0,
+        &[
+            op_alu(0) | MOV_MUL_P,              // P = 2×3 = 6
+            op_alu(0) | d1_mov_imm(DEST_RX, 7), // RX = 7 via D1
+            op_alu(0) | MOV_MUL_P,              // P = 7×3 = 21
+            END,
+        ],
+    );
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.pl, 21, "D1-written RX feeds the multiplier");
+    // MVI to RX (dest 4) likewise.
+    let mut d = Dsp::new();
+    d.regs.ry = 3;
+    d.load_program(0, &[mvi(DEST_RX, 11), op_alu(0) | MOV_MUL_P, END]);
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.pl, 33, "MVI-written RX feeds the multiplier");
+}
+
+#[test]
+fn mov_mul_p_uses_ry_from_before_this_words_y_load() {
+    // MOV MUL,P with a same-word MOV [s],Y: the product uses the start-of-word
+    // RY (Mednafen computes P in the X slot, before the Y slot loads RY).
+    let mut d = Dsp::new();
+    d.regs.rx = 4;
+    d.regs.ry = 5;
+    d.data_ram[1][0] = 100;
+    d.load_program(0, &[op_alu(0) | MOV_MUL_P | mov_s_y(1 /* M1 */), END]);
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.pl, 20, "product from start-of-word RX/RY");
+    assert_eq!(d.regs.ry, 100);
+}
+
+#[test]
+fn d1_write_to_a_bank_read_this_word_is_suppressed() {
+    // X reads M0 (no inc) while D1 writes MC0: Mednafen suppresses the write
+    // (and its CT increment) because bank 0 was read this word (`dr_read`).
+    let mut d = Dsp::new();
+    d.data_ram[0][0] = 0x11;
+    d.load_program(
+        0,
+        &[
+            op_alu(0) | mov_s_x(0 /* M0 */) | d1_mov_imm(DEST_MC0, 0x55),
+            END,
+        ],
+    );
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.rx, 0x11);
+    assert_eq!(d.data_ram[0][0], 0x11, "D1 write to a read bank suppressed");
+    assert_eq!(d.regs.ct[0], 0, "and no CT increment");
+}
+
+#[test]
+fn d1_mc_source_to_same_bank_neither_writes_nor_increments() {
+    // MOV MC0,MC0: the source increment is skipped for d == n and the write is
+    // suppressed (bank read) → no change at all.
+    let mut d = Dsp::new();
+    d.data_ram[0][0] = 0x42;
+    d.data_ram[0][1] = 0x99;
+    d.load_program(0, &[op_alu(0) | d1_mov_s_d(DEST_MC0, MC0), END]);
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.data_ram[0][1], 0x99);
+    assert_eq!(d.regs.ct[0], 0);
+}
+
+#[test]
+fn ct_post_increments_merge_after_the_d1_slot() {
+    // X reads MC0 (CT0 post-inc deferred) while D1 moves MC2 → the CT0
+    // register: the CT0 write cancels bank 0's pending increment (Mednafen
+    // `ct_inc &= ~0xFF`), and the MC2 source still increments CT2.
+    let mut d = Dsp::new();
+    d.data_ram[0][0] = 0x10;
+    d.data_ram[2][0] = 0x05;
+    d.load_program(
+        0,
+        &[
+            op_alu(0) | mov_s_x(MC0) | d1_mov_s_d(DEST_CT0, 6 /* MC2 */),
+            END,
+        ],
+    );
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.regs.rx, 0x10, "X read at the pre-increment CT0");
+    assert_eq!(
+        d.regs.ct[0], 5,
+        "CT0 write wins over the deferred X increment"
+    );
+    assert_eq!(d.regs.ct[2], 1, "MC2 source incremented");
+
+    // A D1 MC write to a bank not otherwise read increments with the rest.
+    let mut d = Dsp::new();
+    d.data_ram[0][0] = 0x10;
+    d.load_program(
+        0,
+        &[
+            op_alu(0) | mov_s_x(MC0) | d1_mov_imm(0x1 /* MC1 */, 0x33),
+            END,
+        ],
+    );
+    d.start(0);
+    d.run_until_stopped(16);
+    assert_eq!(d.data_ram[1][0], 0x33);
+    assert_eq!((d.regs.ct[0], d.regs.ct[1]), (1, 1));
 }

@@ -353,6 +353,7 @@ dependencies = [
 name = "sh2"
 version = "0.20.0"
 dependencies = [
+ "bincode",
  "serde",
  "serde-big-array",
 ]

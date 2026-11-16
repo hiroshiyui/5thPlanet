@@ -59,6 +59,13 @@ pub struct Intc {
     pub vcrb: u16,
     pub vcrc: u16,
     pub vcrd: u16,
+    /// The NMI **input pin** is driven LOW. ICR bit 15 (NMIL) is read-only and
+    /// reflects this pin, not anything software wrote (Mednafen `OnChipRegRead`
+    /// 0xE0: `ICR | (NMILevel << 15)`). Stored inverted so the `Default` (false)
+    /// is the Saturn master's idle-HIGH NMI line (the SMPC drives it high at
+    /// power-on, Mednafen `smpc.cpp` `CPU[0].SetNMI(true)`). A pin property:
+    /// survives reset; the host sets it via `Cpu::set_nmi_pin`.
+    pub nmi_pin_low: bool,
     /// Bit-set of pending sources, indexed by `Source::ord()` slot. A bit
     /// being set means the source has fired but the CPU hasn't accepted
     /// it yet. Cleared by [`Intc::acknowledge`].
@@ -131,6 +138,32 @@ impl Intc {
             }
         }
         self.best = best;
+    }
+
+    /// ICR as software reads it: the stored NMIE/VECMD bits plus the read-only
+    /// NMIL (bit 15) = the current NMI pin level.
+    pub fn icr_read(&self) -> u16 {
+        self.icr | ((!self.nmi_pin_low as u16) << 15)
+    }
+
+    /// Reset the INTC registers to their SH7604 reset values (Mednafen
+    /// `INTC_Reset`: IPRA/IPRB/VCRA-D/VCRWDT/ICR = 0) and drop every pending
+    /// internal request (NMI / user break / on-chip; the on-chip ones are
+    /// re-derived from their now-reset device flags by the caller). The DMAC
+    /// and DIVU vector registers (VCRDMA0/1, VCRDIV) live in those modules on
+    /// the SH7604 and are **not** INTC-reset; the external IRL request is a
+    /// pin level the host owns, so it is kept.
+    pub fn reset_registers(&mut self) {
+        self.ipra = 0;
+        self.iprb = 0;
+        self.icr = 0;
+        self.vcrwdt = 0;
+        self.vcra = 0;
+        self.vcrb = 0;
+        self.vcrc = 0;
+        self.vcrd = 0;
+        self.pending &= 1 << Source::External(0).ord();
+        self.recompute_best();
     }
 
     /// Recompute the pending cache after a priority-register (IPRA/IPRB) write,
@@ -215,25 +248,31 @@ impl Intc {
     /// Vector number for `src`. NMI is fixed at 11; UserBreak at 12;
     /// external interrupts use the latched `ext_vector` (auto-vector
     /// `64+level`, or the device-supplied vector from [`raise_external`]).
+    ///
+    /// On-chip vectors follow Mednafen `GetPendingInt` (`sh7095.inc`), which
+    /// matches the SH7604 HW manual's VCR layout: FRT **ICI** = VCRC[14:8],
+    /// **OCIA and OCIB share** VCRC[6:0] (one "OCI" vector), **OVI** = VCRD[14:8]
+    /// (VCRD's low byte is reserved). Every VCR-derived vector is masked to
+    /// 7 bits (`& 0x7F`), as the hardware vector fields are 7 bits wide.
     pub fn vector_for(&self, src: Source) -> u8 {
-        match src {
-            Source::Nmi => 11,
-            Source::UserBreak => 12,
-            Source::External(_) => self.ext_vector,
-            Source::DivuOvf => self.vcrdiv as u8,
-            Source::DmacCh0 => self.vcrdma0 as u8,
-            Source::DmacCh1 => self.vcrdma1 as u8,
-            Source::Wdt => (self.vcrwdt >> 8) as u8,
-            Source::BscRef => self.vcrwdt as u8,
-            Source::SciEri => (self.vcra >> 8) as u8,
-            Source::SciRxi => self.vcra as u8,
-            Source::SciTxi => (self.vcrb >> 8) as u8,
-            Source::SciTei => self.vcrb as u8,
-            Source::FrtIci => (self.vcrc >> 8) as u8,
-            Source::FrtOcia => self.vcrc as u8,
-            Source::FrtOcib => (self.vcrd >> 8) as u8,
-            Source::FrtOvi => self.vcrd as u8,
-        }
+        let v = match src {
+            Source::Nmi => return 11,
+            Source::UserBreak => return 12,
+            Source::External(_) => return self.ext_vector,
+            Source::DivuOvf => self.vcrdiv as u16,
+            Source::DmacCh0 => self.vcrdma0 as u16,
+            Source::DmacCh1 => self.vcrdma1 as u16,
+            Source::Wdt => self.vcrwdt >> 8,
+            Source::BscRef => self.vcrwdt,
+            Source::SciEri => self.vcra >> 8,
+            Source::SciRxi => self.vcra,
+            Source::SciTxi => self.vcrb >> 8,
+            Source::SciTei => self.vcrb,
+            Source::FrtIci => self.vcrc >> 8,
+            Source::FrtOcia | Source::FrtOcib => self.vcrc,
+            Source::FrtOvi => self.vcrd >> 8,
+        };
+        (v & 0x7F) as u8
     }
 }
 
@@ -261,10 +300,17 @@ impl Source {
     }
 }
 
-/// Template list; `External` is replaced with `External(ext_level)` at
-/// scan time inside [`Intc::next_pending`].
+/// Template list in the SH7604's **default priority order for equal IPR
+/// levels** (highest first): user break, IRL, DIVU, DMAC0, DMAC1, WDT, REF,
+/// SCI (ERI/RXI/TXI/TEI), FRT (ICI/OCI/OVI). [`Intc::recompute_best`] keeps
+/// the first source at the winning level (strict `>`), so this order is the
+/// tie-break — in particular an IRL at the same level as an on-chip source
+/// wins (Mednafen `GetPendingInt` seeds `ipr = IRL` and lets on-chip sources
+/// replace it only when strictly greater). `External` is replaced with
+/// `External(ext_level)` at scan time.
 const ALL_SOURCES: &[Source] = &[
     Source::UserBreak,
+    Source::External(0),
     Source::DivuOvf,
     Source::DmacCh0,
     Source::DmacCh1,
@@ -278,7 +324,6 @@ const ALL_SOURCES: &[Source] = &[
     Source::FrtOcia,
     Source::FrtOcib,
     Source::FrtOvi,
-    Source::External(0),
 ];
 
 #[cfg(test)]
@@ -390,5 +435,61 @@ mod tests {
         assert!(i.next_pending(0).is_some());
         i.acknowledge(Source::DivuOvf);
         assert!(i.next_pending(0).is_none());
+    }
+    #[test]
+    fn frt_vectors_follow_the_vcrc_vcrd_layout() {
+        // SH7604 / Mednafen `GetPendingInt`: ICI = VCRC[14:8], OCIA and OCIB
+        // share VCRC[6:0], OVI = VCRD[14:8]; every vector masked to 7 bits.
+        let mut i = Intc::new();
+        i.vcrc = 0x4152;
+        i.vcrd = 0x6300;
+        assert_eq!(i.vector_for(Source::FrtIci), 0x41);
+        assert_eq!(i.vector_for(Source::FrtOcia), 0x52);
+        assert_eq!(i.vector_for(Source::FrtOcib), 0x52, "OCIB shares OCIA's");
+        assert_eq!(i.vector_for(Source::FrtOvi), 0x63, "OVI from VCRD high");
+        // Bit 7 of each field is not part of the vector.
+        i.vcrc = 0xC1D2;
+        i.vcrd = 0xE3FF;
+        i.vcrwdt = 0xC4C5;
+        assert_eq!(i.vector_for(Source::FrtIci), 0x41);
+        assert_eq!(i.vector_for(Source::FrtOcia), 0x52);
+        assert_eq!(i.vector_for(Source::FrtOvi), 0x63);
+        assert_eq!(i.vector_for(Source::Wdt), 0x44);
+        assert_eq!(i.vector_for(Source::BscRef), 0x45);
+    }
+
+    #[test]
+    fn irl_beats_an_on_chip_source_at_equal_priority() {
+        // Mednafen `GetPendingInt` seeds ipr = IRL; an on-chip source replaces
+        // it only when strictly greater, so at a tie the IRL wins — whichever
+        // was raised first.
+        let mut i = Intc::new();
+        i.ipra = 0x7000; // DIVU priority 7
+        i.raise(Source::DivuOvf);
+        i.raise_external(7, 0x40);
+        assert_eq!(i.next_pending(0), Some((Source::External(7), 7)));
+
+        let mut i = Intc::new();
+        i.iprb = 0x0900; // FRT priority 9
+        i.raise_external(9, 0x41);
+        i.set_pending(Source::FrtOvi, true);
+        assert_eq!(i.next_pending(0), Some((Source::External(9), 9)));
+        // A strictly higher on-chip priority still wins.
+        i.iprb = 0x0A00;
+        i.refresh_priorities();
+        assert_eq!(i.next_pending(0), Some((Source::FrtOvi, 0xA)));
+    }
+
+    #[test]
+    fn on_chip_ties_follow_the_default_priority_order() {
+        // Equal IPR: DIVU > DMAC0 > DMAC1 > WDT (SH7604 default order).
+        let mut i = Intc::new();
+        i.ipra = 0x5550;
+        i.raise(Source::Wdt);
+        i.raise(Source::DmacCh1);
+        i.raise(Source::DmacCh0);
+        assert_eq!(i.next_pending(0), Some((Source::DmacCh0, 5)));
+        i.raise(Source::DivuOvf);
+        assert_eq!(i.next_pending(0), Some((Source::DivuOvf, 5)));
     }
 }

@@ -761,6 +761,43 @@ impl Op {
         )
     }
 
+    /// True for the SH-2 **interrupt-disabled instructions** — `LDC`, `LDC.L`,
+    /// `STC`, `STC.L`, `LDS`, `LDS.L`, `STS`, `STS.L` (SH-2 programming manual
+    /// §4 "Interrupt-disabled instructions"; Mednafen `PART_OP_INTDIS`,
+    /// `sh7095_ops.inc`). No maskable interrupt is accepted between one of
+    /// these and the following instruction: Mednafen decodes the next
+    /// instruction with the pending-interrupt bit stripped (`DoIDIF(true)`).
+    pub fn is_interrupt_disabling(&self) -> bool {
+        use Op::*;
+        matches!(
+            self,
+            LdcSr { .. }
+                | LdcGbr { .. }
+                | LdcVbr { .. }
+                | LdcLSr { .. }
+                | LdcLGbr { .. }
+                | LdcLVbr { .. }
+                | LdsMach { .. }
+                | LdsMacl { .. }
+                | LdsPr { .. }
+                | LdsLMach { .. }
+                | LdsLMacl { .. }
+                | LdsLPr { .. }
+                | StcSr { .. }
+                | StcGbr { .. }
+                | StcVbr { .. }
+                | StcLSr { .. }
+                | StcLGbr { .. }
+                | StcLVbr { .. }
+                | StsMach { .. }
+                | StsMacl { .. }
+                | StsPr { .. }
+                | StsLMach { .. }
+                | StsLMacl { .. }
+                | StsLPr { .. }
+        )
+    }
+
     /// True if this instruction must not appear in a delay slot
     /// (SH-2 software manual §6, "Delayed Branch Instructions").
     /// Only the *branch* family qualifies — Bx/BxS, BRA/BRAF, BSR/BSRF,
@@ -774,11 +811,16 @@ impl Op {
     /// are also **legal** in a delay slot — `RTS; LDC Rm,SR` is the
     /// standard "restore SR on return" idiom the Saturn BIOS relies on;
     /// flagging it as illegal vectors the BIOS into its dead-wait handler.
+    /// An **undefined opcode** ([`Op::Illegal`]) in a slot is also a
+    /// slot-illegal (vector 6), not a general illegal (vector 4): Mednafen's
+    /// slot decode maps the illegal entry `0x00` to `0x80`, which is in
+    /// `OP_SLOT_ILLEGAL`.
     pub fn is_illegal_in_slot(&self) -> bool {
         use Op::*;
         matches!(
             self,
-            Bf { .. }
+            Illegal(_)
+                | Bf { .. }
                 | BfS { .. }
                 | Bt { .. }
                 | BtS { .. }

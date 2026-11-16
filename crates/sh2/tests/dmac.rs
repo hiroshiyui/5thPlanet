@@ -151,7 +151,10 @@ fn dmac_does_not_run_while_a_dmaor_fault_bit_is_set() {
     cpu.onchip.write32(DAR0, 0x4000);
     cpu.onchip.write32(TCR0, 1);
     cpu.onchip.write32(CHCR0, chcr(1, 1, 2, false));
-    cpu.onchip.write32(DMAOR, 0b101); // DME set, but AE (bit 2) also set
+    cpu.onchip.write32(DMAOR, 1); // DME
+    // AE is hardware-set only (software can't write a 1 there), so model a
+    // fault latched by an earlier misaligned transfer.
+    cpu.onchip.dmac.latch_ae();
 
     cpu.step(&mut bus);
 
@@ -248,4 +251,83 @@ fn dmac_block_mode_fixed_destination_overwrites() {
 fn onchip_owns_dmac_window() {
     assert!(OnChip::owns(CHCR0));
     assert!(OnChip::owns(DMAOR));
+}
+
+#[test]
+fn chcr_te_clears_only_by_write_zero_after_a_read() {
+    // CHCR.TE is hardware-set and clear-only (Mednafen `CHCRM`): a write of 0
+    // clears it only once a CHCR read has observed it; a write of 1 never
+    // sets it. The transfer-end interrupt request follows TE.
+    let (mut cpu, mut bus) = cpu_with_nop();
+    cpu.onchip.intc.ipra = 0x0900;
+    bus.write_u32(0x3000, 0xDEAD_BEEF);
+    cpu.onchip.write32(SAR0, 0x3000);
+    cpu.onchip.write32(DAR0, 0x4000);
+    cpu.onchip.write32(TCR0, 1);
+    cpu.onchip.write32(CHCR0, chcr(1, 1, 2, true));
+    cpu.onchip.write32(DMAOR, 1);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 2, 2, "TE latched");
+
+    // Write 0 to TE (keeping DE/IE) without a prior read: TE survives.
+    cpu.onchip.write32(CHCR0, chcr(1, 1, 2, true));
+    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 2, 2, "unread TE kept");
+    // Read CHCR (observes TE), then write 0: TE clears, the IRQ drops.
+    let v = cpu.onchip.read32(CHCR0);
+    assert_eq!(v & 2, 2);
+    cpu.onchip.write32(CHCR0, v & !(2 | 1)); // clear TE and DE
+    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 2, 0, "TE cleared");
+    cpu.onchip.refresh_interrupts();
+    assert_eq!(cpu.onchip.intc.next_pending(0), None, "IRQ dropped with TE");
+
+    // Software can never set TE.
+    cpu.onchip.write32(CHCR0, 0b10);
+    assert_eq!(cpu.onchip.dmac.channels[0].chcr & 2, 0, "TE not settable");
+}
+
+#[test]
+fn dmaor_ae_latched_by_a_misaligned_transfer_needs_read_then_write_zero() {
+    let (mut cpu, mut bus) = cpu_with_nop();
+    cpu.onchip.write32(SAR0, 0x3001); // misaligned for a longword transfer
+    cpu.onchip.write32(DAR0, 0x4000);
+    cpu.onchip.write32(TCR0, 1);
+    cpu.onchip.write32(CHCR0, chcr(1, 1, 2, false));
+    cpu.onchip.write32(DMAOR, 1);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.onchip.dmac.dmaor & 4, 4, "AE latched");
+    cpu.onchip.write32(DMAOR, 1);
+    assert_eq!(cpu.onchip.dmac.dmaor & 4, 4, "unread AE survives write-0");
+    let _ = cpu.onchip.read32(DMAOR);
+    cpu.onchip.write32(DMAOR, 1);
+    assert_eq!(cpu.onchip.dmac.dmaor, 1, "read-then-write-0 clears AE");
+    // A byte read of DMAOR also counts as the observing read.
+    cpu.onchip.dmac.latch_ae();
+    let _ = cpu.onchip.read8(DMAOR + 3);
+    cpu.onchip.write32(DMAOR, 1);
+    assert_eq!(cpu.onchip.dmac.dmaor & 4, 0, "byte read observes AE too");
+}
+
+#[test]
+fn dmac_channel_1_runs_and_both_channels_complete() {
+    // Channel 1 registers sit 0x10 above channel 0.
+    let (mut cpu, mut bus) = cpu_with_nop();
+    bus.write_u32(0x3000, 0x0102_0304);
+    bus.write_u32(0x3100, 0x0506_0708);
+    cpu.onchip.write32(SAR0, 0x3000);
+    cpu.onchip.write32(DAR0, 0x4000);
+    cpu.onchip.write32(TCR0, 1);
+    cpu.onchip.write32(CHCR0, chcr(1, 1, 2, false));
+    cpu.onchip.write32(SAR0 + 0x10, 0x3100);
+    cpu.onchip.write32(DAR0 + 0x10, 0x4100);
+    cpu.onchip.write32(TCR0 + 0x10, 1);
+    cpu.onchip.write32(CHCR0 + 0x10, chcr(1, 1, 2, false));
+    cpu.onchip.write32(DMAOR, 1);
+    cpu.step(&mut bus);
+    let r = |bus: &mut MemBus, a| sh2::bus::Bus::read32(bus, a, sh2::bus::AccessKind::Data).0;
+    assert_eq!(r(&mut bus, 0x4000), 0x0102_0304);
+    assert_eq!(r(&mut bus, 0x4100), 0x0506_0708);
+    assert_eq!(cpu.onchip.read32(CHCR0 + 0x10) & 2, 2, "ch1 TE");
+    assert_eq!(cpu.onchip.read32(SAR0 + 0x10), 0x3104, "ch1 SAR advanced");
+    assert_eq!(cpu.onchip.read32(DAR0 + 0x10), 0x4104, "ch1 DAR advanced");
+    assert_eq!(cpu.onchip.read32(TCR0 + 0x10), 0, "ch1 TCR drained");
 }

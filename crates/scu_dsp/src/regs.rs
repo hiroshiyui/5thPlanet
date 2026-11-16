@@ -11,9 +11,9 @@
 //!   TOP             8-bit              loop top (set by JMP-to-PC / used by BTM)
 //!   LOP             12-bit             loop counter (LPS/BTM)
 //!   RX, RY          32-bit each        multiplier inputs
-//!   MUL             48-bit signed      RX × RY product (recomputed when RX/RY load)
+//!   MUL             48-bit signed      RX × RY product (computed on demand by MOV MUL,P)
 //!   PH:PL           16:32-bit          product register (PL low, PH high/sign)
-//!   ALU             48-bit             ALU result holding register
+//!   ALU             48-bit             this word's ALU result (starts each word = AC)
 //!   ACH:ACL         16:32-bit          accumulator (ACL low, ACH high)
 //!   CT0..CT3        6-bit each         data-RAM pointers within each bank
 //!   RA0, WA0        32-bit each        DMA read / write address registers
@@ -56,7 +56,11 @@ pub struct Registers {
     pub lop: u16,
     pub rx: u32,
     pub ry: u32,
-    /// 48-bit signed RX×RY product (sign-extended in an `i64`).
+    /// 48-bit signed RX×RY product (sign-extended in an `i64`) latched by the
+    /// most recent `MOV MUL,P`. The hardware computes the product on demand
+    /// from the RX/RY in effect at the start of that word (Mednafen
+    /// `scu_dsp_gen.cpp`: `P.T = RX * RY`), so this is an observation, never a
+    /// cached operand that could go stale.
     pub mul: i64,
     /// Product register low / high (PH holds bits 47..32, sign-extended).
     pub pl: u32,

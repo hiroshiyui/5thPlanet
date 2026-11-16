@@ -10,7 +10,7 @@
 use crate::bus::{AccessKind, Bus};
 use crate::cache::{self, Cache};
 use crate::isa::Op;
-use crate::onchip::OnChip;
+use crate::onchip::{OnChip, Source};
 use crate::pipeline::Pipeline;
 use crate::regs::{Registers, Sr};
 
@@ -100,6 +100,19 @@ pub struct Cpu {
     /// very next instruction that reads it pays a 1-cycle stall, then
     /// this is cleared regardless.
     pub(crate) load_dest_pending: Option<u8>,
+    /// Set when the instruction just retired was an **interrupt-disabled**
+    /// one ([`Op::is_interrupt_disabling`]: LDC/STC/LDS/STS and their `.L`
+    /// forms): the next instruction boundary does not accept a maskable
+    /// interrupt (NMI is unaffected — Mednafen strips only `PEX_INT` in
+    /// `DoID(true)`). Consumed at that boundary. Serialized: it is live
+    /// pipeline state between two instructions.
+    pub(crate) int_block: bool,
+    /// True while the core is in the SLEEP power-down state. Mednafen
+    /// re-executes `SLEEP` (3 cycles, PC held) until an exception is pending;
+    /// we model that as a 3-cycle idle step that keeps the on-chip timers and
+    /// DMAC running, leaving `regs.pc` already past the SLEEP so an accepted
+    /// interrupt saves the address of the following instruction. Serialized.
+    pub(crate) sleeping: bool,
     /// Debug only: the last CPU *exception* taken as `(vector, faulting PC)` —
     /// illegal (4) / slot-illegal (6) / address-error (9/10) / TRAPA, but not
     /// hardware interrupts. Used to diagnose spurious faults; not serialized.
@@ -219,6 +232,8 @@ impl Cpu {
             pending_branch: None,
             in_delay_slot: false,
             load_dest_pending: None,
+            int_block: false,
+            sleeping: false,
             last_fault: None,
             last_illegal_word: None,
             dbg_detect_stale: false,
@@ -277,6 +292,8 @@ impl Cpu {
         self.pending_branch = None;
         self.in_delay_slot = false;
         self.load_dest_pending = None;
+        self.int_block = false;
+        self.sleeping = false;
         // A reset must leave the core fetching *current* code, not its pre-reset
         // cache. The SH7604 disables the cache on reset (CCR.CE=0) and clears the
         // address array, so we invalidate the lines and clear CCR. This is
@@ -289,6 +306,13 @@ impl Cpu {
         // Mednafen's reset leaving the core with a clean cache.
         self.cache.purge();
         self.cache.set_ccr(0);
+        // The on-chip peripherals reset too (DMAC/INTC/DIVU/FRT/WDT — Mednafen
+        // `SH7095::Reset`); without this a re-reset slave (SMPC SSHOFF→SSHON)
+        // kept its stale DMAC/timer/interrupt setup. The timer epoch anchors at
+        // the (just-zeroed) cycle counter; a host that then jumps the cycle
+        // re-anchors via `OnChip::reset_timer_epoch`. The BSC master/slave pin
+        // bit is preserved.
+        self.onchip.reset(self.pipeline.cycles);
         let (pc, _) = self.mem_read32(0x0000_0000, AccessKind::Data, bus);
         let (sp, _) = self.mem_read32(0x0000_0004, AccessKind::Data, bus);
         self.regs.pc = pc;
@@ -304,11 +328,43 @@ impl Cpu {
         self.onchip.bsc.is_slave = is_slave;
     }
 
+    /// Drive the NMI input pin level (`true` = high). ICR bit 15 (NMIL) reads
+    /// it back. Defaults to high (the Saturn master's idle NMI line); a pin
+    /// property, so it survives [`reset`]. Edge-triggered NMI delivery is not
+    /// modelled here — the host raises `Source::Nmi` itself.
+    pub fn set_nmi_pin(&mut self, high: bool) {
+        self.onchip.intc.nmi_pin_low = !high;
+    }
+
     /// True when the next [`step`] will execute a branch delay slot
     /// (a branch is pending). Used by trace tooling to match reference
     /// emulators that execute the delay slot inside the branch handler.
     pub fn next_is_delay_slot(&self) -> bool {
         self.pending_branch.is_some()
+    }
+
+    /// True when the instruction just retired was an SH-2 interrupt-disabled
+    /// instruction (LDC/STC/LDS/STS and `.L` forms — [`Op::is_interrupt_disabling`]),
+    /// so the next instruction boundary will not accept a maskable interrupt
+    /// (SH-2 programming manual "interrupt-disabled instructions"; Mednafen
+    /// `PART_OP_INTDIS`).
+    pub fn interrupt_blocked(&self) -> bool {
+        self.int_block
+    }
+
+    /// True when the core can accept a **maskable** interrupt at the next
+    /// instruction boundary: not in a branch delay slot and not right after an
+    /// interrupt-disabled instruction. Host glue that forwards a level/edge
+    /// interrupt into the INTC per instruction (the Saturn SCU → master IRL)
+    /// should gate on this rather than [`Self::next_is_delay_slot`] alone, so a
+    /// request is not consumed at a boundary where the CPU cannot take it.
+    pub fn can_accept_interrupt(&self) -> bool {
+        self.pending_branch.is_none() && !self.int_block
+    }
+
+    /// True while the core is in the SLEEP power-down state (see `sleeping`).
+    pub fn is_sleeping(&self) -> bool {
+        self.sleeping
     }
 
     /// Apply an inter-CPU FRT input-capture (FTI) edge, materializing the lazy
@@ -381,10 +437,18 @@ impl Cpu {
     fn step_instruction(&mut self, bus: &mut impl Bus) -> u32 {
         // ---- Interrupt boundary: check pending INTC sources first ----
         // SH-2 only accepts interrupts at instruction boundaries (never
-        // inside a delay slot — that's a hardware invariant).
+        // inside a delay slot — that's a hardware invariant), and not right
+        // after an interrupt-disabled instruction (LDC/STC/LDS/STS family —
+        // Mednafen `PART_OP_INTDIS`), which blocks maskable interrupts but
+        // not NMI. The block applies to exactly one boundary.
+        let int_blocked = core::mem::take(&mut self.int_block);
         if self.pending_branch.is_none()
             && let Some((src, level)) = self.onchip.intc.next_pending(self.regs.sr.imask())
+            && (!int_blocked || src == Source::Nmi)
         {
+            // An accepted interrupt ends SLEEP; `regs.pc` already points past
+            // the SLEEP, which is the PC the hardware saves.
+            self.sleeping = false;
             let vector = self.onchip.intc.vector_for(src);
             self.onchip.intc.acknowledge(src);
             // External (level-triggered) sources stay asserted until the
@@ -400,6 +464,17 @@ impl Cpu {
             let cost = self.take_exception(vector, Some(level.min(15)), bus);
             self.pipeline.advance(cost);
             return cost;
+        }
+
+        // ---- SLEEP power-down ----
+        // Mednafen `SLEEP`: while no exception is pending the instruction
+        // re-executes in place (`goto SkipPCInc`) costing 3 cycles each time,
+        // with no new fetch. The on-chip FRT/WDT/DMAC keep running (driven by
+        // `Cpu::step` after this returns), so a timer/DMA interrupt — or an
+        // external one the host raises — wakes the core at the boundary above.
+        if self.sleeping {
+            self.pipeline.advance(3);
+            return 3;
         }
 
         let instr_pc = self.regs.pc;
@@ -424,13 +499,17 @@ impl Cpu {
         self.in_delay_slot = was_pending;
 
         // ---- Slot-illegal instruction ----
-        // A delay-slot containing a branch / SR-mutating op / PC-fetching
-        // op raises vector 6. The pushed PC is the *branch* address
-        // (instr_pc - 2), so RTE restarts the branch with consistent state.
+        // A delay slot holding a branch-family op or an undefined opcode
+        // raises vector 6 (`Op::is_illegal_in_slot`). The pushed PC is the
+        // **branch target** — "Saved PC is the effective target address of
+        // the jump" (Mednafen `SLOT_ILLEGAL`: the delayed branch already set
+        // `PC = target`, the slot runs with PC = target+2, and the handler
+        // does `PC -= 2`). So RTE resumes at the branch destination, skipping
+        // the faulting slot.
         if was_pending && op.is_illegal_in_slot() {
-            self.pending_branch = None;
+            let target = self.pending_branch.take().unwrap_or(instr_pc);
             self.in_delay_slot = false;
-            self.regs.pc = instr_pc; // un-advance: re-fetch the slot on return
+            self.regs.pc = target;
             let cost = self.take_exception(6, None, bus);
             self.pipeline.advance(interlock_stall + fetch_stall + cost);
             return interlock_stall + fetch_stall + cost;
@@ -451,6 +530,9 @@ impl Cpu {
             self.regs.pc = target;
         }
         self.in_delay_slot = false;
+
+        // Interrupt-disabled instruction: block acceptance at the next boundary.
+        self.int_block = op.is_interrupt_disabling();
 
         // ---- Post-dispatch scoreboard updates ----
         if let Some(rn) = op.load_dest() {
@@ -528,9 +610,26 @@ impl Cpu {
                 self.regs.macl = 0;
                 1
             }
-            // SLEEP halts the CPU until an interrupt or NMI. For M1 we model
-            // it as a 3-cycle NOP — wake-up plumbing arrives with task #7.
-            Sleep => 3,
+            // SLEEP (SH-2 programming manual; Mednafen `SLEEP`,
+            // `sh7095_ops.inc`): if no interrupt is pending, enter the
+            // power-down state — 3 cycles now and 3 per idle step until an
+            // interrupt is accepted (see `step_instruction`). If one is
+            // already pending (possible right after an interrupt-disabled
+            // instruction), SLEEP falls through at the cost of the next fetch.
+            // Standby mode (SBYCR.SBY) is not modelled.
+            Sleep => {
+                if self
+                    .onchip
+                    .intc
+                    .next_pending(self.regs.sr.imask())
+                    .is_some()
+                {
+                    1
+                } else {
+                    self.sleeping = true;
+                    3
+                }
+            }
 
             // ============================================================
             // Data transfer
@@ -1798,7 +1897,7 @@ impl Cpu {
                 // sar, sar+4, sar+8, sar+12 then advances by 16 (SM ignored); the
                 // destination is written per-longword, advancing by DM each time.
                 if (sar | dar) & 3 != 0 {
-                    self.onchip.dmac.dmaor |= 4; // AE
+                    self.onchip.dmac.latch_ae(); // AE
                     fault = true;
                 }
                 let mut buf = [0u32; 4];
@@ -1816,7 +1915,7 @@ impl Cpu {
                 }
             } else {
                 if (sar | dar) & align != 0 {
-                    self.onchip.dmac.dmaor |= 4; // AE: misaligned word/long address
+                    self.onchip.dmac.latch_ae(); // AE: misaligned word/long address
                     fault = true;
                 }
                 let v = self.dma_read(sar & AM & !align, ts, bus);
@@ -1833,7 +1932,7 @@ impl Cpu {
         // Completion: TE latches only when the count reaches zero (a fault aborts
         // with TCR still non-zero, leaving TE clear). SAR/DAR/TCR write back.
         if tcr == 0 {
-            self.onchip.dmac.channels[ch].chcr |= 0b10; // TE
+            self.onchip.dmac.latch_te(ch); // TE (+ write-0 protection until read)
             // Recalc-on-change (Stage C): TE just latched; if CHCR.IE is set the
             // transfer-end interrupt is now pending. Re-arm the INTC here rather
             // than via a per-instruction refresh.
@@ -1932,9 +2031,9 @@ impl Cpu {
     }
 
     /// MAC.L @Rm+,@Rn+. Signed 32×32 multiply, 64-bit accumulate into
-    /// MACH:MACL. S-bit saturation is implemented to the 48-bit signed
-    /// range (per SH7604 manual); rare in practice but exercised by some
-    /// DSP-heavy code paths.
+    /// MACH:MACL. With S=1 the result saturates to the signed 48-bit range
+    /// (SH-2 programming manual, MAC.L) using Mednafen's exact rule — see the
+    /// body; rare in practice but exercised by some DSP-heavy code paths.
     fn exec_mac_l(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
         let addr_m = self.regs.r[rm as usize];
         let (sm, s1) = self.mem_read32(addr_m, AccessKind::Data, bus);
@@ -1946,17 +2045,21 @@ impl Cpu {
 
         let prod = (sm as i32 as i64).wrapping_mul(sn as i32 as i64);
         let acc = ((self.regs.mach as u64) << 32) | (self.regs.macl as u64);
-        let sum = (acc as i64).wrapping_add(prod);
+        let mut sum = acc.wrapping_add(prod as u64);
 
-        let final_sum = if self.regs.sr.s() {
-            const MAX: i64 = (1i64 << 47) - 1;
-            const MIN: i64 = -(1i64 << 47);
-            sum.clamp(MIN, MAX)
-        } else {
-            sum
-        };
-        self.regs.macl = final_sum as u32;
-        self.regs.mach = (final_sum >> 32) as u32;
+        // S=1 saturation, exactly as Mednafen `MAC_L` (`sh7095_ops.inc`): only
+        // when the 64-bit sum leaves the signed 48-bit window, and the
+        // saturation direction follows the **sign of the product** (`m0 ^ m1`),
+        // not the sign of the sum.
+        if self.regs.sr.s() && sum > 0x0000_7FFF_FFFF_FFFF && sum < 0xFFFF_8000_0000_0000 {
+            sum = if ((sm ^ sn) as i32) < 0 {
+                0xFFFF_8000_0000_0000
+            } else {
+                0x0000_7FFF_FFFF_FFFF
+            };
+        }
+        self.regs.macl = sum as u32;
+        self.regs.mach = (sum >> 32) as u32;
         3 + s1 + s2
     }
 

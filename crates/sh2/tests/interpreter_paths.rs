@@ -1,5 +1,6 @@
 //! Coverage for less-exercised `interpreter.rs` paths: the MAC saturation
-//! (S=1) arms, RTE delay-slot semantics, SLEEP cycle cost, `Cpu::reset`
+//! (S=1) arms, RTE delay-slot semantics, SLEEP power-down, interrupt-disabled
+//! instructions, `Cpu::reset`
 //! reset-vector load, memory-routing classify() branches (cached /
 //! cache-through / associative-purge / on-chip / CCR), and the BSC
 //! master/slave bit reached through the CPU memory path. Every assertion
@@ -146,7 +147,8 @@ fn rte_masks_saved_sr_to_writable_bits() {
 }
 
 // ---------------------------------------------------------------------------
-// SLEEP — modelled as a 3-cycle instruction (interpreter.rs base cost).
+// SLEEP — entering the power-down state costs 3 cycles (see also the
+// SLEEP/interrupt-disabled tests at the end of this file).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -326,5 +328,243 @@ fn bcr1_master_slave_bit_is_read_only() {
         cpu.regs.r[3] & 0x80,
         0x80,
         "master/slave bit stays 1 despite a write of 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cpu::reset resets the on-chip peripherals (Mednafen `SH7095::Reset`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reset_restores_on_chip_peripherals_and_keeps_the_slave_pin() {
+    let (mut cpu, mut bus) = make(&[0x0009, 0x0009]);
+    bus.write_u32(0, PC0); // reset vector PC
+    bus.write_u32(4, SP0); // reset vector SP
+    cpu.set_bsc_slave(true);
+    // Program a handful of on-chip registers away from their reset values.
+    cpu.onchip.write16(0xFFFF_FEE2, 0x5550); // IPRA
+    cpu.onchip.write16(0xFFFF_FE60, 0x0700); // IPRB
+    cpu.onchip.write16(0xFFFF_FE66, 0x4142); // VCRC
+    cpu.onchip.write8(0xFFFF_FE10, 0x8E); // TIER
+    cpu.onchip.write8(0xFFFF_FE16, 0x02); // TCR φ/128
+    cpu.onchip.write16(0xFFFF_FE80, 0xA525); // WTCSR: TME, φ/64
+    cpu.onchip.write32(0xFFFF_FF80, 0x1234); // SAR0 (kept by reset)
+    cpu.onchip.write32(0xFFFF_FF8C, 0x5); // CHCR0 DE|IE
+    cpu.onchip.write32(0xFFFF_FFB0, 0x9); // DMAOR DME|PR
+    cpu.onchip.write32(0xFFFF_FFA0, 0x4C); // VCRDMA0 (kept by reset)
+    cpu.onchip.write32(0xFFFF_FF08, 0x2); // DVCR OVFIE
+    cpu.onchip.write32(0xFFFF_FF00, 7); // DVSR (kept by reset)
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+    cpu.pipeline.cycles = 1_000_000; // well past the timer epoch
+
+    cpu.reset(&mut bus);
+
+    let o = &mut cpu.onchip;
+    assert_eq!((o.intc.ipra, o.intc.iprb, o.intc.vcrc), (0, 0, 0), "INTC");
+    assert_eq!((o.frt.tier, o.frt.tcr, o.frt.frc), (0, 0, 0), "FRT");
+    assert_eq!((o.wdt.wtcsr, o.wdt.wtcnt), (0, 0), "WDT");
+    assert_eq!(o.dmac.channels[0].chcr, 0, "CHCR0");
+    assert_eq!(o.dmac.dmaor, 0, "DMAOR");
+    assert_eq!(o.divu.dvcr, 0, "DVCR");
+    assert_eq!(o.dmac.channels[0].sar, 0x1234, "SAR kept");
+    assert_eq!(o.intc.vcrdma0, 0x4C, "VCRDMA kept");
+    assert_eq!(o.divu.dvsr, 7, "DVSR kept");
+    assert!(o.bsc.is_slave, "master/slave pin survives reset");
+    assert_eq!(o.intc.next_pending(0), None, "no stale on-chip request");
+}
+
+#[test]
+fn reading_ftcsr_after_reset_does_not_hang() {
+    // Regression: `Cpu::reset` zeroes `pipeline.cycles`; the lazy FRT/WDT epoch
+    // (`lastts`) used to keep the large pre-reset value, so the next timer
+    // materialization computed a ~2^64-tick delta and spun forever.
+    let (mut cpu, mut bus) = make(&[0x0009]);
+    bus.write_u32(0, PC0);
+    bus.write_u32(4, SP0);
+    // A long run with the FRT ticking at φ/8.
+    cpu.onchip.write8(0xFFFF_FE16, 0x00);
+    cpu.pipeline.cycles = 50_000_000;
+    let _ = cpu.onchip.read8(0xFFFF_FE11); // no-op probe
+    cpu.onchip.frt_wdt_update(cpu.pipeline.cycles);
+    cpu.reset(&mut bus);
+    assert_eq!(cpu.pipeline.cycles, 0);
+    // Through the CPU memory path (timer-synced read): MOV.B @R1,R0.
+    bus.load_program(PC0, &[0x6010]);
+    cpu.regs.r[1] = 0xFFFF_FE11;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[0] & 0xFF, 0, "FTCSR reads its reset value");
+    // And a backwards jump in the cycle counter without a reset is treated as
+    // zero elapsed ticks (re-anchored), not a wrap-around.
+    cpu.onchip.frt_wdt_update(10_000);
+    cpu.onchip.frt_wdt_update(5_000);
+    cpu.onchip.frt_wdt_update(5_008);
+    assert_eq!(cpu.onchip.frt.frc as u64, (10_000 >> 3) + 1);
+}
+
+// ---------------------------------------------------------------------------
+// MAC.L S=1: Mednafen's exact saturation rule (sh7095_ops.inc `MAC_L`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mac_l_saturation_direction_follows_the_product_sign() {
+    // Accumulator far outside the 48-bit window on the POSITIVE side, plus a
+    // tiny NEGATIVE product (1 × -1): the sum is still out of the window, and
+    // Mednafen saturates by the product's sign → the NEGATIVE floor (a plain
+    // clamp of the sum would give the positive max).
+    let (mut cpu, mut bus) = make(&[0x021F]); // MAC.L @R1+,@R2+
+    bus.write_u32(0x3000, 0x0000_0001);
+    bus.write_u32(0x4000, 0xFFFF_FFFF); // -1
+    cpu.regs.r[1] = 0x3000;
+    cpu.regs.r[2] = 0x4000;
+    cpu.regs.sr.set_s(true);
+    cpu.regs.mach = 0x7FFF_0000;
+    cpu.regs.macl = 0;
+    cpu.step(&mut bus);
+    let result = ((cpu.regs.mach as u64) << 32) | cpu.regs.macl as u64;
+    assert_eq!(result, 0xFFFF_8000_0000_0000, "saturated by product sign");
+}
+
+#[test]
+fn mac_l_does_not_saturate_a_sum_inside_the_48_bit_window() {
+    // MACH:MACL at the +max with a negative product: the sum re-enters the
+    // window, so no saturation applies even with S=1.
+    let (mut cpu, mut bus) = make(&[0x021F]);
+    bus.write_u32(0x3000, 0x0000_0002);
+    bus.write_u32(0x4000, 0xFFFF_FFFD); // -3 → product -6
+    cpu.regs.r[1] = 0x3000;
+    cpu.regs.r[2] = 0x4000;
+    cpu.regs.sr.set_s(true);
+    cpu.regs.mach = 0x0000_7FFF;
+    cpu.regs.macl = 0xFFFF_FFFF;
+    cpu.step(&mut bus);
+    let result = ((cpu.regs.mach as u64) << 32) | cpu.regs.macl as u64;
+    assert_eq!(result, 0x0000_7FFF_FFFF_FFF9);
+}
+
+// ---------------------------------------------------------------------------
+// SLEEP power-down (Mednafen `SLEEP`) and interrupt-disabled instructions
+// (Mednafen `PART_OP_INTDIS`).
+// ---------------------------------------------------------------------------
+
+const VBR: u32 = 0x0000_5000;
+
+#[test]
+fn sleep_idles_until_an_interrupt_then_saves_the_next_pc() {
+    // SLEEP ; MOV #1,R1. While no interrupt is pending the core stays asleep:
+    // every step costs 3 cycles and nothing after SLEEP executes.
+    let (mut cpu, mut bus) = make(&[0x001B, 0xE101]);
+    cpu.regs.vbr = VBR;
+    bus.write_u32(VBR + (64 + 6) * 4, 0x0000_6000); // auto-vector for IRL 6
+    cpu.regs.sr.set_imask(0);
+    assert_eq!(cpu.step(&mut bus), 3, "SLEEP itself");
+    assert!(cpu.is_sleeping());
+    let before = cpu.pipeline.cycles;
+    for _ in 0..10 {
+        assert_eq!(cpu.step(&mut bus), 3, "idle step");
+    }
+    assert_eq!(cpu.pipeline.cycles - before, 30);
+    assert_eq!(cpu.regs.r[1], 0, "the instruction after SLEEP never ran");
+    // An interrupt wakes the core; the saved PC is the instruction AFTER
+    // SLEEP (PC0+2), so RTE resumes past it.
+    cpu.onchip.intc.raise(sh2::InterruptSource::External(6));
+    cpu.step(&mut bus);
+    assert!(!cpu.is_sleeping());
+    assert_eq!(cpu.regs.pc, 0x0000_6000, "vectored");
+    let (saved_pc, _) = sh2::Bus::read32(&mut bus, cpu.regs.r[15], sh2::AccessKind::Data);
+    assert_eq!(saved_pc, PC0 + 2);
+}
+
+#[test]
+fn sleeping_core_keeps_the_frt_running_and_wakes_on_its_interrupt() {
+    // FRT overflow interrupt (OVIE) at IPRB priority 5 with vector 0x50 in
+    // VCRD[14:8]: while asleep the timer keeps counting and its OVI wakes it.
+    let (mut cpu, mut bus) = make(&[0x001B, 0xE101]);
+    cpu.regs.vbr = VBR;
+    cpu.regs.sr.set_imask(0);
+    bus.write_u32(VBR + 0x50 * 4, 0x0000_6100);
+    cpu.onchip.write16(0xFFFF_FE60, 0x0500); // IPRB: FRT priority 5
+    cpu.onchip.write16(0xFFFF_FE68, 0x5000); // VCRD: OVI vector 0x50
+    cpu.onchip.write8(0xFFFF_FE10, 0x02); // TIER: OVIE
+    cpu.onchip.write8(0xFFFF_FE12, 0xFF); // FRC high
+    cpu.onchip.write8(0xFFFF_FE13, 0xF0); // FRC low → 0xFFF0
+    cpu.step(&mut bus); // SLEEP
+    let mut steps = 0;
+    while cpu.regs.pc != 0x0000_6100 {
+        cpu.step(&mut bus);
+        steps += 1;
+        assert!(steps < 1000, "FRT overflow never woke the sleeping core");
+    }
+    assert!(steps > 10, "slept for a while first ({steps} steps)");
+    assert_eq!(cpu.regs.r[1], 0);
+}
+
+#[test]
+fn sleep_with_an_interrupt_already_pending_falls_through() {
+    // LDC R0,SR (lowers imask to 0, but blocks the next boundary) ; SLEEP.
+    // The pending IRL is not accepted before SLEEP (interrupt-disabled), so
+    // SLEEP sees it pending and does not power down; it is taken right after.
+    let (mut cpu, mut bus) = make(&[0x400E, 0x001B, 0xE101]);
+    cpu.regs.vbr = VBR;
+    bus.write_u32(VBR + (64 + 4) * 4, 0x0000_6200);
+    cpu.regs.r[0] = 0; // new SR: imask 0
+    cpu.onchip.intc.raise(sh2::InterruptSource::External(4));
+    cpu.step(&mut bus); // LDC R0,SR
+    cpu.step(&mut bus); // SLEEP (boundary blocked → executes)
+    assert!(!cpu.is_sleeping());
+    cpu.step(&mut bus); // interrupt accepted
+    assert_eq!(cpu.regs.pc, 0x0000_6200);
+    let (saved_pc, _) = sh2::Bus::read32(&mut bus, cpu.regs.r[15], sh2::AccessKind::Data);
+    assert_eq!(saved_pc, PC0 + 4, "saved PC is past the SLEEP");
+}
+
+#[test]
+fn interrupt_disabled_instruction_blocks_the_next_boundary_only() {
+    // LDC R0,SR (imask 15 → 0) ; NOP ; NOP with IRL 5 pending. The boundary
+    // right after LDC is blocked, so the first NOP executes; the interrupt is
+    // taken before the second NOP (saved PC = PC0+4).
+    let (mut cpu, mut bus) = make(&[0x400E, 0x0009, 0x0009]);
+    cpu.regs.vbr = VBR;
+    bus.write_u32(VBR + (64 + 5) * 4, 0x0000_6300);
+    cpu.regs.sr.set_imask(15);
+    cpu.regs.r[0] = 0;
+    cpu.onchip.intc.raise(sh2::InterruptSource::External(5));
+    cpu.step(&mut bus); // LDC R0,SR
+    assert!(cpu.interrupt_blocked());
+    assert!(!cpu.can_accept_interrupt());
+    cpu.step(&mut bus); // NOP at PC0+2 — interrupt held off
+    assert_eq!(cpu.regs.pc, PC0 + 4);
+    assert!(cpu.can_accept_interrupt(), "block lasts one boundary");
+    cpu.step(&mut bus); // interrupt accepted now
+    assert_eq!(cpu.regs.pc, 0x0000_6300);
+    let (saved_pc, _) = sh2::Bus::read32(&mut bus, cpu.regs.r[15], sh2::AccessKind::Data);
+    assert_eq!(saved_pc, PC0 + 4);
+}
+
+#[test]
+fn every_ldc_stc_lds_sts_form_is_interrupt_disabling_but_nmi_is_not_blocked() {
+    use sh2::decoder::decode;
+    // LDC Rm,SR/GBR/VBR, LDC.L, STC, STC.L, LDS, LDS.L, STS, STS.L (m/n = 1).
+    for w in [
+        0x410E, 0x411E, 0x412E, 0x4107, 0x4117, 0x4127, 0x0102, 0x0112, 0x0122, 0x4103, 0x4113,
+        0x4123, 0x410A, 0x411A, 0x412A, 0x4106, 0x4116, 0x4126, 0x010A, 0x011A, 0x012A, 0x4102,
+        0x4112, 0x4122,
+    ] {
+        assert!(decode(w).is_interrupt_disabling(), "{w:#06x}");
+    }
+    assert!(!decode(0x0009).is_interrupt_disabling(), "NOP");
+    assert!(!decode(0x6013).is_interrupt_disabling(), "MOV");
+
+    // NMI is not held off by an interrupt-disabled instruction.
+    let (mut cpu, mut bus) = make(&[0x011A, 0x0009]); // STS MACL,R1 ; NOP
+    cpu.regs.vbr = VBR;
+    bus.write_u32(VBR + 11 * 4, 0x0000_6400);
+    cpu.step(&mut bus); // STS
+    cpu.onchip.intc.raise(sh2::InterruptSource::Nmi);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs.pc, 0x0000_6400,
+        "NMI accepted at the blocked boundary"
     );
 }

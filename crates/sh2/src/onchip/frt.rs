@@ -40,10 +40,10 @@ pub struct Frt {
     /// bit 1 = clearable ⇔ Mednafen's bit 0 = unprotected. A hardware *set*
     /// ([`Self::raise_status`]/[`Self::input_capture`]) drops the bit back to
     /// protected (Mednafen `FTCSRM |= bit`); a *read* marks all set flags
-    /// clearable (Mednafen `FTCSRM = 0`). Do not serialize: a tiny RMW latch, and
-    /// older save states must keep decoding with the same layout — loading 0
-    /// (nothing read yet ⇒ nothing clearable) is the safe, conservative default.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// clearable (Mednafen `FTCSRM = 0`). **Serialized** (Mednafen saves
+    /// `FTCSRM` too): it decides whether the next FTCSR write-0 clears a flag,
+    /// so dropping it on load would make a loaded state diverge from the
+    /// original (the ADR-0027 determinism contract).
     ftcsr_read_ones: u8,
 }
 

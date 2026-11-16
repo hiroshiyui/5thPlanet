@@ -13,11 +13,17 @@
 //!
 //! ```text
 //!   bit 0  CE   cache enable
-//!   bit 1  ID   instruction-fetch disable
-//!   bit 2  OD   data-access disable
+//!   bit 1  ID   instruction replacement disable
+//!   bit 2  OD   data replacement disable
 //!   bit 3  TW   two-way mode (otherwise 4-way)
 //!   bit 4  CP   cache purge (write-only one-shot; invalidates all entries)
 //! ```
+//!
+//! **ID/OD only disable *replacement*** (SH7604 HW manual §8 "instruction /
+//! data replacement disable"; Mednafen `CCRC_Replace_OR`): with ID (OD) set,
+//! an instruction-fetch (data) access that **hits** is still served from the
+//! cache and refreshes the LRU — only a **miss** skips the line fill and goes
+//! straight to the bus. They never mask lookups or write-through updates.
 //!
 //! Lines store their 16 bytes of data alongside the tag, so a hit can
 //! satisfy a read without touching the bus. The write policy is
@@ -135,8 +141,9 @@ pub enum Lookup {
     /// Line is not resident. Caller must fetch from the bus and call
     /// [`Cache::install`] before the data is observable here.
     Miss,
-    /// Cache is disabled or this access kind is masked off (ID/OD).
-    /// Caller should go straight to the bus and skip [`install`].
+    /// Cache is disabled, or this is a miss whose fill is suppressed by
+    /// ID/OD (replacement disable). Caller should go straight to the bus and
+    /// skip [`install`].
     Bypass,
 }
 
@@ -149,7 +156,7 @@ pub enum Probe {
     Hit(usize, usize),
     /// Not resident — caller must fill from the bus and [`install`].
     Miss,
-    /// Cache disabled or this access kind masked (ID/OD) — go to the bus.
+    /// Cache disabled, or a miss whose fill ID/OD suppresses — go to the bus.
     Bypass,
 }
 
@@ -273,20 +280,29 @@ impl Cache {
         }
     }
 
-    /// Probe the cache for `addr` on behalf of an instruction fetch.
+    /// Probe the cache for `addr` on behalf of an instruction fetch. With
+    /// CCR.ID set a hit is still served; only a miss becomes [`Lookup::Bypass`]
+    /// (no fill).
     pub fn lookup_fetch(&mut self, addr: u32) -> Lookup {
-        if !self.enabled() || self.inst_disabled() {
+        if !self.enabled() {
             return Lookup::Bypass;
         }
-        self.lookup(addr)
+        match self.lookup(addr) {
+            Lookup::Miss if self.inst_disabled() => Lookup::Bypass,
+            r => r,
+        }
     }
 
-    /// Probe the cache for `addr` on behalf of a data access.
+    /// Probe the cache for `addr` on behalf of a data access. With CCR.OD set
+    /// a hit is still served; only a miss becomes [`Lookup::Bypass`].
     pub fn lookup_data(&mut self, addr: u32) -> Lookup {
-        if !self.enabled() || self.data_disabled() {
+        if !self.enabled() {
             return Lookup::Bypass;
         }
-        self.lookup(addr)
+        match self.lookup(addr) {
+            Lookup::Miss if self.data_disabled() => Lookup::Bypass,
+            r => r,
+        }
     }
 
     /// Hot-path probe used by the interpreter's `mem_read*`. Returns the
@@ -294,16 +310,15 @@ impl Cache {
     /// of its 16 bytes — the caller then extracts only the 1–4 bytes it needs
     /// in place via [`Cache::line_at`], avoiding the per-access whole-line copy
     /// that dominated `cache_fill` (≈99.9 % of accesses hit; see the
-    /// `bench_cache` probe). `fetch` selects the ID vs OD enable mask. LRU is
-    /// refreshed on a hit, exactly as [`Cache::lookup`] does.
+    /// `bench_cache` probe). `fetch` selects the ID vs OD replacement-disable
+    /// bit, which only turns a **miss** into [`Probe::Bypass`] (no fill) — a
+    /// hit is served regardless (Mednafen `MemReadRT`: the tag lookup runs
+    /// whenever CE is set; `CCRC_Replace_OR` only forces the miss path to the
+    /// external bus). LRU is refreshed on a hit, exactly as [`Cache::lookup`]
+    /// does.
     #[inline]
     pub fn probe(&mut self, addr: u32, fetch: bool) -> Probe {
-        let masked = if fetch {
-            self.inst_disabled()
-        } else {
-            self.data_disabled()
-        };
-        if !self.enabled() || masked {
+        if !self.enabled() {
             return Probe::Bypass;
         }
         match self.lookup_loc(addr) {
@@ -312,6 +327,14 @@ impl Cache {
                 Probe::Hit(set, way)
             }
             None => {
+                let no_replace = if fetch {
+                    self.inst_disabled()
+                } else {
+                    self.data_disabled()
+                };
+                if no_replace {
+                    return Probe::Bypass;
+                }
                 self.dbg_stats[if fetch { 1 } else { 3 }] += 1;
                 Probe::Miss
             }
@@ -377,8 +400,11 @@ impl Cache {
     }
 
     /// Write-through: if the line containing `addr` is currently resident,
-    /// update the byte in place. No-op otherwise. Used by SH-2 stores to
-    /// keep cached copies coherent with the write that also went to bus.
+    /// update the byte in place **and refresh the pseudo-LRU** (a write hit
+    /// counts as an access — Mednafen `Cache_WriteUpdate`). No-op otherwise
+    /// (no write-allocate). OD is ignored here, as on the hardware. Used by
+    /// SH-2 stores to keep cached copies coherent with the write that also
+    /// went to bus.
     pub fn write_through_u8(&mut self, addr: u32, val: u8) {
         if let Some((set_idx, way)) = self.locate(addr) {
             self.sets[set_idx][way].data[(addr & 0xF) as usize] = val;
@@ -404,15 +430,18 @@ impl Cache {
         }
     }
 
-    fn locate(&self, addr: u32) -> Option<(usize, usize)> {
+    /// Find the resident line for a write-through and refresh its LRU state
+    /// (Mednafen `Cache_WriteUpdate` updates `Cache_LRU` on a write hit).
+    fn locate(&mut self, addr: u32) -> Option<(usize, usize)> {
         if !self.enabled() {
             return None;
         }
         let (tag, set_idx) = decompose(addr);
-        self.sets[set_idx]
+        let way = self.sets[set_idx]
             .iter()
-            .position(|line| line.valid && line.tag == tag)
-            .map(|way| (set_idx, way))
+            .position(|line| line.valid && line.tag == tag)?;
+        self.touch(set_idx, way as u8);
+        Some((set_idx, way))
     }
 
     fn pick_victim(&self, set_idx: usize) -> u8 {
@@ -663,14 +692,19 @@ mod tests {
         let line = c.line_at(set, way);
         assert_eq!(extract_u8(line, addr), 0x10);
         assert_eq!(extract_u32(line, addr | 0xC), 0x1C1D1E1F);
-        // A fetch probe with ID set bypasses even when the line is resident;
-        // a data probe still hits (OD not set).
+        // ID is replacement-disable: a resident line still HITS for a fetch;
+        // only a fetch miss bypasses (no fill).
         c.set_ccr(0x01 | 0x02);
-        assert_eq!(c.probe(addr, true), Probe::Bypass);
+        assert!(matches!(c.probe(addr, true), Probe::Hit(_, _)));
+        assert_eq!(
+            c.probe(0x6000_0400, true),
+            Probe::Bypass,
+            "ID miss: no fill"
+        );
         assert!(matches!(c.probe(addr, false), Probe::Hit(_, _)));
         // Bypass isn't tallied; data has hits + the one cold miss.
         let [fh, fm, dh, dm] = c.dbg_stats();
-        assert_eq!((fh, fm), (0, 0), "bypassed fetch not tallied");
+        assert_eq!((fh, fm), (1, 0), "bypassed fetch miss not tallied");
         assert!(dh >= 2 && dm == 1, "data: {dh} hit / {dm} miss");
         c.dbg_reset_stats();
         assert_eq!(c.dbg_stats(), [0; 4]);
@@ -710,20 +744,61 @@ mod tests {
     }
 
     #[test]
-    fn instruction_and_data_masks_route_independently() {
+    fn instruction_and_data_replacement_disables_route_independently() {
+        // ID/OD disable only the miss *fill* of their access kind; a resident
+        // line hits for both (Mednafen `CCRC_Replace_OR`).
         let mut c = Cache::new();
         c.set_ccr(0x01 | 0x02); // CE + ID
         let addr = 0x6000_0000;
-        assert_eq!(c.lookup_fetch(addr), Lookup::Bypass);
+        assert_eq!(c.lookup_fetch(addr), Lookup::Bypass, "fetch miss: no fill");
         assert_eq!(c.lookup_data(addr), Lookup::Miss);
         c.install(addr, line_with(0));
-        // Data sees the install, fetch still bypasses.
+        // Both kinds now hit the resident line.
         assert!(matches!(c.lookup_data(addr), Lookup::Hit(_)));
-        assert_eq!(c.lookup_fetch(addr), Lookup::Bypass);
+        assert!(
+            matches!(c.lookup_fetch(addr), Lookup::Hit(_)),
+            "ID hit served"
+        );
 
         let mut c = Cache::new();
         c.set_ccr(0x01 | 0x04); // CE + OD
-        assert_eq!(c.lookup_data(addr), Lookup::Bypass);
+        assert_eq!(c.lookup_data(addr), Lookup::Bypass, "data miss: no fill");
         assert_eq!(c.lookup_fetch(addr), Lookup::Miss);
+        c.install(addr, line_with(0x40));
+        assert!(
+            matches!(c.lookup_data(addr), Lookup::Hit(_)),
+            "OD hit served"
+        );
+        // Write-through updates the line regardless of OD.
+        c.write_through_u8(addr, 0xEE);
+        let Lookup::Hit(l) = c.lookup_data(addr) else {
+            panic!("hit")
+        };
+        assert_eq!(l[0], 0xEE);
+    }
+
+    #[test]
+    fn write_through_hit_refreshes_the_pseudo_lru() {
+        // Mednafen `Cache_WriteUpdate`: a write hit updates `Cache_LRU`, so the
+        // written line is no longer the eviction victim.
+        let mut c = Cache::new();
+        c.set_ccr(0x01);
+        let base: u32 = 0x6000_0000;
+        for i in 0..4u32 {
+            c.install(base | (i << 10), line_with(i as u8 * 0x10));
+        }
+        // Tag 0 is now the LRU victim; a write hit on it must protect it, so
+        // installing tag 4 evicts tag 1 instead.
+        c.write_through_u32(base, 0xDEAD_BEEF);
+        c.install(base | (4 << 10), line_with(0xC0));
+        assert!(
+            matches!(c.lookup_data(base), Lookup::Hit(_)),
+            "written line kept"
+        );
+        assert_eq!(
+            c.lookup_data(base | (1 << 10)),
+            Lookup::Miss,
+            "tag 1 evicted"
+        );
     }
 }
