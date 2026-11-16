@@ -1,11 +1,14 @@
-//! Minimal CD-block command interface at `0x0589_0000..0x0589_FFFF`.
+//! The CD-block at `0x0589_0000..0x0589_FFFF`, **high-level emulated**
+//! (ADR-0015).
 //!
-//! **NOT a CD-block emulation.** The Saturn CD-block is itself a complete
-//! subsystem — an SH-1 running CD-ROM firmware that handles disc reading,
-//! sub-Q, error correction, audio CD playback. The real thing lands in a
-//! later milestone. For M4 we model *just enough* of the host-interface
-//! register protocol that BIOS init detects "a CD-block is present, no
-//! disc inserted" and proceeds toward the splash instead of hanging.
+//! The real CD-block is an SH-1 running undumped CD-ROM firmware, so instead
+//! of the SH-1 we model what the host observes, after Mednafen `cdb.cpp` (the
+//! oracle) and MAME `saturn_cd_hle.cpp`: the host command interface (HIRQ,
+//! CR1–CR4, periodic status reports), the drive-phase machine (spin-up, seek
+//! timing, 75 Hz × speed sector reads), the 200-block buffer pool with its 24
+//! filters/partitions, the sector-data transfer port, the ISO9660 filesystem
+//! commands, CD-DA playback into the SCSP, and disc authentication — reading
+//! sectors from a [`SectorSource`] (a disc image or a live drive).
 //!
 //! Register layout (host interface; offsets relative to `0x0589_0000`,
 //! matching the Saturn CD-block / SCSP manual and Yabause's `cs2.c`).
@@ -29,12 +32,17 @@
 //! `hirqreg = 0`); the BIOS reads this signature to detect the subsystem.
 //! Thereafter the host drives commands by writing all four of CR1..CR4 —
 //! the block processes the command (`CR1 >> 8`), writes a response back
-//! into CR1..CR4, and sets `HIRQ.CMOK`. With a present dummy disc the
-//! status is `PAUSE`.
+//! into CR1..CR4, and sets `HIRQ.CMOK`. With no disc the status is
+//! `NODISC`; a disc reports `BUSY` through its recognition spin-up, then
+//! `PAUSE` until commanded.
 
 use std::collections::VecDeque;
 
-use crate::disc::{FAD_OFFSET, SectorSource};
+use crate::disc::{FAD_OFFSET, RAW_SECTOR, SectorSource, TrackMode, raw_sector_offset};
+
+/// Byte offset of the user payload inside a raw 2352-byte Mode-2 sector:
+/// 12 sync + 4 header + 8 subheader.
+const MODE2_USER_OFFSET: usize = TrackMode::Mode2.user_offset_2352();
 
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
 pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
@@ -42,9 +50,6 @@ pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
 /// Offset of the data-transfer FIFO within the region.
 const DATA_FIFO: u32 = 0x8000;
 
-/// Byte offset of the user payload inside a raw 2352-byte Mode-2 sector:
-/// 12 sync + 4 header + 8 subheader.
-const MODE2_USER_OFFSET: usize = 24;
 /// User-payload length of a Mode-2 **Form-2** sector (`submode` bit 5 set): the
 /// EDC/ECC area shrinks to a single 4-byte EDC, so the payload grows from the
 /// Form-1 2048 to 2324 (`2352 - 12 sync - 4 header - 8 subheader - 4 EDC`).
@@ -75,6 +80,7 @@ const STAT_TRANS: u16 = 0x4000; // data-transfer request pending
 
 // Further status bytes (high byte of the 16-bit status word, MAME `CD_STAT_*`).
 const STAT_REJECT: u16 = 0xFF00; // CR1 reject marker for malformed requests
+const STAT_WAIT: u16 = 0x8000; // CR1 "busy, retry" bit (Mednafen STATUS_WAIT)
 const STAT_SEEK: u8 = 0x04; // drive seeking
 const STAT_PLAY: u8 = 0x03; // read/playback in progress
 const STAT_STANDBY: u8 = 0x02; // drive stopped (MAME CD_STAT_STANDBY)
@@ -164,16 +170,40 @@ struct Xfer32 {
 /// SH-2 master clock (Hz) — sectors stream at 75×speed of these.
 const MASTER_HZ: u64 = 28_636_400;
 
-/// One ISO9660 directory record (MAME `direntryT`, fields we use).
+/// One ISO9660 directory record (MAME `direntryT` / Mednafen `FileInfoS`,
+/// the fields Change Directory, Get File Info, and Read File use).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct DirEntry {
     firstfad: u32,
     length: u32,
+    /// ISO9660 file flags (bit 1 = directory).
     flags: u8,
     file_unit_size: u8,
     interleave_gap_size: u8,
-    #[allow(dead_code)] // retained for Get File Info / debugging
-    name: Vec<u8>,
+    /// CD-XA file number from the record's system-use `XA` extension (0 if
+    /// none) — Mednafen `ReadRecord` `fnum`.
+    xa_fnum: u8,
+    /// Get File Info attribute byte: the directory flag plus the CD-XA
+    /// attribute bits (`Form1/Form2/interleave/CDDA`, `& 0xF8`) — Mednafen
+    /// `ReadRecord` `attr`.
+    attr: u8,
+}
+
+/// Upper bound on the bytes Change Directory reads for one directory. The
+/// directory length is an untrusted 32-bit field of the disc's records; a
+/// hostile or corrupt image could otherwise make us allocate gigabytes. 1 MiB
+/// (512 sectors, tens of thousands of records) is far beyond any real disc.
+const MAX_DIR_BYTES: u32 = 0x10_0000;
+
+/// Entries the Get File Info whole-directory form stages: Mednafen's file-info
+/// window holds `.`/`..` plus up to 254 records (`FileInfoValidCount`, a u8).
+const FILE_INFO_WINDOW: usize = 254;
+
+/// Clamp a commanded track number into `first..=last` without panicking when
+/// a malformed [`SectorSource`] reports `first > last` (`u8::clamp` asserts
+/// `min <= max`); such a source resolves to `last`.
+fn clamp_track(t: u8, first: u8, last: u8) -> u8 {
+    t.max(first).min(last)
 }
 
 /// Little-endian u32 from a byte slice at `o` (0 if out of range).
@@ -1049,30 +1079,42 @@ impl CdBlock {
             // it; the 276-byte drift fed its ADPCM decoder a stray control byte
             // → a runaway IIR filter → a loud saturating buzz).
             let form2 = matches!(sub, Some((_, _, subm, _)) if subm & 0x20 != 0);
-            let mut buf = [0u8; 2352];
+            // The on-disc sector, re-framed into a raw 2352-byte sector (a
+            // `MODE2/2336` image sector lacks the 16-byte sync + header, so it
+            // lands at byte 16) — the layout Mednafen's buffers hold and its
+            // `DT_SetIBOffsCount` offsets index into. A cooked 2048 sector has
+            // no raw framing (`raw_off == None`).
+            let mut buf = [0u8; RAW_SECTOR];
+            let n = disc.read_full_sector(fad, &mut buf);
+            if n == 0 {
+                return false;
+            }
+            let raw_off = raw_sector_offset(n);
+            if let Some(o) = raw_off.filter(|&o| o > 0) {
+                buf.copy_within(0..n, o);
+                buf[..o].fill(0);
+            }
             // Store the sector's payload: the 2324-byte Form-2 user data, else
-            // the 2048 user payload (`sectlenin==2048`, the common case), else a
-            // leading slice of the full on-disc sector.
+            // the 2048 user payload (`sectlenin==2048`, the common case), else
+            // the *trailing* `sectlenin` bytes of the raw sector — Mednafen
+            // `DT_SetIBOffsCount`: 2336 starts at the subheader (byte 16), 2340
+            // at the header (byte 12), 2352 at the sync (byte 0).
             let data = if self.sectlenin == 2048 {
-                if form2 {
-                    let n = disc.read_full_sector(fad, &mut buf);
-                    if n < MODE2_USER_OFFSET + FORM2_USER_LEN {
-                        return false;
-                    }
+                if form2 && raw_off.is_some() {
                     buf[MODE2_USER_OFFSET..MODE2_USER_OFFSET + FORM2_USER_LEN].to_vec()
                 } else {
-                    if !disc.read_sector(fad, &mut buf[..2048]) {
+                    let mut user = [0u8; 2048];
+                    if !disc.read_sector(fad, &mut user) {
                         return false;
                     }
-                    buf[..2048].to_vec()
+                    user.to_vec()
                 }
             } else {
-                let len = self.sectlenin as usize;
-                let n = disc.read_full_sector(fad, &mut buf);
-                if n == 0 {
-                    return false;
+                let len = (self.sectlenin as usize).min(RAW_SECTOR);
+                match raw_off {
+                    Some(_) => buf[RAW_SECTOR - len..].to_vec(),
+                    None => buf[..len.min(n)].to_vec(),
                 }
-                buf[..len.min(n)].to_vec()
             };
             (data, sub)
         };
@@ -1454,13 +1496,15 @@ impl CdBlock {
     }
 
     /// Start FAD of `track` (clamped to the disc's track range) from the TOC,
-    /// for the Play command's track/index addressing form.
+    /// for the Play command's track/index addressing form. `None` when the
+    /// clamped track has no TOC slot (a malformed source's track 0 / > 99).
     fn track_start_fad(&self, track: u8) -> Option<u32> {
         let d = self.disc.as_ref()?;
-        let t = track.clamp(d.first_track(), d.last_track());
+        let t = clamp_track(track, d.first_track(), d.last_track());
         let toc = d.toc();
-        let i = (t as usize - 1) * 4;
-        Some(((toc[i + 1] as u32) << 16) | ((toc[i + 2] as u32) << 8) | toc[i + 3] as u32)
+        let i = (t as usize).checked_sub(1)? * 4;
+        let e = toc.get(i + 1..i + 4)?;
+        Some(((e[0] as u32) << 16) | ((e[1] as u32) << 8) | e[2] as u32)
     }
 
     /// Track number under the play head, for the track-form end checks
@@ -1483,8 +1527,11 @@ impl CdBlock {
             if self.cur_play_end & 0x80_0000 != 0 {
                 end_met |= self.cd_curfad >= (self.cur_play_end & 0x7F_FFFF);
             } else if let Some(d) = self.disc.as_ref() {
-                let end_track = (((self.cur_play_end >> 8) & 0xFF) as u8)
-                    .clamp(d.first_track(), d.last_track());
+                let end_track = clamp_track(
+                    ((self.cur_play_end >> 8) & 0xFF) as u8,
+                    d.first_track(),
+                    d.last_track(),
+                );
                 // Our index is always 1, so only the track number can exceed
                 // the bound (Mednafen also compares `idx > end_index`).
                 end_met |= self.head_track() > end_track;
@@ -1493,8 +1540,11 @@ impl CdBlock {
         if self.cur_play_start & 0x80_0000 != 0 {
             end_met |= self.cd_curfad < (self.cur_play_start & 0x7F_FFFF);
         } else if let Some(d) = self.disc.as_ref() {
-            let start_track =
-                (((self.cur_play_start >> 8) & 0xFF) as u8).clamp(d.first_track(), d.last_track());
+            let start_track = clamp_track(
+                ((self.cur_play_start >> 8) & 0xFF) as u8,
+                d.first_track(),
+                d.last_track(),
+            );
             end_met |= self.head_track() < start_track;
         }
         end_met
@@ -1740,8 +1790,8 @@ impl CdBlock {
     /// few seconds so the buffer can't grow unbounded if the host stops draining
     /// audio, while still absorbing the read pump's sector-burst fills (the
     /// scheduler ticks the drive in batches, so several sectors can decode in one
-    /// step; a tight cap would drop them and the audio would gap — see
-    /// [`Self::take_cd_audio`]'s jitter buffer).
+    /// step; a tight cap would drop them and the audio would gap — see the
+    /// jitter buffer in [`Self::take_cd_audio_buffered`]).
     fn read_cd_audio_sector(&mut self, fad: u32) -> bool {
         let Some(disc) = self.disc.as_ref() else {
             return false;
@@ -1793,10 +1843,18 @@ impl CdBlock {
     /// whenever the cushion was still settling against the seek startup + bursty
     /// fill, which stuttered at the *start* of playback. A near-miss now just
     /// pads the shortfall once; only a true empty re-arms the cushion.
+    ///
+    /// The cushion only applies while the drive is still streaming CD-DA. Once
+    /// it has stopped (a play shorter than the pre-roll — a jingle or a short
+    /// sound effect — ended, or the drive moved on), whatever is buffered starts
+    /// playing at once; otherwise a short play would never be heard and its
+    /// samples would sit in the buffer and leak in front of the next play.
     pub fn take_cd_audio_buffered(&mut self, n: usize) -> Vec<i16> {
         const PREROLL: usize = 44_100; // ~0.5 s of interleaved stereo
         if !self.cd_audio_primed {
-            if self.cd_audio.len() < PREROLL.max(n) {
+            let ready = self.cd_audio.len() >= PREROLL.max(n)
+                || (!self.cd_audio.is_empty() && !self.streaming_cdda());
+            if !ready {
                 return vec![0i16; n];
             }
             self.cd_audio_primed = true;
@@ -1808,12 +1866,26 @@ impl CdBlock {
         out
     }
 
+    /// Whether the drive is reading an audio track (so more CD-DA is coming):
+    /// in the Play phase with the head on an audio track.
+    fn streaming_cdda(&self) -> bool {
+        self.drive_phase == DrivePhase::Play
+            && self
+                .disc
+                .as_ref()
+                .and_then(|d| d.track_at_fad(self.cd_curfad))
+                .is_some_and(|t| t.is_audio)
+    }
+
     /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
     fn delete_partition_sectors(&mut self, buf: usize, ofs: usize, num: usize) {
-        let end = (ofs + num).min(self.partitions[buf].blocks.len());
-        if ofs > end {
+        let end = ofs
+            .saturating_add(num)
+            .min(self.partitions[buf].blocks.len());
+        if ofs >= end {
             return;
         }
+        self.xfer32_note_removal(buf, ofs, end - ofs);
         #[cfg(not(test))]
         if cd_xfer_trace() {
             eprintln!(
@@ -1842,7 +1914,17 @@ impl CdBlock {
             self.xfer32 = None;
             return 0xFFFF;
         }
-        let bi = self.partitions[x.part].blocks[x.pos + x.sect];
+        // The transfer addresses its blocks by partition position; if they have
+        // gone (a removal path that didn't adjust it), end the transfer rather
+        // than index out of bounds.
+        let Some(&bi) = self
+            .partitions
+            .get(x.part)
+            .and_then(|p| p.blocks.get(x.pos + x.sect))
+        else {
+            self.xfer32 = None;
+            return 0xFFFF;
+        };
         let size = self.blocks[bi].size.max(0) as usize;
         let o = x.offs;
         let d = &self.blocks[bi].data;
@@ -1919,7 +2001,10 @@ impl CdBlock {
     /// Load a directory (MAME `read_new_dir`). `0xFFFFFF` finds the primary
     /// volume descriptor (FAD 166..200), parses the root record, and reads the
     /// root directory; otherwise it reads the sub-directory at entry `fileno`.
-    fn read_new_dir(&mut self, fileno: u32) {
+    /// Returns `false` (the command is rejected) when `fileno` is not a
+    /// directory entry of the current directory — Mednafen `COMMAND_CHANGE_DIR`
+    /// rejects an out-of-window id or a record without the directory attribute.
+    fn read_new_dir(&mut self, fileno: u32) -> bool {
         if fileno == 0xFF_FFFF {
             let mut pvd = None;
             if let Some(disc) = self.disc.as_ref() {
@@ -1940,32 +2025,50 @@ impl CdBlock {
                     }
                 }
             }
-            let Some(sect) = pvd else { return };
-            // Root directory record sits at offset 156 in the PVD.
+            let Some(sect) = pvd else { return true };
+            // Root directory record sits at offset 156 in the PVD. The FAD is
+            // `150 + extent` in 32-bit arithmetic (Mednafen `ReadRecord`).
             self.curroot = DirEntry {
-                firstfad: le32(&sect, 158) + FAD_OFFSET,
+                firstfad: le32(&sect, 158).wrapping_add(FAD_OFFSET),
                 length: le32(&sect, 166),
                 flags: *sect.get(181).unwrap_or(&0),
                 ..Default::default()
             };
-            self.make_dir_current(self.curroot.firstfad);
-        } else if let Some(e) = self.curdir.get(fileno as usize) {
-            let fad = e.firstfad;
-            self.make_dir_current(fad);
+            self.make_dir_current(self.curroot.firstfad, self.curroot.length);
+            true
+        } else {
+            match self.curdir.get(fileno as usize) {
+                Some(e) if e.flags & 0x02 != 0 => {
+                    // Read the *target* directory's own extent length
+                    // (Mednafen `FLS_Run` sizes the read from the selected
+                    // record, `fi->size()`), not the root's.
+                    let (fad, len) = (e.firstfad, e.length);
+                    self.make_dir_current(fad, len);
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
-    /// Parse the directory at `fad` into `curdir` (MAME `make_dir_current`):
-    /// variable-length records, jumping the 0-padded gap at each 0x800 sector
-    /// boundary; `firstfile` is the first non-directory entry.
-    fn make_dir_current(&mut self, fad: u32) {
-        let dirlen = self.curroot.length.max(2048) as usize;
+    /// Parse the `length`-byte directory at `fad` into `curdir` (MAME
+    /// `make_dir_current`): variable-length records, jumping the 0-padded gap
+    /// at each 0x800 sector boundary; `firstfile` is the first non-directory
+    /// entry. The read is capped at [`MAX_DIR_BYTES`] and at the disc's end.
+    fn make_dir_current(&mut self, fad: u32, length: u32) {
+        let disc_sectors = self
+            .disc
+            .as_ref()
+            .map_or(0, |d| d.lead_out_fad().saturating_sub(fad));
+        let dirlen = length
+            .clamp(2048, MAX_DIR_BYTES)
+            .min(disc_sectors.saturating_mul(2048).max(2048)) as usize;
         let nsect = dirlen.div_ceil(2048);
         let mut buf: Vec<u8> = Vec::with_capacity(nsect * 2048);
         if let Some(disc) = self.disc.as_ref() {
             let mut sect = [0u8; 2048];
             for i in 0..nsect as u32 {
-                if disc.read_sector(fad + i, &mut sect) {
+                if disc.read_sector(fad.wrapping_add(i), &mut sect) {
                     buf.extend_from_slice(&sect);
                 } else {
                     buf.resize(buf.len() + 2048, 0);
@@ -1978,7 +2081,7 @@ impl CdBlock {
         while pos < buf.len() {
             let rec = buf[pos] as usize;
             if rec == 0 {
-                if sector_number < self.curroot.length as usize {
+                if sector_number < dirlen {
                     sector_number += 0x800;
                     pos = sector_number;
                     continue;
@@ -1988,17 +2091,24 @@ impl CdBlock {
             if pos + 33 > buf.len() {
                 break;
             }
-            let namelen = buf[pos + 32] as usize;
+            let r = &buf[pos..(pos + rec).min(buf.len())];
+            let flags = buf[pos + 25];
+            // CD-XA system-use extension after the (odd-padded) name: `XA` at
+            // +6, attribute bits at +4, file number at +8 (Mednafen
+            // `ReadRecord`, cdb.cpp:1046).
+            let su_offs = 33 + (buf[pos + 32] as usize | 1);
+            let (xa_attr, xa_fnum) = match r.get(su_offs..) {
+                Some(su) if su.len() >= 14 && &su[6..8] == b"XA" => (su[4] & 0xF8, su[8]),
+                _ => (0, 0),
+            };
             entries.push(DirEntry {
-                firstfad: le32(&buf, pos + 2) + FAD_OFFSET,
+                firstfad: le32(&buf, pos + 2).wrapping_add(FAD_OFFSET),
                 length: le32(&buf, pos + 10),
                 file_unit_size: buf[pos + 26],
                 interleave_gap_size: buf[pos + 27],
-                flags: buf[pos + 25],
-                name: buf
-                    .get(pos + 33..pos + 33 + namelen)
-                    .unwrap_or(&[])
-                    .to_vec(),
+                flags,
+                xa_fnum,
+                attr: (flags & 0x02) | xa_attr,
             });
             pos += rec;
         }
@@ -2067,8 +2177,34 @@ impl CdBlock {
         self.periodic_idle = PERIODIC_IDLE_CYC;
     }
 
+    /// Keep an in-flight sector transfer consistent when `cnt` blocks at `ofs`
+    /// are about to leave partition `part` by another path (Reset Selector,
+    /// Delete Sector Data). The transfer addresses blocks by partition
+    /// *position*, so a removal before its window shifts the window down, and
+    /// a removal overlapping it ends the data stream at the current sector (the
+    /// next data-port read returns the `0xFFFF` end marker) and drops its
+    /// pending get-and-delete, whose blocks are gone.
+    ///
+    /// Mednafen differs in mechanism, not outcome for a well-behaved host: its
+    /// transfer holds pool-buffer *indices* (`DT.BufList`, cdb.cpp:3533) and
+    /// keeps streaming the freed buffers' stale bytes. Real software doesn't
+    /// free a partition under its own transfer; this only has to stay sound.
+    fn xfer32_note_removal(&mut self, part: usize, ofs: usize, cnt: usize) {
+        let Some(x) = self.xfer32.as_mut().filter(|x| x.part == part) else {
+            return;
+        };
+        if ofs + cnt <= x.pos {
+            x.pos -= cnt;
+        } else if ofs < x.pos + x.num {
+            x.num = x.sect;
+            x.delete = false;
+        }
+    }
+
     /// Free every block held by partition `p` and empty it.
     fn clear_partition(&mut self, p: usize) {
+        let n = self.partitions[p].blocks.len();
+        self.xfer32_note_removal(p, 0, n);
         let idxs = core::mem::take(&mut self.partitions[p].blocks);
         for b in idxs {
             self.free_block(b);
@@ -2122,9 +2258,11 @@ impl CdBlock {
     /// synchronously and set CMOK immediately, which is observationally
     /// equivalent for the BIOS (it polls HIRQ for CMOK after issuing).
     ///
-    /// Only the commands BIOS init issues with no disc present are
-    /// modelled; everything else falls back to a plain status report,
-    /// which is what most CD-block commands return.
+    /// [`Self::dispatch_inner`] implements the host command set the BIOS and
+    /// games use (status/TOC/session, Init, Play/Seek, the filter/partition
+    /// and sector-data commands, the filesystem commands, authentication);
+    /// an unimplemented command (the MPEG card, copy/move sector data) falls
+    /// back to a plain status report.
     fn execute(&mut self) {
         let command = (self.cr1 >> 8) as u8;
         let cr_in = [self.cr1, self.cr2, self.cr3, self.cr4];
@@ -2232,26 +2370,32 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
             }
             0x03 => {
-                // Get session info (MAME `cmd_get_session_info`). CR1 low byte
-                // selects which session; the BIOS reads CR3 (session count in
-                // the high byte) and CR4. With a disc, session 0 ("total / disc
-                // end") returns the lead-out FAD; otherwise the disc start.
-                // (MAME warns CR4 must be > 1 and < 100 or the BIOS rejects the
-                // no-disc default — hence CR3=0x0100, CR4=0 there.)
-                let which = (self.cr1 & 0xFF) as u8;
-                self.status = STAT_PAUSE;
-                self.cr1 = (self.status as u16) << 8;
-                self.cr2 = 0x0000;
-                match (&self.disc, which) {
-                    (Some(d), 0) => {
-                        let lo = d.lead_out_fad();
-                        self.cr3 = 0x0100 | ((lo >> 16) & 0xFF) as u16;
-                        self.cr4 = lo as u16;
-                    }
-                    _ => {
-                        self.cr3 = 0x0100;
-                        self.cr4 = 0x0000;
-                    }
+                // Get session info (Mednafen `COMMAND_GET_SESSINFO`,
+                // cdb.cpp:2691). Read-only: the drive status is reported, never
+                // changed (forcing PAUSE here turned an empty tray's NODISC
+                // into a phantom disc). During recognition spin-up the block
+                // answers WAIT. Otherwise CR1 low byte selects the session:
+                // 0 = whole disc → session count 1 + the lead-out FAD;
+                // 1 → `rsw = 1`, FAD 0; anything else → `0xFF` / `0xFFFFFF`
+                // (single-session discs only). With no disc Mednafen's cleared
+                // TOC puts the lead-out at FAD 150.
+                if self.drive_phase == DrivePhase::Startup {
+                    self.cd_report();
+                    self.cr1 |= STAT_WAIT;
+                } else {
+                    let sess = self.cr1 & 0xFF;
+                    let (rsw, fad) = match sess {
+                        0 => (
+                            0x01u16,
+                            self.disc.as_ref().map_or(FAD_OFFSET, |d| d.lead_out_fad()),
+                        ),
+                        1 => (0x01, 0),
+                        _ => (0xFF, 0xFF_FFFF),
+                    };
+                    self.cr1 = self.cd_stat();
+                    self.cr2 = 0x0000;
+                    self.cr3 = (rsw << 8) | ((fad >> 16) & 0xFF) as u16;
+                    self.cr4 = fad as u16;
                 }
                 self.hirq |= HIRQ_CMOK;
             }
@@ -2403,14 +2547,22 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             0x43 => {
-                // Get filter subheader conditions.
-                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
-                let fl = self.filters[f].clone();
-                self.cr1 = self.cd_stat() | fl.chan as u16;
-                self.cr2 = ((fl.smmask as u16) << 8) | fl.cimask as u16;
-                self.cr3 = fl.fid as u16;
-                self.cr4 = ((fl.smval as u16) << 8) | fl.cival as u16;
-                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                // Get filter subheader conditions (Mednafen
+                // `COMMAND_GET_FILTSUBHC`, cdb.cpp:3116): an out-of-range
+                // filter number is rejected, not silently mapped to filter 23.
+                // CR3 echoes the filter number in its high byte.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if let Some(fl) = self.filters.get(f) {
+                    self.cr1 = self.cd_stat() | fl.chan as u16;
+                    self.cr2 = ((fl.smmask as u16) << 8) | fl.cimask as u16;
+                    self.cr3 = ((f as u16) << 8) | fl.fid as u16;
+                    self.cr4 = ((fl.smval as u16) << 8) | fl.cival as u16;
+                    self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x44 => {
                 // Set filter mode (CR1 low; bit 7 = re-initialise the filter).
@@ -2427,13 +2579,21 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             0x45 => {
-                // Get filter mode.
-                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
-                self.cr1 = self.cd_stat() | self.filters[f].mode as u16;
-                self.cr2 = 0;
-                self.cr3 = 0;
-                self.cr4 = 0;
-                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                // Get filter mode (Mednafen `COMMAND_GET_FILTMODE`,
+                // cdb.cpp:3160): reject an out-of-range filter number; CR3
+                // echoes the filter number in its high byte.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if let Some(fl) = self.filters.get(f) {
+                    self.cr1 = self.cd_stat() | fl.mode as u16;
+                    self.cr2 = 0;
+                    self.cr3 = (f as u16) << 8;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x46 => {
                 // Set filter connection: CR1 bit0=true cond, bit1=false cond.
@@ -2477,12 +2637,14 @@ impl CdBlock {
                 let num = self.cr4 as usize;
                 self.calcsize = 0;
                 if let Some(p) = self.partitions.get(buf) {
-                    let idxs: Vec<usize> = p.blocks.clone();
-                    for i in 0..num {
-                        if let Some(&b) = idxs.get(offs + i) {
-                            self.calcsize += (self.blocks[b].size.max(0) as u32) / 2;
-                        }
-                    }
+                    let blocks = &self.blocks;
+                    self.calcsize = p
+                        .blocks
+                        .iter()
+                        .skip(offs)
+                        .take(num)
+                        .map(|&b| (blocks[b].size.max(0) as u32) / 2)
+                        .sum();
                 }
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
@@ -2818,9 +2980,14 @@ impl CdBlock {
             0x70 => {
                 // Change directory: CR3 low + CR4 = file id (0xFFFFFF = root).
                 let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
-                self.read_new_dir(temp);
+                let ok = self.read_new_dir(temp);
                 self.cd_report();
-                self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+                if ok {
+                    self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
+                } else {
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x71 => {
                 // Read directory: just (re)connect the filter for the read.
@@ -2842,34 +3009,54 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_EFLS;
             }
             0x73 => {
-                // Get target file info: stage a 12-byte record for the host to
-                // read through the FIFO (FAD, length, gap/unit size, id, flags).
-                let temp = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
-                if temp != 0xFF_FFFF {
-                    if let Some(e) = self.curdir.get(temp as usize) {
-                        let mut f = vec![0u8; 12];
-                        f[0..4].copy_from_slice(&e.firstfad.to_be_bytes());
-                        f[4..8].copy_from_slice(&e.length.to_be_bytes());
-                        f[8] = e.interleave_gap_size;
-                        f[9] = e.file_unit_size;
-                        f[10] = temp as u8;
-                        f[11] = e.flags;
-                        self.xfer = f;
-                        self.xfer_pos = 0;
-                    }
-                    self.xfer_done = 0;
-                    self.transfer_request = true;
-                    self.cr1 = self.cd_stat() | STAT_TRANS;
-                    self.cr2 = 6; // 6 words for a single file
+                // Get target file info (Mednafen `COMMAND_GET_FINFO`,
+                // cdb.cpp:3836): stage 12-byte records for the host to read
+                // through the FIFO — FAD, size (both big-endian), unit size,
+                // gap size, CD-XA file number, attribute. A single id stages
+                // its record (6 words); `0xFFFFFF` stages the whole listed
+                // directory from id 2 (6 words per entry, `.`/`..` excluded).
+                // An id outside the directory, the whole form of a directory
+                // with no files, or no directory loaded is rejected; a busy
+                // data transfer answers WAIT.
+                let id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
+                let listed = self.curdir.len().saturating_sub(2).min(FILE_INFO_WINDOW);
+                let entries: Option<&[DirEntry]> = if self.curdir.is_empty() {
+                    None
+                } else if id == 0xFF_FFFF {
+                    (listed > 0).then(|| &self.curdir[2..2 + listed])
                 } else {
+                    self.curdir.get(id as usize).map(core::slice::from_ref)
+                };
+                if self.xfer32.is_some() {
+                    self.cd_report();
+                    self.cr1 |= STAT_WAIT;
+                } else if let Some(entries) = entries {
+                    let mut f = Vec::with_capacity(entries.len() * 12);
+                    for e in entries {
+                        f.extend_from_slice(&e.firstfad.to_be_bytes());
+                        f.extend_from_slice(&e.length.to_be_bytes());
+                        f.extend_from_slice(&[
+                            e.file_unit_size,
+                            e.interleave_gap_size,
+                            e.xa_fnum,
+                            e.attr,
+                        ]);
+                    }
+                    let words = (f.len() / 2) as u16;
+                    self.xfer = f;
+                    self.xfer_pos = 0;
                     self.xfer_done = 0;
                     self.transfer_request = true;
                     self.cr1 = self.cd_stat() | STAT_TRANS;
-                    self.cr2 = 0x5F4; // all entries (whole-directory form)
+                    self.cr2 = words;
+                    self.cr3 = 0;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_DRDY;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
                 }
-                self.cr3 = 0;
-                self.cr4 = 0;
-                self.hirq |= HIRQ_CMOK | HIRQ_DRDY;
+                self.hirq |= HIRQ_CMOK;
             }
             0x74 => {
                 // Read file: start the read pump over a file's sectors.
@@ -2878,7 +3065,9 @@ impl CdBlock {
                 let file_id = ((self.cr3 as u32 & 0xFF) << 16) | self.cr4 as u32;
                 if let Some(e) = self.curdir.get(file_id as usize) {
                     let nsect = e.length.div_ceil(self.sectlenin.max(1));
-                    let start_fad = e.firstfad + file_offset;
+                    // 24-bit FAD arithmetic (Mednafen `COMMAND_READ_FILE`
+                    // masks `fad + offset` with 0xFFFFFF, cdb.cpp:3918).
+                    let start_fad = e.firstfad.wrapping_add(file_offset) & 0xFF_FFFF;
                     let sec_count = nsect.saturating_sub(file_offset);
                     self.cd_device_filter = if (file_filter as usize) < MAX_FILTERS {
                         file_filter
@@ -3385,6 +3574,118 @@ mod tests {
         );
     }
 
+    /// The [`mode2_form_disc`] sectors as a `MODE2/2336` image (each sector
+    /// stripped of its 12-byte sync + 4-byte header).
+    fn mode2_2336_disc() -> Disc {
+        let raw = mode2_form_disc();
+        let mut bin = Vec::new();
+        for fad in FAD_OFFSET..FAD_OFFSET + 2 {
+            bin.extend_from_slice(&raw.read_full_sector(fad).unwrap()[16..]);
+        }
+        Disc::from_cue(
+            "FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2336\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("mode2/2336 cue")
+    }
+
+    /// A `MODE2/2336` image carries the subheader, so Form-2 detection and the
+    /// 2324-byte payload apply exactly as for a raw 2352 image.
+    #[test]
+    fn form2_detection_and_sizing_apply_to_mode2_2336_images() {
+        let mut c = CdBlock::new();
+        c.insert_disc(mode2_2336_disc());
+        c.cd_device_filter = 0;
+        assert!(c.read_filtered_sector(FAD_OFFSET));
+        let b2 = c.partitions[0].blocks[0];
+        assert_eq!(c.blocks[b2].size, FORM2_USER_LEN as i32, "Form-2 → 2324");
+        assert_eq!(c.blocks[b2].data[2300], 2300usize as u8);
+        assert_eq!(c.blocks[b2].subm, 0x64, "subheader read from a 2336 sector");
+        assert!(c.read_filtered_sector(FAD_OFFSET + 1));
+        let b1 = c.partitions[0].blocks[1];
+        assert_eq!(c.blocks[b1].size, 2048, "Form-1 stays 2048");
+        assert_eq!(c.blocks[b1].data[0], 1);
+    }
+
+    /// A non-2048 host sector length takes the *trailing* bytes of the raw
+    /// sector (Mednafen `DT_SetIBOffsCount`: 2336 from the subheader, 2340 from
+    /// the header, 2352 from the sync), for raw and 2336 images alike.
+    #[test]
+    fn raw_sector_lengths_take_the_trailing_bytes_of_the_raw_sector() {
+        for disc in [mode2_form_disc(), mode2_2336_disc()] {
+            let is_2336 = disc.tracks()[0].length == 2 && disc.image().len() == 2 * 2336;
+            let mut c = CdBlock::new();
+            c.insert_disc(disc);
+            c.cd_device_filter = 0;
+            for (len, first) in [(2336u32, 0x00), (2340, 0x00), (2352, 0x00)] {
+                c.sectlenin = len;
+                assert!(c.read_filtered_sector(FAD_OFFSET));
+                let b = *c.partitions[0].blocks.last().unwrap();
+                let d = &c.blocks[b].data;
+                assert_eq!(d.len(), len as usize);
+                assert_eq!(d[0], first);
+                // The submode byte sits at raw offset 18 = trailing index
+                // `18 - (2352 - len)`.
+                assert_eq!(d[18 - (2352 - len as usize)], 0x64, "len {len}");
+                if len == 2352 && !is_2336 {
+                    assert_eq!(d[1], 0xFF, "2352 starts at the sync pattern");
+                }
+                // Header mode byte at raw offset 15 (absent → 0 in a 2336 image).
+                if len >= 2340 {
+                    let mode = d[15 - (2352 - len as usize)];
+                    assert_eq!(mode, if is_2336 { 0 } else { 2 });
+                }
+            }
+        }
+    }
+
+    /// A malformed live source can report `first_track > last_track` and a TOC
+    /// with no valid slot; track-form addressing must clamp without the
+    /// `u8::clamp` assertion panic and without indexing outside the TOC.
+    #[test]
+    fn track_form_addressing_survives_a_malformed_track_range() {
+        #[derive(Debug)]
+        struct Bad;
+        impl SectorSource for Bad {
+            fn toc(&self) -> [u8; 408] {
+                [0xFF; 408]
+            }
+            fn first_track(&self) -> u8 {
+                5
+            }
+            fn last_track(&self) -> u8 {
+                0
+            }
+            fn lead_out_fad(&self) -> u32 {
+                FAD_OFFSET
+            }
+            fn track_at_fad(&self, _: u32) -> Option<crate::disc::TrackInfo> {
+                None
+            }
+            fn read_sector(&self, _: u32, _: &mut [u8]) -> bool {
+                false
+            }
+            fn read_full_sector(&self, _: u32, _: &mut [u8]) -> usize {
+                0
+            }
+            fn subheader(&self, _: u32) -> Option<(u8, u8, u8, u8)> {
+                None
+            }
+            fn fingerprint(&self) -> u64 {
+                0
+            }
+        }
+        let mut c = CdBlock::new();
+        c.insert_disc(Bad);
+        assert_eq!(c.track_start_fad(3), None, "clamped to track 0 → no slot");
+        c.cur_play_start = 0x0301;
+        c.cur_play_end = 0x0463;
+        let _ = c.check_end_met();
+        assert_eq!(clamp_track(7, 5, 0), 0);
+        assert_eq!(clamp_track(7, 1, 9), 7);
+        assert_eq!(clamp_track(0, 1, 9), 1);
+    }
+
     /// Regression: a **buffer-full pause** (`end_met` false) must NOT consume
     /// the pending play-end IRQ — Mednafen clears `PlayEndIRQType` only inside
     /// `if(end_met && PlayEndIRQType)` (cdb.cpp:2437-2443). Unconditionally
@@ -3699,13 +4000,39 @@ mod tests {
     fn get_session_returns_the_lead_out_fad() {
         let mut c = CdBlock::new();
         c.insert_disc(iso_disc()); // lead-out FAD = 150 + 4 = 154
+        // During recognition spin-up the block answers WAIT (Mednafen
+        // cdb.cpp:2693), without touching the drive status.
+        assert!(c.dbg_in_startup());
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(c.read16(0x0018) & STAT_WAIT, STAT_WAIT, "WAIT in Startup");
+        assert!(c.dbg_in_startup(), "Get Session doesn't end the spin-up");
+        c.tick(60_000_000); // settle the spin-up
+        assert!(!c.dbg_in_startup());
         // Get Session, session 0 (total / disc end): CR1 = 0x0300.
-        c.write16(0x0018, 0x0300);
-        c.write16(0x001C, 0x0000);
-        c.write16(0x0020, 0x0000);
-        c.write16(0x0024, 0x0000);
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(c.read16(0x0018) & STAT_WAIT, 0);
         assert_eq!(c.read16(0x0020), 0x0100, "1 session, lead-out FAD hi 0");
         assert_eq!(c.read16(0x0024), 154, "lead-out FAD 154");
+        // Session 1 → rsw 1, FAD 0; session 2+ → 0xFF / 0xFFFFFF.
+        cmd(&mut c, 0x0301, 0, 0, 0);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0x0100, 0x0000));
+        cmd(&mut c, 0x0302, 0, 0, 0);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0xFFFF, 0xFFFF));
+    }
+
+    /// Get Session Info is read-only: with an empty tray it must keep reporting
+    /// NODISC (it used to force PAUSE, a phantom disc), lead-out FAD 150.
+    #[test]
+    fn get_session_without_a_disc_keeps_nodisc() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x0300, 0, 0, 0);
+        assert_eq!(
+            c.read16(0x0018) >> 8,
+            STAT_NODISC as u16,
+            "status untouched"
+        );
+        assert_eq!(c.status, STAT_NODISC);
+        assert_eq!((c.read16(0x0020), c.read16(0x0024)), (0x0100, 150));
     }
 
     /// Issue a full 4-CR command (high byte of CR1 = command) and run it.
@@ -3745,11 +4072,8 @@ mod tests {
         println!("numfiles={} firstfile={}", c.numfiles, c.firstfile);
         for (i, e) in c.curdir.iter().enumerate() {
             println!(
-                "  [{i:>2}] name={:<16?} firstfad=0x{:06X} len={:>8} flags=0x{:02X}",
-                String::from_utf8_lossy(&e.name),
-                e.firstfad,
-                e.length,
-                e.flags
+                "  [{i:>2}] firstfad=0x{:06X} len={:>8} flags=0x{:02X} attr=0x{:02X} fnum={}",
+                e.firstfad, e.length, e.flags, e.attr, e.xa_fnum
             );
         }
     }
@@ -3785,6 +4109,26 @@ mod tests {
         // Get Filter Mode (0x45).
         cmd(&mut c, 0x4500, 0x0000, 0x0100, 0x0000);
         assert_eq!(c.read16(0x0018) & 0xFF, 0x07);
+    }
+
+    /// Get Filter Subheader / Get Filter Mode reject a filter number ≥ 24
+    /// (Mednafen `fnum >= 0x18` → `CDStatusResults(true)`) instead of
+    /// silently answering for filter 23, and echo the filter number in CR3.
+    #[test]
+    fn get_filter_queries_reject_out_of_range_filters() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x4207, 0x0000, 0x1799, 0x0000); // filter 23: chan 7, fid 0x99
+        cmd(&mut c, 0x4300, 0x0000, 0x1700, 0x0000);
+        assert_eq!(c.read16(0x0018) & 0xFF, 0x07);
+        assert_eq!(c.read16(0x0020), 0x1799, "CR3 = filter number | file id");
+        cmd(&mut c, 0x4500, 0x0000, 0x1700, 0x0000);
+        assert_eq!(c.read16(0x0020), 0x1700, "CR3 = filter number");
+        for command in [0x4300u16, 0x4500] {
+            cmd(&mut c, command, 0x0000, 0x1800, 0x0000); // filter 24
+            assert_eq!(c.read16(0x0018), STAT_REJECT, "cmd {command:04X}");
+            cmd(&mut c, command, 0x0000, 0xFF00, 0x0000);
+            assert_eq!(c.read16(0x0018), STAT_REJECT, "cmd {command:04X}");
+        }
     }
 
     #[test]
@@ -3929,6 +4273,87 @@ mod tests {
         assert_eq!(c.read16(0x8000), 0x1234, "sector 1 high half");
         assert_eq!(c.read16(0x8000), 0x5678, "sector 1 low half");
         assert_eq!(c.xfer_done, 2052, "16-bit reads count transferred bytes");
+    }
+
+    /// Regression: Reset Selector (0x48) clearing the partition under an armed
+    /// Get Sector Data transfer must not leave the data port indexing removed
+    /// blocks (an out-of-bounds panic); the transfer ends with the `0xFFFF`
+    /// end marker instead, on both the 16- and 32-bit port widths.
+    #[test]
+    fn reset_selector_under_an_armed_transfer_ends_it_without_panicking() {
+        for wide in [false, true] {
+            let mut c = CdBlock::new();
+            c.insert_disc(data_disc());
+            play(&mut c, 150, 2);
+            pump(&mut c);
+            assert_eq!(c.partitions[0].blocks.len(), 2);
+            cmd(&mut c, 0x6300, 0x0000, 0x0000, 0x0002); // Get-and-delete 2
+            let _ = c.read16(0x8000); // mid-sector
+            cmd(&mut c, 0x4800, 0x0000, 0x0000, 0x0000); // Reset Selector: part 0
+            assert!(c.partitions[0].blocks.is_empty());
+            let free = c.free_blocks;
+            if wide {
+                assert_eq!(c.read32(0x8000), 0xFFFF_FFFF);
+            } else {
+                assert_eq!(c.read16(0x8000), 0xFFFF);
+            }
+            assert!(c.xfer32.is_none(), "transfer ended");
+            assert_eq!(c.free_blocks, free, "nothing double-freed");
+            // End Data Transfer afterwards is a no-op on the pool too.
+            cmd(&mut c, 0x0600, 0, 0, 0);
+            assert_eq!(c.free_blocks, free);
+        }
+    }
+
+    /// Delete Sector Data (0x62) under an armed transfer: deleting blocks
+    /// *before* the transfer window shifts it (the stream keeps its sectors);
+    /// deleting *inside* it ends the stream instead of reading freed blocks.
+    #[test]
+    fn delete_sector_data_under_an_armed_transfer_keeps_it_consistent() {
+        let mut c = CdBlock::new();
+        c.insert_disc(data_disc());
+        play(&mut c, 150, 2);
+        pump(&mut c);
+        // Transfer only sector 1 (offset 1, count 1), then delete sector 0.
+        cmd(&mut c, 0x6100, 0x0001, 0x0000, 0x0001);
+        cmd(&mut c, 0x6200, 0x0000, 0x0000, 0x0001);
+        assert_eq!(c.partitions[0].blocks.len(), 1);
+        assert_eq!(
+            c.read32(0x8000),
+            0x1234_5678,
+            "window shifted: still streams FAD 151"
+        );
+        // Now delete the very sector being streamed.
+        cmd(&mut c, 0x6200, 0x0000, 0x0000, 0x0001);
+        assert!(c.partitions[0].blocks.is_empty());
+        assert_eq!(c.read16(0x8000), 0xFFFF, "stream ended, no panic");
+        assert!(c.xfer32.is_none());
+    }
+
+    /// The data port tolerates a transfer whose blocks vanished by a path
+    /// that did not adjust it: the read ends the transfer, never panics.
+    #[test]
+    fn data_port_read_of_a_missing_block_ends_the_transfer() {
+        let mut c = CdBlock::new();
+        c.xfer32 = Some(Xfer32 {
+            delete: true,
+            part: 3,
+            pos: 5,
+            num: 2,
+            sect: 0,
+            offs: 0,
+        });
+        assert_eq!(c.read16(0x8000), 0xFFFF);
+        assert!(c.xfer32.is_none());
+        c.xfer32 = Some(Xfer32 {
+            delete: false,
+            part: 99, // not even a partition
+            pos: 0,
+            num: 1,
+            sect: 0,
+            offs: 0,
+        });
+        assert_eq!(c.read16(0x8000), 0xFFFF);
     }
 
     #[test]
@@ -4346,6 +4771,9 @@ mod tests {
         // A sub-range (offset 1, count 1) sums just that one block.
         cmd(&mut c, 0x5200, 0x0001, 0x0100, 0x0001);
         assert_eq!(c.calcsize, 1024, "block 11 only = 2048/2 words");
+        // A range running past the partition sums only the blocks it has.
+        cmd(&mut c, 0x5200, 0x0002, 0x0100, 0xFFFF);
+        assert_eq!(c.calcsize, 512, "block 12 only = 1024/2 words");
     }
 
     // ===== FAD search (0x55 Execute / 0x56 Get) =====
@@ -4738,12 +5166,17 @@ mod tests {
         let mut c = CdBlock::new();
         c.insert_disc(fs_disc());
         cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
-        // Get File Info (0x73) with id 0xFFFFFF = whole-directory form: CR2 is
-        // the all-entries word count (0x5F4), TRANS set, no per-file FAD staged.
+        // Get File Info (0x73) with id 0xFFFFFF = whole-directory form: one
+        // 6-word record per listed entry from id 2 (`.`/`..` excluded) — here
+        // just file "X" — actually staged, not stale FIFO data.
+        c.xfer = vec![0xEE; 64]; // stale bytes from an earlier transfer
+        c.xfer_pos = 40;
         cmd(&mut c, 0x7300, 0x0000, 0x00FF, 0xFFFF);
-        assert_eq!(c.read16(0x001C), 0x05F4, "whole-directory word count");
+        assert_eq!(c.read16(0x001C), 6, "6 words × 1 listed entry");
         assert!(c.transfer_request, "transfer pending");
         assert_eq!(c.hirq & HIRQ_DRDY, HIRQ_DRDY);
+        let words: Vec<u16> = (0..6).map(|_| c.read16(0x8000)).collect();
+        assert_eq!(words, [0x0000, 0x00AA, 0x0000, 0x0800, 0x0000, 0x0000]);
     }
 
     #[test]
@@ -4754,14 +5187,156 @@ mod tests {
         // Get File Info for id 2 (the file "X" at FAD 170, length 2048).
         cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002);
         assert_eq!(c.read16(0x001C), 6, "CR2 = 6 words for a single file");
-        // The 12-byte record streams big-endian through the FIFO: FAD, length,
-        // gap/unit, id, flags.
+        // Mednafen `FileInfoS`: FAD, size, unit size, gap size, XA file
+        // number, attribute — streamed big-endian through the FIFO.
         assert_eq!(c.read16(0x8000), 0x0000, "FAD hi");
         assert_eq!(c.read16(0x8000), 0x00AA, "FAD lo = 170");
         assert_eq!(c.read16(0x8000), 0x0000, "length hi");
         assert_eq!(c.read16(0x8000), 0x0800, "length lo = 2048");
-        let _gap_unit = c.read16(0x8000); // gap/unit size bytes
-        assert_eq!(c.read16(0x8000) >> 8, 2, "id byte = 2");
+        assert_eq!(c.read16(0x8000), 0x0000, "unit / gap size");
+        assert_eq!(c.read16(0x8000), 0x0000, "no XA fnum, not a directory");
+        // id 0 (`.`) is a directory: attr bit 1.
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0000);
+        for _ in 0..5 {
+            let _ = c.read16(0x8000);
+        }
+        assert_eq!(c.read16(0x8000) & 0x00FF, 0x02, "`.` carries the dir attr");
+    }
+
+    /// Get File Info rejects (Mednafen `CDStatusResults(true)`) an id outside
+    /// the directory, and any id before a directory has been read — instead of
+    /// reporting a transfer of stale data.
+    #[test]
+    fn get_file_info_rejects_invalid_ids() {
+        let mut c = CdBlock::new();
+        c.insert_disc(fs_disc());
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0002); // no directory read yet
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert!(!c.transfer_request);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // ChangeDir → root
+        cmd(&mut c, 0x7300, 0x0000, 0x0000, 0x0063); // id 99
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert!(!c.transfer_request);
+        assert_eq!(c.hirq & HIRQ_DRDY, 0, "no data-ready for a reject");
+    }
+
+    /// One ISO9660 directory record with an optional system-use area.
+    fn dir_record(lba: u32, len: u32, flags: u8, name: &[u8], su: &[u8]) -> Vec<u8> {
+        let name_pad = name.len() | 1; // name + pad byte to an even offset
+        let mut r = vec![0u8; 33 + name_pad + su.len()];
+        r[0] = r.len() as u8;
+        r[2..6].copy_from_slice(&lba.to_le_bytes());
+        r[10..14].copy_from_slice(&len.to_le_bytes());
+        r[25] = flags;
+        r[32] = name.len() as u8;
+        r[33..33 + name.len()].copy_from_slice(name);
+        r[33 + name_pad..].copy_from_slice(su);
+        r
+    }
+
+    /// An ISO whose PVD (sector 16) roots at sector 17 with `root_len` bytes;
+    /// `dirs` places record lists at the given sectors.
+    fn iso_with_dirs(root_len: u32, dirs: &[(usize, Vec<Vec<u8>>)]) -> Disc {
+        let mut img = vec![0u8; 2048 * 24];
+        let pvd = 16 * 2048;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        let root = dir_record(17, root_len, 0x02, &[0], &[]);
+        img[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        for (sector, recs) in dirs {
+            let mut o = sector * 2048;
+            for r in recs {
+                img[o..o + r.len()].copy_from_slice(r);
+                o += r.len();
+            }
+        }
+        Disc::from_iso(img)
+    }
+
+    /// Change Directory into a subdirectory reads *that* directory's extent
+    /// length (Mednafen sizes the read from the selected record), not the
+    /// root's: here the root spans 2 sectors but the 1-sector subdirectory is
+    /// followed by a sector of record-shaped junk that must not be parsed.
+    /// A non-directory id is rejected.
+    #[test]
+    fn change_dir_reads_the_target_directorys_own_length() {
+        let su_xa = {
+            let mut su = [0u8; 14];
+            su[4] = 0x48; // XA attr: Form 1 (0x08) | CD-DA (0x40)
+            su[6..8].copy_from_slice(b"XA");
+            su[8] = 7; // XA file number
+            su
+        };
+        let disc = iso_with_dirs(
+            4096,
+            &[
+                (
+                    17,
+                    vec![
+                        dir_record(17, 4096, 0x02, &[0], &[]),
+                        dir_record(17, 4096, 0x02, &[1], &[]),
+                        dir_record(19, 2048, 0x02, b"SUB", &[]),
+                        dir_record(22, 100, 0x00, b"F", &su_xa),
+                    ],
+                ),
+                (
+                    19,
+                    vec![
+                        dir_record(19, 2048, 0x02, &[0], &[]),
+                        dir_record(17, 4096, 0x02, &[1], &[]),
+                        dir_record(23, 10, 0x00, b"A", &[]),
+                    ],
+                ),
+                // Sector 20: junk that parses as records if over-read.
+                (20, vec![dir_record(0, 0, 0, b"JUNK", &[])]),
+            ],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF); // root
+        assert_eq!(c.curdir.len(), 4);
+        // The XA extension feeds the file-info attribute + file number.
+        assert_eq!((c.curdir[3].attr, c.curdir[3].xa_fnum), (0x48, 7));
+        // Change into a file → rejected, directory unchanged.
+        cmd(&mut c, 0x7000, 0x0000, 0x0000, 0x0003);
+        assert_eq!(c.read16(0x0018), STAT_REJECT);
+        assert_eq!(c.curdir.len(), 4);
+        // Change into SUB (id 2): only its own 2048-byte extent is parsed.
+        cmd(&mut c, 0x7000, 0x0000, 0x0000, 0x0002);
+        assert_ne!(c.read16(0x0018), STAT_REJECT);
+        assert_eq!(c.curdir.len(), 3, "the junk sector after SUB is not read");
+        assert_eq!(c.curdir[2].firstfad, 23 + 150);
+    }
+
+    /// A hostile root length (here 4 GiB) must not size the read buffer: the
+    /// directory read is capped (and clamped to the disc end).
+    #[test]
+    fn change_dir_caps_a_hostile_directory_length() {
+        let disc = iso_with_dirs(
+            u32::MAX,
+            &[(
+                17,
+                vec![
+                    dir_record(17, u32::MAX, 0x02, &[0], &[]),
+                    dir_record(17, u32::MAX, 0x02, &[1], &[]),
+                ],
+            )],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.curdir.len(), 2);
+        // A record whose extent wraps the 32-bit FAD doesn't overflow-panic.
+        let disc = iso_with_dirs(
+            2048,
+            &[(17, vec![dir_record(u32::MAX, 2048, 0x00, b"W", &[])])],
+        );
+        let mut c = CdBlock::new();
+        c.insert_disc(disc);
+        cmd(&mut c, 0x7000, 0x0000, 0x00FF, 0xFFFF);
+        assert_eq!(c.curdir[0].firstfad, u32::MAX.wrapping_add(150));
+        // Reading that file computes `fad + offset` in 24 bits, no panic.
+        cmd(&mut c, 0x7400, 0x0000, 0x0000, 0x0000);
     }
 
     #[test]
@@ -4837,6 +5412,32 @@ mod tests {
         let out = c.take_cd_audio_buffered(64);
         assert_eq!(out, vec![0i16; 64], "no cushion yet → silence");
         assert!(!c.cd_audio_primed, "still un-primed below the pre-roll");
+    }
+
+    /// A CD-DA play shorter than the pre-roll cushion must still be heard:
+    /// once the drive has stopped streaming audio, the buffered samples start
+    /// draining immediately instead of waiting for a cushion that will never
+    /// fill (and leaking in front of the next play). While the drive is still
+    /// playing an audio track the cushion holds as before.
+    #[test]
+    fn short_cdda_play_drains_once_the_drive_stops_streaming() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        assert!(c.read_cd_audio_sector(FAD_OFFSET)); // 1176 samples ≪ pre-roll
+        // Still playing the audio track → hold the cushion.
+        c.drive_phase = DrivePhase::Play;
+        c.cd_curfad = FAD_OFFSET;
+        assert_eq!(c.take_cd_audio_buffered(64), vec![0i16; 64]);
+        assert!(!c.cd_audio_primed);
+        // The play ended (drive paused) → drain what was decoded.
+        c.drive_phase = DrivePhase::Pause;
+        let out = c.take_cd_audio_buffered(1176);
+        assert!(out.iter().any(|&s| s != 0), "the short play is heard");
+        assert!(
+            c.cd_audio.is_empty(),
+            "nothing left to leak into the next play"
+        );
+        assert!(!c.cd_audio_primed, "fully drained → re-arms the cushion");
     }
 
     #[test]

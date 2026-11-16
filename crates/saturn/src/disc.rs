@@ -18,8 +18,12 @@
 //!   (`[Entry]` points `0xA0`/`0xA1`/`0xA2` + per-track `PLBA`); the `.img`
 //!   is raw 2352-byte sectors. This is what `roms/` ships for testing.
 //!
-//! Sector data is normalised to the 2048-byte user payload regardless of the
-//! on-disc sector size (2352 raw sectors carry sync/header/EDC around it).
+//! Two read paths: [`Disc::read_sector`] returns the 2048-byte (Form-1) user
+//! payload regardless of the on-disc sector size (2352 raw sectors carry
+//! sync/header/EDC around it, 2336 Mode-2 sectors a subheader) — used for
+//! ISO9660 metadata; [`Disc::read_full_sector`] returns the on-disc bytes so
+//! the CD-block read pump can deliver Form-2 (2324-byte) payloads and the
+//! raw 2336/2340/2352 host sector lengths.
 //!
 //! The Saturn TOC layout ([`Disc::toc`]) follows MAME's `saturn_cd_hle.cpp`:
 //! 102 four-byte entries — 99 track slots (unused = `0xFFFFFFFF`) then three
@@ -36,6 +40,27 @@ pub const FAD_OFFSET: u32 = 150;
 /// User-data bytes per sector, the unit the CD-block buffers and transfers.
 pub const SECTOR_USER: usize = 2048;
 
+/// Bytes in a raw CD sector (sync + header + payload + EDC/ECC, or audio).
+pub const RAW_SECTOR: usize = 2352;
+
+/// Bytes in a `MODE2/2336` image sector: a raw Mode-2 sector minus its 12-byte
+/// sync and 4-byte header, so it begins at the 8-byte subheader.
+pub const MODE2_SECTOR: usize = 2336;
+
+/// The Mode-2 subheader (`fnum, chan, submode, coding` twice) length.
+const MODE2_SUBHEADER_LEN: usize = 8;
+
+/// Where an on-disc sector of `len` bytes sits inside the equivalent raw
+/// 2352-byte sector: `0` for a raw sector, `16` (past sync + header) for a
+/// `MODE2/2336` sector, `None` for a cooked 2048-byte one (no raw framing).
+pub fn raw_sector_offset(len: usize) -> Option<usize> {
+    match len {
+        RAW_SECTOR => Some(0),
+        MODE2_SECTOR => Some(RAW_SECTOR - MODE2_SECTOR),
+        _ => None,
+    }
+}
+
 /// Track data type, which fixes where the 2048-byte user payload sits inside a
 /// raw 2352-byte sector (and the `ctrl/adr` reported in status/TOC).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,11 +76,22 @@ pub enum TrackMode {
 impl TrackMode {
     /// Byte offset of the 2048-byte user payload within a *raw 2352-byte*
     /// sector of this mode (irrelevant for 2048-byte cooked sectors).
-    fn user_offset_2352(self) -> usize {
+    pub const fn user_offset_2352(self) -> usize {
         match self {
             TrackMode::Audio => 0,
             TrackMode::Mode1 => 16, // sync(12) + header(4)
             TrackMode::Mode2 => 24, // sync(12) + header(4) + subheader(8)
+        }
+    }
+
+    /// Byte offset of the user payload within an on-disc sector of
+    /// `sector_size` bytes: the raw-2352 offset above, the 8-byte subheader of
+    /// a sync/header-less `MODE2/2336` sector, or 0 for a cooked 2048 sector.
+    fn user_offset(self, sector_size: usize) -> usize {
+        match sector_size {
+            RAW_SECTOR => self.user_offset_2352(),
+            MODE2_SECTOR => MODE2_SUBHEADER_LEN,
+            _ => 0,
         }
     }
 
@@ -90,6 +126,22 @@ impl Track {
     pub fn ctrl_addr(&self) -> u8 {
         self.mode.ctrl_addr()
     }
+}
+
+/// One parsed track before FAD assignment (see [`Disc::from_pending_tracks`]).
+#[derive(Clone, Copy, Debug)]
+struct PendingTrack {
+    number: u8,
+    mode: TrackMode,
+    /// On-disc bytes per sector (2048 / 2336 / 2352).
+    sector_size: usize,
+    /// Image offset of the track's in-file `INDEX 00` pregap (= `offset` when
+    /// it has none).
+    pregap_offset: usize,
+    /// Image offset of the track's `INDEX 01` (its first sector).
+    offset: usize,
+    /// `PREGAP` frames that are *not* stored in the image (FAD-only gap).
+    gap: u32,
 }
 
 /// A track's geometry by value — the trait-object form of [`Track`] (which the
@@ -190,6 +242,15 @@ impl Disc {
     /// Parse a CUE sheet. `cue` is the `.cue` text; `load` resolves each
     /// `FILE "name" BINARY` reference to its raw bytes. Tracks across multiple
     /// `FILE`s are concatenated into one image.
+    ///
+    /// `INDEX` times are frame counts relative to the start of their `FILE`.
+    /// When several tracks share one `FILE`, the byte position of a later
+    /// track is accumulated **track by track at each track's own sector size**
+    /// (Mednafen `CDAccess_Image` `FileOffset` walk), so a `MODE1/2048` track
+    /// followed by `AUDIO` (2352) in one BIN lands on the right byte. An
+    /// `INDEX 00` pregap lives in the file at the *new* track's sector size; a
+    /// `PREGAP` directive adds a gap that is not in the file (it only moves
+    /// the track's FAD).
     pub fn from_cue(
         cue: &str,
         mut load: impl FnMut(&str) -> Option<Vec<u8>>,
@@ -198,14 +259,19 @@ impl Disc {
             number: u8,
             mode: TrackMode,
             sector_size: usize,
-            // (file_base in `image`, file length) of the FILE this track is in,
-            // plus the INDEX-01 offset in *frames* relative to that file.
+            /// Image offset where the FILE this track is in starts.
             file_base: usize,
-            index01_frame: u32,
+            /// Ordinal of that FILE (so same-file tracks can be chained).
+            file_no: usize,
+            index00_frame: Option<u32>,
+            index01_frame: Option<u32>,
+            /// `PREGAP` frames (not stored in the file).
+            gap: u32,
         }
 
         let mut image = Vec::new();
         let mut file_base = 0usize; // image offset where the current FILE starts
+        let mut file_no = 0usize;
         let mut have_file = false;
         let mut pending: Vec<Pending> = Vec::new();
         let mut cur: Option<Pending> = None;
@@ -218,6 +284,9 @@ impl Disc {
                     let name = cue_quoted(t).ok_or("FILE without a quoted name")?;
                     let bytes = load(&name).ok_or_else(|| alloc::format!("missing {name}"))?;
                     file_base = image.len();
+                    if have_file {
+                        file_no += 1;
+                    }
                     image.extend_from_slice(&bytes);
                     have_file = true;
                 }
@@ -238,20 +307,33 @@ impl Disc {
                         mode,
                         sector_size,
                         file_base,
-                        index01_frame: 0,
+                        file_no,
+                        index00_frame: None,
+                        index01_frame: None,
+                        gap: 0,
                     });
                 }
                 Some(kw) if kw == "INDEX" => {
                     let idx: u8 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0xFF);
-                    if idx == 1 {
+                    if idx <= 1 {
                         let frame =
                             mmss_ff_to_frames(it.next().unwrap_or("")).ok_or("bad INDEX")?;
                         if let Some(p) = cur.as_mut() {
-                            p.index01_frame = frame;
+                            if idx == 0 {
+                                p.index00_frame = Some(frame);
+                            } else {
+                                p.index01_frame = Some(frame);
+                            }
                         }
                     }
                 }
-                _ => {} // ignore PREGAP / REM / PERFORMER / etc.
+                Some(kw) if kw == "PREGAP" => {
+                    let frames = mmss_ff_to_frames(it.next().unwrap_or("")).ok_or("bad PREGAP")?;
+                    if let Some(p) = cur.as_mut() {
+                        p.gap = frames;
+                    }
+                }
+                _ => {} // ignore POSTGAP / REM / PERFORMER / etc.
             }
         }
         if let Some(p) = cur.take() {
@@ -260,17 +342,44 @@ impl Disc {
         if pending.is_empty() {
             return Err(String::from("no tracks in CUE"));
         }
-        Disc::from_pending_tracks(
-            image,
-            pending.into_iter().map(|p| {
-                (
-                    p.number,
-                    p.mode,
-                    p.sector_size,
-                    p.file_base + p.index01_frame as usize * p.sector_size,
-                )
-            }),
-        )
+
+        // Resolve each track's byte positions. A track that starts a FILE is
+        // placed relative to the file base; a later track in the same FILE is
+        // chained from the previous one: the frames in between are the
+        // previous track's own data (its sector size), the `INDEX 00` pregap
+        // is this track's (its sector size).
+        let bad = |n: u8| alloc::format!("track {n}: INDEX out of order or out of range");
+        let mut tracks = Vec::with_capacity(pending.len());
+        let mut prev: Option<(usize, u32, usize, usize)> = None; // (file_no, idx01, size, offset)
+        for p in &pending {
+            let idx01 = p.index01_frame.unwrap_or(0);
+            let idx00 = p.index00_frame.unwrap_or(idx01);
+            let pregap_frames = idx01.checked_sub(idx00).ok_or_else(|| bad(p.number))?;
+            let pregap_offset = match prev {
+                Some((fno, pidx01, psize, poffset)) if fno == p.file_no => idx00
+                    .checked_sub(pidx01)
+                    .and_then(|f| (f as usize).checked_mul(psize))
+                    .and_then(|b| b.checked_add(poffset)),
+                _ => (idx00 as usize)
+                    .checked_mul(p.sector_size)
+                    .and_then(|b| b.checked_add(p.file_base)),
+            }
+            .ok_or_else(|| bad(p.number))?;
+            let offset = (pregap_frames as usize)
+                .checked_mul(p.sector_size)
+                .and_then(|b| b.checked_add(pregap_offset))
+                .ok_or_else(|| bad(p.number))?;
+            tracks.push(PendingTrack {
+                number: p.number,
+                mode: p.mode,
+                sector_size: p.sector_size,
+                pregap_offset,
+                offset,
+                gap: p.gap,
+            });
+            prev = Some((p.file_no, idx01, p.sector_size, offset));
+        }
+        Disc::from_pending_tracks(image, tracks)
     }
 
     /// Parse a CloneCD `.ccd` + raw `.img`. The CCD's `[Entry]` blocks give a
@@ -336,7 +445,7 @@ impl Disc {
             .ok_or("CCD: no point 0xA1 (last track)")?;
         let lead_out_lba = entries.iter().find(|e| e.point == 0xA2).map(|e| e.plba);
 
-        let mut tracks: Vec<(u8, TrackMode, usize, usize)> = Vec::new();
+        let mut tracks: Vec<PendingTrack> = Vec::new();
         for tno in 1..=n {
             let (control, lba) = entries
                 .iter()
@@ -349,47 +458,100 @@ impl Disc {
             } else {
                 TrackMode::Audio
             };
-            tracks.push((tno, mode, 2352, lba.max(0) as usize * 2352));
+            let offset = usize::try_from(lba.max(0))
+                .ok()
+                .and_then(|l| l.checked_mul(2352))
+                .ok_or_else(|| alloc::format!("CCD: track {tno} PLBA {lba} out of range"))?;
+            tracks.push(PendingTrack {
+                number: tno,
+                mode,
+                sector_size: 2352,
+                pregap_offset: offset,
+                offset,
+                gap: 0,
+            });
         }
-        let mut disc = Disc::from_pending_tracks(img, tracks.into_iter())?;
+        let mut disc = Disc::from_pending_tracks(img, tracks)?;
         if let Some(lo) = lead_out_lba {
-            disc.lead_out_fad = (lo.max(0) as u32) + FAD_OFFSET;
+            disc.lead_out_fad = u32::try_from(lo.max(0))
+                .ok()
+                .and_then(|l| l.checked_add(FAD_OFFSET))
+                .filter(|&f| f <= 0xFF_FFFF)
+                .ok_or_else(|| alloc::format!("CCD: lead-out PLBA {lo} out of range"))?;
         }
         Ok(disc)
     }
 
-    /// Build a [`Disc`] from `(number, mode, sector_size, image_byte_offset)`
-    /// tuples in track order, deriving each track's FAD/length from the next
-    /// track's start (and the image end for the last).
-    /// Build a disc from a concatenated sector image plus a per-track
-    /// `(number, mode, sector_size, image_offset)` list. The ISO/CUE/CCD
-    /// parsers all funnel here so the track-table geometry, TOC, fingerprint,
-    /// and byte-swapped-audio warning are computed in exactly one place.
-    fn from_pending_tracks(
-        image: Vec<u8>,
-        tracks: impl Iterator<Item = (u8, TrackMode, usize, usize)>,
-    ) -> Result<Disc, String> {
-        let raw: Vec<_> = tracks.collect();
+    /// Build a disc from a concatenated sector image plus the per-track
+    /// [`PendingTrack`] list (in track order). The CUE/CCD parsers both funnel
+    /// here so the track-table geometry, TOC, fingerprint, and
+    /// byte-swapped-audio warning are computed in exactly one place.
+    ///
+    /// Track numbers must be `1..=99` and strictly increasing (they index the
+    /// 99-slot TOC). FADs are **accumulated track by track** — each track
+    /// starts where the previous one's sectors end, plus any `PREGAP` — rather
+    /// than derived from the joined-image byte offset, which is only right
+    /// when every track shares one sector size (Mednafen `CDAccess_Image`
+    /// `RunningLBA` walk). A track's length runs from its `INDEX 01` to the
+    /// next track's `INDEX 01`, so the next track's in-file `INDEX 00` pregap
+    /// is counted in it (sectors there are read at the preceding track's
+    /// geometry — exact when both tracks share a sector size, the normal case).
+    fn from_pending_tracks(image: Vec<u8>, raw: Vec<PendingTrack>) -> Result<Disc, String> {
         if raw.is_empty() {
             return Err(String::from("no tracks"));
         }
-        let mut out = Vec::with_capacity(raw.len());
-        for (i, &(number, mode, sector_size, offset)) in raw.iter().enumerate() {
-            // The track runs until the next track's image offset (or image end).
-            let end = raw.get(i + 1).map(|n| n.3).unwrap_or(image.len());
-            if offset > image.len() || end < offset {
-                return Err(alloc::format!("track {number} offset {offset} past image"));
+        let too_big = || String::from("disc image geometry overflows the FAD range");
+        let mut out: Vec<Track> = Vec::with_capacity(raw.len());
+        for (i, t) in raw.iter().enumerate() {
+            if !(1..=99).contains(&t.number) {
+                return Err(alloc::format!("track number {} outside 1..=99", t.number));
             }
-            let length = ((end - offset) / sector_size) as u32;
-            // First track starts at FAD 150; later tracks follow contiguously.
-            let start_fad = FAD_OFFSET + (offset / sector_size) as u32;
+            if let Some(p) = out.last()
+                && t.number <= p.number
+            {
+                return Err(alloc::format!(
+                    "track {} does not follow track {}",
+                    t.number,
+                    p.number
+                ));
+            }
+            if t.sector_size == 0
+                || t.offset > image.len()
+                || t.pregap_offset > t.offset
+                || (i > 0 && t.pregap_offset < raw[i - 1].offset)
+            {
+                return Err(alloc::format!(
+                    "track {} offset {} past image or out of order",
+                    t.number,
+                    t.offset
+                ));
+            }
+            // This track's own sectors run up to where the next track's
+            // in-file data (its pregap) begins; the next track's pregap is
+            // counted at the next track's sector size.
+            let next = raw.get(i + 1);
+            let own_end = next.map_or(image.len(), |n| n.pregap_offset.min(image.len()));
+            let mut length = own_end.saturating_sub(t.offset) / t.sector_size;
+            if let Some(n) = next {
+                length += n.offset.saturating_sub(n.pregap_offset) / n.sector_size.max(1);
+            }
+            let length = u32::try_from(length).map_err(|_| too_big())?;
+            let start_fad = match out.last() {
+                Some(p) => p.start_fad.checked_add(p.length),
+                None => u32::try_from(t.offset / t.sector_size)
+                    .ok()
+                    .and_then(|s| s.checked_add(FAD_OFFSET)),
+            }
+            .and_then(|f| f.checked_add(t.gap))
+            .filter(|f| f.checked_add(length).is_some_and(|e| e <= 0xFF_FFFF))
+            .ok_or_else(too_big)?;
             out.push(Track {
-                number,
-                mode,
+                number: t.number,
+                mode: t.mode,
                 start_fad,
                 length,
-                image_offset: offset,
-                sector_size,
+                image_offset: t.offset,
+                sector_size: t.sector_size,
             });
         }
         let last = out.last().unwrap();
@@ -456,19 +618,23 @@ impl Disc {
         probed >= 2 && le_jumps > probed * 50 && be_jumps * 8 < le_jumps
     }
 
-    /// The 2048-byte user payload of the sector at `fad`, or `None` if `fad`
-    /// is outside any track (e.g. the lead-out) or the image is short.
+    /// The 2048-byte (Form-1) user payload of the sector at `fad`, or `None`
+    /// if `fad` is outside any track (e.g. the lead-out) or the image is short.
+    ///
+    /// Always 2048 bytes, even for a Mode-2 **Form-2** sector (whose payload is
+    /// 2324): this is the ISO9660 metadata reader (volume descriptors and
+    /// directory records, which are Form-1 by definition). Sector *data* the
+    /// host transfers goes through the CD-block read pump, which takes the full
+    /// sector ([`Self::read_full_sector`]) and sizes Form-2 payloads itself.
     pub fn read_sector(&self, fad: u32) -> Option<&[u8]> {
         let t = self.track_at_fad(fad)?;
         let rel = (fad - t.start_fad) as usize;
-        let base = t.image_offset
-            + rel * t.sector_size
-            + t.mode.user_offset_2352() * (t.sector_size == 2352) as usize;
+        let base = t.image_offset + rel * t.sector_size + t.mode.user_offset(t.sector_size);
         self.image.get(base..base + SECTOR_USER)
     }
 
-    /// The full on-disc sector bytes at `fad` (2352 for raw tracks, 2048 for a
-    /// cooked ISO). Used by the read pump, which stores `sectlenin` bytes.
+    /// The full on-disc sector bytes at `fad` (2352 for raw tracks, 2336 for
+    /// `MODE2/2336`, 2048 for a cooked ISO). Used by the read pump.
     pub fn read_full_sector(&self, fad: u32) -> Option<&[u8]> {
         let t = self.track_at_fad(fad)?;
         let rel = (fad - t.start_fad) as usize;
@@ -476,19 +642,20 @@ impl Disc {
         self.image.get(base..base + t.sector_size)
     }
 
-    /// The Mode-2 subheader `(chan, fnum, subm, cinf)` of a raw 2352 sector, or
-    /// `None` for a Mode-1 / audio / cooked sector (no subheader to filter on).
+    /// The Mode-2 subheader `(chan, fnum, subm, cinf)` of a raw 2352 or a
+    /// `MODE2/2336` sector, or `None` for a Mode-1 / audio / cooked sector (no
+    /// subheader to filter on).
     pub fn subheader(&self, fad: u32) -> Option<(u8, u8, u8, u8)> {
         let t = self.track_at_fad(fad)?;
-        if t.sector_size != 2352 {
-            return None;
-        }
         let raw = self.read_full_sector(fad)?;
-        // The 4-byte header's mode byte (offset 15) is 2 for Mode 2.
-        if raw.get(15) != Some(&2) {
-            return None;
-        }
-        Some((raw[17], raw[16], raw[18], raw[19]))
+        let sh = match t.sector_size {
+            // The 4-byte header's mode byte (offset 15) is 2 for Mode 2.
+            RAW_SECTOR if raw.get(15) == Some(&2) => &raw[16..20],
+            // A 2336 sector *is* Mode 2 and starts at the subheader.
+            MODE2_SECTOR if t.mode == TrackMode::Mode2 => &raw[..4],
+            _ => return None,
+        };
+        Some((sh[1], sh[0], sh[2], sh[3]))
     }
 
     /// The track containing `fad`, if any.
@@ -631,7 +798,10 @@ fn mmss_ff_to_frames(s: &str) -> Option<u32> {
     let m: u32 = p.next()?.parse().ok()?;
     let sec: u32 = p.next()?.parse().ok()?;
     let f: u32 = p.next()?.parse().ok()?;
-    Some((m * 60 + sec) * 75 + f)
+    m.checked_mul(60)?
+        .checked_add(sec)?
+        .checked_mul(75)?
+        .checked_add(f)
 }
 
 /// Parse a decimal or `0x`-prefixed hex integer (CCD values are mixed).
@@ -1140,5 +1310,191 @@ PLBA=0
         assert_eq!(fp, SectorSource::fingerprint(&d));
         let other = Disc::from_iso(vec![0xFF; SECTOR_USER]);
         assert_ne!(fp, SectorSource::fingerprint(&other));
+    }
+
+    #[test]
+    fn cue_rejects_track_numbers_outside_the_toc_or_out_of_order() {
+        let load = |_: &str| Some(vec![0u8; 2352 * 4]);
+        let one = |n: &str| {
+            alloc::format!("FILE \"g.bin\" BINARY\n  TRACK {n} MODE1/2352\n    INDEX 01 00:00:00\n")
+        };
+        // TRACK 00 would underflow the `(t - 1) * 4` TOC index.
+        assert!(Disc::from_cue(&one("00"), load).is_err(), "track 0");
+        // Track numbers > 99 overflow the 99-slot TOC.
+        assert!(Disc::from_cue(&one("100"), load).is_err(), "track 100");
+        assert!(
+            Disc::from_cue(&one("99"), load).is_ok(),
+            "track 99 is valid"
+        );
+        // Decreasing (or repeated) numbers would make first > last.
+        let backwards = "\
+FILE \"g.bin\" BINARY
+  TRACK 02 MODE1/2352
+    INDEX 01 00:00:00
+  TRACK 01 AUDIO
+    INDEX 01 00:00:02
+";
+        assert!(Disc::from_cue(backwards, load).is_err(), "2 then 1");
+        let repeated = backwards.replace("TRACK 01", "TRACK 02");
+        assert!(Disc::from_cue(&repeated, load).is_err(), "2 then 2");
+        // INDEX 01 before the previous track's INDEX 01 in the same FILE.
+        let rewind = "\
+FILE \"g.bin\" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:02
+  TRACK 02 AUDIO
+    INDEX 01 00:00:01
+";
+        assert!(Disc::from_cue(rewind, load).is_err(), "INDEX rewinds");
+        // INDEX 00 after INDEX 01.
+        let pregap_after = "\
+FILE \"g.bin\" BINARY
+  TRACK 01 AUDIO
+    INDEX 00 00:00:02
+    INDEX 01 00:00:01
+";
+        assert!(Disc::from_cue(pregap_after, load).is_err(), "INDEX 00 > 01");
+    }
+
+    #[test]
+    fn ccd_rejects_out_of_range_track_counts_and_lbas() {
+        // 0xA1 claims track 0 is the last → no tracks.
+        let zero = "[Entry 0]\nPoint=0xa1\nControl=0x04\nPMin=0\nPLBA=0\n";
+        assert!(Disc::from_ccd(zero, vec![0u8; 2352]).is_err());
+        // A PLBA so large that `lba * 2352` overflows usize.
+        let huge = "\
+[Entry 0]
+Point=0xa1
+Control=0x04
+PMin=1
+PLBA=0
+[Entry 1]
+Point=0x01
+Control=0x04
+PLBA=9223372036854775807
+";
+        assert!(Disc::from_ccd(huge, vec![0u8; 2352]).is_err());
+        // A lead-out LBA that doesn't fit the 24-bit FAD.
+        let lead_out = "\
+[Entry 0]
+Point=0xa1
+Control=0x04
+PMin=1
+PLBA=0
+[Entry 1]
+Point=0xa2
+Control=0x04
+PLBA=4294967295
+[Entry 2]
+Point=0x01
+Control=0x04
+PLBA=0
+";
+        assert!(Disc::from_ccd(lead_out, vec![0u8; 2352]).is_err());
+    }
+
+    #[test]
+    fn mmss_ff_parser_rejects_overflowing_times() {
+        assert_eq!(mmss_ff_to_frames("4294967295:00:00"), None);
+        assert_eq!(mmss_ff_to_frames("00:4294967295:00"), None);
+        assert_eq!(mmss_ff_to_frames("00:00:4294967295"), Some(u32::MAX));
+        assert_eq!(mmss_ff_to_frames("01:00:4294967295"), None);
+        // And the CUE parser surfaces it as an error, not a panic.
+        let cue = "FILE \"g.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 99999999:00:00\n";
+        assert!(Disc::from_cue(cue, |_| Some(vec![0u8; 2352])).is_err());
+    }
+
+    #[test]
+    fn cue_mixed_sector_sizes_accumulate_fads_track_by_track() {
+        // Single BIN: 3 MODE1/2048 sectors, then a 2-frame INDEX 00 pregap and
+        // 4 AUDIO sectors (2352 each). The audio INDEX 01 is at frame 5 of the
+        // file but byte 3*2048 + 2*2352 — NOT 5*2352 — and its FAD follows the
+        // data track's 3 sectors + pregap: 150 + 3 + 2 = 155 (dividing the
+        // joined byte offset by 2352 would give 150 + 4).
+        let mut bin = vec![0u8; 3 * 2048 + 6 * 2352];
+        bin[2 * 2048] = 0xD2; // data sector 2, user byte 0
+        let audio0 = 3 * 2048 + 2 * 2352;
+        bin[audio0] = 0xA0; // first audio sector, sample byte 0
+        let cue = "\
+FILE \"mixed.bin\" BINARY
+  TRACK 01 MODE1/2048
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 00 00:00:03
+    INDEX 01 00:00:05
+";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.tracks()[0].start_fad, 150);
+        assert_eq!(d.tracks()[0].length, 5, "3 data sectors + 2-frame pregap");
+        assert_eq!(d.tracks()[1].start_fad, 155);
+        assert_eq!(d.tracks()[1].length, 4);
+        assert_eq!(d.lead_out_fad(), 159);
+        assert_eq!(d.read_sector(152).unwrap()[0], 0xD2);
+        assert_eq!(d.read_full_sector(155).unwrap()[0], 0xA0);
+
+        // Same layout split across two FILEs (redump style): the second file's
+        // FAD still follows the first file's sector count, not its byte length.
+        let data = vec![0u8; 3 * 2048];
+        let mut audio = vec![0u8; 6 * 2352];
+        audio[2 * 2352] = 0xA0;
+        let cue2 = "\
+FILE \"d.bin\" BINARY
+  TRACK 01 MODE1/2048
+    INDEX 01 00:00:00
+FILE \"a.bin\" BINARY
+  TRACK 02 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 00:00:02
+";
+        let d2 = Disc::from_cue(cue2, |n| {
+            Some(if n == "d.bin" {
+                data.clone()
+            } else {
+                audio.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(d2.tracks()[1].start_fad, 155);
+        assert_eq!(d2.tracks()[1].length, 4);
+        assert_eq!(d2.read_full_sector(155).unwrap()[0], 0xA0);
+    }
+
+    #[test]
+    fn cue_pregap_directive_moves_the_fad_without_file_data() {
+        let bin = vec![0u8; 2352 * 4];
+        let cue = "\
+FILE \"g.bin\" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    PREGAP 00:02:00
+    INDEX 01 00:00:02
+";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.tracks()[0].length, 2);
+        assert_eq!(d.tracks()[1].start_fad, 150 + 2 + 150);
+        assert!(d.track_at_fad(153).is_none(), "the PREGAP has no sectors");
+        assert_eq!(d.lead_out_fad(), 302 + 2);
+    }
+
+    #[test]
+    fn mode2_2336_sectors_expose_the_subheader_and_user_payload() {
+        // A MODE2/2336 sector starts at the 8-byte subheader (no sync/header);
+        // the user payload follows at byte 8.
+        let mut bin = vec![0u8; 2336 * 2];
+        bin[0] = 0x01; // fnum
+        bin[1] = 0x02; // chan
+        bin[2] = 0x20; // submode: Form 2
+        bin[3] = 0x04; // coding info
+        bin[8] = 0x77; // user[0]
+        let cue = "FILE \"x.bin\" BINARY\n  TRACK 01 MODE2/2336\n    INDEX 01 00:00:00\n";
+        let d = Disc::from_cue(cue, |_| Some(bin.clone())).unwrap();
+        assert_eq!(d.tracks()[0].length, 2);
+        assert_eq!(d.subheader(150), Some((0x02, 0x01, 0x20, 0x04)));
+        assert_eq!(d.read_sector(150).unwrap()[0], 0x77);
+        assert_eq!(d.read_full_sector(150).unwrap().len(), MODE2_SECTOR);
+        assert_eq!(raw_sector_offset(MODE2_SECTOR), Some(16));
+        assert_eq!(raw_sector_offset(RAW_SECTOR), Some(0));
+        assert_eq!(raw_sector_offset(SECTOR_USER), None);
     }
 }

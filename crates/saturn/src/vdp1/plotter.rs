@@ -8,7 +8,14 @@
 //! * **List walker** — END / jump / skip / call (one level) / return,
 //!   matching CMDCTRL bits 14-12 (VDP1 manual §"Jump Mode").
 //! * **Coordinate commands** — local-coordinate origin (type 0xA),
-//!   system clipping (0x9), user clipping (0x8).
+//!   system clipping (0x9), user clipping (0x8 / 0xB). These are persistent
+//!   hardware registers held in [`super::timing::DrawTiming`] (shared with
+//!   the draw-cycle model and serialized), so they carry across command
+//!   lists like Mednafen's static `SysClip*` / `UserClip*` / `Local*`.
+//! * **Clipping** — Mednafen's two-test clip (`vdp1_common.h` `PBODY`): with
+//!   user clipping off (CMDPMOD bit 10) only the system clip applies; with it
+//!   on, bit 9 clear draws *inside* the user rectangle (and the system clip),
+//!   bit 9 set draws inside the system clip but *outside* the user one.
 //! * **Primitives** — normal/scaled/distorted sprites (textured), and
 //!   polygon/line/polyline (untextured), all reduced to a textured-quad
 //!   rasteriser using forward-differenced edge walking with 16.16 fixed
@@ -139,10 +146,13 @@ pub struct PlotResult {
 pub struct Plotter<'a> {
     vram: &'a Vram,
     fb: &'a mut Framebuffer,
+    /// Local-coordinate origin for the current command (from the persistent
+    /// [`super::timing::DrawTiming`] registers).
     local_x: i32,
     local_y: i32,
-    sys_clip: Rect,
-    user_clip: Rect,
+    /// The user-clip rectangle to *exclude* for the current command, when it
+    /// draws with CMDPMOD bits 10+9 (user clip on, draw outside).
+    clip_out: Option<Rect>,
     cmd: Command,
     mode: PixelMode,
     /// Per-vertex gouraud colours (R, G, B; 5-bit each) for the four quad
@@ -165,23 +175,12 @@ pub struct Plotter<'a> {
 
 impl<'a> Plotter<'a> {
     pub fn new(vram: &'a Vram, fb: &'a mut Framebuffer, bpp8: bool, die: bool, dil: bool) -> Self {
-        // Default clip is the whole frame buffer — 512×256 dots, doubled
-        // horizontally in the 8bpp layout and vertically under DIE (source-y
-        // space is two fields). Command 0x09 (system clipping) narrows it,
-        // command 0x08 sets the user one.
-        let full = Rect {
-            min_x: 0,
-            max_x: if bpp8 { FB_STRIDE * 2 } else { FB_STRIDE } - 1,
-            min_y: 0,
-            max_y: if die { FB_HEIGHT * 2 } else { FB_HEIGHT } - 1,
-        };
         Self {
             vram,
             fb,
             local_x: 0,
             local_y: 0,
-            sys_clip: full,
-            user_clip: full,
+            clip_out: None,
             cmd: Command::default(),
             mode: PixelMode::Generic,
             gouraud: None,
@@ -343,13 +342,47 @@ impl<'a> Plotter<'a> {
                 );
             }
 
-            // Clipping mode: CMDPMOD bit 10 selects the user clip,
-            // otherwise the system clip bounds the primitive.
-            let clip = if self.cmd.pmod & 0x0400 != 0 {
-                self.user_clip
-            } else {
-                self.sys_clip
+            // Clip/local registers as of this command (`timing.command` has
+            // already applied any 0x8–0xB update, exactly when Mednafen's
+            // `DoDrawing` would).
+            let regs = timing.regs();
+            self.local_x = regs.local_x;
+            self.local_y = regs.local_y;
+            let sys = Rect {
+                min_x: 0,
+                max_x: regs.sys_clip_x,
+                min_y: 0,
+                max_y: regs.sys_clip_y,
             };
+            let user = Rect {
+                min_x: regs.uclip_x0,
+                max_x: regs.uclip_x1,
+                min_y: regs.uclip_y0,
+                max_y: regs.uclip_y1,
+            };
+            // Mednafen's two clip tests (`vdp1_common.h` `PBODY`): CMDPMOD
+            // bit 10 enables the user clip; bit 9 selects drawing outside it.
+            // Inside mode bounds the primitive by user ∩ system; outside mode
+            // bounds it by the system clip and drops dots inside the user one.
+            let user_en = self.cmd.pmod & 0x0400 != 0;
+            let user_outside = self.cmd.pmod & 0x0200 != 0;
+            let clip = if user_en && !user_outside {
+                Rect {
+                    min_x: sys.min_x.max(user.min_x),
+                    max_x: sys.max_x.min(user.max_x),
+                    min_y: sys.min_y.max(user.min_y),
+                    max_y: sys.max_y.min(user.max_y),
+                }
+            } else {
+                sys
+            };
+            self.clip_out = (user_en && user_outside).then_some(user);
+            if clip.min_x > clip.max_x || clip.min_y > clip.max_y {
+                // An empty clip window: every dot is clipped.
+                if self.cmd.command_type() < 0x8 {
+                    continue;
+                }
+            }
 
             match self.cmd.command_type() {
                 0x0 => {
@@ -388,28 +421,10 @@ impl<'a> Plotter<'a> {
                     self.load_gouraud();
                     self.draw_line(&clip);
                 }
-                0x8 => {
-                    // User clipping coordinates.
-                    self.user_clip = Rect {
-                        min_x: self.cmd.xa as i32,
-                        max_x: self.cmd.xc as i32,
-                        min_y: self.cmd.ya as i32,
-                        max_y: self.cmd.yc as i32,
-                    };
-                }
-                0x9 => {
-                    // System clipping: lower-right only, origin (0,0).
-                    self.sys_clip = Rect {
-                        min_x: 0,
-                        max_x: self.cmd.xc as i32,
-                        min_y: 0,
-                        max_y: self.cmd.yc as i32,
-                    };
-                }
-                0xA => {
-                    // Local coordinates are signed 11-bit values.
-                    self.local_x = sign_extend(self.cmd.xa, 11);
-                    self.local_y = sign_extend(self.cmd.ya, 11);
+                0x8..=0xB => {
+                    // User clip (0x8, and its 0xB alias — Mednafen's
+                    // `command_table`), system clip (0x9), local coordinates
+                    // (0xA): already latched by `timing.command` above.
                 }
                 _ => {
                     // Illegal command: hardware prematurely ends the list.
@@ -424,6 +439,14 @@ impl<'a> Plotter<'a> {
             cycles,
             copr: ((position * 0x20) >> 3) as u16,
         }
+    }
+
+    /// Whether dot `(x, y)` falls in the user rectangle a draw-outside
+    /// (CMDPMOD bits 10+9) command must not touch.
+    #[inline]
+    fn in_clip_out(&self, x: i32, y: i32) -> bool {
+        self.clip_out
+            .is_some_and(|r| (r.min_x..=r.max_x).contains(&x) && (r.min_y..=r.max_y).contains(&y))
     }
 
     #[inline]
@@ -469,6 +492,9 @@ impl<'a> Plotter<'a> {
     ) -> bool {
         self.pixels += 1; // a processed dot, drawn or clipped, costs draw time
         if self.mode == PixelMode::Poly {
+            if self.in_clip_out(x, y) {
+                return false;
+            }
             if let Some(fy) = self.fb_y(y) {
                 self.fb_put(x, fy, self.cmd.colr);
             }
@@ -611,6 +637,11 @@ impl<'a> Plotter<'a> {
         // `(rtd - 0x4000) >> 31`); paletted/poly use pen 0.
         let transparent = if rgb_direct { raw < 0x4000 } else { raw == 0 };
         if transparent && !spd {
+            return false;
+        }
+        // Outside-user-clip mode: a dot inside the user rectangle is clipped
+        // (after the texel fetch, so end-codes still truncate the span).
+        if self.in_clip_out(x, y) {
             return false;
         }
 
