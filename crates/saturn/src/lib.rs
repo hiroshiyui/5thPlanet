@@ -52,6 +52,7 @@ pub mod cartridge;
 pub mod cd_block;
 pub mod diagnostics;
 pub mod disc;
+pub mod host_files;
 pub mod memory;
 pub mod savestate;
 pub mod scheduler;
