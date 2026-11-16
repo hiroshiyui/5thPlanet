@@ -844,7 +844,18 @@ fn vdp1_polygon() -> (bool, String) {
     const FB: u32 = 0x05C8_0000; // draw framebuffer
     let mut sat = Saturn::new(assemble(&[bra_self(), NOP]));
     sat.reset();
-    // One polygon (10,10)-(20,20) in blue (RGB555 0x001F), then an END command.
+    // A system-clip command first: the clip window is a persistent VDP1
+    // register that powers on at 0 (Mednafen `SysClipX/Y = 0`), so like real
+    // software the list must set it before drawing. Then one polygon
+    // (10,10)-(20,20) in blue (RGB555 0x001F), then an END command.
+    let sysclip: [u16; 12] = [
+        0x0009, 0x0000, // CMDCTRL system clip | CMDLINK
+        0, 0, 0, 0, 0, 0, 0, 0, // unused
+        319, 223, // XC,YC = lower-right corner
+    ];
+    for (i, w) in sysclip.iter().enumerate() {
+        sat.bus.write16(VRAM + i as u32 * 2, *w, AccessKind::Data);
+    }
     let cmd: [u16; 14] = [
         0x0004, 0x0000, // CMDCTRL polygon | CMDLINK
         0x0080, 0x001F, // CMDPMOD (ECD, no transparency) | CMDCOLR (blue)
@@ -855,9 +866,10 @@ fn vdp1_polygon() -> (bool, String) {
         0x000A, 0x0014, // XD,YD = (10,20)
     ];
     for (i, w) in cmd.iter().enumerate() {
-        sat.bus.write16(VRAM + i as u32 * 2, *w, AccessKind::Data);
+        sat.bus
+            .write16(VRAM + 0x20 + i as u32 * 2, *w, AccessKind::Data);
     }
-    sat.bus.write16(VRAM + 0x20, 0x8000, AccessKind::Data); // END command
+    sat.bus.write16(VRAM + 0x40, 0x8000, AccessKind::Data); // END command
     sat.bus.write16(0x05D0_0004, 0x0001, AccessKind::Data); // PTMR PTM=01: draw now
     let px = |x: u32, y: u32| sat.bus.vdp1.read16(FB + (y * 512 + x) * 2);
     let (interior, corner) = (px(15, 15), px(0, 0));

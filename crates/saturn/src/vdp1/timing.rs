@@ -176,9 +176,38 @@ pub struct DrawTiming {
     bpp8: bool,
 }
 
+/// A snapshot of the persistent VDP1 clip / local-coordinate registers (see
+/// [`DrawTiming`]), as the plotter reads them per command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClipRegs {
+    pub local_x: i32,
+    pub local_y: i32,
+    pub sys_clip_x: i32,
+    pub sys_clip_y: i32,
+    pub uclip_x0: i32,
+    pub uclip_y0: i32,
+    pub uclip_x1: i32,
+    pub uclip_y1: i32,
+}
+
 impl DrawTiming {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The current clip / local-coordinate registers. The plotter draws with
+    /// these, so the pixels and the draw-cycle model share one register set.
+    pub fn regs(&self) -> ClipRegs {
+        ClipRegs {
+            local_x: self.local_x,
+            local_y: self.local_y,
+            sys_clip_x: self.sys_clip_x,
+            sys_clip_y: self.sys_clip_y,
+            uclip_x0: self.uclip_x0,
+            uclip_y0: self.uclip_y0,
+            uclip_x1: self.uclip_x1,
+            uclip_y1: self.uclip_y1,
+        }
     }
 
     /// Latch the frame-buffer depth for the coming walk (Mednafen reads TVMR

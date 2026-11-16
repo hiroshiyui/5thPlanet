@@ -85,7 +85,7 @@ fn window_boundaries_route_to_the_right_region() {
 // ---------------------------------------------------------------------
 
 /// Pack two halfwords into one big-endian command word.
-fn w(hi: u16, lo: u16) -> u32 {
+const fn w(hi: u16, lo: u16) -> u32 {
     ((hi as u32) << 16) | lo as u32
 }
 
@@ -100,9 +100,27 @@ fn put(v: &mut Vdp1, pos: u32, words: [u32; 8]) {
 /// CMDCTRL=0x8000 — list terminator.
 const END: [u32; 8] = [0x8000_0000, 0, 0, 0, 0, 0, 0, 0];
 
+/// System clip (type 9) to the lower-right corner (1023, 511) — covers every
+/// frame-buffer layout (8bpp doubles x, DIE doubles y).
+const SYSCLIP_ALL: [u32; 8] = [w(0x0009, 0), 0, 0, 0, 0, w(1023, 511), 0, 0];
+
+/// A fresh VDP1 whose (persistent) system clip has been opened up by a prior
+/// command list. The clip / local-coordinate registers power on at 0
+/// (Mednafen `SysClipX/Y = 0`) and survive across lists like the hardware's,
+/// so — exactly like real software — something must set the clip before a
+/// list can draw. Priming it in a separate list also exercises persistence.
+fn clipped_vdp1() -> Vdp1 {
+    let mut v = Vdp1::new();
+    put(&mut v, 0, SYSCLIP_ALL);
+    put(&mut v, 1, END);
+    v.process_list();
+    let _ = v.take_draw_end();
+    v
+}
+
 #[test]
 fn polygon_fills_a_solid_rectangle() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Type 4 polygon, jump-next, plain replace with ECD set (→ the
     // no-transparency Poly writer), colour 0x001F, rectangle (10,10)-(20,20).
     put(
@@ -131,7 +149,7 @@ fn polygon_fills_a_solid_rectangle() {
 
 #[test]
 fn normal_sprite_blits_16bpp_character() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 8×8 character of RGB555 colour 0xC210 at VRAM byte 0x1000.
     for i in 0..64u32 {
         v.vram.write16(0x1000 + i * 2, 0xC210);
@@ -165,7 +183,7 @@ fn rgb_direct_transparency_uses_the_msb_band() {
     // 16bpp RGB-direct (M13 H3): a texel < 0x4000 is transparent, a texel in
     // 0x4000-0x7FFF is an end-code (also not drawn), and an MSB-set texel is
     // opaque — not the old `== 0` transparency / `== 0x7FFF` end-code.
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     v.vram.write16(0x1000, 0x1000); // col 0: transparent (< 0x4000)
     v.vram.write16(0x1002, 0x8123); // col 1: opaque (MSB set)
     v.vram.write16(0x1004, 0x4000); // col 2: end-code (0x4000-0x7FFF band)
@@ -197,7 +215,7 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
     // destination dot's MSB (which VDP2 reads for sprite shadow/priority) and
     // DISCARD its own colour — not paint a solid block. The 8bpp path already
     // did this; the 16bpp path wrongly wrote the sprite's colour. (M13 H1c.)
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Underlying scene: an 8×8 char of RGB 0xC210 at VRAM 0x1000.
     for i in 0..64u32 {
         v.vram.write16(0x1000 + i * 2, 0xC210);
@@ -250,7 +268,7 @@ fn msbon_16bpp_sprite_flags_dest_msb_and_discards_its_colour() {
 
 #[test]
 fn normal_sprite_4bpp_adds_colour_bank() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 4bpp character: every byte 0x33 → both nibbles select colour 3.
     for i in 0..(8 * 8 / 2) as u32 {
         v.vram.write8(0x800 + i, 0x33);
@@ -281,7 +299,7 @@ fn normal_sprite_4bpp_adds_colour_bank() {
 
 #[test]
 fn line_draws_a_horizontal_run() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     put(
         &mut v,
         0,
@@ -307,7 +325,7 @@ fn line_draws_a_horizontal_run() {
 
 #[test]
 fn local_coordinates_offset_subsequent_primitives() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Type 0xA: set the local-coordinate origin to (100,50).
     put(&mut v, 0, [w(0x000A, 0), 0, 0, w(100, 50), 0, 0, 0, 0]);
     // Polygon (0,0)-(10,10) — drawn relative to the local origin.
@@ -338,7 +356,7 @@ fn local_coordinates_offset_subsequent_primitives() {
 
 #[test]
 fn skip_jump_mode_does_not_draw_its_primitive() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // CMDCTRL 0x4004 — SKIP flag (0x4000) + type 4 polygon.
     put(
         &mut v,
@@ -362,7 +380,7 @@ fn skip_jump_mode_does_not_draw_its_primitive() {
 
 #[test]
 fn end_bit_terminates_before_drawing_later_commands() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     put(&mut v, 0, END);
     // This polygon sits after the terminator and must never run.
     put(
@@ -386,7 +404,7 @@ fn end_bit_terminates_before_drawing_later_commands() {
 
 #[test]
 fn jump_assign_redirects_the_walker_over_an_intermediate_command() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // cmd0: polygon at (10,10) that, after drawing, jumps to position 2
     // (CMDLINK = pos << 2 = 8), skipping cmd1.
     put(
@@ -427,7 +445,7 @@ fn jump_assign_redirects_the_walker_over_an_intermediate_command() {
 
 #[test]
 fn ptmr_write_through_registers_triggers_the_plot() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     put(
         &mut v,
         0,
@@ -463,7 +481,7 @@ fn ptmr_write_through_registers_triggers_the_plot() {
 
 #[test]
 fn distorted_sprite_maps_a_texture_onto_a_skewed_quad() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 8×8 character, solid colour 0xE318, at VRAM byte 0x2000.
     for i in 0..64u32 {
         v.vram.write16(0x2000 + i * 2, 0xE318);
@@ -495,7 +513,7 @@ fn distorted_sprite_maps_a_texture_onto_a_skewed_quad() {
 
 #[test]
 fn erase_clears_the_ewrr_region_to_the_erase_colour() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Pre-dirty a pixel that lies inside the erase rectangle.
     v.fb.set_pixel(5, 5, 0x7FFF);
     // EWDR = fill colour; EWLR upper-left (0,0); EWRR lower-right such
@@ -522,7 +540,7 @@ fn put_gouraud(v: &mut Vdp1, base: u32, abcd: [u16; 4]) {
 
 #[test]
 fn gouraud_uniform_offsets_every_channel() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     put_gouraud(&mut v, 0x100, [0x7FFF; 4]); // all vertices max → +15/channel
     // Type 4 polygon, CMDPMOD = gouraud (0x4) + SPD (0x40); base colour black.
     put(
@@ -548,7 +566,7 @@ fn gouraud_uniform_offsets_every_channel() {
 
 #[test]
 fn gouraud_interpolates_across_a_polygon() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Left vertices dark (correction 0 → −16), right vertices bright (+15).
     put_gouraud(&mut v, 0x100, [0x0000, 0x7FFF, 0x7FFF, 0x0000]);
     put(
@@ -580,7 +598,7 @@ fn gouraud_interpolates_across_a_polygon() {
 
 #[test]
 fn gouraud_applies_to_a_normal_sprite() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 8×8 character of black (0x0000) at VRAM byte 0x2000.
     for i in 0..64u32 {
         v.vram.write16(0x2000 + i * 2, 0x0000);
@@ -609,7 +627,7 @@ fn gouraud_applies_to_a_normal_sprite() {
 
 #[test]
 fn draw_end_flag_pops_once_per_plot() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     put(&mut v, 0, END);
     assert!(!v.take_draw_end(), "no plot yet");
     v.process_list();
@@ -656,7 +674,7 @@ fn put_hgradient_char(v: &mut Vdp1, base: u32) -> u16 {
 
 #[test]
 fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 8×8 solid character colour 0x9234 at VRAM byte 0x3000.
     for i in 0..64u32 {
         v.vram.write16(0x3000 + i * 2, 0x9234);
@@ -692,7 +710,7 @@ fn scaled_sprite_zooms_a_character_to_an_explicit_rect() {
 
 #[test]
 fn sprite_coordinates_are_signed_13_bit() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     for i in 0..64u32 {
         v.vram.write16(0x3000 + i * 2, 0x9234);
     }
@@ -721,7 +739,7 @@ fn sprite_coordinates_are_signed_13_bit() {
 
 #[test]
 fn local_coordinates_are_signed_11_bit() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     for i in 0..64u32 {
         v.vram.write16(0x3000 + i * 2, 0xA468);
     }
@@ -763,7 +781,7 @@ fn local_coordinates_are_signed_11_bit() {
 
 #[test]
 fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     for i in 0..64u32 {
         v.vram.write16(0x3000 + i * 2, 0xA468);
     }
@@ -799,7 +817,7 @@ fn scaled_sprite_zoom_with_display_size_and_centre_anchor() {
 
 #[test]
 fn normal_sprite_horizontal_flip_reverses_columns() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     let srca = put_hgradient_char(&mut v, 0x4000);
     // No flip first to learn the orientation, then h-flip and compare.
     put(
@@ -824,7 +842,7 @@ fn normal_sprite_horizontal_flip_reverses_columns() {
 
     // Now h-flip (CMDCTRL bit 4 = 0x0010): texel U is read reversed, so the
     // left screen column shows the last texel and vice versa.
-    let mut v2 = Vdp1::new();
+    let mut v2 = clipped_vdp1();
     let srca2 = put_hgradient_char(&mut v2, 0x4000);
     put(
         &mut v2,
@@ -848,7 +866,7 @@ fn normal_sprite_horizontal_flip_reverses_columns() {
 
 #[test]
 fn normal_sprite_vertical_flip_reverses_rows() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Per-row gradient: row r → colour r+1.
     for row in 0..8u32 {
         for col in 0..8u32 {
@@ -886,7 +904,7 @@ fn normal_sprite_vertical_flip_reverses_rows() {
 
 #[test]
 fn colour_mode_16color_lut_indirects_through_vram() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 4bpp character: every byte 0x55 → both nibbles select index 5.
     for i in 0..(8 * 8 / 2) as u32 {
         v.vram.write8(0x5000 + i, 0x55);
@@ -923,7 +941,7 @@ fn colour_mode_64_128_256_add_the_correct_bank_mask() {
     // differently.
     let colr: u16 = 0x0140;
     for (pmod_mode, mask) in [(0x0010u16, 0xFFC0u16), (0x0018, 0xFF80), (0x0020, 0xFF00)] {
-        let mut v = Vdp1::new();
+        let mut v = clipped_vdp1();
         for i in 0..64u32 {
             v.vram.write8(0x5000 + i, 0x05);
         }
@@ -955,7 +973,7 @@ fn colour_mode_64_128_256_add_the_correct_bank_mask() {
 
 #[test]
 fn end_code_truncates_the_row_unless_disabled() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // 8bpp 64-colour character: texel (0,0) = 0xFF (the 8bpp end-code), the
     // rest = 0x05. With ECD clear, the end-code truncates the rest of its row.
     for i in 0..64u32 {
@@ -994,7 +1012,7 @@ fn end_code_truncates_the_row_unless_disabled() {
     );
 
     // With ECD set (CMDPMOD bit 7 = 0x80) the end-code is treated as data.
-    let mut v2 = Vdp1::new();
+    let mut v2 = clipped_vdp1();
     for i in 0..64u32 {
         v2.vram.write8(0x5000 + i, 0x05);
     }
@@ -1027,7 +1045,7 @@ fn transparent_texel_is_dropped_when_spd_off_and_kept_when_on() {
     // 16bpp character of all-zero pixels (colour 0 = transparent code). With
     // SPD off the sprite leaves the background untouched; with SPD on the
     // zero is drawn as an opaque colour-0 pixel.
-    let mut bg = Vdp1::new();
+    let mut bg = clipped_vdp1();
     bg.fb.set_pixel(10, 10, 0x1F);
     for i in 0..64u32 {
         bg.vram.write16(0x2000 + i * 2, 0x0000);
@@ -1055,7 +1073,7 @@ fn transparent_texel_is_dropped_when_spd_off_and_kept_when_on() {
         "transparent texel keeps background"
     );
 
-    let mut on = Vdp1::new();
+    let mut on = clipped_vdp1();
     on.fb.set_pixel(10, 10, 0x1F);
     for i in 0..64u32 {
         on.vram.write16(0x2000 + i * 2, 0x0000);
@@ -1081,7 +1099,7 @@ fn transparent_texel_is_dropped_when_spd_off_and_kept_when_on() {
 
 #[test]
 fn mesh_mode_draws_a_checkerboard() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Type 4 polygon with MESH (CMDPMOD bit 8 = 0x100). Mesh drops dots where
     // (x ^ y) & 1 != 0 (Mednafen), leaving a 50% checkerboard on even parity.
     put(
@@ -1112,7 +1130,7 @@ fn mesh_mode_draws_a_checkerboard() {
 
 #[test]
 fn half_luminance_colour_calc_halves_the_source() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // CMDPMOD colour-calc = 0b10 (half luminance): output = ((pix & !0x8421)
     // >> 1) | 0x8000. For an untextured polygon, pix = CMDCOLR.
     let colr: u16 = 0x7FFF; // all channels 31
@@ -1140,7 +1158,7 @@ fn half_luminance_colour_calc_halves_the_source() {
 
 #[test]
 fn half_transparent_blends_with_a_marked_destination() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Destination has its MSB set (required for the half-transparent blend);
     // its colour is white 0x7FFF | MSB. Source colour is black.
     v.fb.set_pixel(15, 15, 0xFFFF); // MSB | all-31
@@ -1165,7 +1183,7 @@ fn half_transparent_blends_with_a_marked_destination() {
     assert_eq!(v.fb.pixel(15, 15), 0xBDEF, "half-transparent blend result");
 
     // A destination with MSB clear is overwritten outright (no blend).
-    let mut v2 = Vdp1::new();
+    let mut v2 = clipped_vdp1();
     v2.fb.set_pixel(15, 15, 0x7FFF); // MSB clear
     put(
         &mut v2,
@@ -1188,7 +1206,7 @@ fn half_transparent_blends_with_a_marked_destination() {
 
 #[test]
 fn shadow_calc_halves_only_a_marked_destination() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Shadow (calc mode 1) halves the destination iff its MSB is set; the
     // source colour is ignored.
     v.fb.set_pixel(15, 15, 0xFFFF); // MSB | 31,31,31
@@ -1219,7 +1237,7 @@ fn shadow_calc_halves_only_a_marked_destination() {
 
 #[test]
 fn msbon_forces_the_pixel_high_bit() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // MSBON (CMDPMOD bit 15) read-modifies the destination dot's MSB and
     // DISCARDS the source colour (Mednafen `PlotPixel`). Over an empty (black)
     // framebuffer the dot becomes 0x0000 | 0x8000 = 0x8000 — the source blue
@@ -1250,7 +1268,7 @@ fn msbon_forces_the_pixel_high_bit() {
 
 #[test]
 fn polyline_draws_the_four_quad_edges() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // Type 5 polyline connects A→B→C→D→A with line segments (no fill).
     put(
         &mut v,
@@ -1278,7 +1296,7 @@ fn polyline_draws_the_four_quad_edges() {
 
 #[test]
 fn system_clipping_bounds_a_primitive() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // System clip (type 9): lower-right corner (XC,YC). Origin is fixed (0,0).
     // Clip to x<=25, y<=25.
     put(&mut v, 0, [w(0x0009, 0), 0, 0, 0, 0, w(25, 25), 0, 0]);
@@ -1306,7 +1324,7 @@ fn system_clipping_bounds_a_primitive() {
 
 #[test]
 fn user_clipping_applies_only_when_cmdpmod_selects_it() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // User clip (type 8): rectangle (XA,YA)-(XC,YC) = (15,15)-(25,25).
     put(
         &mut v,
@@ -1337,7 +1355,7 @@ fn user_clipping_applies_only_when_cmdpmod_selects_it() {
 
 #[test]
 fn fully_offscreen_sprite_is_rejected() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     for i in 0..64u32 {
         v.vram.write16(0x2000 + i * 2, 0x7FFF);
     }
@@ -1367,7 +1385,7 @@ fn fully_offscreen_sprite_is_rejected() {
 
 #[test]
 fn call_and_return_walk_a_subroutine_then_resume() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     // cmd0: CALL (jump-mode 0x2000) the subroutine at position 3
     //       (CMDLINK = 3 << 2 = 12), drawing a polygon at (10,10) first.
     put(
@@ -1426,12 +1444,166 @@ fn call_and_return_walk_a_subroutine_then_resume() {
     assert_eq!(v.fb.pixel(45, 45), 0x03E0, "resumed at the return address");
 }
 
+/// A (10,10)-(40,40) solid polygon in `colr` with CMDPMOD `pmod`.
+fn quad_10_40(pmod: u16, colr: u16) -> [u32; 8] {
+    [
+        w(0x0004, 0),
+        w(pmod, colr),
+        0,
+        w(10, 10),
+        w(40, 10),
+        w(40, 40),
+        w(10, 40),
+        0,
+    ]
+}
+
+#[test]
+fn user_clip_draw_outside_mode_skips_only_the_user_rectangle() {
+    // CMDPMOD bits 10+9 (0x0600): user clip on, draw *outside* it (Mednafen
+    // `UserClipMode`): the system clip still bounds the primitive, and the
+    // dots inside the user rectangle are the ones dropped.
+    let mut v = clipped_vdp1();
+    put(
+        &mut v,
+        0,
+        [w(0x0008, 0), 0, 0, w(15, 15), 0, w(25, 25), 0, 0],
+    );
+    put(&mut v, 1, quad_10_40(0x0680, 0x001F));
+    put(&mut v, 2, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(20, 20), 0, "inside the user clip: not drawn");
+    assert_eq!(v.fb.pixel(12, 12), 0x001F, "outside the user clip: drawn");
+    assert_eq!(v.fb.pixel(35, 35), 0x001F, "outside the user clip: drawn");
+}
+
+#[test]
+fn user_clip_draw_outside_mode_is_still_bounded_by_the_system_clip() {
+    let mut v = clipped_vdp1();
+    put(&mut v, 0, [w(0x0009, 0), 0, 0, 0, 0, w(30, 30), 0, 0]);
+    put(
+        &mut v,
+        1,
+        [w(0x0008, 0), 0, 0, w(15, 15), 0, w(25, 25), 0, 0],
+    );
+    put(&mut v, 2, quad_10_40(0x0680, 0x001F));
+    put(&mut v, 3, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(12, 12), 0x001F);
+    assert_eq!(v.fb.pixel(35, 12), 0, "past the system clip");
+}
+
+#[test]
+fn user_clip_inside_mode_is_also_limited_by_the_system_clip() {
+    // Mednafen applies the system clip on top of an inside-mode user clip:
+    // a user rectangle reaching past the system clip draws only the overlap.
+    let mut v = clipped_vdp1();
+    put(&mut v, 0, [w(0x0009, 0), 0, 0, 0, 0, w(20, 20), 0, 0]);
+    put(
+        &mut v,
+        1,
+        [w(0x0008, 0), 0, 0, w(15, 15), 0, w(35, 35), 0, 0],
+    );
+    put(&mut v, 2, quad_10_40(0x0480, 0x001F));
+    put(&mut v, 3, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(18, 18), 0x001F, "user ∩ system drawn");
+    assert_eq!(
+        v.fb.pixel(30, 30),
+        0,
+        "inside the user clip, past the system clip"
+    );
+    assert_eq!(
+        v.fb.pixel(12, 12),
+        0,
+        "inside the system clip, outside the user clip"
+    );
+}
+
+#[test]
+fn user_clip_coordinates_are_13_bit_and_type_0xb_aliases_type_0x8() {
+    // Type 0xB is Mednafen's second SetUserClip slot, not an illegal command;
+    // the corner fields are masked to 13 bits (`& 0x1FFF`), so stray high
+    // bits (here 0xE000) don't move the rectangle.
+    let mut v = clipped_vdp1();
+    put(
+        &mut v,
+        0,
+        [
+            w(0x000B, 0),
+            0,
+            0,
+            w(0xE000 | 15, 0xE000 | 15),
+            0,
+            w(0xE000 | 25, 0xE000 | 25),
+            0,
+            0,
+        ],
+    );
+    put(&mut v, 1, quad_10_40(0x0480, 0x001F));
+    put(&mut v, 2, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(20, 20), 0x001F, "0xB set the user clip");
+    assert_eq!(v.fb.pixel(30, 30), 0, "clipped by the masked rectangle");
+}
+
+#[test]
+fn clip_and_local_registers_persist_across_command_lists() {
+    // List 1 sets local coordinates (+100,+50) and a user clip; list 2 sets
+    // neither, yet draws at the persisted offset and honours the clip — the
+    // registers are hardware state, not per-list (Mednafen's static
+    // `LocalX/Y`, `UserClip*`), shared by the plotter and the timing model.
+    let mut v = clipped_vdp1();
+    put(&mut v, 0, [w(0x000A, 0), 0, 0, w(100, 50), 0, 0, 0, 0]);
+    put(
+        &mut v,
+        1,
+        [w(0x0008, 0), 0, 0, w(115, 65), 0, w(125, 75), 0, 0],
+    );
+    put(&mut v, 2, END);
+    v.process_list();
+    put(&mut v, 0, quad_10_40(0x0080, 0x001F));
+    put(&mut v, 1, quad_10_40(0x0480, 0x03E0));
+    put(&mut v, 2, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(15, 15), 0, "not at the un-offset position");
+    assert_eq!(v.fb.pixel(112, 62), 0x001F, "drawn at the persisted offset");
+    assert_eq!(v.fb.pixel(120, 70), 0x03E0, "persisted user clip applied");
+    assert_eq!(v.fb.pixel(130, 80), 0x001F, "outside it only the 1st quad");
+}
+
+#[test]
+fn power_on_system_clip_is_zero() {
+    // The clip registers power on at 0 (Mednafen `SysClipX/Y = 0`): a list
+    // that never sets the system clip can only reach dot (0,0).
+    let mut v = Vdp1::new();
+    put(
+        &mut v,
+        0,
+        [
+            w(0x0004, 0),
+            w(0x0080, 0x001F),
+            0,
+            w(0, 0),
+            w(10, 0),
+            w(10, 10),
+            w(0, 10),
+            0,
+        ],
+    );
+    put(&mut v, 1, END);
+    v.process_list();
+    assert_eq!(v.fb.pixel(0, 0), 0x001F);
+    assert_eq!(v.fb.pixel(5, 5), 0);
+}
+
 #[test]
 fn illegal_command_type_terminates_the_list() {
-    let mut v = Vdp1::new();
-    // Type 0xB is not a defined command → the plotter ends the list early,
-    // so the polygon queued after it never draws.
-    put(&mut v, 0, [w(0x000B, 0), 0, 0, 0, 0, 0, 0, 0]);
+    let mut v = clipped_vdp1();
+    // Types 0xC–0xF are not defined commands → the plotter ends the list
+    // early (Mednafen `(CommandData[0] & 0xF) >= 0xC`), so the polygon queued
+    // after it never draws. (0xB is a SetUserClip alias, not illegal.)
+    put(&mut v, 0, [w(0x000C, 0), 0, 0, 0, 0, 0, 0, 0]);
     put(
         &mut v,
         1,
@@ -1481,7 +1653,7 @@ fn timed_draw_end_fires_after_the_draw_duration_via_run_for() {
 
 #[test]
 fn tvm_8bpp_polygon_writes_one_byte_per_dot() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     v.regs.write16(0x00, 0x0001); // TVMR.TVM = 8 bits/pixel framebuffer
     // Polygon colour 0x125F over (600,10)-(610,20) — x beyond the 16bpp
     // 512-dot stride, reachable only in the 1024-byte-wide 8bpp layout.
@@ -1514,7 +1686,7 @@ fn tvm_8bpp_polygon_writes_one_byte_per_dot() {
 
 #[test]
 fn die_double_interlace_plots_the_selected_field_at_half_y() {
-    let mut v = Vdp1::new();
+    let mut v = clipped_vdp1();
     v.regs.write16(0x02, 0x0008); // FBCR: DIE=1, DIL=0 (even field)
     // Polygon over source lines 100..=103: the even lines 100/102 land at
     // fb lines 50/51; the odd field's lines are dropped.
