@@ -39,19 +39,35 @@ fn illegal_instruction_vectors_through_vector_4() {
 }
 
 #[test]
-fn slot_illegal_pushes_branch_address_and_vectors_through_6() {
-    // BRA +0 ; JMP @R0  (JMP is illegal in a delay slot → vector 6)
-    let (mut cpu, mut bus) = make(&[0xA000, 0x002B]);
+fn slot_illegal_pushes_branch_target_and_vectors_through_6() {
+    // BRA +4 (target PC0+4+8) ; JMP @R0 (JMP is illegal in a delay slot →
+    // vector 6).
+    let (mut cpu, mut bus) = make(&[0xA004, 0x402B]);
     install_vector(&mut bus, 6, 0x0000_6100);
     cpu.regs.r[0] = 0; // JMP target, never reached
 
     cpu.step(&mut bus); // BRA sets pending_branch
     cpu.step(&mut bus); // JMP in slot → slot-illegal
     assert_eq!(cpu.regs.pc, 0x0000_6100);
-    // Resume PC is the slot instruction's address (PC0+2), so RTE re-runs
-    // the slot — software can patch around it.
+    // Mednafen `SLOT_ILLEGAL`: "Saved PC is the effective target address of
+    // the jump" — the BRA destination, not the slot or the branch address.
     let (resume_pc, _) = bus.read32(cpu.regs.r[15], sh2::AccessKind::Data);
-    assert_eq!(resume_pc, PC0 + 2);
+    assert_eq!(resume_pc, PC0 + 4 + 8);
+}
+
+#[test]
+fn undefined_opcode_in_a_delay_slot_is_slot_illegal_not_general_illegal() {
+    // BRA +0 ; 0xFFFF (undefined) in the slot → vector 6 (Mednafen maps the
+    // illegal decode entry to SLOT_ILLEGAL in a slot), not vector 4.
+    let (mut cpu, mut bus) = make(&[0xA000, 0xFFFF]);
+    install_vector(&mut bus, 4, 0x0000_6000);
+    install_vector(&mut bus, 6, 0x0000_6100);
+
+    cpu.step(&mut bus); // BRA
+    cpu.step(&mut bus); // undefined op in slot
+    assert_eq!(cpu.regs.pc, 0x0000_6100, "vector 6, not 4");
+    let (resume_pc, _) = bus.read32(cpu.regs.r[15], sh2::AccessKind::Data);
+    assert_eq!(resume_pc, PC0 + 4, "saved PC = branch target");
 }
 
 #[test]

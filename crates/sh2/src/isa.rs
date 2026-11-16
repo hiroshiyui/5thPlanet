@@ -774,11 +774,16 @@ impl Op {
     /// are also **legal** in a delay slot — `RTS; LDC Rm,SR` is the
     /// standard "restore SR on return" idiom the Saturn BIOS relies on;
     /// flagging it as illegal vectors the BIOS into its dead-wait handler.
+    /// An **undefined opcode** ([`Op::Illegal`]) in a slot is also a
+    /// slot-illegal (vector 6), not a general illegal (vector 4): Mednafen's
+    /// slot decode maps the illegal entry `0x00` to `0x80`, which is in
+    /// `OP_SLOT_ILLEGAL`.
     pub fn is_illegal_in_slot(&self) -> bool {
         use Op::*;
         matches!(
             self,
-            Bf { .. }
+            Illegal(_)
+                | Bf { .. }
                 | BfS { .. }
                 | Bt { .. }
                 | BtS { .. }

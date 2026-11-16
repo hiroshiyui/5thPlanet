@@ -431,13 +431,17 @@ impl Cpu {
         self.in_delay_slot = was_pending;
 
         // ---- Slot-illegal instruction ----
-        // A delay-slot containing a branch / SR-mutating op / PC-fetching
-        // op raises vector 6. The pushed PC is the *branch* address
-        // (instr_pc - 2), so RTE restarts the branch with consistent state.
+        // A delay slot holding a branch-family op or an undefined opcode
+        // raises vector 6 (`Op::is_illegal_in_slot`). The pushed PC is the
+        // **branch target** — "Saved PC is the effective target address of
+        // the jump" (Mednafen `SLOT_ILLEGAL`: the delayed branch already set
+        // `PC = target`, the slot runs with PC = target+2, and the handler
+        // does `PC -= 2`). So RTE resumes at the branch destination, skipping
+        // the faulting slot.
         if was_pending && op.is_illegal_in_slot() {
-            self.pending_branch = None;
+            let target = self.pending_branch.take().unwrap_or(instr_pc);
             self.in_delay_slot = false;
-            self.regs.pc = instr_pc; // un-advance: re-fetch the slot on return
+            self.regs.pc = target;
             let cost = self.take_exception(6, None, bus);
             self.pipeline.advance(interlock_stall + fetch_stall + cost);
             return interlock_stall + fetch_stall + cost;
@@ -1939,9 +1943,9 @@ impl Cpu {
     }
 
     /// MAC.L @Rm+,@Rn+. Signed 32×32 multiply, 64-bit accumulate into
-    /// MACH:MACL. S-bit saturation is implemented to the 48-bit signed
-    /// range (per SH7604 manual); rare in practice but exercised by some
-    /// DSP-heavy code paths.
+    /// MACH:MACL. With S=1 the result saturates to the signed 48-bit range
+    /// (SH-2 programming manual, MAC.L) using Mednafen's exact rule — see the
+    /// body; rare in practice but exercised by some DSP-heavy code paths.
     fn exec_mac_l(&mut self, rn: u8, rm: u8, bus: &mut impl Bus) -> u32 {
         let addr_m = self.regs.r[rm as usize];
         let (sm, s1) = self.mem_read32(addr_m, AccessKind::Data, bus);
@@ -1953,17 +1957,21 @@ impl Cpu {
 
         let prod = (sm as i32 as i64).wrapping_mul(sn as i32 as i64);
         let acc = ((self.regs.mach as u64) << 32) | (self.regs.macl as u64);
-        let sum = (acc as i64).wrapping_add(prod);
+        let mut sum = acc.wrapping_add(prod as u64);
 
-        let final_sum = if self.regs.sr.s() {
-            const MAX: i64 = (1i64 << 47) - 1;
-            const MIN: i64 = -(1i64 << 47);
-            sum.clamp(MIN, MAX)
-        } else {
-            sum
-        };
-        self.regs.macl = final_sum as u32;
-        self.regs.mach = (final_sum >> 32) as u32;
+        // S=1 saturation, exactly as Mednafen `MAC_L` (`sh7095_ops.inc`): only
+        // when the 64-bit sum leaves the signed 48-bit window, and the
+        // saturation direction follows the **sign of the product** (`m0 ^ m1`),
+        // not the sign of the sum.
+        if self.regs.sr.s() && sum > 0x0000_7FFF_FFFF_FFFF && sum < 0xFFFF_8000_0000_0000 {
+            sum = if ((sm ^ sn) as i32) < 0 {
+                0xFFFF_8000_0000_0000
+            } else {
+                0x0000_7FFF_FFFF_FFFF
+            };
+        }
+        self.regs.macl = sum as u32;
+        self.regs.mach = (sum >> 32) as u32;
         3 + s1 + s2
     }
 

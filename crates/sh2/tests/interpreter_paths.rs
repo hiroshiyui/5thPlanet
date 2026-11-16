@@ -400,3 +400,43 @@ fn reading_ftcsr_after_reset_does_not_hang() {
     cpu.onchip.frt_wdt_update(5_008);
     assert_eq!(cpu.onchip.frt.frc as u64, (10_000 >> 3) + 1);
 }
+
+// ---------------------------------------------------------------------------
+// MAC.L S=1: Mednafen's exact saturation rule (sh7095_ops.inc `MAC_L`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mac_l_saturation_direction_follows_the_product_sign() {
+    // Accumulator far outside the 48-bit window on the POSITIVE side, plus a
+    // tiny NEGATIVE product (1 × -1): the sum is still out of the window, and
+    // Mednafen saturates by the product's sign → the NEGATIVE floor (a plain
+    // clamp of the sum would give the positive max).
+    let (mut cpu, mut bus) = make(&[0x021F]); // MAC.L @R1+,@R2+
+    bus.write_u32(0x3000, 0x0000_0001);
+    bus.write_u32(0x4000, 0xFFFF_FFFF); // -1
+    cpu.regs.r[1] = 0x3000;
+    cpu.regs.r[2] = 0x4000;
+    cpu.regs.sr.set_s(true);
+    cpu.regs.mach = 0x7FFF_0000;
+    cpu.regs.macl = 0;
+    cpu.step(&mut bus);
+    let result = ((cpu.regs.mach as u64) << 32) | cpu.regs.macl as u64;
+    assert_eq!(result, 0xFFFF_8000_0000_0000, "saturated by product sign");
+}
+
+#[test]
+fn mac_l_does_not_saturate_a_sum_inside_the_48_bit_window() {
+    // MACH:MACL at the +max with a negative product: the sum re-enters the
+    // window, so no saturation applies even with S=1.
+    let (mut cpu, mut bus) = make(&[0x021F]);
+    bus.write_u32(0x3000, 0x0000_0002);
+    bus.write_u32(0x4000, 0xFFFF_FFFD); // -3 → product -6
+    cpu.regs.r[1] = 0x3000;
+    cpu.regs.r[2] = 0x4000;
+    cpu.regs.sr.set_s(true);
+    cpu.regs.mach = 0x0000_7FFF;
+    cpu.regs.macl = 0xFFFF_FFFF;
+    cpu.step(&mut bus);
+    let result = ((cpu.regs.mach as u64) << 32) | cpu.regs.macl as u64;
+    assert_eq!(result, 0x0000_7FFF_FFFF_FFF9);
+}
