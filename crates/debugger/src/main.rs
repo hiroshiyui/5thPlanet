@@ -1439,6 +1439,9 @@ impl Dbg {
         println!("CD command {cmd:02X} not seen in {max_frames} frames");
     }
 
+    /// Dispatch one REPL line. Returns `false` to quit. Each arm is a one-line
+    /// argument parse + call into a `cmd_*` / `dump_*` handler, so adding a
+    /// command never grows this table by more than a few lines.
     fn exec(&mut self, line: &str) -> bool {
         let mut it = line.split_whitespace();
         let Some(cmd) = it.next() else { return true };
@@ -1492,67 +1495,18 @@ impl Dbg {
                 ),
                 None => println!("usage: cb <cmd-hex> [cr4-hex] [max-frames]"),
             },
-            "frame" | "f" => {
-                let n = a1.and_then(parse_dec).unwrap_or(1);
-                for _ in 0..n {
-                    let mut fb = std::mem::take(&mut self.fb);
-                    self.sat.run_frame(&mut fb);
-                    self.fb = fb;
-                }
-                println!(
-                    "master @ {:08X} disp={}",
-                    self.sat.master().regs.pc,
-                    self.sat.bus.vdp2.regs.display_enabled()
-                );
-            }
-            "run" => {
-                if let Some(c) = a1.and_then(parse_dec) {
+            "frame" | "f" => self.cmd_frames(a1.and_then(parse_dec).unwrap_or(1)),
+            "run" => match a1.and_then(parse_dec) {
+                Some(c) => {
                     self.sat.run_for(c);
                     println!("master @ {:08X}", self.sat.master().regs.pc);
-                } else {
-                    println!("usage: run <cycles>");
                 }
-            }
+                None => println!("usage: run <cycles>"),
+            },
             // `b` (no arg) lists; `b <addr> [ri v]` adds a master breakpoint.
-            "b" => match a1 {
-                None => self.list_bps(),
-                Some(tok) => match self.resolve(tok) {
-                    Some(pc) => {
-                        let g = Self::parse_guard(a2, a3);
-                        self.mbps.push((pc, g));
-                        println!("master bp #{} @ {}", self.mbps.len() - 1, self.fmt_addr(pc));
-                    }
-                    None => println!("unknown symbol/address {tok:?}"),
-                },
-            },
-            "bs" => match a1 {
-                None => self.list_bps(),
-                Some(tok) => match self.resolve(tok) {
-                    Some(pc) => {
-                        let g = Self::parse_guard(a2, a3);
-                        self.sbps.push((pc, g));
-                        println!(
-                            "slave bp #{} @ {}",
-                            self.mbps.len() + self.sbps.len() - 1,
-                            self.fmt_addr(pc)
-                        );
-                    }
-                    None => println!("unknown symbol/address {tok:?}"),
-                },
-            },
-            "bd" => match a1 {
-                Some("*") => {
-                    self.mbps.clear();
-                    self.sbps.clear();
-                    self.bp68 = None;
-                    println!("all breakpoints cleared");
-                }
-                Some(s) => match parse_dec(s) {
-                    Some(id) => self.delete_bp(id as usize),
-                    None => println!("usage: bd <id|*>"),
-                },
-                None => println!("usage: bd <id|*>  (ids from `b`)"),
-            },
+            "b" => self.cmd_add_bp(false, a1, a2, a3),
+            "bs" => self.cmd_add_bp(true, a1, a2, a3),
+            "bd" => self.cmd_delete_bp(a1),
             "sym" => match (a1, a2.and_then(|t| self.resolve(t))) {
                 (Some(name), Some(addr)) => {
                     self.define_sym(name, addr);
@@ -1562,55 +1516,10 @@ impl Dbg {
             },
             "syms" => match a1 {
                 Some(path) => self.load_syms(path),
-                None => {
-                    if self.syms.is_empty() {
-                        println!("(no symbols; `syms <file>` or `sym <name> <addr>`)");
-                    } else {
-                        let mut s = self.syms.clone();
-                        s.sort_by_key(|(_, a)| *a);
-                        for (n, a) in &s {
-                            println!("  {a:08X}  {n}");
-                        }
-                    }
-                }
+                None => self.list_syms(),
             },
-            "b68" => match a1.and_then(|t| self.resolve(t)) {
-                Some(pc) => {
-                    // Optional register guard: `b68 <addr> <reg> <val>` where reg
-                    // 0-7 = D0-D7, 8-15 = A0-A7.
-                    let guard = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
-                        (Some(idx), Some(val)) if idx < 16 => Some((idx as u8, val)),
-                        _ => None,
-                    };
-                    self.bp68 = Some((pc, guard));
-                    match guard {
-                        Some((ri, v)) => {
-                            let name = if ri < 8 {
-                                format!("D{ri}")
-                            } else {
-                                format!("A{}", ri - 8)
-                            };
-                            println!("68k bp @ {pc:06X} when {name}=={v:08X} (arm with `fc`)");
-                        }
-                        None => println!("68k bp @ {pc:06X} (arm with `fc`)"),
-                    }
-                }
-                None => {
-                    self.bp68 = None;
-                    println!("68k bp cleared");
-                }
-            },
-            "probe" => match a1.map(|t| self.resolve(t)) {
-                Some(Some(addr)) => {
-                    self.bp_probe = Some(addr);
-                    println!("bp probe @ {addr:08X} (raw WRAM captured on next bp hit)");
-                }
-                Some(None) => println!("unknown symbol/address"),
-                None => {
-                    self.bp_probe = None;
-                    println!("bp probe cleared");
-                }
-            },
+            "b68" => self.cmd_b68(a1, a2, a3),
+            "probe" => self.cmd_probe(a1),
             "m" | "x" => match a1.and_then(|t| self.resolve(t)) {
                 Some(addr) => self.dump_mem(addr, a2.and_then(parse_num).unwrap_or(64)),
                 None => println!("usage: m <addr|sym> [len]"),
@@ -1631,72 +1540,11 @@ impl Dbg {
             "t68" => self.trace68(a1.and_then(parse_dec).map(|n| n as usize).unwrap_or(64)),
             "cd" => self.cd_state(),
             "frt" => self.dump_frt(),
-            // Register-write watch: `rwatch <reg> <hexval> [after_cyc]` logs (on
-            // the master) the executing PC each time R[reg] transitions to the
-            // value (only past after_cyc, so a long `fc` stays full-speed); dump
-            // with `rwdump`. Finds where a value (e.g. a movie read-count) is
-            // computed into a register — beats the bp-stack/read-watch confounds.
-            "rwatch" => {
-                // reg is DECIMAL (R0..R15); val is hex.
-                let reg = (a1.and_then(parse_dec).unwrap_or(12) as u8) & 0x0F;
-                let val = a2.and_then(parse_num).unwrap_or(0);
-                let after = a3.and_then(parse_dec).unwrap_or(0);
-                let m = self.sat.master_mut();
-                m.dbg_regwatch = Some((reg, val));
-                m.dbg_regwatch_after = after;
-                m.dbg_regwatch_armed = false;
-                m.dbg_regwatch_log.clear();
-                println!("regwatch armed: R{reg} -> {val:#X} (after cyc {after})");
-            }
-            "rwdump" => {
-                let log = core::mem::take(&mut self.sat.master_mut().dbg_regwatch_log);
-                println!("regwatch: {} transition(s) to target value:", log.len());
-                for (pc, cyc) in &log {
-                    println!("  pc={} cyc={cyc}", self.fmt_addr(*pc));
-                }
-            }
-            "ftcsr" => {
-                // Trace master FTCSR (FRT status; bit7 ICF = inter-CPU FTI flag)
-                // byte accesses — to see where/when the master polls & clears the
-                // slave's "done" pulse. `ftcsrdump` to print + drain.
-                let m = self.sat.master_mut();
-                m.dbg_ftcsr = true;
-                m.dbg_ftcsr_log.clear();
-                println!("master FTCSR-access trace armed");
-            }
-            "ftcsrdump" => {
-                let log = core::mem::take(&mut self.sat.master_mut().dbg_ftcsr_log);
-                println!(
-                    "FTCSR: {} byte access(es) [pc ~= access instr + 2]:",
-                    log.len()
-                );
-                for (pc, val, is_w, cyc) in &log {
-                    let icf = if val & 0x80 != 0 { "ICF=1" } else { "ICF=0" };
-                    println!(
-                        "  {} FTCSR={val:02X} {icf} pc={} cyc={cyc}",
-                        if *is_w { "WR" } else { "RD" },
-                        self.fmt_addr(*pc)
-                    );
-                }
-            }
-            "pctail" => {
-                // Raw post-clear PC trace (armed by the first FTCSR write under
-                // `ftcsr`): the master's path right after acking the slave's
-                // round-1 done — the streaming round-2 decision. One PC per line.
-                let log = core::mem::take(&mut self.sat.master_mut().dbg_pc_log);
-                let n = a1
-                    .and_then(parse_dec)
-                    .map(|v| v as usize)
-                    .unwrap_or(log.len());
-                println!(
-                    "post-clear PC trace: {} PCs (showing {})",
-                    log.len(),
-                    n.min(log.len())
-                );
-                for pc in log.iter().take(n) {
-                    println!("{pc:08X}");
-                }
-            }
+            "rwatch" => self.cmd_rwatch(a1, a2, a3),
+            "rwdump" => self.cmd_rwdump(),
+            "ftcsr" => self.cmd_ftcsr_arm(),
+            "ftcsrdump" => self.cmd_ftcsr_dump(),
+            "pctail" => self.cmd_pctail(a1),
             "cache" => self.dump_cache(),
             "caudit" => self.cache_audit(),
             "stale" => self.detect_stale(a1.and_then(parse_dec).unwrap_or(2000)),
@@ -1713,110 +1561,29 @@ impl Dbg {
                 a1.and_then(parse_num).unwrap_or(0) as usize,
                 a2.and_then(parse_dec).map(|n| n as usize).unwrap_or(256),
             ),
+            // Render the current VDP state to a PPM after one run_frame (a stable
+            // hang leaves the screen unchanged) + report dims and non-black px.
             "fbdump" => {
-                // Render the current VDP state to a PPM (one run_frame; a stable
-                // hang leaves the screen unchanged) + report dims and non-black px.
                 let mut fb = std::mem::take(&mut self.fb);
-                let (w, h) = self.sat.run_frame(&mut fb);
+                let dims = self.sat.run_frame(&mut fb);
                 self.fb = fb;
-                let px = w * h;
-                let nb = (0..px)
-                    .filter(|&i| (self.fb[i * 4] | self.fb[i * 4 + 1] | self.fb[i * 4 + 2]) != 0)
-                    .count();
-                let path = a1.unwrap_or("tmp/fb.ppm");
-                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-                for i in 0..px {
-                    out.extend_from_slice(&self.fb[i * 4..i * 4 + 3]);
-                }
-                match std::fs::write(path, &out) {
-                    Ok(()) => println!("fbdump: {w}x{h}  {nb}/{px} non-black px  -> {path}"),
-                    Err(e) => println!("fbdump write failed: {e}"),
-                }
+                self.write_fb_ppm("fbdump", a1.unwrap_or("tmp/fb.ppm"), dims);
             }
-            "scsp" => {
-                // a6 = sound-driver work-area base. The driver's command ring
-                // lives at a6+0x1840 (write ptr) / a6+0x1842 (read ptr): the main
-                // loop (0x1066) keys a voice only when they differ. Capture a6 and
-                // the bytes around 0x1840 first (needs &mut self) so we can watch
-                // whether the BIOS master ever queues a sound command.
-                let a6 = self.sat.bus.scsp.cpu.regs.a[6];
-                let ring = self.read_sound_words(a6.wrapping_add(0x1840), 4);
-                let s = &self.sat.bus.scsp;
-                let active = (0..32).filter(|&i| s.slot_active(i)).count();
-                println!(
-                    "SCSP running(SNDON)={}  active slots={}/32",
-                    s.running, active
+            // Composite the CURRENT VDP state to a PPM WITHOUT advancing the
+            // machine (unlike `fbdump`, which runs a frame first). Lets a `poke`
+            // to a VDP register be seen in isolation — a frame of CPU execution
+            // can't overwrite it before the render. Read-only.
+            "render" => {
+                let mut fb = std::mem::take(&mut self.fb);
+                let dims = saturn::vdp2::render_frame(
+                    &self.sat.bus.vdp2,
+                    Some(self.sat.bus.vdp1.display_fb()),
+                    &mut fb,
                 );
-                let c = &s.cpu;
-                println!(
-                    "  68k pc={:06X} stopped={} a7={:08X}  d0={:08X} d1={:08X} a0={:08X} a1={:08X}",
-                    c.regs.pc,
-                    c.stopped,
-                    c.regs.a[7],
-                    c.regs.d[0],
-                    c.regs.d[1],
-                    c.regs.a[0],
-                    c.regs.a[1]
-                );
-                println!(
-                    "  68k a6={a6:06X}  cmd-ring @a6+0x1840: {:04X} {:04X} {:04X} {:04X}  (write/read ptrs)",
-                    ring[0], ring[1], ring[2], ring[3]
-                );
-                let (keyon_execs, slot_starts) = s.ctrl.dbg_keyon_counts();
-                println!(
-                    "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
-                );
-                let (tof, ttc, tts) = s.ctrl.dbg_timer_counts();
-                println!(
-                    "  timers (lifetime): overflow A/B/C={}/{}/{}  tick_timers calls={ttc} samples={tts}",
-                    tof[0], tof[1], tof[2]
-                );
-                let (lvl, scieb, scipd) = s.ctrl.irq_state();
-                println!(
-                    "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
-                    c.regs.sr.imask, c.regs.sr.supervisor
-                );
-                let (dsp_run, efreg, efreg_hw, mixs_hw) = s.dsp_state();
-                let efmax = efreg.iter().map(|&e| (e as i32).abs()).max().unwrap_or(0);
-                println!(
-                    "  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}",
-                    &efreg[..4]
-                );
-                println!("  EFREG high-water: {efreg_hw:?}");
-                println!("  MIXS  high-water: {mixs_hw:?}");
-                println!(
-                    "  DSP program writes EFREG indices (EWT targets): {:?}",
-                    s.dsp_ewt_targets()
-                );
-                // Per-active-slot playback parameters — to tell a mis-programmed
-                // slot (bad SA/pitch/loop) from a render bug (sane params).
-                for i in 0..32 {
-                    if !s.slot_active(i) {
-                        continue;
-                    }
-                    let d = s.slot_debug(i);
-                    println!(
-                        "  slot{i:02} SA={:05X} loop={}[{:04X}..{:04X}] {} oct={:+} fns={:03X} step={:05X} eg={}/{:03X} | direct(disdl={} pan={:02X}) tl={:02X} | dsp-send(imxl={} isel={}) dsp-ret(efsdl={} efpan={:02X})",
-                        d.sa,
-                        d.lpctl,
-                        d.lsa,
-                        d.lea,
-                        if d.pcm8 { "8b" } else { "16b" },
-                        d.oct,
-                        d.fns,
-                        d.step,
-                        d.eg_state,
-                        d.eg_volume >> 16,
-                        d.disdl,
-                        d.dipan,
-                        d.tl,
-                        d.imxl,
-                        d.isel,
-                        d.efsdl,
-                        d.efpan,
-                    );
-                }
+                self.fb = fb;
+                self.write_fb_ppm("render", a1.unwrap_or("tmp/fb.ppm"), dims);
             }
+            "scsp" => self.dump_scsp(),
             "w" => match a1.and_then(|t| self.resolve(t)) {
                 Some(addr) => {
                     let sz = a2.and_then(parse_num).unwrap_or(2) as u8;
@@ -1837,19 +1604,7 @@ impl Dbg {
                 None => println!("usage: save <file>"),
             },
             "load" => match a1 {
-                Some(path) => match std::fs::read(path) {
-                    Ok(bytes) => match self.sat.load_state(&bytes) {
-                        Ok(()) => {
-                            // The cmd_log isn't serialized (kept out of save
-                            // states to stay lean); re-enable logging so `cdlog`
-                            // captures commands issued after the load.
-                            self.sat.bus.cd_block.cmd_log_on = true;
-                            println!("loaded {path}; master @ {:08X}", self.sat.master().regs.pc)
-                        }
-                        Err(e) => println!("load failed: {e:?}"),
-                    },
-                    Err(e) => println!("read failed: {e}"),
-                },
+                Some(path) => self.cmd_load(path),
                 None => println!("usage: load <file>"),
             },
             // Inject a port-1 digital-pad state (held until changed), so an
@@ -1866,54 +1621,7 @@ impl Dbg {
                     "usage: pad <mask-hex>  (A=400 B=100 C=200 START=800 UP=1000 DOWN=2000 LEFT=4000 RIGHT=8000; 0=release)"
                 ),
             },
-            // Write a value to a bus address (debug poke) — e.g. to neutralize a
-            // VDP2 register and re-`render` it, isolating a render bug from the
-            // CPU state that produced it. Goes through the same bus path as a CPU
-            // store (AccessKind::Data).
-            "poke" => match (a1.and_then(|t| self.resolve(t)), a2.and_then(parse_num)) {
-                (Some(addr), Some(val)) => {
-                    let sz = a3.and_then(parse_num).unwrap_or(2) as u8;
-                    match sz {
-                        1 => {
-                            self.sat.bus.write8(addr, val as u8, AccessKind::Data);
-                        }
-                        4 => {
-                            self.sat.bus.write32(addr, val, AccessKind::Data);
-                        }
-                        _ => {
-                            self.sat.bus.write16(addr, val as u16, AccessKind::Data);
-                        }
-                    }
-                    println!("poke {addr:08X} = {val:08X} ({sz}B)");
-                }
-                _ => println!("usage: poke <addr|sym> <val-hex> [size=1|2|4]"),
-            },
-            // Composite the CURRENT VDP state to a PPM WITHOUT advancing the
-            // machine (unlike `fbdump`, which runs a frame first). Lets a `poke`
-            // to a VDP register be seen in isolation — a frame of CPU execution
-            // can't overwrite it before the render. Read-only.
-            "render" => {
-                let mut fb = std::mem::take(&mut self.fb);
-                let (w, h) = saturn::vdp2::render_frame(
-                    &self.sat.bus.vdp2,
-                    Some(self.sat.bus.vdp1.display_fb()),
-                    &mut fb,
-                );
-                self.fb = fb;
-                let px = w * h;
-                let nb = (0..px)
-                    .filter(|&i| (self.fb[i * 4] | self.fb[i * 4 + 1] | self.fb[i * 4 + 2]) != 0)
-                    .count();
-                let path = a1.unwrap_or("tmp/fb.ppm");
-                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-                for i in 0..px {
-                    out.extend_from_slice(&self.fb[i * 4..i * 4 + 3]);
-                }
-                match std::fs::write(path, &out) {
-                    Ok(()) => println!("render: {w}x{h}  {nb}/{px} non-black px  -> {path}"),
-                    Err(e) => println!("render write failed: {e}"),
-                }
-            }
+            "poke" => self.cmd_poke(a1, a2, a3),
             // Replay a jupiter input movie (SAT_INPUT_REC) to drive an
             // input-gated boot path headlessly + deterministically. Run first,
             // on a fresh sdbg with the same bios/disc/region the recording used.
@@ -1924,6 +1632,328 @@ impl Dbg {
             other => println!("unknown command {other:?}; try `help`"),
         }
         true
+    }
+
+    // ---- Command handlers (split out of `exec`) ---------------------------
+
+    /// `frame [n]`: run `n` full frames, then report the master PC + display.
+    fn cmd_frames(&mut self, n: u64) {
+        for _ in 0..n {
+            let mut fb = std::mem::take(&mut self.fb);
+            self.sat.run_frame(&mut fb);
+            self.fb = fb;
+        }
+        println!(
+            "master @ {:08X} disp={}",
+            self.sat.master().regs.pc,
+            self.sat.bus.vdp2.regs.display_enabled()
+        );
+    }
+
+    /// `b`/`bs [addr] [ri v]`: list (no address) or add a master/slave
+    /// breakpoint with an optional register guard.
+    fn cmd_add_bp(&mut self, slave: bool, a1: Option<&str>, a2: Option<&str>, a3: Option<&str>) {
+        let Some(tok) = a1 else {
+            self.list_bps();
+            return;
+        };
+        let Some(pc) = self.resolve(tok) else {
+            println!("unknown symbol/address {tok:?}");
+            return;
+        };
+        let g = Self::parse_guard(a2, a3);
+        if slave {
+            self.sbps.push((pc, g));
+            println!(
+                "slave bp #{} @ {}",
+                self.mbps.len() + self.sbps.len() - 1,
+                self.fmt_addr(pc)
+            );
+        } else {
+            self.mbps.push((pc, g));
+            println!("master bp #{} @ {}", self.mbps.len() - 1, self.fmt_addr(pc));
+        }
+    }
+
+    /// `bd <id|*>`: delete one breakpoint by id, or all of them.
+    fn cmd_delete_bp(&mut self, a1: Option<&str>) {
+        match a1 {
+            Some("*") => {
+                self.mbps.clear();
+                self.sbps.clear();
+                self.bp68 = None;
+                println!("all breakpoints cleared");
+            }
+            Some(s) => match parse_dec(s) {
+                Some(id) => self.delete_bp(id as usize),
+                None => println!("usage: bd <id|*>"),
+            },
+            None => println!("usage: bd <id|*>  (ids from `b`)"),
+        }
+    }
+
+    /// `syms` (no file): list the symbol table sorted by address.
+    fn list_syms(&self) {
+        if self.syms.is_empty() {
+            println!("(no symbols; `syms <file>` or `sym <name> <addr>`)");
+            return;
+        }
+        let mut s = self.syms.clone();
+        s.sort_by_key(|(_, a)| *a);
+        for (n, a) in &s {
+            println!("  {a:08X}  {n}");
+        }
+    }
+
+    /// `b68 [addr] [reg val]`: set (or, with no/unknown address, clear) the
+    /// SCSP 68k breakpoint. Guard reg 0-7 = D0-D7, 8-15 = A0-A7.
+    fn cmd_b68(&mut self, a1: Option<&str>, a2: Option<&str>, a3: Option<&str>) {
+        let Some(pc) = a1.and_then(|t| self.resolve(t)) else {
+            self.bp68 = None;
+            println!("68k bp cleared");
+            return;
+        };
+        let guard = match (a2.and_then(parse_dec), a3.and_then(parse_num)) {
+            (Some(idx), Some(val)) if idx < 16 => Some((idx as u8, val)),
+            _ => None,
+        };
+        self.bp68 = Some((pc, guard));
+        match guard {
+            Some((ri, v)) => {
+                let name = if ri < 8 {
+                    format!("D{ri}")
+                } else {
+                    format!("A{}", ri - 8)
+                };
+                println!("68k bp @ {pc:06X} when {name}=={v:08X} (arm with `fc`)");
+            }
+            None => println!("68k bp @ {pc:06X} (arm with `fc`)"),
+        }
+    }
+
+    /// `probe [addr]`: set/clear the breakpoint memory probe.
+    fn cmd_probe(&mut self, a1: Option<&str>) {
+        match a1.map(|t| self.resolve(t)) {
+            Some(Some(addr)) => {
+                self.bp_probe = Some(addr);
+                println!("bp probe @ {addr:08X} (raw WRAM captured on next bp hit)");
+            }
+            Some(None) => println!("unknown symbol/address"),
+            None => {
+                self.bp_probe = None;
+                println!("bp probe cleared");
+            }
+        }
+    }
+
+    /// Register-write watch: `rwatch <reg> <hexval> [after_cyc]` logs (on the
+    /// master) the executing PC each time R[reg] transitions to the value (only
+    /// past after_cyc, so a long `fc` stays full-speed); dump with `rwdump`.
+    /// Finds where a value (e.g. a movie read-count) is computed into a register
+    /// — beats the bp-stack/read-watch confounds. `reg` is DECIMAL, `val` hex.
+    fn cmd_rwatch(&mut self, a1: Option<&str>, a2: Option<&str>, a3: Option<&str>) {
+        let reg = (a1.and_then(parse_dec).unwrap_or(12) as u8) & 0x0F;
+        let val = a2.and_then(parse_num).unwrap_or(0);
+        let after = a3.and_then(parse_dec).unwrap_or(0);
+        let m = self.sat.master_mut();
+        m.dbg_regwatch = Some((reg, val));
+        m.dbg_regwatch_after = after;
+        m.dbg_regwatch_armed = false;
+        m.dbg_regwatch_log.clear();
+        println!("regwatch armed: R{reg} -> {val:#X} (after cyc {after})");
+    }
+
+    /// `rwdump`: print + drain the register-watch log.
+    fn cmd_rwdump(&mut self) {
+        let log = core::mem::take(&mut self.sat.master_mut().dbg_regwatch_log);
+        println!("regwatch: {} transition(s) to target value:", log.len());
+        for (pc, cyc) in &log {
+            println!("  pc={} cyc={cyc}", self.fmt_addr(*pc));
+        }
+    }
+
+    /// `ftcsr`: trace master FTCSR (FRT status; bit7 ICF = inter-CPU FTI flag)
+    /// byte accesses — to see where/when the master polls & clears the slave's
+    /// "done" pulse. `ftcsrdump` prints + drains.
+    fn cmd_ftcsr_arm(&mut self) {
+        let m = self.sat.master_mut();
+        m.dbg_ftcsr = true;
+        m.dbg_ftcsr_log.clear();
+        println!("master FTCSR-access trace armed");
+    }
+
+    /// `ftcsrdump`: print + drain the FTCSR access trace.
+    fn cmd_ftcsr_dump(&mut self) {
+        let log = core::mem::take(&mut self.sat.master_mut().dbg_ftcsr_log);
+        println!(
+            "FTCSR: {} byte access(es) [pc ~= access instr + 2]:",
+            log.len()
+        );
+        for (pc, val, is_w, cyc) in &log {
+            let icf = if val & 0x80 != 0 { "ICF=1" } else { "ICF=0" };
+            println!(
+                "  {} FTCSR={val:02X} {icf} pc={} cyc={cyc}",
+                if *is_w { "WR" } else { "RD" },
+                self.fmt_addr(*pc)
+            );
+        }
+    }
+
+    /// `pctail [n]`: the raw post-clear PC trace (armed by the first FTCSR write
+    /// under `ftcsr`) — the master's path right after acking the slave's
+    /// round-1 done. One PC per line.
+    fn cmd_pctail(&mut self, a1: Option<&str>) {
+        let log = core::mem::take(&mut self.sat.master_mut().dbg_pc_log);
+        let n = a1
+            .and_then(parse_dec)
+            .map(|v| v as usize)
+            .unwrap_or(log.len());
+        println!(
+            "post-clear PC trace: {} PCs (showing {})",
+            log.len(),
+            n.min(log.len())
+        );
+        for pc in log.iter().take(n) {
+            println!("{pc:08X}");
+        }
+    }
+
+    /// Write the first `dims` pixels of `self.fb` as a binary PPM to `path` and
+    /// report the dims + non-black pixel count (`fbdump` / `render`).
+    fn write_fb_ppm(&self, what: &str, path: &str, (w, h): (usize, usize)) {
+        let px = w * h;
+        let nb = (0..px)
+            .filter(|&i| (self.fb[i * 4] | self.fb[i * 4 + 1] | self.fb[i * 4 + 2]) != 0)
+            .count();
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for i in 0..px {
+            out.extend_from_slice(&self.fb[i * 4..i * 4 + 3]);
+        }
+        match std::fs::write(path, &out) {
+            Ok(()) => println!("{what}: {w}x{h}  {nb}/{px} non-black px  -> {path}"),
+            Err(e) => println!("{what} write failed: {e}"),
+        }
+    }
+
+    /// `scsp`: SCSP sound state. a6 = the sound-driver work-area base; the
+    /// driver's command ring lives at a6+0x1840 (write ptr) / a6+0x1842 (read
+    /// ptr): the main loop (0x1066) keys a voice only when they differ. The
+    /// ring bytes are captured first (needs `&mut self`) so we can watch whether
+    /// the BIOS master ever queues a sound command.
+    fn dump_scsp(&mut self) {
+        let a6 = self.sat.bus.scsp.cpu.regs.a[6];
+        let ring = self.read_sound_words(a6.wrapping_add(0x1840), 4);
+        let s = &self.sat.bus.scsp;
+        let active = (0..32).filter(|&i| s.slot_active(i)).count();
+        println!(
+            "SCSP running(SNDON)={}  active slots={}/32",
+            s.running, active
+        );
+        let c = &s.cpu;
+        println!(
+            "  68k pc={:06X} stopped={} a7={:08X}  d0={:08X} d1={:08X} a0={:08X} a1={:08X}",
+            c.regs.pc, c.stopped, c.regs.a[7], c.regs.d[0], c.regs.d[1], c.regs.a[0], c.regs.a[1]
+        );
+        println!(
+            "  68k a6={a6:06X}  cmd-ring @a6+0x1840: {:04X} {:04X} {:04X} {:04X}  (write/read ptrs)",
+            ring[0], ring[1], ring[2], ring[3]
+        );
+        let (keyon_execs, slot_starts) = s.ctrl.dbg_keyon_counts();
+        println!(
+            "  key-on activity (lifetime): KYONEX strobes={keyon_execs}  slot starts={slot_starts}"
+        );
+        let (tof, ttc, tts) = s.ctrl.dbg_timer_counts();
+        println!(
+            "  timers (lifetime): overflow A/B/C={}/{}/{}  tick_timers calls={ttc} samples={tts}",
+            tof[0], tof[1], tof[2]
+        );
+        let (lvl, scieb, scipd) = s.ctrl.irq_state();
+        println!(
+            "  68k IRQ: asserted_level={lvl}  SCIEB={scieb:04X} SCIPD={scipd:04X}  imask={} super={}",
+            c.regs.sr.imask, c.regs.sr.supervisor
+        );
+        let (dsp_run, efreg, efreg_hw, mixs_hw) = s.dsp_state();
+        let efmax = efreg.iter().map(|&e| (e as i32).abs()).max().unwrap_or(0);
+        println!(
+            "  DSP running={dsp_run} EFREG[0..4]={:?} max|EFREG|={efmax}",
+            &efreg[..4]
+        );
+        println!("  EFREG high-water: {efreg_hw:?}");
+        println!("  MIXS  high-water: {mixs_hw:?}");
+        println!(
+            "  DSP program writes EFREG indices (EWT targets): {:?}",
+            s.dsp_ewt_targets()
+        );
+        // Per-active-slot playback parameters — to tell a mis-programmed slot
+        // (bad SA/pitch/loop) from a render bug (sane params).
+        for i in 0..32 {
+            if !s.slot_active(i) {
+                continue;
+            }
+            let d = s.slot_debug(i);
+            println!(
+                "  slot{i:02} SA={:05X} loop={}[{:04X}..{:04X}] {} oct={:+} fns={:03X} step={:05X} eg={}/{:03X} | direct(disdl={} pan={:02X}) tl={:02X} | dsp-send(imxl={} isel={}) dsp-ret(efsdl={} efpan={:02X})",
+                d.sa,
+                d.lpctl,
+                d.lsa,
+                d.lea,
+                if d.pcm8 { "8b" } else { "16b" },
+                d.oct,
+                d.fns,
+                d.step,
+                d.eg_state,
+                d.eg_volume >> 16,
+                d.disdl,
+                d.dipan,
+                d.tl,
+                d.imxl,
+                d.isel,
+                d.efsdl,
+                d.efpan,
+            );
+        }
+    }
+
+    /// `load <file>`: restore a save state.
+    fn cmd_load(&mut self, path: &str) {
+        match std::fs::read(path) {
+            Ok(bytes) => match self.sat.load_state(&bytes) {
+                Ok(()) => {
+                    // The cmd_log isn't serialized (kept out of save states to
+                    // stay lean); re-enable logging so `cdlog` captures commands
+                    // issued after the load.
+                    self.sat.bus.cd_block.cmd_log_on = true;
+                    println!("loaded {path}; master @ {:08X}", self.sat.master().regs.pc)
+                }
+                Err(e) => println!("load failed: {e:?}"),
+            },
+            Err(e) => println!("read failed: {e}"),
+        }
+    }
+
+    /// `poke <addr> <val> [sz]`: write a value to a bus address (debug poke) —
+    /// e.g. to neutralize a VDP2 register and re-`render` it, isolating a render
+    /// bug from the CPU state that produced it. Goes through the same bus path
+    /// as a CPU store (AccessKind::Data).
+    fn cmd_poke(&mut self, a1: Option<&str>, a2: Option<&str>, a3: Option<&str>) {
+        let (Some(addr), Some(val)) = (a1.and_then(|t| self.resolve(t)), a2.and_then(parse_num))
+        else {
+            println!("usage: poke <addr|sym> <val-hex> [size=1|2|4]");
+            return;
+        };
+        let sz = a3.and_then(parse_num).unwrap_or(2) as u8;
+        match sz {
+            1 => {
+                self.sat.bus.write8(addr, val as u8, AccessKind::Data);
+            }
+            4 => {
+                self.sat.bus.write32(addr, val, AccessKind::Data);
+            }
+            _ => {
+                self.sat.bus.write16(addr, val as u16, AccessKind::Data);
+            }
+        }
+        println!("poke {addr:08X} = {val:08X} ({sz}B)");
     }
 }
 
