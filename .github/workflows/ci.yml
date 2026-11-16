@@ -1,0 +1,68 @@
+# Continuous integration: the gates CLAUDE.md asks every change to pass —
+# rustfmt, clippy (-D warnings) for the workspace and the two non-default
+# jupiter builds (headless, gpu-presenter), and the full test suite.
+#
+# SDL3 isn't packaged on ubuntu-22.04/24.04, so (like package-linux.yml) the
+# SDL3 frontend links a vendored SDL3 built from source via jupiter's
+# `sdl-static` feature. Tests that need a BIOS / disc image skip themselves when
+# bios/ and roms/ are empty (they are gitignored; never commit media).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: fmt + clippy + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time deps for the vendored SDL3 cmake build (same list as
+      # package-linux.yml — keep them in sync).
+      - name: Install SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libdecor-0-dev libdrm-dev libgbm-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libdbus-1-dev libibus-1.0-dev libudev-dev liburing-dev
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install # reads rust-toolchain.toml (+ rustfmt, clippy)
+
+      # SHA-pinned (community action — supply-chain hygiene); the comment tracks
+      # the release the SHA corresponds to. Also caches the cmake'd SDL3 in target/.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ci
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (workspace, default features)
+        run: cargo clippy --workspace --all-targets --features jupiter/sdl-static -- -D warnings
+
+      - name: clippy (jupiter headless)
+        run: cargo clippy -p jupiter --all-targets --no-default-features -- -D warnings
+
+      - name: clippy (jupiter gpu-presenter)
+        run: cargo clippy -p jupiter --all-targets --features sdl-static,gpu-presenter -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --features jupiter/sdl-static
