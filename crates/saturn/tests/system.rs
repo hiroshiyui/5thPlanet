@@ -225,6 +225,41 @@ fn debug_step_slave_is_a_no_op_while_halted_then_runs_once_released() {
     assert_eq!(sat.slave().pipeline.cycles, before + cost as u64);
 }
 
+#[test]
+fn single_step_applies_fti_and_trigger_point_dma_like_run_for() {
+    // The single-step path must run the same per-instruction side effects as
+    // `step_cpus`: a DMA started by the stepped store completes at once, and
+    // an FTI pulse reaches the sibling's FRT without a drain.
+    let mut sat = Saturn::with_blank_bios();
+    sat.reset();
+    sat.bus.high_wram.write32(0x100, 0x1234_5678);
+    let scu = 0x05FE_0000;
+    sat.bus.write32(scu, 0x0600_0100, AccessKind::Data); // D0R
+    sat.bus.write32(scu + 0x04, 0x05E0_0000, AccessKind::Data); // D0W (VDP2)
+    sat.bus.write32(scu + 0x08, 4, AccessKind::Data); // D0C
+    sat.bus.write32(scu + 0x0C, 0x101, AccessKind::Data); // D0AD
+    sat.bus.write32(scu + 0x14, 7, AccessKind::Data); // D0MD manual
+    let pc = 0x0020_1000u32;
+    sat.bus.write16(pc, 0x2212, AccessKind::Data); // MOV.L R1,@R2 (D0EN)
+    sat.bus.write16(pc + 2, 0x2431, AccessKind::Data); // MOV.W R3,@R4 (FTI)
+    sat.master_mut().regs.pc = pc;
+    sat.master_mut().regs.r[1] = 0x101; // enable + go
+    sat.master_mut().regs.r[2] = scu + 0x10;
+    sat.master_mut().regs.r[4] = 0x0100_0000; // slave FTI window
+    sat.debug_step_master_nodrain();
+    assert_eq!(
+        sat.bus.vdp2.read32(0x05E0_0000),
+        0x1234_5678,
+        "the DMA ran at the triggering instruction"
+    );
+    sat.release_slave();
+    sat.debug_step_master_nodrain();
+    assert!(
+        !sat.bus.slave_input_capture,
+        "the FTI pulse was applied by the step itself"
+    );
+}
+
 // ---- run-loop drains observed end-to-end ----------------------------------
 
 #[test]

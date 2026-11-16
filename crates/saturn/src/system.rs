@@ -108,6 +108,91 @@ fn trace_scu_interrupt(
     }
 }
 
+/// Debug (`SAT_INTC_TRACE`): log each VBlank-OUT raise. The value, if numeric,
+/// is the global cycle to start logging from (default 0 = from power-on); read
+/// once and cached so the per-frame check is a single load when unset.
+fn intc_trace_after() -> Option<u64> {
+    use std::sync::OnceLock;
+    static AFTER: OnceLock<Option<u64>> = OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let v = std::env::var("SAT_INTC_TRACE").ok()?;
+        Some(v.trim().parse().unwrap_or(0))
+    })
+}
+
+/// Sample the CD-block external-interrupt level and the SCU interrupt line
+/// immediately before one **master** instruction and, if the master can accept
+/// an interrupt now, forward the highest-priority unmasked pending SCU source
+/// to its INTC (latching the SCU's fixed `0x40 + index` vector, not the
+/// auto-vector). Shared by the run loop ([`Saturn::step_cpus`]) and the
+/// single-step debug path so both deliver interrupts at the same instruction.
+///
+/// **This is the single acceptance gate** for SCU/CD interrupts: the SH-2
+/// cannot take an interrupt between a delayed branch and its slot, so while the
+/// next instruction is a delay slot the pending edge is left in the SCU for the
+/// next instruction boundary (forwarding a DMA-end into the `nop` slot after an
+/// `rte` corrupted SAN5's CD-DMA handshake). Any further "interrupt blocked"
+/// condition belongs here, next to `next_is_delay_slot()`.
+#[inline]
+fn forward_scu_irq(bus: &mut SaturnBus, master: &mut Sh2Entity, site: &str) {
+    // CD-block external interrupt (Source::Cd, vector 0x50, level 7): assert
+    // the SCU level from the live CD HIRQ before each instruction (Mednafen
+    // `RecalcIRQOut`). VF2's GFS file library is driven by this interrupt.
+    let cd_active = bus.cd_block.irq_active();
+    bus.scu.set_cd_int(cd_active);
+    // Phase 2B: the SCU presents the highest-priority unmasked pending source
+    // as an IRL the master samples every instruction at its current SR.imask.
+    let cpu = &master.cpu;
+    if cpu.next_is_delay_slot() {
+        return;
+    }
+    let imask = cpu.regs.sr.imask();
+    if let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
+        trace_scu_interrupt(
+            site,
+            source,
+            level,
+            imask,
+            cpu.regs.pc,
+            cpu.pipeline.cycles,
+            bus.scu.ims,
+            bus.scu.ist,
+        );
+        master
+            .cpu
+            .onchip
+            .intc
+            .raise_external(level, source.vector());
+    }
+}
+
+/// Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
+/// instruction flagged on the bus: pulse the target core's FRT now so it sees
+/// the input-capture on its next instruction, not up to a batch later (M13 A1,
+/// FTI as a per-instruction event).
+#[inline]
+fn apply_fti(
+    bus: &mut SaturnBus,
+    scheduler: &mut Scheduler<SaturnEntity>,
+    master_id: EntityId,
+    slave_id: EntityId,
+) {
+    if core::mem::take(&mut bus.slave_input_capture) {
+        scheduler
+            .entity_mut(slave_id)
+            .sh2_mut()
+            .cpu
+            .fti_input_capture();
+    }
+    if core::mem::take(&mut bus.master_input_capture) {
+        scheduler
+            .entity_mut(master_id)
+            .sh2_mut()
+            .cpu
+            .fti_input_capture();
+    }
+}
+
 /// INTBACK SF-busy time in microseconds, computed from the request.
 ///
 /// Reconciled against Mednafen (the LLE reference), which models INTBACK as a
@@ -831,62 +916,52 @@ impl Saturn {
             bus,
             scheduler,
             master_id,
+            slave_id,
             ..
         } = self;
-        // Phase 2B: sample the SCU IRL before the instruction, exactly as
-        // `step_cpus` does on the real run, so the single-step debug path and
-        // `run_for` deliver SCU interrupts at the same (per-instruction) point.
-        let cd_active = bus.cd_block.irq_active();
-        bus.scu.set_cd_int(cd_active);
-        let imask = scheduler.entity(*master_id).sh2().cpu.regs.sr.imask();
-        let pc = scheduler.entity(*master_id).sh2().cpu.regs.pc;
-        let cycle = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
-        let in_delay_slot = scheduler.entity(*master_id).sh2().cpu.next_is_delay_slot();
-        if !in_delay_slot && let Some((source, level)) = bus.scu.take_pending_interrupt(imask) {
-            trace_scu_interrupt(
-                "step",
-                source,
-                level,
-                imask,
-                pc,
-                cycle,
-                bus.scu.ims,
-                bus.scu.ist,
-            );
-            scheduler
-                .entity_mut(*master_id)
-                .sh2_mut()
-                .cpu
-                .onchip
-                .intc
-                .raise_external(level, source.vector());
+        // Exactly the per-instruction sequence `step_cpus` runs for the master:
+        // interrupt sampling (the shared gate), the step itself (which publishes
+        // the cycle + PC to the bus and honours breakpoints), the FTI pulse and
+        // the trigger-point DMA drain — so single-stepping delivers interrupts
+        // and side effects at the same instruction as `run_for`.
+        forward_scu_irq(bus, scheduler.entity_mut(*master_id).sh2_mut(), "step");
+        let before = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+        bus.cur_is_slave = false;
+        scheduler.entity_mut(*master_id).step(bus);
+        apply_fti(bus, scheduler, *master_id, *slave_id);
+        if bus.scu.dma_pending() {
+            drain_dma(bus);
         }
-        let cpu = &mut scheduler.entity_mut(*master_id).sh2_mut().cpu;
-        // Mirror Sh2Entity::step: publish the current cycle to the bus so
-        // time-varying peripheral reads (SMPC SF INTBACK completion) settle
-        // at the exact instruction that reads them.
-        bus.cycle = cpu.pipeline.cycles;
-        cpu.step(bus)
+        let after = scheduler.entity(*master_id).sh2().cpu.pipeline.cycles;
+        (after - before) as u32
     }
 
     /// Debug-only: step the **slave** SH-2 one instruction (master frozen),
     /// for inspecting slave code. Returns 0 if the slave is halted. The slave
-    /// receives no SCU interrupt (those go to the master), so this is a plain
-    /// step; bus writes still trigger the `bw` watchpoint with the slave's PC.
+    /// receives no SCU interrupt (those go to the master); otherwise it runs
+    /// the same per-instruction sequence as in `step_cpus` (FTI pulse,
+    /// trigger-point DMA drain), and bus writes still trigger the `bw`
+    /// watchpoint with the slave's PC.
     pub fn debug_step_slave(&mut self) -> u32 {
         let Self {
             bus,
             scheduler,
+            master_id,
             slave_id,
             ..
         } = self;
-        let s = scheduler.entity_mut(*slave_id).sh2_mut();
-        if s.is_halted() {
+        if scheduler.entity(*slave_id).sh2().is_halted() {
             return 0;
         }
-        bus.cycle = s.cpu.pipeline.cycles;
-        bus.step_pc = s.cpu.regs.pc;
-        s.cpu.step(bus)
+        let before = scheduler.entity(*slave_id).sh2().cpu.pipeline.cycles;
+        bus.cur_is_slave = true;
+        scheduler.entity_mut(*slave_id).step(bus);
+        apply_fti(bus, scheduler, *master_id, *slave_id);
+        if bus.scu.dma_pending() {
+            drain_dma(bus);
+        }
+        let after = scheduler.entity(*slave_id).sh2().cpu.pipeline.cycles;
+        (after - before) as u32
     }
 
     /// Debug-only: run the SMPC/SCU drains once (the same set `run_for`
@@ -1001,8 +1076,9 @@ impl Saturn {
         if !vblank && (prev & 0x0008) != 0 {
             self.bus.scu.raise(crate::scu::Source::VBlankOut);
             self.bus.scu.trigger_dma_factor(1);
-            #[cfg(not(test))]
-            if std::env::var_os("SAT_INTC_TRACE").is_some() && now > 130_000_000 {
+            if let Some(after) = intc_trace_after()
+                && now >= after
+            {
                 eprintln!("RAISE VBlankOut now={now} IMS={:08X}", self.bus.scu.ims);
             }
         }
@@ -1213,25 +1289,10 @@ impl Saturn {
             };
         }
         // Apply any inter-CPU FRT input-capture (FTI) pulse the just-executed
-        // instruction flagged on the bus — pulse the *sibling's* FRT now so it
-        // sees the input-capture on its next instruction, not up to a batch
-        // (≤256 cy) later (M13 A1, incremental: FTI as a per-instruction event).
+        // instruction flagged on the bus (see [`apply_fti`]).
         macro_rules! apply_fti {
             () => {
-                if core::mem::take(&mut bus.slave_input_capture) {
-                    scheduler
-                        .entity_mut(*slave_id)
-                        .sh2_mut()
-                        .cpu
-                        .fti_input_capture();
-                }
-                if core::mem::take(&mut bus.master_input_capture) {
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .fti_input_capture();
-                }
+                apply_fti(bus, scheduler, *master_id, *slave_id)
             };
         }
         // Timing-sensitivity probe knob: run up to `batch` master instructions
@@ -1253,50 +1314,9 @@ impl Saturn {
                 while scheduler.entity(*cd_id).next_deadline() <= mcyc {
                     scheduler.entity_mut(*cd_id).step(bus);
                 }
-                // CD-block external interrupt (Source::Cd, vector 0x50, level 7):
-                // assert/deassert the SCU level from the live CD HIRQ before each
-                // instruction (Mednafen `RecalcIRQOut`). VF2's GFS file library is
-                // driven by this interrupt; without it the intro loops forever.
-                let cd_active = bus.cd_block.irq_active();
-                bus.scu.set_cd_int(cd_active);
-                // Phase 2B: sample the SCU interrupt line at the master's *current*
-                // SR.imask, every instruction. The SCU presents the highest-priority
-                // unmasked pending source as an IRL the master samples each cycle, so
-                // an interrupt becomes deliverable at the exact instruction imask
-                // drops below its level — not up to a full batch late, as the old
-                // once-per-batch `drain_scu_intc` forwarding did. The SCU's fixed
-                // per-source vector (0x40 + index) is latched, not the 64+level
-                // auto-vector.
-                // One borrow of the master entity per instruction for the two
-                // gating reads (imask + delay-slot). `pc`/`cycle` are only needed
-                // for the interrupt-fire trace, so they're read inside that (rare)
-                // branch — not on every instruction.
-                let master = scheduler.entity(*master_id).sh2();
-                let imask = master.cpu.regs.sr.imask();
-                let in_delay_slot = master.cpu.next_is_delay_slot();
-                if !in_delay_slot
-                    && let Some((source, level)) = bus.scu.take_pending_interrupt(imask)
-                {
-                    let master = scheduler.entity(*master_id).sh2();
-                    let (pc, cycle) = (master.cpu.regs.pc, master.cpu.pipeline.cycles);
-                    trace_scu_interrupt(
-                        "run",
-                        source,
-                        level,
-                        imask,
-                        pc,
-                        cycle,
-                        bus.scu.ims,
-                        bus.scu.ist,
-                    );
-                    scheduler
-                        .entity_mut(*master_id)
-                        .sh2_mut()
-                        .cpu
-                        .onchip
-                        .intc
-                        .raise_external(level, source.vector());
-                }
+                // Sample the CD/SCU interrupt lines and forward a pending source
+                // unless the master is in a delay slot (the single gate).
+                forward_scu_irq(bus, scheduler.entity_mut(*master_id).sh2_mut(), "run");
                 // Master leads by one instruction.
                 before_master(scheduler.entity(*master_id).sh2());
                 // Debug master PC+cycle stream (cost-lockstep vs Mednafen), capped.
@@ -1387,29 +1407,39 @@ impl Saturn {
             // cycle-exactly rather than up to a batch late — see `batch_size`.
             let batch = self.batch_size(now, remaining);
             self.step_cpus(now + batch);
-            // Feed the SCSP the master's ACTUAL advance, not the planned batch:
-            // the last instruction overshoots the batch edge by its cost (up to
-            // ~50 cycles of M12-t8 wait-states against a <=256-cycle batch), and
-            // a per-batch `run(batch)` dropped that overshoot from the SCSP
-            // timeline forever - in VF2 fights (mailbox polls at +48/read) the
-            // sound subsystem fell ~25% behind real time: slow BGM, and audio
-            // production of ~553 samples/frame vs 738 starved the frontend's
-            // pacing reserve (the user-felt "FPS downgrade").
-            self.scsp_debt += self.now() - now;
-            const SCSP_CHUNK: u64 = 256;
-            while self.scsp_debt >= SCSP_CHUNK {
-                self.feed_cd_audio(SCSP_CHUNK);
-                self.bus.scsp.run(SCSP_CHUNK);
-                self.scsp_debt -= SCSP_CHUNK;
-            }
-            self.update_video_timing();
-            self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
-            self.drain_scu_dsp();
-            self.drain_vdp1();
-            self.drain_scsp();
-            self.drain_input_capture();
+            self.post_batch(now);
         }
+    }
+
+    /// The between-batch work shared by [`run_for`](Self::run_for) and
+    /// [`run_for_traced`](Self::run_for_traced) (one definition so the trace
+    /// tool can never diverge from the real run): pay the SCSP the master's
+    /// actual advance since `batch_start`, settle the raster, then run the
+    /// peripheral drains.
+    fn post_batch(&mut self, batch_start: u64) {
+        // Feed the SCSP the master's ACTUAL advance, not the planned batch:
+        // the last instruction overshoots the batch edge by its cost (up to
+        // ~50 cycles of M12-t8 wait-states against a <=256-cycle batch), and
+        // a per-batch `run(batch)` dropped that overshoot from the SCSP
+        // timeline forever - in VF2 fights (mailbox polls at +48/read) the
+        // sound subsystem fell ~25% behind real time: slow BGM, and audio
+        // production of ~553 samples/frame vs 738 starved the frontend's
+        // pacing reserve (the user-felt "FPS downgrade"). The debt is banked
+        // and paid in fixed chunks (see `scsp_debt`).
+        self.scsp_debt += self.now() - batch_start;
+        const SCSP_CHUNK: u64 = 256;
+        while self.scsp_debt >= SCSP_CHUNK {
+            self.feed_cd_audio(SCSP_CHUNK);
+            self.bus.scsp.run(SCSP_CHUNK);
+            self.scsp_debt -= SCSP_CHUNK;
+        }
+        self.update_video_timing();
+        self.drain_smpc();
+        let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
+        self.drain_scu_dsp();
+        self.drain_vdp1();
+        self.drain_scsp();
+        self.drain_input_capture();
     }
 
     /// Debug-only: like [`run_for`](Self::run_for), but append the master
@@ -1436,21 +1466,7 @@ impl Saturn {
                     pcs.push(cpu.regs.pc);
                 }
             });
-            // See run_for: banked debt, paid in fixed chunks.
-            self.scsp_debt += self.now() - now;
-            const SCSP_CHUNK: u64 = 256;
-            while self.scsp_debt >= SCSP_CHUNK {
-                self.feed_cd_audio(SCSP_CHUNK);
-                self.bus.scsp.run(SCSP_CHUNK);
-                self.scsp_debt -= SCSP_CHUNK;
-            }
-            self.update_video_timing();
-            self.drain_smpc();
-            let _ = drain_dma(&mut self.bus); // backstop (per-instruction drain in step_cpus)
-            self.drain_scu_dsp();
-            self.drain_vdp1();
-            self.drain_scsp();
-            self.drain_input_capture();
+            self.post_batch(now);
         }
     }
 
