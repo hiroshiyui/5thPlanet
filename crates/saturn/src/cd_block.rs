@@ -1839,10 +1839,18 @@ impl CdBlock {
     /// whenever the cushion was still settling against the seek startup + bursty
     /// fill, which stuttered at the *start* of playback. A near-miss now just
     /// pads the shortfall once; only a true empty re-arms the cushion.
+    ///
+    /// The cushion only applies while the drive is still streaming CD-DA. Once
+    /// it has stopped (a play shorter than the pre-roll — a jingle or a short
+    /// sound effect — ended, or the drive moved on), whatever is buffered starts
+    /// playing at once; otherwise a short play would never be heard and its
+    /// samples would sit in the buffer and leak in front of the next play.
     pub fn take_cd_audio_buffered(&mut self, n: usize) -> Vec<i16> {
         const PREROLL: usize = 44_100; // ~0.5 s of interleaved stereo
         if !self.cd_audio_primed {
-            if self.cd_audio.len() < PREROLL.max(n) {
+            let ready = self.cd_audio.len() >= PREROLL.max(n)
+                || (!self.cd_audio.is_empty() && !self.streaming_cdda());
+            if !ready {
                 return vec![0i16; n];
             }
             self.cd_audio_primed = true;
@@ -1852,6 +1860,17 @@ impl CdBlock {
             self.cd_audio_primed = false; // fully drained → re-buffer before resuming
         }
         out
+    }
+
+    /// Whether the drive is reading an audio track (so more CD-DA is coming):
+    /// in the Play phase with the head on an audio track.
+    fn streaming_cdda(&self) -> bool {
+        self.drive_phase == DrivePhase::Play
+            && self
+                .disc
+                .as_ref()
+                .and_then(|d| d.track_at_fad(self.cd_curfad))
+                .is_some_and(|t| t.is_audio)
     }
 
     /// Remove `num` blocks from partition `buf` starting at `ofs`, freeing them.
@@ -5387,6 +5406,32 @@ mod tests {
         let out = c.take_cd_audio_buffered(64);
         assert_eq!(out, vec![0i16; 64], "no cushion yet → silence");
         assert!(!c.cd_audio_primed, "still un-primed below the pre-roll");
+    }
+
+    /// A CD-DA play shorter than the pre-roll cushion must still be heard:
+    /// once the drive has stopped streaming audio, the buffered samples start
+    /// draining immediately instead of waiting for a cushion that will never
+    /// fill (and leaking in front of the next play). While the drive is still
+    /// playing an audio track the cushion holds as before.
+    #[test]
+    fn short_cdda_play_drains_once_the_drive_stops_streaming() {
+        let mut c = CdBlock::new();
+        c.insert_disc(audio_disc());
+        assert!(c.read_cd_audio_sector(FAD_OFFSET)); // 1176 samples ≪ pre-roll
+        // Still playing the audio track → hold the cushion.
+        c.drive_phase = DrivePhase::Play;
+        c.cd_curfad = FAD_OFFSET;
+        assert_eq!(c.take_cd_audio_buffered(64), vec![0i16; 64]);
+        assert!(!c.cd_audio_primed);
+        // The play ended (drive paused) → drain what was decoded.
+        c.drive_phase = DrivePhase::Pause;
+        let out = c.take_cd_audio_buffered(1176);
+        assert!(out.iter().any(|&s| s != 0), "the short play is heard");
+        assert!(
+            c.cd_audio.is_empty(),
+            "nothing left to leak into the next play"
+        );
+        assert!(!c.cd_audio_primed, "fully drained → re-arms the cushion");
     }
 
     #[test]
