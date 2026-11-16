@@ -395,8 +395,9 @@ fn main() -> ExitCode {
         },
     };
 
-    // Sibling files for the quicksave state (`.state`) and the persisted
-    // internal backup RAM / battery (`.bup`), keyed to the BIOS path.
+    // Base path for the BIOS-keyed save files — the internal backup RAM
+    // (`.bup`) and the backup-cart cards (`.N.crtbup`). Save states key to the
+    // loaded disc instead (`Session::state_base`, ADR-0023).
     let save_base = std::path::PathBuf::from(&bios_path);
 
     // Fold the legacy `mouse` config token (`off`/`1`/`2`) into the per-port
@@ -733,9 +734,10 @@ fn run(
     };
     saturn.insert_cartridge(cart);
 
-    // Save-state quickslot and the persisted battery (internal backup RAM),
-    // both keyed to the BIOS path. F5/F9 use the former; the latter is the
-    // console's "memory card", loaded here and written back on exit.
+    // The persisted battery (internal backup RAM) — the console's "memory
+    // card", keyed to the BIOS path; loaded here and written back on change and
+    // at exit. (The F5/F9 quickslot is a save state, keyed to the disc image —
+    // `Session::state_path`, ADR-0023.)
     let bup_path = battery_path(&save_base);
     if let Ok(bytes) = fs::read(&bup_path) {
         saturn.load_internal_backup(&bytes);
@@ -950,7 +952,6 @@ fn run(
         ));
     }
 
-    let event_subsystem = sdl.event().expect("SDL event subsystem");
     let mut events = sdl.event_pump().expect("event pump");
     let mut framebuffer = vec![0u8; FRAMEBUFFER_BYTES];
     let osd = Osd::new();
@@ -1184,7 +1185,13 @@ fn run(
                 }
                 let ctx = OsdCtx {
                     disc_present: saturn.has_disc(),
-                    slot_used: std::array::from_fn(|n| sess.slot_path(n as u8).exists()),
+                    // Which save slots exist — 10 file stats, so only while the
+                    // menu is open (the Save/Load screens read it).
+                    slot_used: if osd.is_open() {
+                        std::array::from_fn(|n| sess.slot_path(n as u8).exists())
+                    } else {
+                        Default::default()
+                    },
                     scale: sess.ui.scale,
                     fullscreen: sess.ui.fullscreen,
                     sharp: sess.ui.sharp,
@@ -1564,7 +1571,6 @@ fn run(
                 }
 
                 if perflog && pl_last.elapsed().as_secs() >= 1 {
-                    let total: u32 = pl_bursts.iter().sum();
                     eprintln!(
                         "EMU  frames/s={pl_frames} burst[0/1/2]={}/{}/{} | advance avg {:.2} ms/frame",
                         pl_bursts[0],
@@ -1576,7 +1582,6 @@ fn run(
                             0.0
                         },
                     );
-                    let _ = total;
                     pl_advance = std::time::Duration::ZERO;
                     pl_frames = 0;
                     pl_bursts = [0; 3];
@@ -1605,9 +1610,6 @@ fn run(
         let mut audio_last_change = std::time::Instant::now();
         let mut audio_last_log = std::time::Instant::now();
         'main: loop {
-            // (See the event-range flush note in the git history: SDL ≥ 2.28
-            // emits display events 0.37's binding panics on.)
-            event_subsystem.flush_events(0x201, 0x20F);
             for ev in events.poll_iter() {
                 match ev {
                     Event::Quit { .. } => break 'main,
