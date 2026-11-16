@@ -320,6 +320,18 @@ impl SaturnBus {
         Some((u32::from(hi) << 16) | u32::from(lo))
     }
 
+    /// Settle the SMPC against the current cycle before an SMPC register
+    /// access: drop SF once an INTBACK's execution time has elapsed and raise
+    /// the SCU SMPC interrupt once its phase end is reached, so a guest poll
+    /// observes both at the exact instruction rather than at a batch boundary.
+    #[inline]
+    fn settle_smpc(&mut self) {
+        self.smpc.settle_intback(self.cycle);
+        if self.smpc.take_intback_irq(self.cycle) {
+            self.scu.raise(crate::scu::Source::Smpc);
+        }
+    }
+
     /// Pop the last-noted raster-register read `(reg_offset, stored_value)` (M13
     /// A1 jitter probe). The aggregate drains this after each instruction.
     pub fn take_raster_read(&mut self) -> Option<(u32, u16, u32, u64)> {
@@ -686,7 +698,7 @@ impl Bus for SaturnBus {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read8(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
-                self.smpc.settle_intback(self.cycle);
+                self.settle_smpc();
                 self.smpc.read8(addr - SMPC_BASE)
             }
             BACKUP_BASE..=BACKUP_END => self.backup.read8(addr - BACKUP_BASE),
@@ -714,7 +726,7 @@ impl Bus for SaturnBus {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read16(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
-                self.smpc.settle_intback(self.cycle);
+                self.settle_smpc();
                 self.smpc.read16(addr - SMPC_BASE)
             }
             BACKUP_BASE..=BACKUP_END => self.backup.read16(addr - BACKUP_BASE),
@@ -760,7 +772,7 @@ impl Bus for SaturnBus {
         let v = match addr {
             BIOS_BASE..=BIOS_END => self.bios.read32(addr - BIOS_BASE),
             SMPC_BASE..=SMPC_END => {
-                self.smpc.settle_intback(self.cycle);
+                self.settle_smpc();
                 self.smpc.read32(addr - SMPC_BASE)
             }
             BACKUP_BASE..=BACKUP_END => self.backup.read32(addr - BACKUP_BASE),

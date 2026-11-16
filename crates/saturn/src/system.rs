@@ -1279,6 +1279,12 @@ impl Saturn {
         {
             next = next.min(t - now);
         }
+        // The INTBACK phase-end interrupt lands at its exact cycle too.
+        if let Some(t) = self.bus.smpc.intback_irq_at
+            && t > now
+        {
+            next = next.min(t - now);
+        }
         // VDP1 sprite-draw-end: an in-flight plot completes at a known cycle, so
         // make the batch land there exactly — the draw-end interrupt fires at the
         // modelled cycle, not up to a batch late (M13 A1, incremental).
@@ -1569,8 +1575,13 @@ impl Saturn {
     /// effect. Called from `run_for` between scheduler batches.
     fn drain_smpc(&mut self) {
         // Fallback: drop SF once a pending INTBACK's execution time has
-        // elapsed, in case nothing read SMPC to settle it on-access.
-        self.bus.smpc.settle_intback(self.now());
+        // elapsed, and raise its phase-end interrupt, in case nothing read
+        // SMPC to settle it on-access (the batch is clamped to both edges).
+        let now = self.now();
+        self.bus.smpc.settle_intback(now);
+        if self.bus.smpc.take_intback_irq(now) {
+            self.bus.scu.raise(crate::scu::Source::Smpc);
+        }
         while let Some(cmd) = self.bus.smpc.take_pending() {
             match cmd {
                 SmpcCommand::SshOn => self.release_slave(),
@@ -1599,10 +1610,12 @@ impl Saturn {
                     // is `(SR & ~0x80 & ~NPE) | 0x0F`, with NPE (0x20) set iff
                     // peripheral data was also requested — *not* the old
                     // `0x40 | stage<<5` (bit 6 set, low nibble 0), which the
-                    // BIOS's INTBACK state machine reads. Raise the SMPC
-                    // interrupt now so the response is ready the moment SF
-                    // drops, and keep SF busy for the request-dependent
-                    // execution time (`intback_busy_us`); `settle_intback`
+                    // BIOS's INTBACK state machine reads. Schedule the SMPC
+                    // interrupt for the end of the phase that filled OREG
+                    // (Mednafen raises it after the phase's clocks, not at
+                    // dispatch; a request for neither phase raises none), and
+                    // keep SF busy for the request-dependent execution time
+                    // (`intback_busy_us`); `settle_intback`
                     // clears it on the exact instruction that reads SMPC past
                     // completion.
                     let ireg0 = self.bus.smpc.ireg[0];
@@ -1641,9 +1654,20 @@ impl Saturn {
                         self.bus.smpc.sr &= !0xA0;
                         self.bus.smpc.intback_stage = 0;
                     }
+                    let now = self.now();
                     let busy = us_to_cycles(intback_busy_us(ireg0, ireg1));
-                    self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
-                    self.bus.scu.raise(crate::scu::Source::Smpc);
+                    self.bus.smpc.intback_complete_at = Some(now.saturating_add(busy));
+                    // The status phase ends after its own clocks even when
+                    // peripheral data follows on CONTINUE.
+                    let irq_phase = if want_status {
+                        Some(intback_busy_us(ireg0, 0))
+                    } else if want_periph {
+                        Some(intback_busy_us(0, ireg1))
+                    } else {
+                        None
+                    };
+                    self.bus.smpc.intback_irq_at =
+                        irq_phase.map(|us| now.saturating_add(us_to_cycles(us)));
                     continue; // do NOT mark_command_done (SF stays busy)
                 }
                 SmpcCommand::SetTime => {
@@ -1699,9 +1723,9 @@ impl Saturn {
             self.respond_to_intback_peripheral();
             self.bus.smpc.sr = intback_last_block_sr(&self.bus.smpc);
             self.bus.smpc.intback_stage = 0;
-            let busy = us_to_cycles(700);
-            self.bus.smpc.intback_complete_at = Some(self.now().saturating_add(busy));
-            self.bus.scu.raise(crate::scu::Source::Smpc);
+            let done = self.now().saturating_add(us_to_cycles(700));
+            self.bus.smpc.intback_complete_at = Some(done);
+            self.bus.smpc.intback_irq_at = Some(done); // raised at the phase end
         }
     }
 

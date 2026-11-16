@@ -149,6 +149,12 @@ pub struct Smpc {
     /// reference-derived and unverified — see the `REVIEW(magic)` on
     /// `intback_busy_us`.)
     pub intback_complete_at: Option<u64>,
+    /// Global cycle at which the in-flight INTBACK phase raises the SCU SMPC
+    /// interrupt: the **end** of the phase that filled OREG (status: 92 + 952
+    /// SMPC clocks; peripheral: its scan), as Mednafen's `SCU_SetInt(SMPC)`
+    /// sits after each phase's `SMPC_EAT_CLOCKS` — not the instant the command
+    /// is dequeued. Taken by [`Smpc::take_intback_irq`].
+    pub intback_irq_at: Option<u64>,
     /// INTBACK staged-peripheral protocol state. 0 = not in an INTBACK
     /// peripheral sequence; 1 = the status phase returned and peripheral data
     /// follows on the host's CONTINUE (`SR.NPE` set). The status phase sets it
@@ -635,14 +641,28 @@ impl Smpc {
         self.sf = 0;
     }
 
+    /// `true` exactly once, when the in-flight INTBACK phase's interrupt time
+    /// (`intback_irq_at`) has been reached at global `cycle`; the caller raises
+    /// the SCU SMPC source.
+    pub fn take_intback_irq(&mut self, cycle: u64) -> bool {
+        match self.intback_irq_at {
+            Some(t) if cycle >= t => {
+                self.intback_irq_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve a pending INTBACK against the current global cycle: once
     /// the command's execution time has elapsed (`intback_complete_at`),
     /// drop SF so the BIOS's poll loop sees "done". Called on every SMPC
     /// access so SF clears at the *exact* instruction that reads it,
     /// rather than at a coarse drain boundary — the BIOS polls SF tightly
     /// and a late clear desyncs it from the raster (Yabause reference-diff
-    /// at the 0x1D64 SF poll). OREG and the SMPC interrupt are filled when
-    /// the command is dequeued, so the response is ready before SF drops.
+    /// at the 0x1D64 SF poll). OREG is filled when the command is dequeued, so
+    /// the response is ready before SF drops; the SMPC interrupt is raised at
+    /// the phase end (`intback_irq_at`).
     pub fn settle_intback(&mut self, cycle: u64) {
         if let Some(done_at) = self.intback_complete_at
             && cycle >= done_at

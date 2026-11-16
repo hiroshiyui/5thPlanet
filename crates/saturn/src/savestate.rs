@@ -67,8 +67,10 @@ const MAGIC: [u8; 4] = *b"5PSS";
 /// bytes reported after the digital buttons by a `ThreeDPad` port — M13 E2).
 /// v17 (one bump for the 2026-11 review-fix round): the header gained the
 /// cartridge identity (kind, cart-ID, ROM fingerprint) and is now validated
-/// prefix-first; the concurrent sh2 (on-chip reset state) and CD-block/VDP1
-/// fixes of the same round changed their serialized shapes.
+/// prefix-first; the SMPC gained `cd_on`/`clock_352` (live INTBACK OREG10/11)
+/// and `intback_irq_at` (the phase-end interrupt time); the concurrent sh2
+/// (on-chip reset state) and CD-block/VDP1 fixes of the same round changed
+/// their serialized shapes.
 const VERSION: u32 = 17;
 
 /// The header's leading fields, identical in every version — decoded on its

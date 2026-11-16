@@ -208,6 +208,21 @@ fn nmireq_raises_nmi_on_master_sh2_through_run_for() {
 }
 
 #[test]
+fn intback_interrupt_fires_at_the_phase_end_not_at_dispatch() {
+    // Mednafen raises SCU_INT_SMPC after the status phase's 92 + 952 SMPC
+    // clocks (~261 µs ≈ 7_475 cycles), not when the command is dequeued.
+    let smpc_bit = 1u32 << saturn::ScuSource::Smpc.bit();
+    let mut sat = build();
+    sat.bus.write8(0x0010_0001, 0x01, AccessKind::Data); // IREG0: status
+    sat.bus.write8(0x0010_0003, 0x00, AccessKind::Data);
+    sat.bus.write8(COMREG, 0x10, AccessKind::Data);
+    sat.run_for(2_000);
+    assert_eq!(sat.bus.scu.ist & smpc_bit, 0, "not yet at dispatch");
+    sat.run_for(8_000);
+    assert_ne!(sat.bus.scu.ist & smpc_bit, 0, "raised at the phase end");
+}
+
+#[test]
 fn intback_system_status_reflects_the_live_machine() {
     // OREG10/11 track CKCHG / SSHON / SNDON / CDOFF (Mednafen CMD_INTBACK).
     let mut sat = build();
