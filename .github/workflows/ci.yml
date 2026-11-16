@@ -27,7 +27,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Build-time deps for the vendored SDL3 cmake build (same list as
       # package-linux.yml — keep them in sync).
