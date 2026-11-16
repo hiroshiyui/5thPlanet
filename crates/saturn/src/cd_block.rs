@@ -34,7 +34,11 @@
 
 use std::collections::VecDeque;
 
-use crate::disc::{FAD_OFFSET, SectorSource};
+use crate::disc::{FAD_OFFSET, RAW_SECTOR, SectorSource, TrackMode, raw_sector_offset};
+
+/// Byte offset of the user payload inside a raw 2352-byte Mode-2 sector:
+/// 12 sync + 4 header + 8 subheader.
+const MODE2_USER_OFFSET: usize = TrackMode::Mode2.user_offset_2352();
 
 pub const CD_BLOCK_BASE: u32 = 0x0589_0000;
 pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
@@ -42,9 +46,6 @@ pub const CD_BLOCK_END: u32 = 0x0589_FFFF;
 /// Offset of the data-transfer FIFO within the region.
 const DATA_FIFO: u32 = 0x8000;
 
-/// Byte offset of the user payload inside a raw 2352-byte Mode-2 sector:
-/// 12 sync + 4 header + 8 subheader.
-const MODE2_USER_OFFSET: usize = 24;
 /// User-payload length of a Mode-2 **Form-2** sector (`submode` bit 5 set): the
 /// EDC/ECC area shrinks to a single 4-byte EDC, so the payload grows from the
 /// Form-1 2048 to 2324 (`2352 - 12 sync - 4 header - 8 subheader - 4 EDC`).
@@ -174,6 +175,13 @@ struct DirEntry {
     interleave_gap_size: u8,
     #[allow(dead_code)] // retained for Get File Info / debugging
     name: Vec<u8>,
+}
+
+/// Clamp a commanded track number into `first..=last` without panicking when
+/// a malformed [`SectorSource`] reports `first > last` (`u8::clamp` asserts
+/// `min <= max`); such a source resolves to `last`.
+fn clamp_track(t: u8, first: u8, last: u8) -> u8 {
+    t.max(first).min(last)
 }
 
 /// Little-endian u32 from a byte slice at `o` (0 if out of range).
@@ -1049,30 +1057,42 @@ impl CdBlock {
             // it; the 276-byte drift fed its ADPCM decoder a stray control byte
             // → a runaway IIR filter → a loud saturating buzz).
             let form2 = matches!(sub, Some((_, _, subm, _)) if subm & 0x20 != 0);
-            let mut buf = [0u8; 2352];
+            // The on-disc sector, re-framed into a raw 2352-byte sector (a
+            // `MODE2/2336` image sector lacks the 16-byte sync + header, so it
+            // lands at byte 16) — the layout Mednafen's buffers hold and its
+            // `DT_SetIBOffsCount` offsets index into. A cooked 2048 sector has
+            // no raw framing (`raw_off == None`).
+            let mut buf = [0u8; RAW_SECTOR];
+            let n = disc.read_full_sector(fad, &mut buf);
+            if n == 0 {
+                return false;
+            }
+            let raw_off = raw_sector_offset(n);
+            if let Some(o) = raw_off.filter(|&o| o > 0) {
+                buf.copy_within(0..n, o);
+                buf[..o].fill(0);
+            }
             // Store the sector's payload: the 2324-byte Form-2 user data, else
-            // the 2048 user payload (`sectlenin==2048`, the common case), else a
-            // leading slice of the full on-disc sector.
+            // the 2048 user payload (`sectlenin==2048`, the common case), else
+            // the *trailing* `sectlenin` bytes of the raw sector — Mednafen
+            // `DT_SetIBOffsCount`: 2336 starts at the subheader (byte 16), 2340
+            // at the header (byte 12), 2352 at the sync (byte 0).
             let data = if self.sectlenin == 2048 {
-                if form2 {
-                    let n = disc.read_full_sector(fad, &mut buf);
-                    if n < MODE2_USER_OFFSET + FORM2_USER_LEN {
-                        return false;
-                    }
+                if form2 && raw_off.is_some() {
                     buf[MODE2_USER_OFFSET..MODE2_USER_OFFSET + FORM2_USER_LEN].to_vec()
                 } else {
-                    if !disc.read_sector(fad, &mut buf[..2048]) {
+                    let mut user = [0u8; 2048];
+                    if !disc.read_sector(fad, &mut user) {
                         return false;
                     }
-                    buf[..2048].to_vec()
+                    user.to_vec()
                 }
             } else {
-                let len = self.sectlenin as usize;
-                let n = disc.read_full_sector(fad, &mut buf);
-                if n == 0 {
-                    return false;
+                let len = (self.sectlenin as usize).min(RAW_SECTOR);
+                match raw_off {
+                    Some(_) => buf[RAW_SECTOR - len..].to_vec(),
+                    None => buf[..len.min(n)].to_vec(),
                 }
-                buf[..len.min(n)].to_vec()
             };
             (data, sub)
         };
@@ -1454,13 +1474,15 @@ impl CdBlock {
     }
 
     /// Start FAD of `track` (clamped to the disc's track range) from the TOC,
-    /// for the Play command's track/index addressing form.
+    /// for the Play command's track/index addressing form. `None` when the
+    /// clamped track has no TOC slot (a malformed source's track 0 / > 99).
     fn track_start_fad(&self, track: u8) -> Option<u32> {
         let d = self.disc.as_ref()?;
-        let t = track.clamp(d.first_track(), d.last_track());
+        let t = clamp_track(track, d.first_track(), d.last_track());
         let toc = d.toc();
-        let i = (t as usize - 1) * 4;
-        Some(((toc[i + 1] as u32) << 16) | ((toc[i + 2] as u32) << 8) | toc[i + 3] as u32)
+        let i = (t as usize).checked_sub(1)? * 4;
+        let e = toc.get(i + 1..i + 4)?;
+        Some(((e[0] as u32) << 16) | ((e[1] as u32) << 8) | e[2] as u32)
     }
 
     /// Track number under the play head, for the track-form end checks
@@ -1483,8 +1505,11 @@ impl CdBlock {
             if self.cur_play_end & 0x80_0000 != 0 {
                 end_met |= self.cd_curfad >= (self.cur_play_end & 0x7F_FFFF);
             } else if let Some(d) = self.disc.as_ref() {
-                let end_track = (((self.cur_play_end >> 8) & 0xFF) as u8)
-                    .clamp(d.first_track(), d.last_track());
+                let end_track = clamp_track(
+                    ((self.cur_play_end >> 8) & 0xFF) as u8,
+                    d.first_track(),
+                    d.last_track(),
+                );
                 // Our index is always 1, so only the track number can exceed
                 // the bound (Mednafen also compares `idx > end_index`).
                 end_met |= self.head_track() > end_track;
@@ -1493,8 +1518,11 @@ impl CdBlock {
         if self.cur_play_start & 0x80_0000 != 0 {
             end_met |= self.cd_curfad < (self.cur_play_start & 0x7F_FFFF);
         } else if let Some(d) = self.disc.as_ref() {
-            let start_track =
-                (((self.cur_play_start >> 8) & 0xFF) as u8).clamp(d.first_track(), d.last_track());
+            let start_track = clamp_track(
+                ((self.cur_play_start >> 8) & 0xFF) as u8,
+                d.first_track(),
+                d.last_track(),
+            );
             end_met |= self.head_track() < start_track;
         }
         end_met
@@ -3383,6 +3411,118 @@ mod tests {
             c.blocks[b1].data[0], 1,
             "Form-1 payload ramp (sector tag 1)"
         );
+    }
+
+    /// The [`mode2_form_disc`] sectors as a `MODE2/2336` image (each sector
+    /// stripped of its 12-byte sync + 4-byte header).
+    fn mode2_2336_disc() -> Disc {
+        let raw = mode2_form_disc();
+        let mut bin = Vec::new();
+        for fad in FAD_OFFSET..FAD_OFFSET + 2 {
+            bin.extend_from_slice(&raw.read_full_sector(fad).unwrap()[16..]);
+        }
+        Disc::from_cue(
+            "FILE \"m2.bin\" BINARY\n  TRACK 01 MODE2/2336\n    INDEX 01 00:00:00\n",
+            |_| Some(bin.clone()),
+        )
+        .expect("mode2/2336 cue")
+    }
+
+    /// A `MODE2/2336` image carries the subheader, so Form-2 detection and the
+    /// 2324-byte payload apply exactly as for a raw 2352 image.
+    #[test]
+    fn form2_detection_and_sizing_apply_to_mode2_2336_images() {
+        let mut c = CdBlock::new();
+        c.insert_disc(mode2_2336_disc());
+        c.cd_device_filter = 0;
+        assert!(c.read_filtered_sector(FAD_OFFSET));
+        let b2 = c.partitions[0].blocks[0];
+        assert_eq!(c.blocks[b2].size, FORM2_USER_LEN as i32, "Form-2 → 2324");
+        assert_eq!(c.blocks[b2].data[2300], 2300usize as u8);
+        assert_eq!(c.blocks[b2].subm, 0x64, "subheader read from a 2336 sector");
+        assert!(c.read_filtered_sector(FAD_OFFSET + 1));
+        let b1 = c.partitions[0].blocks[1];
+        assert_eq!(c.blocks[b1].size, 2048, "Form-1 stays 2048");
+        assert_eq!(c.blocks[b1].data[0], 1);
+    }
+
+    /// A non-2048 host sector length takes the *trailing* bytes of the raw
+    /// sector (Mednafen `DT_SetIBOffsCount`: 2336 from the subheader, 2340 from
+    /// the header, 2352 from the sync), for raw and 2336 images alike.
+    #[test]
+    fn raw_sector_lengths_take_the_trailing_bytes_of_the_raw_sector() {
+        for disc in [mode2_form_disc(), mode2_2336_disc()] {
+            let is_2336 = disc.tracks()[0].length == 2 && disc.image().len() == 2 * 2336;
+            let mut c = CdBlock::new();
+            c.insert_disc(disc);
+            c.cd_device_filter = 0;
+            for (len, first) in [(2336u32, 0x00), (2340, 0x00), (2352, 0x00)] {
+                c.sectlenin = len;
+                assert!(c.read_filtered_sector(FAD_OFFSET));
+                let b = *c.partitions[0].blocks.last().unwrap();
+                let d = &c.blocks[b].data;
+                assert_eq!(d.len(), len as usize);
+                assert_eq!(d[0], first);
+                // The submode byte sits at raw offset 18 = trailing index
+                // `18 - (2352 - len)`.
+                assert_eq!(d[18 - (2352 - len as usize)], 0x64, "len {len}");
+                if len == 2352 && !is_2336 {
+                    assert_eq!(d[1], 0xFF, "2352 starts at the sync pattern");
+                }
+                // Header mode byte at raw offset 15 (absent → 0 in a 2336 image).
+                if len >= 2340 {
+                    let mode = d[15 - (2352 - len as usize)];
+                    assert_eq!(mode, if is_2336 { 0 } else { 2 });
+                }
+            }
+        }
+    }
+
+    /// A malformed live source can report `first_track > last_track` and a TOC
+    /// with no valid slot; track-form addressing must clamp without the
+    /// `u8::clamp` assertion panic and without indexing outside the TOC.
+    #[test]
+    fn track_form_addressing_survives_a_malformed_track_range() {
+        #[derive(Debug)]
+        struct Bad;
+        impl SectorSource for Bad {
+            fn toc(&self) -> [u8; 408] {
+                [0xFF; 408]
+            }
+            fn first_track(&self) -> u8 {
+                5
+            }
+            fn last_track(&self) -> u8 {
+                0
+            }
+            fn lead_out_fad(&self) -> u32 {
+                FAD_OFFSET
+            }
+            fn track_at_fad(&self, _: u32) -> Option<crate::disc::TrackInfo> {
+                None
+            }
+            fn read_sector(&self, _: u32, _: &mut [u8]) -> bool {
+                false
+            }
+            fn read_full_sector(&self, _: u32, _: &mut [u8]) -> usize {
+                0
+            }
+            fn subheader(&self, _: u32) -> Option<(u8, u8, u8, u8)> {
+                None
+            }
+            fn fingerprint(&self) -> u64 {
+                0
+            }
+        }
+        let mut c = CdBlock::new();
+        c.insert_disc(Bad);
+        assert_eq!(c.track_start_fad(3), None, "clamped to track 0 → no slot");
+        c.cur_play_start = 0x0301;
+        c.cur_play_end = 0x0463;
+        let _ = c.check_end_met();
+        assert_eq!(clamp_track(7, 5, 0), 0);
+        assert_eq!(clamp_track(7, 1, 9), 7);
+        assert_eq!(clamp_track(0, 1, 9), 1);
     }
 
     /// Regression: a **buffer-full pause** (`end_met` false) must NOT consume
