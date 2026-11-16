@@ -2522,14 +2522,22 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             0x43 => {
-                // Get filter subheader conditions.
-                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
-                let fl = self.filters[f].clone();
-                self.cr1 = self.cd_stat() | fl.chan as u16;
-                self.cr2 = ((fl.smmask as u16) << 8) | fl.cimask as u16;
-                self.cr3 = fl.fid as u16;
-                self.cr4 = ((fl.smval as u16) << 8) | fl.cival as u16;
-                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                // Get filter subheader conditions (Mednafen
+                // `COMMAND_GET_FILTSUBHC`, cdb.cpp:3116): an out-of-range
+                // filter number is rejected, not silently mapped to filter 23.
+                // CR3 echoes the filter number in its high byte.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if let Some(fl) = self.filters.get(f) {
+                    self.cr1 = self.cd_stat() | fl.chan as u16;
+                    self.cr2 = ((fl.smmask as u16) << 8) | fl.cimask as u16;
+                    self.cr3 = ((f as u16) << 8) | fl.fid as u16;
+                    self.cr4 = ((fl.smval as u16) << 8) | fl.cival as u16;
+                    self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x44 => {
                 // Set filter mode (CR1 low; bit 7 = re-initialise the filter).
@@ -2546,13 +2554,21 @@ impl CdBlock {
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
             }
             0x45 => {
-                // Get filter mode.
-                let f = (((self.cr3 >> 8) & 0xFF) as usize).min(MAX_FILTERS - 1);
-                self.cr1 = self.cd_stat() | self.filters[f].mode as u16;
-                self.cr2 = 0;
-                self.cr3 = 0;
-                self.cr4 = 0;
-                self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                // Get filter mode (Mednafen `COMMAND_GET_FILTMODE`,
+                // cdb.cpp:3160): reject an out-of-range filter number; CR3
+                // echoes the filter number in its high byte.
+                let f = ((self.cr3 >> 8) & 0xFF) as usize;
+                if let Some(fl) = self.filters.get(f) {
+                    self.cr1 = self.cd_stat() | fl.mode as u16;
+                    self.cr2 = 0;
+                    self.cr3 = (f as u16) << 8;
+                    self.cr4 = 0;
+                    self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
+                } else {
+                    self.cd_report();
+                    self.cr1 = STAT_REJECT;
+                    self.hirq |= HIRQ_CMOK;
+                }
             }
             0x46 => {
                 // Set filter connection: CR1 bit0=true cond, bit1=false cond.
@@ -2596,12 +2612,14 @@ impl CdBlock {
                 let num = self.cr4 as usize;
                 self.calcsize = 0;
                 if let Some(p) = self.partitions.get(buf) {
-                    let idxs: Vec<usize> = p.blocks.clone();
-                    for i in 0..num {
-                        if let Some(&b) = idxs.get(offs + i) {
-                            self.calcsize += (self.blocks[b].size.max(0) as u32) / 2;
-                        }
-                    }
+                    let blocks = &self.blocks;
+                    self.calcsize = p
+                        .blocks
+                        .iter()
+                        .skip(offs)
+                        .take(num)
+                        .map(|&b| (blocks[b].size.max(0) as u32) / 2)
+                        .sum();
                 }
                 self.cd_report();
                 self.hirq |= HIRQ_CMOK | HIRQ_ESEL;
@@ -4068,6 +4086,26 @@ mod tests {
         assert_eq!(c.read16(0x0018) & 0xFF, 0x07);
     }
 
+    /// Get Filter Subheader / Get Filter Mode reject a filter number ≥ 24
+    /// (Mednafen `fnum >= 0x18` → `CDStatusResults(true)`) instead of
+    /// silently answering for filter 23, and echo the filter number in CR3.
+    #[test]
+    fn get_filter_queries_reject_out_of_range_filters() {
+        let mut c = CdBlock::new();
+        cmd(&mut c, 0x4207, 0x0000, 0x1799, 0x0000); // filter 23: chan 7, fid 0x99
+        cmd(&mut c, 0x4300, 0x0000, 0x1700, 0x0000);
+        assert_eq!(c.read16(0x0018) & 0xFF, 0x07);
+        assert_eq!(c.read16(0x0020), 0x1799, "CR3 = filter number | file id");
+        cmd(&mut c, 0x4500, 0x0000, 0x1700, 0x0000);
+        assert_eq!(c.read16(0x0020), 0x1700, "CR3 = filter number");
+        for command in [0x4300u16, 0x4500] {
+            cmd(&mut c, command, 0x0000, 0x1800, 0x0000); // filter 24
+            assert_eq!(c.read16(0x0018), STAT_REJECT, "cmd {command:04X}");
+            cmd(&mut c, command, 0x0000, 0xFF00, 0x0000);
+            assert_eq!(c.read16(0x0018), STAT_REJECT, "cmd {command:04X}");
+        }
+    }
+
     #[test]
     fn cd_device_connection_round_trips() {
         let mut c = CdBlock::new();
@@ -4708,6 +4746,9 @@ mod tests {
         // A sub-range (offset 1, count 1) sums just that one block.
         cmd(&mut c, 0x5200, 0x0001, 0x0100, 0x0001);
         assert_eq!(c.calcsize, 1024, "block 11 only = 2048/2 words");
+        // A range running past the partition sums only the blocks it has.
+        cmd(&mut c, 0x5200, 0x0002, 0x0100, 0xFFFF);
+        assert_eq!(c.calcsize, 512, "block 12 only = 1024/2 words");
     }
 
     // ===== FAD search (0x55 Execute / 0x56 Get) =====
