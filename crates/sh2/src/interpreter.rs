@@ -328,6 +328,14 @@ impl Cpu {
         self.onchip.bsc.is_slave = is_slave;
     }
 
+    /// Drive the NMI input pin level (`true` = high). ICR bit 15 (NMIL) reads
+    /// it back. Defaults to high (the Saturn master's idle NMI line); a pin
+    /// property, so it survives [`reset`]. Edge-triggered NMI delivery is not
+    /// modelled here — the host raises `Source::Nmi` itself.
+    pub fn set_nmi_pin(&mut self, high: bool) {
+        self.onchip.intc.nmi_pin_low = !high;
+    }
+
     /// True when the next [`step`] will execute a branch delay slot
     /// (a branch is pending). Used by trace tooling to match reference
     /// emulators that execute the delay slot inside the branch handler.

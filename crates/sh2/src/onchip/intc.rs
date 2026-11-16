@@ -59,6 +59,13 @@ pub struct Intc {
     pub vcrb: u16,
     pub vcrc: u16,
     pub vcrd: u16,
+    /// The NMI **input pin** is driven LOW. ICR bit 15 (NMIL) is read-only and
+    /// reflects this pin, not anything software wrote (Mednafen `OnChipRegRead`
+    /// 0xE0: `ICR | (NMILevel << 15)`). Stored inverted so the `Default` (false)
+    /// is the Saturn master's idle-HIGH NMI line (the SMPC drives it high at
+    /// power-on, Mednafen `smpc.cpp` `CPU[0].SetNMI(true)`). A pin property:
+    /// survives reset; the host sets it via `Cpu::set_nmi_pin`.
+    pub nmi_pin_low: bool,
     /// Bit-set of pending sources, indexed by `Source::ord()` slot. A bit
     /// being set means the source has fired but the CPU hasn't accepted
     /// it yet. Cleared by [`Intc::acknowledge`].
@@ -131,6 +138,12 @@ impl Intc {
             }
         }
         self.best = best;
+    }
+
+    /// ICR as software reads it: the stored NMIE/VECMD bits plus the read-only
+    /// NMIL (bit 15) = the current NMI pin level.
+    pub fn icr_read(&self) -> u16 {
+        self.icr | ((!self.nmi_pin_low as u16) << 15)
     }
 
     /// Reset the INTC registers to their SH7604 reset values (Mednafen

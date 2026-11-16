@@ -137,7 +137,11 @@ fn intc_ipra_block_icr_and_vcrwdt_byte_access() {
     o.write16(0xFFFF_FEE4, 0x00C3); // VCRWDT
     // Only ICR NMIE/VECMD (0x0101) and the 7-bit VCRWDT fields are writable.
     assert_eq!(o.intc.icr, 0x0001, "ICR keeps only NMIE/VECMD");
+    // NMIL (bit 15) reads the NMI pin (idle high by default), not the write.
+    assert_eq!(o.read16(0xFFFF_FEE0), 0x8001, "NMIL = pin level");
+    o.intc.nmi_pin_low = true;
+    assert_eq!(o.read16(0xFFFF_FEE0), 0x0001, "pin low → NMIL 0");
     assert_eq!(o.intc.vcrwdt, 0x0043, "VCRWDT vector fields are 7 bits");
-    assert_eq!(o.read8(0xFFFF_FEE0), 0x00, "ICR high byte");
+    assert_eq!(o.read8(0xFFFF_FEE0), 0x00, "ICR high byte (pin low)");
     assert_eq!(o.read8(0xFFFF_FEE5), 0x43, "VCRWDT low byte");
 }

@@ -386,8 +386,8 @@ impl OnChip {
 fn intc_read8(i: &Intc, off: u32, ipra_block: bool) -> u8 {
     if ipra_block {
         match off {
-            0x00 => (i.icr >> 8) as u8,
-            0x01 => i.icr as u8,
+            0x00 => (i.icr_read() >> 8) as u8,
+            0x01 => i.icr_read() as u8,
             0x02 => (i.ipra >> 8) as u8,
             0x03 => i.ipra as u8,
             0x04 => (i.vcrwdt >> 8) as u8,
@@ -441,7 +441,8 @@ fn intc_write8(i: &mut Intc, off: u32, val: u8, ipra_block: bool) {
     }
     // Writable-bit masks (Mednafen `OnChipRegWrite`, `sh7095.inc`): the vector
     // fields are 7 bits, IPRA's low nibble and IPRB's low byte are reserved,
-    // and only ICR's NMIE (bit 8) / VECMD (bit 0) are writable.
+    // and only ICR's NMIE (bit 8) / VECMD (bit 0) are writable (NMIL, bit 15,
+    // is the read-only NMI pin level — see `Intc::icr_read`).
     i.icr &= 0x0101;
     i.ipra &= 0xFFF0;
     i.iprb &= 0xFF00;
