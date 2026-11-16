@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use saturn::cartridge::Cartridge;
+use saturn::host_files::{self, battery_path, cart_card_path, parse_cart, write_atomic};
 
 // The OSD menu is pure logic (no sdl3): compile it for the SDL3 frontend and
 // for tests (so its unit tests run even with `--no-default-features`), but not
@@ -211,7 +212,7 @@ fn run_doctor(bios_path: Option<String>, disc_path: Option<String>) -> ExitCode 
             Ok(bios) => {
                 let region = detect_region(&bp, None);
                 let disc = match disc_path {
-                    Some(dp) => match load_image_disc(&dp) {
+                    Some(dp) => match host_files::load_image_disc(std::path::Path::new(&dp)) {
                         Ok(d) => Some(d),
                         Err(e) => {
                             eprintln!("doctor: disc load failed ({dp}): {e}");
@@ -447,27 +448,6 @@ fn detect_region(bios_path: &str, cfg_region: Option<&str>) -> u8 {
     }
 }
 
-/// Parse a `--cart=` spec into a [`Cartridge`]. Accepts `ram1m`/`ram4m`
-/// (Extension DRAM), `bram[4|8|16|32]` (battery backup RAM, in Mbit), and
-/// `rom:<path>` (a game ROM image loaded from disk).
-fn parse_cart(spec: &str) -> Result<Cartridge, String> {
-    if let Some(path) = spec.strip_prefix("rom:") {
-        let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        return Ok(Cartridge::rom(bytes));
-    }
-    match spec {
-        "ram1m" => Ok(Cartridge::ext_ram_1mb()),
-        "ram4m" => Ok(Cartridge::ext_ram_4mb()),
-        "bram" | "bram32" => Ok(Cartridge::backup_ram(0x0040_0000)),
-        "bram4" => Ok(Cartridge::backup_ram(0x0008_0000)),
-        "bram8" => Ok(Cartridge::backup_ram(0x0010_0000)),
-        "bram16" => Ok(Cartridge::backup_ram(0x0020_0000)),
-        other => Err(format!(
-            "unknown cart kind '{other}' (use ram1m / ram4m / bram[4|8|16|32] / rom:<path>)"
-        )),
-    }
-}
-
 /// Find the BIOS images the OSD BIOS screen can power-cycle into: every
 /// `.bin` of exactly 512 KiB in the launched image's directory, sorted.
 /// Returns the list and the launched image's index in it (the launched path
@@ -510,41 +490,9 @@ fn insert_from_spec(sat: &mut saturn::Saturn, spec: &str) -> Result<(), String> 
     if let Some(device) = spec.strip_prefix("cdrom:") {
         sat.insert_disc(physdisc::PhysicalDisc::open(device)?);
     } else {
-        sat.insert_disc(load_image_disc(spec)?);
+        sat.insert_disc(host_files::load_image_disc(std::path::Path::new(spec))?);
     }
     Ok(())
-}
-
-/// Load a disc image, picking the parser by file extension: `.iso` (raw
-/// 2048-byte data track), `.cue` (CUE sheet + its `.bin`s), or `.ccd`
-/// (CloneCD control file + sibling `.img`).
-fn load_image_disc(path: &str) -> Result<saturn::disc::Disc, String> {
-    use saturn::disc::Disc;
-    use std::path::Path;
-
-    let p = Path::new(path);
-    let dir = p.parent().unwrap_or_else(|| Path::new("."));
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "iso" => Ok(Disc::from_iso(fs::read(p).map_err(|e| e.to_string())?)),
-        "cue" => {
-            let cue = fs::read_to_string(p).map_err(|e| e.to_string())?;
-            Disc::from_cue(&cue, |name| fs::read(dir.join(name)).ok())
-        }
-        "ccd" => {
-            let ccd = fs::read_to_string(p).map_err(|e| e.to_string())?;
-            let img = p.with_extension("img");
-            let bytes = fs::read(&img).map_err(|e| format!("{}: {e}", img.display()))?;
-            Disc::from_ccd(&ccd, bytes)
-        }
-        other => Err(format!(
-            "unknown disc format '.{other}' (use .cue / .iso / .ccd)"
-        )),
-    }
 }
 
 /// Game-frames to compute before the next render submit, given the current
@@ -573,21 +521,13 @@ fn state_base_for(launched_spec: Option<&str>, bios_base: &std::path::Path) -> s
     }
 }
 
-/// Path to backup-RAM cartridge **card** `card`'s virtual memory-card file
-/// (`<save_base>.<card>.crtbup`), keyed to the BIOS like the internal `.bup`
-/// (ADR-0028). `card` is a [`config::BACKUP_CARDS`] slot index.
-#[cfg_attr(not(feature = "sdl-frontend"), allow(dead_code))]
-fn cart_card_path(save_base: &std::path::Path, card: u8) -> std::path::PathBuf {
-    save_base.with_extension(format!("{card}.crtbup"))
-}
-
 /// Persist the currently-plugged backup cartridge (if any) to the active card's
 /// file, before switching cards or ejecting (ADR-0028).
 #[cfg(feature = "sdl-frontend")]
 fn persist_active_backup_card(saturn: &saturn::Saturn, sess: &Session) {
     if let Some(bytes) = saturn.cartridge_backup() {
         let path = cart_card_path(&sess.save_base, sess.cfg.cart_card);
-        if let Err(e) = fs::write(&path, bytes) {
+        if let Err(e) = write_atomic(&path, bytes) {
             eprintln!("failed to persist backup card to {}: {e}", path.display());
         }
     }
@@ -796,10 +736,10 @@ fn run(
     // Save-state quickslot and the persisted battery (internal backup RAM),
     // both keyed to the BIOS path. F5/F9 use the former; the latter is the
     // console's "memory card", loaded here and written back on exit.
-    let battery_path = save_base.with_extension("bup");
-    if let Ok(bytes) = fs::read(&battery_path) {
+    let bup_path = battery_path(&save_base);
+    if let Ok(bytes) = fs::read(&bup_path) {
         saturn.load_internal_backup(&bytes);
-        eprintln!("loaded backup RAM from {}", battery_path.display());
+        eprintln!("loaded backup RAM from {}", bup_path.display());
     }
 
     // The battery backup *cartridge* persists to a `.crtbup` virtual memory-card
@@ -1362,7 +1302,7 @@ fn run(
                                 break 'emu;
                             }
                         }
-                        EmuIn::Quicksave => match fs::write(sess.state_path(), saturn.save_state())
+                        EmuIn::Quicksave => match write_atomic(&sess.state_path(), &saturn.save_state())
                         {
                             Ok(()) => osd.set_toast("Quicksave", 90),
                             Err(e) => eprintln!("save state failed: {e}"),
@@ -2196,18 +2136,18 @@ fn run(
         // final machine state — keyed to the final save base (a BIOS swap
         // re-keys it mid-session).
         let (saturn, final_base, final_card) = emu.join().expect("emu thread");
-        let battery_path = final_base.with_extension("bup");
-        if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
+        let bup_path = battery_path(&final_base);
+        if let Err(e) = write_atomic(&bup_path, saturn.internal_backup()) {
             eprintln!(
                 "failed to persist backup RAM to {}: {e}",
-                battery_path.display()
+                bup_path.display()
             );
         }
         // Persist the backup cartridge too, when one is plugged in — to the
         // active card's file (ADR-0028).
         if let Some(bytes) = saturn.cartridge_backup() {
             let cart_path = cart_card_path(&final_base, final_card);
-            if let Err(e) = fs::write(&cart_path, bytes) {
+            if let Err(e) = write_atomic(&cart_path, bytes) {
                 eprintln!(
                     "failed to persist backup cartridge to {}: {e}",
                     cart_path.display()
@@ -2599,7 +2539,7 @@ fn dispatch_osd(
             osd.set_toast("Reset", 120);
             osd.close();
         }
-        OsdAction::Save(n) => match fs::write(sess.slot_path(n), saturn.save_state()) {
+        OsdAction::Save(n) => match write_atomic(&sess.slot_path(n), &saturn.save_state()) {
             Ok(()) => osd.set_toast(format!("Saved slot {n}"), 120),
             Err(e) => osd.set_toast(format!("Save failed: {e}"), 180),
         },
@@ -2806,13 +2746,13 @@ fn dispatch_osd(
                     // launch path: region, ports, RTC, disc, cartridge. (A
                     // `--cart=rom:` cart has no Settings equivalent and is
                     // not re-created — same as the Cartridge screen.)
-                    let old_bup = sess.save_base.with_extension("bup");
-                    if let Err(e) = fs::write(&old_bup, saturn.internal_backup()) {
+                    let old_bup = battery_path(&sess.save_base);
+                    if let Err(e) = write_atomic(&old_bup, saturn.internal_backup()) {
                         eprintln!("failed to persist backup RAM to {}: {e}", old_bup.display());
                     }
                     if let Some(bytes) = saturn.cartridge_backup() {
                         let old_crt = cart_card_path(&sess.save_base, sess.cfg.cart_card);
-                        if let Err(e) = fs::write(&old_crt, bytes) {
+                        if let Err(e) = write_atomic(&old_crt, bytes) {
                             eprintln!(
                                 "failed to persist backup cartridge to {}: {e}",
                                 old_crt.display()
@@ -2833,7 +2773,7 @@ fn dispatch_osd(
                     // Save files re-key to the new image; adopt its battery.
                     sess.save_base = path;
                     sess.bios_active = i;
-                    if let Ok(b) = fs::read(sess.save_base.with_extension("bup")) {
+                    if let Ok(b) = fs::read(battery_path(&sess.save_base)) {
                         saturn.load_internal_backup(&b);
                     }
                     if saturn.cartridge_backup().is_some()
@@ -2877,7 +2817,7 @@ fn dispatch_osd(
             // out, so switching carts doesn't lose its saves.
             if let Some(bytes) = saturn.cartridge_backup() {
                 let crt = cart_card_path(&sess.save_base, sess.cfg.cart_card);
-                if let Err(e) = fs::write(&crt, bytes) {
+                if let Err(e) = write_atomic(&crt, bytes) {
                     eprintln!(
                         "failed to persist backup cartridge to {}: {e}",
                         crt.display()
@@ -2926,7 +2866,7 @@ fn dispatch_osd(
             // Write a fresh, formatted card image to the slot's file.
             let fresh = osd_cart_to_cartridge(osd::OsdCart::BackupRam);
             if let Some(b) = fresh.bram_bytes()
-                && let Err(e) = fs::write(cart_card_path(&sess.save_base, n), b)
+                && let Err(e) = write_atomic(&cart_card_path(&sess.save_base, n), b)
             {
                 eprintln!("failed to create backup card {n}: {e}");
             }
@@ -3030,8 +2970,8 @@ fn run(
     saturn.insert_cartridge(cart);
 
     // Persist the internal backup RAM ("battery") across headless runs too.
-    let battery_path = save_base.with_extension("bup");
-    if let Ok(bytes) = fs::read(&battery_path) {
+    let bup_path = battery_path(&save_base);
+    if let Ok(bytes) = fs::read(&bup_path) {
         saturn.load_internal_backup(&bytes);
     }
     let cart_battery_path = cart_card_path(&save_base, cfg.cart_card);
@@ -3443,7 +3383,9 @@ fn run(
                 .vdp1
                 .display_fb()
                 .as_slice()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|p| p[0] != 0 || p[1] != 0)
                 .count();
             let vdp1_draw = saturn
@@ -3451,11 +3393,15 @@ fn run(
                 .vdp1
                 .fb
                 .as_slice()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|p| p[0] != 0 || p[1] != 0)
                 .count();
             let out_nonblack = framebuffer
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(dump_dims.0 * dump_dims.1)
                 .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
                 .count();
@@ -3637,14 +3583,14 @@ fn run(
         }
     }
 
-    if let Err(e) = fs::write(&battery_path, saturn.internal_backup()) {
+    if let Err(e) = write_atomic(&bup_path, saturn.internal_backup()) {
         eprintln!(
             "failed to persist backup RAM to {}: {e}",
-            battery_path.display()
+            bup_path.display()
         );
     }
     if let Some(bytes) = saturn.cartridge_backup()
-        && let Err(e) = fs::write(&cart_battery_path, bytes)
+        && let Err(e) = write_atomic(&cart_battery_path, bytes)
     {
         eprintln!(
             "failed to persist backup cartridge to {}: {e}",
@@ -3706,7 +3652,7 @@ fn run(
     if let Ok(path) = std::env::var("SAT_DUMP") {
         let (w, h) = dump_dims;
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-        for px in framebuffer[..w * h * 4].chunks_exact(4) {
+        for px in framebuffer[..w * h * 4].as_chunks::<4>().0 {
             ppm.extend_from_slice(&px[..3]); // RGBA → RGB
         }
         match fs::write(&path, &ppm) {
