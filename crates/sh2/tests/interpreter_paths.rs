@@ -328,3 +328,75 @@ fn bcr1_master_slave_bit_is_read_only() {
         "master/slave bit stays 1 despite a write of 0"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cpu::reset resets the on-chip peripherals (Mednafen `SH7095::Reset`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reset_restores_on_chip_peripherals_and_keeps_the_slave_pin() {
+    let (mut cpu, mut bus) = make(&[0x0009, 0x0009]);
+    bus.write_u32(0, PC0); // reset vector PC
+    bus.write_u32(4, SP0); // reset vector SP
+    cpu.set_bsc_slave(true);
+    // Program a handful of on-chip registers away from their reset values.
+    cpu.onchip.write16(0xFFFF_FEE2, 0x5550); // IPRA
+    cpu.onchip.write16(0xFFFF_FE60, 0x0700); // IPRB
+    cpu.onchip.write16(0xFFFF_FE66, 0x4142); // VCRC
+    cpu.onchip.write8(0xFFFF_FE10, 0x8E); // TIER
+    cpu.onchip.write8(0xFFFF_FE16, 0x02); // TCR φ/128
+    cpu.onchip.write16(0xFFFF_FE80, 0xA525); // WTCSR: TME, φ/64
+    cpu.onchip.write32(0xFFFF_FF80, 0x1234); // SAR0 (kept by reset)
+    cpu.onchip.write32(0xFFFF_FF8C, 0x5); // CHCR0 DE|IE
+    cpu.onchip.write32(0xFFFF_FFB0, 0x9); // DMAOR DME|PR
+    cpu.onchip.write32(0xFFFF_FFA0, 0x4C); // VCRDMA0 (kept by reset)
+    cpu.onchip.write32(0xFFFF_FF08, 0x2); // DVCR OVFIE
+    cpu.onchip.write32(0xFFFF_FF00, 7); // DVSR (kept by reset)
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+    cpu.pipeline.cycles = 1_000_000; // well past the timer epoch
+
+    cpu.reset(&mut bus);
+
+    let o = &mut cpu.onchip;
+    assert_eq!((o.intc.ipra, o.intc.iprb, o.intc.vcrc), (0, 0, 0), "INTC");
+    assert_eq!((o.frt.tier, o.frt.tcr, o.frt.frc), (0, 0, 0), "FRT");
+    assert_eq!((o.wdt.wtcsr, o.wdt.wtcnt), (0, 0), "WDT");
+    assert_eq!(o.dmac.channels[0].chcr, 0, "CHCR0");
+    assert_eq!(o.dmac.dmaor, 0, "DMAOR");
+    assert_eq!(o.divu.dvcr, 0, "DVCR");
+    assert_eq!(o.dmac.channels[0].sar, 0x1234, "SAR kept");
+    assert_eq!(o.intc.vcrdma0, 0x4C, "VCRDMA kept");
+    assert_eq!(o.divu.dvsr, 7, "DVSR kept");
+    assert!(o.bsc.is_slave, "master/slave pin survives reset");
+    assert_eq!(o.intc.next_pending(0), None, "no stale on-chip request");
+}
+
+#[test]
+fn reading_ftcsr_after_reset_does_not_hang() {
+    // Regression: `Cpu::reset` zeroes `pipeline.cycles`; the lazy FRT/WDT epoch
+    // (`lastts`) used to keep the large pre-reset value, so the next timer
+    // materialization computed a ~2^64-tick delta and spun forever.
+    let (mut cpu, mut bus) = make(&[0x0009]);
+    bus.write_u32(0, PC0);
+    bus.write_u32(4, SP0);
+    // A long run with the FRT ticking at φ/8.
+    cpu.onchip.write8(0xFFFF_FE16, 0x00);
+    cpu.pipeline.cycles = 50_000_000;
+    let _ = cpu.onchip.read8(0xFFFF_FE11); // no-op probe
+    cpu.onchip.frt_wdt_update(cpu.pipeline.cycles);
+    cpu.reset(&mut bus);
+    assert_eq!(cpu.pipeline.cycles, 0);
+    // Through the CPU memory path (timer-synced read): MOV.B @R1,R0.
+    bus.load_program(PC0, &[0x6010]);
+    cpu.regs.r[1] = 0xFFFF_FE11;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[0] & 0xFF, 0, "FTCSR reads its reset value");
+    // And a backwards jump in the cycle counter without a reset is treated as
+    // zero elapsed ticks (re-anchored), not a wrap-around.
+    cpu.onchip.frt_wdt_update(10_000);
+    cpu.onchip.frt_wdt_update(5_000);
+    cpu.onchip.frt_wdt_update(5_008);
+    assert_eq!(cpu.onchip.frt.frc as u64, (10_000 >> 3) + 1);
+}

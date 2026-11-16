@@ -26,8 +26,8 @@ fn read32_byte_aggregation_for_non_native_window() {
     o.write16(0xFFFF_FE62, 0x3344); // VCRA
     assert_eq!(
         o.read32(0xFFFF_FE60),
-        0x1122_3344,
-        "read32 aggregates IPRB:VCRA big-endian"
+        0x1100_3344,
+        "read32 aggregates IPRB:VCRA big-endian (IPRB low byte reserved)"
     );
 }
 
@@ -35,8 +35,9 @@ fn read32_byte_aggregation_for_non_native_window() {
 fn write32_byte_aggregation_splits_into_four_bytes_for_non_native_window() {
     let mut o = OnChip::new();
     o.write32(0xFFFF_FE60, 0xDEAD_BEEF); // IPRB:VCRA via the byte-split path
-    assert_eq!(o.intc.iprb, 0xDEAD, "high halfword → IPRB");
-    assert_eq!(o.intc.vcra, 0xBEEF, "low halfword → VCRA");
+    // Writable-bit masks (Mednafen): IPRB & 0xFF00, VCRA & 0x7F7F.
+    assert_eq!(o.intc.iprb, 0xDE00, "high halfword → IPRB");
+    assert_eq!(o.intc.vcra, 0x3E6F, "low halfword → VCRA");
 }
 
 #[test]
@@ -46,9 +47,11 @@ fn dmac_byte_read_modify_write_preserves_the_rest_of_the_word() {
     let mut o = OnChip::new();
     o.write32(0xFFFF_FF8C, 0x1122_3344); // CHCR0
     o.write8(0xFFFF_FF8F, 0xFF); // low byte only
+    // TE (bit 1) is hardware-set / clear-only, so the written 1 there is
+    // ignored (Mednafen `CHCR = (V & ~2) | ...`).
     assert_eq!(
-        o.dmac.channels[0].chcr, 0x1122_33FF,
-        "only the low byte changed"
+        o.dmac.channels[0].chcr, 0x1122_33FD,
+        "only the low byte changed (TE not software-settable)"
     );
     // And byte reads pick the right byte out of the word.
     assert_eq!(o.read8(0xFFFF_FF8C), 0x11, "byte 0 of CHCR0");
@@ -56,12 +59,13 @@ fn dmac_byte_read_modify_write_preserves_the_rest_of_the_word() {
 }
 
 #[test]
-fn dmaor_native_32_bit_path_masks_to_16_bits() {
-    // DMAOR (0xFFFFFFB0) is a native 32-bit register but only the low 16 bits
-    // are storable; the high bits are masked off on write.
+fn dmaor_native_32_bit_path_masks_to_its_writable_bits() {
+    // DMAOR (0xFFFFFFB0) is a native 32-bit register; only DME (bit 0) and PR
+    // (bit 3) are software-writable, NMIF/AE are clear-only (Mednafen
+    // `DMAOR = (V & 9) | ...`).
     let mut o = OnChip::new();
-    o.write32(0xFFFF_FFB0, 0xFFFF_0001);
-    assert_eq!(o.dmac.dmaor, 0x0000_0001, "DMAOR masked to 16 bits");
+    o.write32(0xFFFF_FFB0, 0xFFFF_FFF7);
+    assert_eq!(o.dmac.dmaor, 0x0000_0001, "only DME/PR writable");
     assert_eq!(
         o.read32(0xFFFF_FFB0),
         0x0000_0001,
@@ -131,8 +135,9 @@ fn intc_ipra_block_icr_and_vcrwdt_byte_access() {
     let mut o = OnChip::new();
     o.write16(0xFFFF_FEE0, 0xAA55); // ICR
     o.write16(0xFFFF_FEE4, 0x00C3); // VCRWDT
-    assert_eq!(o.intc.icr, 0xAA55, "ICR round-trips");
-    assert_eq!(o.intc.vcrwdt, 0x00C3, "VCRWDT round-trips");
-    assert_eq!(o.read8(0xFFFF_FEE0), 0xAA, "ICR high byte");
-    assert_eq!(o.read8(0xFFFF_FEE5), 0xC3, "VCRWDT low byte");
+    // Only ICR NMIE/VECMD (0x0101) and the 7-bit VCRWDT fields are writable.
+    assert_eq!(o.intc.icr, 0x0001, "ICR keeps only NMIE/VECMD");
+    assert_eq!(o.intc.vcrwdt, 0x0043, "VCRWDT vector fields are 7 bits");
+    assert_eq!(o.read8(0xFFFF_FEE0), 0x00, "ICR high byte");
+    assert_eq!(o.read8(0xFFFF_FEE5), 0x43, "VCRWDT low byte");
 }

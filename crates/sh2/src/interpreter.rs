@@ -289,6 +289,13 @@ impl Cpu {
         // Mednafen's reset leaving the core with a clean cache.
         self.cache.purge();
         self.cache.set_ccr(0);
+        // The on-chip peripherals reset too (DMAC/INTC/DIVU/FRT/WDT — Mednafen
+        // `SH7095::Reset`); without this a re-reset slave (SMPC SSHOFF→SSHON)
+        // kept its stale DMAC/timer/interrupt setup. The timer epoch anchors at
+        // the (just-zeroed) cycle counter; a host that then jumps the cycle
+        // re-anchors via `OnChip::reset_timer_epoch`. The BSC master/slave pin
+        // bit is preserved.
+        self.onchip.reset(self.pipeline.cycles);
         let (pc, _) = self.mem_read32(0x0000_0000, AccessKind::Data, bus);
         let (sp, _) = self.mem_read32(0x0000_0004, AccessKind::Data, bus);
         self.regs.pc = pc;
@@ -1798,7 +1805,7 @@ impl Cpu {
                 // sar, sar+4, sar+8, sar+12 then advances by 16 (SM ignored); the
                 // destination is written per-longword, advancing by DM each time.
                 if (sar | dar) & 3 != 0 {
-                    self.onchip.dmac.dmaor |= 4; // AE
+                    self.onchip.dmac.latch_ae(); // AE
                     fault = true;
                 }
                 let mut buf = [0u32; 4];
@@ -1816,7 +1823,7 @@ impl Cpu {
                 }
             } else {
                 if (sar | dar) & align != 0 {
-                    self.onchip.dmac.dmaor |= 4; // AE: misaligned word/long address
+                    self.onchip.dmac.latch_ae(); // AE: misaligned word/long address
                     fault = true;
                 }
                 let v = self.dma_read(sar & AM & !align, ts, bus);
@@ -1833,7 +1840,7 @@ impl Cpu {
         // Completion: TE latches only when the count reaches zero (a fault aborts
         // with TCR still non-zero, leaving TE clear). SAR/DAR/TCR write back.
         if tcr == 0 {
-            self.onchip.dmac.channels[ch].chcr |= 0b10; // TE
+            self.onchip.dmac.latch_te(ch); // TE (+ write-0 protection until read)
             // Recalc-on-change (Stage C): TE just latched; if CHCR.IE is set the
             // transfer-end interrupt is now pending. Re-arm the INTC here rather
             // than via a per-instruction refresh.

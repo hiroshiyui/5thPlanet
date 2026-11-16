@@ -107,7 +107,7 @@ impl OnChip {
             0x0E0..=0x0FF => intc_read8(&self.intc, addr & 0x1F, /*ipra*/ true),
             0x100..=0x11F => (self.divu.read32(addr & 0x1F) >> (8 * (3 - (addr & 3)))) as u8,
             0x140..=0x17F => self.ubc.read8(addr & 0x1F),
-            0x180..=0x1BF => dmac_read8(&self.dmac, addr & 0x3F),
+            0x180..=0x1BF => dmac_read8(&mut self.dmac, addr & 0x3F),
             0x1C0..=0x1FF => self.bsc.read8(addr & 0x1F),
             _ => 0,
         }
@@ -164,7 +164,7 @@ impl OnChip {
             // are routed here rather than in `dmac_read32`.
             0x1A0 => self.intc.vcrdma0,
             0x1A8 => self.intc.vcrdma1,
-            0x180..=0x1BF => dmac_read32(&self.dmac, addr & 0x3F),
+            0x180..=0x1BF => dmac_read32(&mut self.dmac, addr & 0x3F),
             _ => {
                 ((self.read8(addr) as u32) << 24)
                     | ((self.read8(addr + 1) as u32) << 16)
@@ -210,6 +210,16 @@ impl OnChip {
     pub fn frt_wdt_update(&mut self, now: u64) {
         let prev = self.lastts;
         self.lastts = now;
+        // A cycle counter that moved *backwards* (a discontinuity: e.g. a CPU
+        // reset zeroing `pipeline.cycles` without re-anchoring the epoch) must
+        // not be read as a ~2^64-tick delta — `wrapping_sub` of the shifted
+        // values would spin the per-tick loop effectively forever. Treat it as
+        // zero elapsed ticks and re-anchor the epoch at `now` (as
+        // [`Self::reset_timer_epoch`] does). Mednafen asserts this never
+        // happens (`assert(timestamp >= FRT.lastts)`).
+        if now < prev {
+            return;
+        }
         let mut flagged = false;
         if self.frt.tcr & 0x03 != 0x03 {
             let shift = Frt::shift(self.frt.tcr);
@@ -265,6 +275,35 @@ impl OnChip {
     #[inline]
     pub fn timer_next_ts(&self) -> u64 {
         self.next_ts
+    }
+
+    /// Reset the on-chip peripherals to their SH7604 reset state, as the
+    /// SH7604 does on a power-on / manual reset (Mednafen `SH7095::Reset`,
+    /// `sh7095.inc`): DMAC CHCR0/1 + DMAOR = 0 (SAR/DAR/TCR and the VCRDMA
+    /// vectors are kept), INTC IPR/VCR/ICR = 0 (`INTC_Reset`), DIVU DVCR = 0
+    /// (the other DIVU registers and VCRDIV are kept), FRT all registers 0
+    /// (`FRT_Reset`), WDT WTCSR/WTCNT/RSTCSR = 0 (`WDT_Reset`). The FRT/WDT
+    /// timer epoch is re-anchored to `now` (`FRT.lastts = timestamp`) and the
+    /// next event recomputed (`FRT_WDT_Recalc_NET`). The BSC (including the
+    /// pin-strapped master/slave bit) and the SCI/UBC register-storage stubs
+    /// are left untouched.
+    pub fn reset(&mut self, now: u64) {
+        for ch in 0..2 {
+            self.dmac.channels[ch].chcr = 0;
+            self.dmac.chcrm[ch] = 0;
+        }
+        self.dmac.dmaor = 0;
+        self.dmac.dmaorm = 0;
+        self.intc.reset_registers();
+        self.divu.dvcr = 0;
+        self.divu.pending_latency = None;
+        self.frt = Frt::default();
+        self.wdt = Wdt::default();
+        self.lastts = now;
+        self.frt_wdt_recalc_net(now);
+        // Re-derive the on-chip interrupt requests from the reset flags.
+        self.intc_sig = None;
+        self.refresh_interrupts();
     }
 
     /// Re-anchor the timer epoch to `now` without ticking (Mednafen does this on
@@ -400,6 +439,17 @@ fn intc_write8(i: &mut Intc, off: u32, val: u8, ipra_block: bool) {
             _ => {}
         }
     }
+    // Writable-bit masks (Mednafen `OnChipRegWrite`, `sh7095.inc`): the vector
+    // fields are 7 bits, IPRA's low nibble and IPRB's low byte are reserved,
+    // and only ICR's NMIE (bit 8) / VECMD (bit 0) are writable.
+    i.icr &= 0x0101;
+    i.ipra &= 0xFFF0;
+    i.iprb &= 0xFF00;
+    i.vcra &= 0x7F7F;
+    i.vcrb &= 0x7F7F;
+    i.vcrc &= 0x7F7F;
+    i.vcrd &= 0x7F00;
+    i.vcrwdt &= 0x7F7F;
     // An IPRA/IPRB write changes source priorities, so the cached highest-
     // priority pending source must be re-derived (no-op for VCR*/ICR writes,
     // but cheap and rare).
@@ -407,7 +457,9 @@ fn intc_write8(i: &mut Intc, off: u32, val: u8, ipra_block: bool) {
 }
 
 // ---- DMAC register helpers ----
-fn dmac_read32(d: &Dmac, off: u32) -> u32 {
+
+/// Side-effect-free DMAC register read (used for byte read-modify-write).
+fn dmac_peek32(d: &Dmac, off: u32) -> u32 {
     match off {
         0x00 => d.channels[0].sar,
         0x04 => d.channels[0].dar,
@@ -422,22 +474,35 @@ fn dmac_read32(d: &Dmac, off: u32) -> u32 {
     }
 }
 
+/// Software DMAC register read: a CHCR / DMAOR read "observes" the hardware-
+/// set TE / AE flags, making them clearable by a subsequent write of 0
+/// (Mednafen `OnChipRegRead`: `CHCRM = 0` / `DMAORM = 0`).
+fn dmac_read32(d: &mut Dmac, off: u32) -> u32 {
+    match off {
+        0x0C => d.chcrm[0] = 0,
+        0x1C => d.chcrm[1] = 0,
+        0x30 => d.dmaorm = 0,
+        _ => {}
+    }
+    dmac_peek32(d, off)
+}
+
 fn dmac_write32(d: &mut Dmac, off: u32, val: u32) {
     match off {
         0x00 => d.channels[0].sar = val,
         0x04 => d.channels[0].dar = val,
         0x08 => d.channels[0].tcr = val & 0x00FF_FFFF,
-        0x0C => d.channels[0].chcr = val,
+        0x0C => d.write_chcr(0, val),
         0x10 => d.channels[1].sar = val,
         0x14 => d.channels[1].dar = val,
         0x18 => d.channels[1].tcr = val & 0x00FF_FFFF,
-        0x1C => d.channels[1].chcr = val,
-        0x30 => d.dmaor = val & 0xFFFF,
+        0x1C => d.write_chcr(1, val),
+        0x30 => d.write_dmaor(val),
         _ => {}
     }
 }
 
-fn dmac_read8(d: &Dmac, off: u32) -> u8 {
+fn dmac_read8(d: &mut Dmac, off: u32) -> u8 {
     let word = dmac_read32(d, off & !3);
     (word >> (8 * (3 - (off & 3)))) as u8
 }
@@ -445,7 +510,7 @@ fn dmac_read8(d: &Dmac, off: u32) -> u8 {
 fn dmac_write8(d: &mut Dmac, off: u32, val: u8) {
     let word_off = off & !3;
     let shift = 8 * (3 - (off & 3));
-    let cur = dmac_read32(d, word_off);
+    let cur = dmac_peek32(d, word_off);
     let mask = !(0xFFu32 << shift);
     dmac_write32(d, word_off, (cur & mask) | ((val as u32) << shift));
 }
@@ -548,8 +613,9 @@ mod tests {
         let mut o = OnChip::new();
         // IPRA at FFFFFEE2 — write the whole halfword.
         o.write16(0xFFFF_FEE2, 0xABCD);
-        assert_eq!(o.intc.ipra, 0xABCD);
-        assert_eq!(o.read16(0xFFFF_FEE2), 0xABCD);
+        // IPRA bits 3..0 are reserved (Mednafen masks writes with 0xFFF0).
+        assert_eq!(o.intc.ipra, 0xABC0);
+        assert_eq!(o.read16(0xFFFF_FEE2), 0xABC0);
     }
 
     #[test]
